@@ -100,6 +100,12 @@ code showed why:
 | Secrets are plain text in the bucket | Secrets are their own type, envelope-encrypted at rest. |
 | 94 `unsafe` sites, pre-1.0 C extension reachable from user SQL | `#![forbid(unsafe_code)]` everywhere except one small, audited FFI crate. No SQLite extensions. Fuzz the SQL layer. |
 
+**Rule: a cell never sees another cell's bytes.** Every byte of a new cell's
+memory starts as zero, as the Wasm spec requires. Today that comes from
+`calloc` (kernel zero pages or glibc `memset`). If we ever pool and reuse
+memory buffers to make spawn faster, the used part must be wiped before reuse.
+The test `fresh_cells_never_see_old_memory` guards this.
+
 ## The sandbox: what Wasm gives us, and what it doesn't
 
 **Free with Wasm:**

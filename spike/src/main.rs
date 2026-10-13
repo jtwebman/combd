@@ -66,6 +66,11 @@ fn request<V: CellVm>(vm: &mut V, req: &str, counter: &mut i64) -> Result<String
 }
 
 fn rss_kb() -> u64 {
+    // Linux: read it directly. macOS: ask ps.
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap_or("");
+        return line.split_whitespace().nth(1).and_then(|n| n.parse().ok()).unwrap_or(0);
+    }
     let out = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
@@ -331,6 +336,28 @@ mod tests {
         let b = finish(&mut copy, SLICE, &mut 0).unwrap();
         assert_eq!(response(&vm, &a), "75025");
         assert_eq!(response(&copy, &b), "75025");
+    }
+
+    /// Security: a new cell must never see bytes left by a dead one.
+    #[test]
+    fn fresh_cells_never_see_old_memory() {
+        let eng = interp::Interp { max_pages: 16384 };
+        let prog = eng.load(&wasm()).unwrap();
+        let clean = eng.spawn(&prog).unwrap();
+        let len = (0u32..).step_by(4096).take_while(|&p| clean.read(p, 1).is_some()).count() as u32 * 4096;
+        let expected = clean.read(0, len).unwrap();
+        for _ in 0..20 {
+            let mut old = eng.spawn(&prog).unwrap();
+            request(&mut old, "sieve 3000000", &mut 0).unwrap(); // grows memory well past 1 MiB
+            let mut p = 0;
+            while old.write(p, &[0xAA; 4096]) {
+                p += 4096;
+            }
+            drop(old);
+            let new = eng.spawn(&prog).unwrap();
+            assert_eq!(new.read(0, len).unwrap(), expected, "a fresh cell saw old memory");
+            assert!(new.read(len, 1).is_none());
+        }
     }
 
     #[test]

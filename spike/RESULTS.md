@@ -63,6 +63,53 @@ Max latencies (not shown) were 4 to 70 ms in some runs, on both engines.
 sometimes parks a thread. A Linux server with pinned threads should tell a
 cleaner story.
 
+## Linux (Docker)
+
+Same code in a Docker container on the same Mac: Linux 7.0 (LinuxKit), ARM64,
+4 KB pages, 8 CPUs given to the VM. Build and run with
+`docker build -f spike/Dockerfile -t combd-spike .` then
+`docker run --rm combd-spike`. All tests pass inside the container. Two full
+runs, ranges shown.
+
+| Measure | interp (ours) | wasmtime | Winner |
+|---|---|---|---|
+| Load a module | **0.35 ms** | 25 ms | ours, ~70x |
+| Spawn a cell | 4.9 to 8.8 us | **4.8 to 5.0 us** | about a tie |
+| Spawn + first request | **12 to 15 us** | 24 to 27 us | ours, ~2x |
+| Crash, then fresh cell serves | **8.8 to 9.6 us** | 15 us | ours, ~1.6x |
+| Memory, idle cell | 8.5 KB | **6.0 KB** | wasmtime |
+| Memory, cell paused mid-loop | **20.8 KB** | 86.6 KB | ours, ~4x less |
+| 10,000 paused cells, whole process | **207 MB** | 854 MB | ours, ~4x less |
+| Hello, quiet, p50 / p99 | **8 / 114 to 203 us** | 97 to 239 / 2,100 to 4,600 us | ours |
+| Hello, stuck neighbor, p50 / p99 | **37 / 79 to 252 us** | 211 / 1,900 to 2,400 us | ours |
+| Hello, heavy neighbor, preemption off, p50 | 102,000 to 106,000 us | n/a | |
+| fib 30 / sieve / sort | 40 / 295 / 568 ms | **2.7 / 16.5 / 16.5 ms** | wasmtime, 15x to 35x |
+
+What changed on Linux:
+- **Paused cells shrank from 69 KB to 21 KB on our engine,** thanks to 4 KB
+  pages. Wasmtime stayed near 87 KB, likely because each paused call holds its
+  own fiber stack. 10,000 paused cells: 207 MB vs 854 MB.
+- **Our spawn got slower (0.6 us to ~5 us).** glibc serves each 1 MiB cell
+  buffer with its own `mmap`, and that system call is the cost.
+- **glibc needed one setting.** After big frees, glibc raises its mmap
+  threshold and starts serving 1 MiB blocks from its heap, which it then
+  zeroes by hand. Crash restart was 33 us until we pinned
+  `MALLOC_MMAP_THRESHOLD_=131072` (set in the Dockerfile). Then it dropped to
+  9 us. Zeroing still happens either way; the setting only moves it from
+  glibc's `memset` to the kernel's lazy zero pages.
+- **Wasmtime's latency is much worse here than on macOS** (p50 ~100 to 240 us
+  vs ~25 us). We run it with default settings and no pooling allocator, so
+  every call sets up a fresh async stack. A tuned Wasmtime would do better.
+  Treat its latency rows as "Wasmtime untuned".
+
+## Security: memory is always zero
+
+Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,
+whether the kernel zeroes the pages lazily or glibc zeroes them with `memset`.
+Safe Rust can't expose leftover memory at all (that takes `unsafe`, which is
+banned). The test `fresh_cells_never_see_old_memory` fills dead cells with a
+pattern and checks that new cells never see it.
+
 ## What we learned
 
 1. **The Erlang shape works.** Preemption holds, crashes stay contained, a
@@ -106,5 +153,6 @@ are heavy on compute a fast option.
 1. Run the official Wasm spec test suite against the interpreter.
 2. Fast-interpreter work toward the 5x target. Profile `sort` first; it is the
    worst at 39x.
-3. Same race on a Linux x86 box (4 KB pages, pinned threads).
+3. Same race on a real Linux x86 server (done on ARM64 in Docker, see above).
+   Also rerun Wasmtime with its pooling allocator for a fairer latency row.
 4. Add celld to the scoreboard (needs a yes to install and run it).
