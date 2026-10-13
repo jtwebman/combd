@@ -411,30 +411,50 @@ no real file or network access. Days of work, not months.
 Each gets a tiny SDK for the cell API (`fetch`, `storage.sql`, alarms, `db`)
 and an example cell. The JS path below does not block any of this.
 
-## Our own JS engine (long track)
+## Our own JS engine
 
-Bun did not write a JS engine. It runs on JavaScriptCore and built the runtime
-around it. Writing a *fast* JIT engine takes big teams a decade. Writing a
-*correct interpreter* has been done by small teams (QuickJS, Boa, Nova), and
-the hard part is the long tail of conformance.
+Bun did not write a JS engine (it runs on JavaScriptCore). But the old rule
+that a fast engine "takes big teams a decade" assumed humans write the code.
+With AI writing it, the bottleneck moves to checking it, and JS has excellent
+checkers. So we treat this as an experiment with a scoreboard, like phase 0.
 
-What would make ours worth it: **compile JS straight to our engine's own
-bytecode, not to Wasm.**
-- One interpreter instead of two (QuickJS in Wasm interprets an interpreter).
-- JS cells get reductions, fair preemption, let it crash, `snapshot_after_init`,
-  mid-call snapshots, and replayable crashes natively.
-- The JS heap lives in safe Rust: arena objects addressed by index, no
-  `unsafe`. A bug can't corrupt memory, and the heap is plain data, so
-  snapshots still work.
-- Strong oracles: test262 (50,000+ tests) plus differential runs against V8.
+**Why ours could win where it counts:**
+- **Compile JS straight to our engine's own bytecode,** not to Wasm. One
+  interpreter, not two stacked.
+- **Yielding, let it crash, `snapshot_after_init`, mid-call snapshots, and
+  replayable crashes built in from day one.** V8 can't retrofit these.
+- **A narrower target than V8:** no browser, no DOM, fewer legacy web quirks,
+  and no `eval` / `new Function` (Cloudflare Workers ban them too).
+- **Workers traffic is mostly short requests.** V8's peak speed comes from its
+  optimizing JIT, which only kicks in once code runs hot. A strong interpreter
+  (shapes, inline caches) plus warm snapshots can beat V8 on startup, memory
+  per instance, tail latency, and short requests, even where V8 still wins
+  long-running compute.
 
-Order and gates:
-1. Bridge first: QuickJS in Wasm (above), so JS users aren't blocked.
-2. Milestone 1: enough JS to run a Hono "hello" handler on our VM, with
-   snapshots and preemption. Race it against QuickJS in Wasm. **If it is not
-   clearly faster (target 5x or more), stop and keep QuickJS.**
-3. Milestone 2: Workers APIs, then conformance tracked as a test262 pass rate.
+**The harness comes first (week 1), before the engine:**
+- test262 runner (50,000+ conformance tests), tracked as a pass rate.
+- Differential runner: every program on our engine, Node (V8), and Bun (JSC).
+  Outputs must match.
+- Performance suite: startup, short Hono-style requests, JSON, templating,
+  memory per instance, p99 under load, plus long compute benchmarks.
+- Fuzzer: random JS programs, run everywhere, outputs compared. Runs nonstop.
+- Nightly scoreboard against V8, JSC, and QuickJS.
+
+**Then build, and let the AI loop grind against the harness:**
+1. Month 1: parser, bytecode, shapes and inline caches, a safe-Rust GC (arena
+   objects addressed by index, no `unsafe`). Goal: Hono "hello" on our VM, with
+   snapshots and preemption, and a test262 pass rate on the board.
+2. Months 2 to 3: conformance and interpreter speed, nonstop.
+3. Gate: race it against QuickJS in Wasm. If it is not clearly faster
+   (target 5x or more), stop and keep QuickJS.
 4. Replace QuickJS once ours passes enough of test262 and wins the race.
+
+**Security rules for any JIT:** tests prove an engine gives right answers.
+They can't prove a speculative optimizing JIT is safe against a hostile
+program, and that is where V8's worst security bugs come from. So:
+- the safe-Rust interpreter is always the default,
+- any JIT tier is opt-in, for trusted code, in its own locked-down process,
+- the fuzzer runs against the JIT before and after every change.
 
 ## The runtime: Erlang ideas on Wasmtime
 
