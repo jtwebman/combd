@@ -12,6 +12,15 @@ pub enum Outcome {
     Trap(String),
 }
 
+/// A host function a module imports.
+#[derive(Clone, Debug)]
+pub struct Import {
+    pub module: String,
+    pub name: String,
+    /// How many values it returns (0 or 1 for everything we support).
+    pub results: u32,
+}
+
 pub trait Engine {
     type Program;
     type Vm: CellVm;
@@ -30,6 +39,12 @@ pub trait CellVm {
     fn resume(&mut self, results: &[u64]);
     fn read(&self, ptr: u32, len: u32) -> Option<Vec<u8>>;
     fn write(&mut self, ptr: u32, bytes: &[u8]) -> bool;
+    /// Which import a `HostCall` refers to.
+    fn import(&self, idx: u32) -> Option<&Import>;
+    /// Output the engine captured itself (only engines that run host calls inline).
+    fn host_out(&self) -> Vec<u8> {
+        Vec::new()
+    }
     /// A full copy of the cell, even mid-call. `None` if the engine can't.
     fn snapshot(&self) -> Option<Self>
     where

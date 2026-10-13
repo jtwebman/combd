@@ -1,0 +1,108 @@
+//! Host functions a cell can import: combd's own, plus a small, safe slice of
+//! WASI preview 1. Every engine calls these same functions.
+//!
+//! No files, no network, no sleeping. Output goes to a capped buffer. The clock
+//! is coarse on purpose (timing attacks). Anything else answers "not supported".
+
+use crate::engine::Import;
+use std::io::Read;
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// What the host keeps for one cell.
+#[derive(Default)]
+pub struct HostState {
+    pub counter: i64,
+    /// stdout and stderr, capped at `MAX_OUT`.
+    pub out: Vec<u8>,
+}
+
+const MAX_OUT: usize = 64 * 1024;
+const MAX_RANDOM: u32 = 64 * 1024;
+/// Clocks are rounded down to this many nanoseconds (1 ms).
+const CLOCK_GRAIN: u64 = 1_000_000;
+
+/// Guest memory, as the host sees it.
+pub trait Mem {
+    fn read(&self, ptr: u32, len: u32) -> Option<Vec<u8>>;
+    fn write(&mut self, ptr: u32, bytes: &[u8]) -> bool;
+}
+
+const OK: u64 = 0;
+const EBADF: u64 = 8;
+const EFAULT: u64 = 21;
+const EINVAL: u64 = 28;
+const ENOSYS: u64 = 52;
+const ENOTCAPABLE: u64 = 76;
+
+/// Run import `imp`. `Err` means the cell must crash.
+pub fn call(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Result<Vec<u64>, String> {
+    let r = match (imp.module.as_str(), imp.name.as_str()) {
+        ("combd", "counter_incr") => {
+            st.counter += 1;
+            st.counter as u64
+        }
+        ("env", "abort") => return Err("abort".into()),
+        ("wasi_snapshot_preview1", "proc_exit") => return Err(format!("exit {}", args[0] as i32)),
+        ("wasi_snapshot_preview1", name) => wasi(name, args, mem, st),
+        (m, n) => return Err(format!("unknown import {m}.{n}")),
+    };
+    Ok(if imp.results == 0 { vec![] } else { vec![r] })
+}
+
+fn put(mem: &mut dyn Mem, ptr: u32, bytes: &[u8]) -> u64 {
+    if mem.write(ptr, bytes) { OK } else { EFAULT }
+}
+
+fn u32_at(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(b[i..i + 4].try_into().unwrap())
+}
+
+fn wasi(name: &str, a: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> u64 {
+    let arg = |i: usize| a[i] as u32;
+    match name {
+        "fd_write" => {
+            if arg(0) != 1 && arg(0) != 2 {
+                return EBADF;
+            }
+            let Some(iovs) = arg(2).checked_mul(8).and_then(|n| mem.read(arg(1), n)) else { return EFAULT };
+            let mut total = 0u32;
+            for iov in iovs.chunks_exact(8) {
+                let Some(bytes) = mem.read(u32_at(iov, 0), u32_at(iov, 4)) else { return EFAULT };
+                let room = MAX_OUT.saturating_sub(st.out.len());
+                st.out.extend_from_slice(&bytes[..bytes.len().min(room)]);
+                total = total.saturating_add(bytes.len() as u32);
+            }
+            put(mem, arg(3), &total.to_le_bytes())
+        }
+        // stdin is always empty.
+        "fd_read" if arg(0) == 0 => put(mem, arg(3), &0u32.to_le_bytes()),
+        "random_get" => {
+            if arg(1) > MAX_RANDOM {
+                return EINVAL;
+            }
+            let mut b = vec![0u8; arg(1) as usize];
+            match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)) {
+                Ok(()) => put(mem, arg(0), &b),
+                Err(_) => ENOSYS,
+            }
+        }
+        "clock_time_get" => {
+            static START: OnceLock<Instant> = OnceLock::new();
+            let ns = match arg(0) {
+                0 => SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64),
+                1..=3 => START.get_or_init(Instant::now).elapsed().as_nanos() as u64,
+                _ => return EINVAL,
+            };
+            put(mem, arg(2), &(ns / CLOCK_GRAIN * CLOCK_GRAIN).to_le_bytes())
+        }
+        "clock_res_get" => put(mem, arg(1), &CLOCK_GRAIN.to_le_bytes()),
+        "args_sizes_get" | "environ_sizes_get" => match put(mem, arg(0), &0u32.to_le_bytes()) {
+            OK => put(mem, arg(1), &0u32.to_le_bytes()),
+            err => err,
+        },
+        "args_get" | "environ_get" | "sched_yield" => OK,
+        n if n.starts_with("path_") => ENOTCAPABLE,
+        _ => ENOSYS,
+    }
+}

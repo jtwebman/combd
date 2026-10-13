@@ -41,7 +41,7 @@ pub fn sort(n: usize) -> u64 {
     v.iter().step_by(97).fold(0, |a, &b| a.wrapping_mul(31).wrapping_add(b))
 }
 
-/// One request: "hello", "spin", "panic", "fib N", "sieve N", or "sort N".
+/// One request: "hello", "print", "spin", "panic", "fib N", "sieve N", or "sort N".
 pub fn run(req: &str, counter: impl FnOnce() -> i64) -> String {
     let (cmd, arg) = req.split_once(' ').unwrap_or((req, "0"));
     let n: u64 = arg.trim().parse().unwrap_or(0);
@@ -54,6 +54,8 @@ pub fn run(req: &str, counter: impl FnOnce() -> i64) -> String {
             }
         }
         "panic" => panic!("boom"),
+        // wasm32-unknown-unknown has no stdout, so "print" just answers.
+        "print" => "printed".into(),
         "fib" => fib(n as u32).to_string(),
         "sieve" => sieve(n as usize).to_string(),
         "sort" => sort(n as usize).to_string(),

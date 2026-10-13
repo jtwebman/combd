@@ -11,7 +11,7 @@
 //! ponytail: naive stack interpreter, one big match. Register bytecode and
 //! fused ops are the known next step if compute speed matters.
 
-use crate::engine::{CellVm, Engine, Outcome};
+use crate::engine::{CellVm, Engine, Import, Outcome};
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
@@ -155,6 +155,7 @@ pub struct Module {
     types: Vec<FuncType>,
     func_types: Vec<u32>, // every function, imports first
     imports: u32,
+    import_names: Vec<Import>,
     funcs: Vec<Func>, // defined functions only
     globals: Vec<u64>,
     mem: (u32, Option<u32>), // min and max pages
@@ -204,8 +205,11 @@ pub fn load(wasm: &[u8]) -> Result<Module, String> {
             }
             Payload::ImportSection(r) => {
                 for i in r.into_imports() {
-                    match i.map_err(e)?.ty {
+                    let i = i.map_err(e)?;
+                    match i.ty {
                         TypeRef::Func(t) => {
+                            let results = m.types.get(t as usize).map_or(0, |ty| ty.results().len() as u32);
+                            m.import_names.push(Import { module: i.module.to_string(), name: i.name.to_string(), results });
                             m.func_types.push(t);
                             m.imports += 1;
                         }
@@ -652,6 +656,10 @@ impl CellVm for Vm {
             }
             None => false,
         }
+    }
+
+    fn import(&self, idx: u32) -> Option<&Import> {
+        self.m.import_names.get(idx as usize)
     }
 
     fn snapshot(&self) -> Option<Vm> {

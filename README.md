@@ -79,6 +79,9 @@ recovered from crashes about 3 times faster, used less memory, and came in
 5.5 times smaller. It is still far slower at raw math, and closing that gap is
 next. **[See the results.](spike/RESULTS.md)**
 
+Cells already run in five languages: Rust, C, Zig, Go (TinyGo), and
+AssemblyScript (TypeScript-like). See [langs/](langs/).
+
 ## Standing on shoulders
 
 combd is inspired by [celld](https://github.com/denoland/celld),

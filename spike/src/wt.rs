@@ -2,13 +2,14 @@
 //! Fuel yields stand in for reductions. Host calls run inline, so this engine
 //! never returns `HostCall`, and it can't snapshot.
 
-use crate::engine::{CellVm, Engine, Outcome};
+use crate::engine::{CellVm, Engine, Import, Outcome};
+use crate::host::{self, HostState, Mem};
 use std::future::Future;
 use std::pin::{pin, Pin};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
-    Caller, Config, Instance, InstanceAllocationStrategy, InstancePre, Linker, Memory, Module, PoolingAllocationConfig, Store,
-    Val, ValType,
+    Caller, Config, ExternType, Instance, InstanceAllocationStrategy, InstancePre, Linker, Memory, Module,
+    PoolingAllocationConfig, Store, Val, ValType,
 };
 
 pub struct Wt {
@@ -33,14 +34,10 @@ impl Wt {
     }
 }
 
-pub struct Host {
-    counter: i64,
-}
-
-type Running = Pin<Box<dyn Future<Output = (Store<Host>, wasmtime::Result<Vec<Val>>)> + Send>>;
+type Running = Pin<Box<dyn Future<Output = (Store<HostState>, wasmtime::Result<Vec<Val>>)> + Send>>;
 
 pub struct WtVm {
-    store: Option<Store<Host>>,
+    store: Option<Store<HostState>>,
     instance: Instance,
     memory: Memory,
     running: Option<Running>,
@@ -60,24 +57,80 @@ fn block_on<F: Future>(f: F) -> F::Output {
     }
 }
 
+/// Guest memory seen through a Wasmtime caller.
+struct SliceMem<'a>(Option<&'a mut [u8]>);
+
+impl Mem for SliceMem<'_> {
+    fn read(&self, ptr: u32, len: u32) -> Option<Vec<u8>> {
+        self.0.as_ref()?.get(ptr as usize..(ptr as usize).checked_add(len as usize)?).map(<[u8]>::to_vec)
+    }
+    fn write(&mut self, ptr: u32, bytes: &[u8]) -> bool {
+        let Some(m) = self.0.as_mut() else { return false };
+        match m.get_mut(ptr as usize..ptr as usize + bytes.len()) {
+            Some(to) => {
+                to.copy_from_slice(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+fn to_u64(v: &Val) -> u64 {
+    match v {
+        Val::I32(x) => *x as u32 as u64,
+        Val::I64(x) => *x as u64,
+        Val::F32(x) => *x as u64,
+        Val::F64(x) => *x,
+        _ => 0,
+    }
+}
+
+fn from_u64(t: &ValType, v: u64) -> Val {
+    match t {
+        ValType::I64 => Val::I64(v as i64),
+        ValType::F32 => Val::F32(v as u32),
+        ValType::F64 => Val::F64(v),
+        _ => Val::I32(v as i32),
+    }
+}
+
 impl Engine for Wt {
-    type Program = InstancePre<Host>;
+    type Program = InstancePre<HostState>;
     type Vm = WtVm;
 
-    fn load(&self, wasm: &[u8]) -> Result<InstancePre<Host>, String> {
+    fn load(&self, wasm: &[u8]) -> Result<InstancePre<HostState>, String> {
         let module = Module::new(&self.engine, wasm).map_err(e)?;
         let mut linker = Linker::new(&self.engine);
-        linker
-            .func_wrap("combd", "counter_incr", |mut c: Caller<'_, Host>| {
-                c.data_mut().counter += 1;
-                c.data().counter
-            })
-            .map_err(e)?;
+        // Every import goes to the same host functions our own engine uses.
+        for i in module.imports() {
+            let ExternType::Func(ty) = i.ty() else { return Err("only function imports are supported".into()) };
+            let results: Vec<ValType> = ty.results().collect();
+            let imp = Import { module: i.module().into(), name: i.name().into(), results: results.len() as u32 };
+            linker
+                .func_new(i.module(), i.name(), ty.clone(), move |mut caller: Caller<'_, HostState>, params, out| {
+                    let args: Vec<u64> = params.iter().map(to_u64).collect();
+                    let memory = caller.get_export("memory").and_then(|x| x.into_memory());
+                    let (data, st) = match memory {
+                        Some(m) => {
+                            let (d, s) = m.data_and_store_mut(&mut caller);
+                            (Some(d), s)
+                        }
+                        None => (None, caller.data_mut()),
+                    };
+                    let r = host::call(&imp, &args, &mut SliceMem(data), st).map_err(wasmtime::Error::msg)?;
+                    for ((slot, t), v) in out.iter_mut().zip(&results).zip(r) {
+                        *slot = from_u64(t, v);
+                    }
+                    Ok(())
+                })
+                .map_err(e)?;
+        }
         linker.instantiate_pre(&module).map_err(e)
     }
 
-    fn spawn(&self, pre: &InstancePre<Host>) -> Result<WtVm, String> {
-        let mut store = Store::new(&self.engine, Host { counter: 0 });
+    fn spawn(&self, pre: &InstancePre<HostState>) -> Result<WtVm, String> {
+        let mut store = Store::new(&self.engine, HostState::default());
         store.set_fuel(u64::MAX).map_err(e)?;
         store.fuel_async_yield_interval(Some(self.fuel_slice)).map_err(e)?;
         let instance = block_on(pre.instantiate_async(&mut store)).map_err(e)?;
@@ -121,17 +174,7 @@ impl CellVm for WtVm {
                 self.store = Some(store);
                 self.running = None;
                 match r {
-                    Ok(vals) => Outcome::Done(
-                        vals.iter()
-                            .map(|v| match v {
-                                Val::I32(x) => *x as u32 as u64,
-                                Val::I64(x) => *x as u64,
-                                Val::F32(x) => *x as u64,
-                                Val::F64(x) => *x,
-                                _ => 0,
-                            })
-                            .collect(),
-                    ),
+                    Ok(vals) => Outcome::Done(vals.iter().map(to_u64).collect()),
                     Err(err) => Outcome::Trap(format!("{err:#}")),
                 }
             }
@@ -154,6 +197,14 @@ impl CellVm for WtVm {
             }
             None => false,
         }
+    }
+
+    fn import(&self, _idx: u32) -> Option<&Import> {
+        None // host calls run inline, never as `HostCall`
+    }
+
+    fn host_out(&self) -> Vec<u8> {
+        self.store.as_ref().map_or_else(Vec::new, |s| s.data().out.clone())
     }
 
     fn snapshot(&self) -> Option<WtVm> {

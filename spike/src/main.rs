@@ -1,17 +1,20 @@
 //! Phase 0: the engine race. Same Rust cell, our interpreter vs Wasmtime.
 //!
 //!   cargo run --release -- all              every test, each in a fresh process
+//!   cargo run --release -- langs            every language's cell, on both engines
 //!   cargo run --release -- <test> <engine>  tests: compute startup crash density fairness
 //!                                           engines: interp wasmtime wasmtime-pool (compute also: native)
 
 #![forbid(unsafe_code)]
 
 mod engine;
+mod host;
 mod interp;
 #[cfg(feature = "wasmtime")]
 mod wt;
 
 use engine::{CellVm, Engine, Outcome};
+use host::HostState;
 use std::time::{Duration, Instant};
 
 const GUEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../guest/target/wasm32-unknown-unknown/release/combd_guest.wasm");
@@ -25,32 +28,131 @@ fn cells() -> usize {
     std::env::var("COMBD_CELLS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000)
 }
 
+const LANGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../langs/out");
+
+/// The Rust cell, plus every cell built by `langs/Dockerfile`.
+fn lang_cells() -> Vec<(String, Vec<u8>)> {
+    let mut out = vec![("rust".to_string(), wasm())];
+    let mut files: Vec<_> = std::fs::read_dir(LANGS).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    files.sort();
+    for f in files.into_iter().filter(|f| f.extension().is_some_and(|x| x == "wasm")) {
+        out.push((f.file_stem().unwrap().to_string_lossy().into_owned(), std::fs::read(&f).unwrap()));
+    }
+    out
+}
+
+/// Reactor modules (C, Go, Zig, AssemblyScript) export `_initialize`, which
+/// must run once before anything else.
+fn init<V: CellVm>(vm: &mut V, st: &mut HostState) -> Result<(), String> {
+    if vm.begin("_initialize", &[]).is_ok() {
+        finish(vm, u32::MAX, st)?;
+    }
+    Ok(())
+}
+
+/// Run the same checks on every language's cell.
+fn langs<E: Engine>(name: &str, eng: &E) -> bool {
+    let mut all_ok = true;
+    for (lang, wasm) in lang_cells() {
+        let t = Instant::now();
+        let prog = match eng.load(&wasm) {
+            Ok(p) => p,
+            Err(err) => {
+                println!("langs    {name:<9} {lang:<5} LOAD FAILED: {err}");
+                all_ok = false;
+                continue;
+            }
+        };
+        let load = t.elapsed();
+        let fresh = || -> Result<(E::Vm, HostState), String> {
+            let mut vm = eng.spawn(&prog)?;
+            let mut st = HostState::default();
+            init(&mut vm, &mut st)?;
+            Ok((vm, st))
+        };
+        let mut fails = vec![];
+        let mut check = |what: &str, ok: Result<bool, String>| match ok {
+            Ok(true) => {}
+            Ok(false) => fails.push(what.to_string()),
+            Err(e) => fails.push(format!("{what} ({e})")),
+        };
+        check("hello", fresh().and_then(|(mut vm, mut st)| Ok(request(&mut vm, "hello", &mut st)? == "hello #1")));
+        check("fib", fresh().and_then(|(mut vm, mut st)| Ok(request(&mut vm, "fib 25", &mut st)? == "75025")));
+        check(
+            "print",
+            fresh().and_then(|(mut vm, mut st)| {
+                let answer = request(&mut vm, "print", &mut st)?;
+                let out = [st.out, vm.host_out()].concat();
+                // AssemblyScript and Rust on wasm32-unknown-unknown have no stdout.
+                let has_stdout = lang != "as" && lang != "rust";
+                Ok(answer == "printed" && (!has_stdout || String::from_utf8_lossy(&out).contains("hi from")))
+            }),
+        );
+        check(
+            "spin",
+            fresh().and_then(|(mut vm, mut st)| {
+                start(&mut vm, "spin", &mut st)?;
+                Ok((0..50).all(|_| matches!(vm.run(SLICE), Outcome::Yield)))
+            }),
+        );
+        check("panic", fresh().map(|(mut vm, mut st)| request(&mut vm, "panic", &mut st).is_err()));
+        let fib = fresh().and_then(|(mut vm, mut st)| {
+            let t = Instant::now();
+            request(&mut vm, "fib 30", &mut st)?;
+            Ok(t.elapsed())
+        });
+        let fib = fib.map_or("failed".into(), |d| format!("{:.1} ms", d.as_secs_f64() * 1e3));
+        let verdict = if fails.is_empty() { "all 5 checks pass".to_string() } else { format!("FAILED: {}", fails.join(", ")) };
+        all_ok &= fails.is_empty();
+        println!(
+            "langs    {name:<9} {lang:<5} {:>7.1} KB  load {:>6.2} ms  fib 30 {fib:>9}  {verdict}",
+            wasm.len() as f64 / 1024.0,
+            load.as_secs_f64() * 1e3
+        );
+    }
+    all_ok
+}
+
 fn wasm() -> Vec<u8> {
     std::fs::read(GUEST).expect("build the guest first: cd guest && cargo build --release --target wasm32-unknown-unknown")
 }
 
-/// Our only host import: `combd.counter_incr`.
-fn host(counter: &mut i64) -> [u64; 1] {
-    *counter += 1;
-    [*counter as u64]
+/// Guest memory of a cell that is waiting on a host call.
+struct VmMem<'a, V>(&'a mut V);
+
+impl<V: CellVm> host::Mem for VmMem<'_, V> {
+    fn read(&self, ptr: u32, len: u32) -> Option<Vec<u8>> {
+        self.0.read(ptr, len)
+    }
+    fn write(&mut self, ptr: u32, bytes: &[u8]) -> bool {
+        self.0.write(ptr, bytes)
+    }
+}
+
+/// Answer a `HostCall` and hand the result back to the cell.
+fn serve<V: CellVm>(vm: &mut V, import: u32, args: &[u64], st: &mut HostState) -> Result<(), String> {
+    let imp = vm.import(import).ok_or("unknown import")?.clone();
+    let r = host::call(&imp, args, &mut VmMem(vm), st)?;
+    vm.resume(&r);
+    Ok(())
 }
 
 /// Run the current call to the end, slice by slice.
-fn finish<V: CellVm>(vm: &mut V, slice: u32, counter: &mut i64) -> Result<Vec<u64>, String> {
+fn finish<V: CellVm>(vm: &mut V, slice: u32, st: &mut HostState) -> Result<Vec<u64>, String> {
     loop {
         match vm.run(slice) {
             Outcome::Done(r) => return Ok(r),
             Outcome::Yield => {}
-            Outcome::HostCall { .. } => vm.resume(&host(counter)),
+            Outcome::HostCall { import, args } => serve(vm, import, &args, st)?,
             Outcome::Trap(t) => return Err(t),
         }
     }
 }
 
 /// Copy a request into the cell and begin `handle`. Nothing runs yet.
-fn start<V: CellVm>(vm: &mut V, req: &str, counter: &mut i64) -> Result<(), String> {
+fn start<V: CellVm>(vm: &mut V, req: &str, st: &mut HostState) -> Result<(), String> {
     vm.begin("alloc", &[req.len() as u64])?;
-    let ptr = finish(vm, u32::MAX, counter)?[0] as u32;
+    let ptr = finish(vm, u32::MAX, st)?[0] as u32;
     if !vm.write(ptr, req.as_bytes()) {
         return Err("bad alloc pointer".into());
     }
@@ -62,9 +164,9 @@ fn response<V: CellVm>(vm: &V, r: &[u64]) -> String {
     String::from_utf8_lossy(&vm.read((r >> 32) as u32, r as u32).unwrap_or_default()).into_owned()
 }
 
-fn request<V: CellVm>(vm: &mut V, req: &str, counter: &mut i64) -> Result<String, String> {
-    start(vm, req, counter)?;
-    let r = finish(vm, SLICE, counter)?;
+fn request<V: CellVm>(vm: &mut V, req: &str, st: &mut HostState) -> Result<String, String> {
+    start(vm, req, st)?;
+    let r = finish(vm, SLICE, st)?;
     Ok(response(vm, &r))
 }
 
@@ -91,7 +193,7 @@ fn compute<E: Engine>(name: &str, eng: &E, prog: &E::Program) {
     for req in WORK {
         let mut vm = eng.spawn(prog).unwrap();
         let t = Instant::now();
-        let out = request(&mut vm, req, &mut 0).unwrap();
+        let out = request(&mut vm, req, &mut HostState::default()).unwrap();
         println!("compute  {name:<9} {req:<14} {:>9.1} ms  -> {out}", t.elapsed().as_secs_f64() * 1e3);
     }
 }
@@ -121,7 +223,7 @@ fn startup<E: Engine>(name: &str, eng: &E, wasm: &[u8]) {
     let t = Instant::now();
     for _ in 0..n {
         let mut vm = eng.spawn(&prog).unwrap();
-        request(&mut vm, "hello", &mut 0).unwrap();
+        request(&mut vm, "hello", &mut HostState::default()).unwrap();
     }
     let cold = t.elapsed() / n;
     println!(
@@ -137,10 +239,10 @@ fn crash<E: Engine>(name: &str, eng: &E, prog: &E::Program) {
     let mut total = Duration::ZERO;
     for _ in 0..n {
         let mut vm = eng.spawn(prog).unwrap();
-        request(&mut vm, "panic", &mut 0).expect_err("panic must trap");
+        request(&mut vm, "panic", &mut HostState::default()).expect_err("panic must trap");
         let t = Instant::now();
         let mut fresh = eng.spawn(prog).unwrap();
-        assert_eq!(request(&mut fresh, "hello", &mut 0).unwrap(), "hello #1");
+        assert_eq!(request(&mut fresh, "hello", &mut HostState::default()).unwrap(), "hello #1");
         total += t.elapsed();
     }
     println!("crash    {name:<9} trap -> fresh cell -> hello served: {:>7.1} us avg over {n}, host still up", us(total / n));
@@ -152,7 +254,7 @@ fn density<E: Engine>(name: &str, eng: &E, prog: &E::Program) {
     let mut cells: Vec<E::Vm> = (0..n).map(|_| eng.spawn(prog).unwrap()).collect();
     let idle = rss_kb();
     for vm in &mut cells {
-        start(vm, "spin", &mut 0).unwrap();
+        start(vm, "spin", &mut HostState::default()).unwrap();
         assert!(matches!(vm.run(SLICE), Outcome::Yield));
     }
     let paused = rss_kb();
@@ -195,7 +297,7 @@ where
                     };
                     let mut bad = (neighbor != Neighbor::Quiet).then(|| {
                         let mut vm = eng.spawn(prog).unwrap();
-                        start(&mut vm, job, &mut 0).unwrap();
+                        start(&mut vm, job, &mut HostState::default()).unwrap();
                         vm
                     });
                     // Without preemption every hello waits a whole sort, so serve fewer.
@@ -203,13 +305,13 @@ where
                     let (mut lat, mut bad_time, mut bad_slices, mut bad_max) = (vec![], Duration::ZERO, 0u64, Duration::ZERO);
                     for vm in cells.iter_mut().take(hellos) {
                         let since = Instant::now();
-                        let mut counter = 0;
-                        start(vm, "hello", &mut counter).unwrap();
+                        let mut st = HostState::default();
+                        start(vm, "hello", &mut st).unwrap();
                         if let Some(b) = bad.as_mut() {
                             let ts = Instant::now();
                             match b.run(budget) {
                                 Outcome::Yield => {}
-                                Outcome::Done(_) => start(b, job, &mut 0).unwrap(),
+                                Outcome::Done(_) => start(b, job, &mut HostState::default()).unwrap(),
                                 _ => panic!("bad neighbor misbehaved in an unexpected way"),
                             }
                             let d = ts.elapsed();
@@ -217,7 +319,7 @@ where
                             bad_slices += 1;
                             bad_max = bad_max.max(d);
                         }
-                        finish(vm, SLICE, &mut counter).unwrap();
+                        finish(vm, SLICE, &mut st).unwrap();
                         lat.push(since.elapsed());
                     }
                     (lat, bad_time, bad_slices, bad_max)
@@ -286,6 +388,14 @@ fn main() {
             }
         }
         ["compute", "native"] => compute_native(),
+        ["langs"] => {
+            let mut ok = langs("interp", &interp::Interp { max_pages: 16384 });
+            #[cfg(feature = "wasmtime")]
+            {
+                ok &= langs("wasmtime", &wt::Wt::new(WT_FUEL, None));
+            }
+            std::process::exit(if ok { 0 } else { 1 });
+        }
         [test, "interp"] => run(test, "interp", &interp::Interp { max_pages: 16384 }),
         #[cfg(feature = "wasmtime")]
         [test, "wasmtime"] => run(test, "wasmtime", &wt::Wt::new(WT_FUEL, None)),
@@ -303,7 +413,7 @@ mod tests {
 
     fn answers<E: Engine>(eng: &E) -> Vec<Result<String, String>> {
         let prog = eng.load(&wasm()).unwrap();
-        REQS.iter().map(|r| request(&mut eng.spawn(&prog).unwrap(), r, &mut 0)).collect()
+        REQS.iter().map(|r| request(&mut eng.spawn(&prog).unwrap(), r, &mut HostState::default())).collect()
     }
 
     #[test]
@@ -323,9 +433,9 @@ mod tests {
         let eng = interp::Interp { max_pages: 16384 };
         let prog = eng.load(&wasm()).unwrap();
         let mut vm = eng.spawn(&prog).unwrap();
-        assert_eq!(request(&mut vm, "panic", &mut 0), Err("unreachable".into()));
+        assert_eq!(request(&mut vm, "panic", &mut HostState::default()), Err("unreachable".into()));
         let mut vm = eng.spawn(&prog).unwrap();
-        start(&mut vm, "spin", &mut 0).unwrap();
+        start(&mut vm, "spin", &mut HostState::default()).unwrap();
         for _ in 0..100 {
             assert!(matches!(vm.run(1000), Outcome::Yield));
         }
@@ -336,13 +446,23 @@ mod tests {
         let eng = interp::Interp { max_pages: 16384 };
         let prog = eng.load(&wasm()).unwrap();
         let mut vm = eng.spawn(&prog).unwrap();
-        start(&mut vm, "fib 25", &mut 0).unwrap();
+        start(&mut vm, "fib 25", &mut HostState::default()).unwrap();
         assert!(matches!(vm.run(100), Outcome::Yield));
         let mut copy = vm.snapshot().unwrap();
-        let a = finish(&mut vm, SLICE, &mut 0).unwrap();
-        let b = finish(&mut copy, SLICE, &mut 0).unwrap();
+        let a = finish(&mut vm, SLICE, &mut HostState::default()).unwrap();
+        let b = finish(&mut copy, SLICE, &mut HostState::default()).unwrap();
         assert_eq!(response(&vm, &a), "75025");
         assert_eq!(response(&copy, &b), "75025");
+    }
+
+    /// Every language cell built by `langs/Dockerfile` must pass on our engine.
+    #[test]
+    fn every_language_passes() {
+        if lang_cells().len() == 1 {
+            eprintln!("skipping: build langs/out first (see langs/README.md)");
+            return;
+        }
+        assert!(langs("interp", &interp::Interp { max_pages: 16384 }));
     }
 
     /// Security: a new cell must never see bytes left by a dead one.
@@ -355,7 +475,7 @@ mod tests {
         let expected = clean.read(0, len).unwrap();
         for _ in 0..20 {
             let mut old = eng.spawn(&prog).unwrap();
-            request(&mut old, "sieve 3000000", &mut 0).unwrap(); // grows memory well past 1 MiB
+            request(&mut old, "sieve 3000000", &mut HostState::default()).unwrap(); // grows memory well past 1 MiB
             let mut p = 0;
             while old.write(p, &[0xAA; 4096]) {
                 p += 4096;
@@ -372,6 +492,6 @@ mod tests {
         let eng = interp::Interp { max_pages: 64 }; // 4 MiB
         let prog = eng.load(&wasm()).unwrap();
         let mut vm = eng.spawn(&prog).unwrap();
-        assert!(request(&mut vm, "sieve 5000000", &mut 0).is_err());
+        assert!(request(&mut vm, "sieve 5000000", &mut HostState::default()).is_err());
     }
 }

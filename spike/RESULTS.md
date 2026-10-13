@@ -136,6 +136,42 @@ It scales in a straight line. Two walls showed up on the way:
 At 21.4 KB each, a million paused cells is about 21 GB. That fits on an
 ordinary 32 to 64 GB server, once the map limit is handled.
 
+## Languages (step 0a)
+
+The same test cell in five languages, each built by `langs/Dockerfile`, run
+on both engines with five checks each:
+- `hello`: a host call,
+- `fib 25`: correctness,
+- `print`: stdout through the WASI shim,
+- `spin`: must yield,
+- `panic`: must crash cleanly.
+
+| Language | Size | Load (ours / wasmtime) | fib 30 (ours / wasmtime) | Checks |
+|---|---|---|---|---|
+| Rust | 27.6 KB | 0.86 / 23.0 ms | 27.2 / 2.3 ms | 5 of 5 on both |
+| AssemblyScript | 9.5 KB | 0.15 / 6.8 ms | 49.7 / 6.7 ms | 5 of 5 on both |
+| C (wasi-libc) | 23.8 KB | 0.33 / 20.8 ms | 33.1 / 2.5 ms | 5 of 5 on both |
+| Go (TinyGo) | 208.8 KB | 2.04 / 174.7 ms | 37.9 / 2.6 ms | 5 of 5 on both |
+| Zig | 41.2 KB | 0.54 / 35.1 ms | 31.5 / 2.6 ms | 5 of 5 on both |
+
+- **Our interpreter ran four new compilers' output with zero changes.** That
+  includes TinyGo's runtime and Zig's standard library.
+- **Loading is 20x to 85x faster than Wasmtime.** Go is the extreme: 2 ms vs
+  175 ms, because Wasmtime compiles the whole module to machine code first.
+- **Compute is 7x to 15x behind Wasmtime** on these builds.
+- **The WASI shim is small and safe** (`spike/src/host.rs`, shared by both
+  engines):
+  - stdout and stderr go to a 64 KB capped buffer,
+  - the clock is rounded to 1 ms (timing attacks),
+  - randomness comes from the OS,
+  - args and env are empty,
+  - `proc_exit` crashes the cell,
+  - every `path_*` call answers "not permitted",
+  - anything else answers "not supported".
+
+  Zig alone imports 27 WASI functions, mostly file-system calls its standard
+  library pulls in. None of them get real access.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

@@ -699,8 +699,10 @@ hot cells later, the way BEAM did.
    ~146 ms with preemption off. Verdict: keep our interpreter, and close the
    compute gap to within 5x of Wasmtime in phase 1. Still to do: add celld
    itself to the scoreboard.
-0a. **Languages right away.** WASI preview 1 shim on our engine, plus example
-   cells in AssemblyScript, TinyGo, C, and Zig.
+0a. **DONE 2026-10-13. Languages right away.** A small, safe WASI preview 1
+   shim, plus the test cell in AssemblyScript, TinyGo, C, and Zig
+   (`langs/`). All five languages, including Rust, pass all checks on both
+   engines. See [spike/RESULTS.md](spike/RESULTS.md).
 0b. **JS spike.** QuickJS compiled to Wasm, running a Hono-style JSON handler
    on our engine, on Wasmtime, and on Node (V8) as the baseline. Measure speed,
    memory per cell, and start time with and without `snapshot_after_init`. The
