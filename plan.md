@@ -251,6 +251,14 @@ It holds a `db` binding.
 
 ```wit
 interface db {
+  /// A pinned connection. Lives as long as the handle, across many calls and
+  /// many requests. Session features all work here.
+  resource session {
+    query: func(sql: string, params: list<value>) -> result<rows, db-error>;
+    begin: func() -> result<transaction, db-error>;
+    listen: func(channel: string) -> result<_, db-error>;  // NOTIFY arrives as an event
+    close: func();
+  }
   resource transaction {
     query: func(sql: string, params: list<value>) -> result<rows, db-error>;
     commit: func() -> result<_, db-error>;
@@ -258,18 +266,55 @@ interface db {
   }
   query: func(binding: string, sql: string, params: list<value>) -> result<rows, db-error>;
   begin: func(binding: string) -> result<transaction, db-error>;
+  session: func(binding: string) -> result<session, db-error>;
 }
 ```
 
 ### Rules
 
-- **Transaction-mode pooling, like PgBouncer.** A connection is lent for one
-  query, or held for one transaction (an unforgeable `transaction` handle).
+- **Two modes.**
+  - **Pooled (default), like PgBouncer's transaction mode.** A connection is
+    lent for one query, or held for one transaction. A `transaction` handle
+    can span many calls within a request. Best for most Workers.
+  - **Pinned session, which PgBouncer can't pool at all.** `db.session()` pins
+    one connection to the cell for as long as the handle lives, across many
+    calls and many requests. Everything session-scoped works:
+    - transactions that span requests (`BEGIN` in one request, `COMMIT` in a
+      later one),
+    - session advisory locks (`pg_advisory_lock`),
+    - `SET`, temp tables, cursors, session prepared statements,
+    - `LISTEN` / `NOTIFY`, delivered to the cell as events.
+
+    Durable Objects are the natural home for this. A DO has one name, one
+    owner, and runs one thing at a time, so it can own a connection the way
+    an Erlang process owns a resource. A Worker can hold a session for one
+    request, and reaches longer-lived sessions through a DO.
 - **Crash = rollback.** If a cell traps mid-transaction, the host rolls back
   and returns the connection. Let it crash, and the database stays clean.
-- **Clean before reuse.** Session state (`SET`, temp tables, advisory locks)
-  is reset (`DISCARD ALL` on Postgres) before a connection goes back to the
-  pool, so nothing leaks between Workers that share a binding.
+- **Locks.** Row locks (`SELECT ... FOR UPDATE`) and transaction advisory
+  locks (`pg_advisory_xact_lock`) work in both modes and end with the
+  transaction. Session advisory locks need a pinned session. A cell waiting on
+  a lock is just paused, so waiting costs no CPU. `lock_timeout` is a lever,
+  and deadlocks come back as normal errors.
+- **Sessions end cleanly, and that releases the locks.** A session closes
+  when its handle is dropped, when the cell crashes, hibernates, or is
+  evicted, and when its node fences itself or loses the cell. Postgres
+  releases session locks when the connection closes, so a lock can never
+  outlive its owner. When a cell moves to another node, the new owner simply
+  waits for the old connection to close before it gets the lock: mutual
+  exclusion holds, and the ownership epoch and the database agree.
+- **Open sessions keep a cell resident.** A cell holding a session or an open
+  transaction doesn't hibernate until `session_idle_timeout` passes. Then the
+  host rolls back, closes the session, and lets it sleep.
+- **Sessions can't starve the pool.** Pinned sessions count against the
+  fleet-wide cap, and `max_sessions` per binding keeps room for pooled
+  queries. When no session is free, `db.session()` waits until its deadline,
+  then fails.
+- **Clean before reuse.** Before any connection goes back to the pool, the
+  host rolls back anything open and runs `DISCARD ALL`. That resets `SET`,
+  drops temp tables, unlistens, deallocates statements, and releases every
+  advisory lock. If anything about the connection looks off, it is closed
+  instead of reused. Nothing leaks between Workers that share a binding.
 - **Prepared statements are cached by the host** per connection, so cells
   get the speed without managing names.
 - **Credentials never reach the cell.** They are an encrypted secret that only
@@ -286,12 +331,16 @@ interface db {
 
 ### Levers and visibility
 
-- Levers per binding: `max_connections` (fleet-wide), `min_idle`, query
-  timeout, max transaction time, queue deadline, and read-replica routing.
+- Levers per binding: `max_connections` (fleet-wide), `max_sessions`,
+  `min_idle`, query timeout, `lock_timeout`, max transaction time,
+  `session_idle_timeout`, queue deadline, and read-replica routing.
+- Lever per cell class: a scheduling boost for cells holding a database lock,
+  so a lock holder is never starved behind busy neighbors.
 - Query caching for reads, opt-in per binding with a TTL. Off by default,
   because stale data is a correctness risk.
-- You can see: open, idle, and busy connections, pool wait time, query latency
-  p50 and p99, slow queries, and errors, per binding and per Worker. Auto mode
+- You can see: open, idle, and busy connections, pinned sessions and which
+  cell holds each, locks held and lock wait time, pool wait time, query
+  latency p50 and p99, slow queries, and errors, per binding and per Worker. Auto mode
   uses "time waiting on the database" to raise concurrency per instance.
 
 ### Also: raw TCP
