@@ -293,6 +293,28 @@ interpreter, mostly in maintenance), Stitch (fast Rust interpreter), Pulley
 (Wasmtime's own interpreter mode), Wizard (research engine, in-place
 interpreter).
 
+**Keeping the JIT door open.** Interpreter first, JIT later is the BEAM, V8,
+JVM, and CPython path. Rules from day one so a JIT can slot in:
+1. One internal bytecode. The interpreter runs it, a future JIT compiles it.
+2. Pauses only at fixed safe points (loop back-edges, calls). Any tier must
+   write its state out in interpreter format at those points. This keeps
+   snapshot, migration, and exact replay working with a JIT.
+3. One reduction counter, same place, same meaning in every tier.
+4. One memory layout and host-call ABI, so interpreted and compiled functions
+   call each other freely.
+5. Per-function hot counters from the start, to pick what to compile.
+
+The interpreter stays the JIT's test oracle forever (differential fuzzing).
+
+JIT costs: it brings back `unsafe`, writable+executable memory, and the codegen
+bug class. So it is opt-in per deployment, off for untrusted tenants, and the
+compiler runs in its own locked process. Use Cranelift as a codegen library
+rather than writing our own backends.
+
+Speed ladder, stop when good enough: (1) faster interpreter (register
+bytecode, fused ops), (2) copy-and-patch baseline JIT like CPython's,
+(3) Cranelift optimizing tier for hot cells only.
+
 **Decision:** lean toward our own interpreter. The spike races it against
 Wasmtime so real numbers decide. If we ever need raw speed, add a JIT tier for
 hot cells later, the way BEAM did.
