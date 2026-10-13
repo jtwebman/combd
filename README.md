@@ -73,8 +73,9 @@ them misbehave, and see if the rest stay fast. If the numbers hold, we build.
 combd is inspired by [celld](https://github.com/denoland/celld),
 [workerd](https://github.com/cloudflare/workerd), and
 [Erlang/OTP](https://www.erlang.org/). We use none of their code, but we owe
-them the ideas. Cells run on [Wasmtime](https://wasmtime.dev/), the
-WebAssembly engine from the Bytecode Alliance.
+them the ideas. For the engine, we are racing our own safe-Rust WebAssembly
+interpreter against [Wasmtime](https://wasmtime.dev/), and the numbers will
+decide.
 
 ## License
 
