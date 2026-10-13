@@ -25,6 +25,8 @@ const PAGE: usize = 65536;
 const MAX_FRAMES: usize = 10_000;
 const MAX_STACK: usize = 1 << 20;
 const MAX_TABLE: u64 = 1 << 20;
+/// Spare stack slots past a function's max height, for host call results.
+const SLACK: usize = 8;
 
 /// Where a branch goes: the new pc, the operand height to cut back to, and how
 /// many values on top to carry over.
@@ -46,6 +48,12 @@ macro_rules! ops {
             LocalGet(u32), LocalSet(u32), LocalTee(u32), GlobalGet(u32), GlobalSet(u32),
             I32Const(i32), I64Const(i64), F32Const(u32), F64Const(u64),
             MemorySize, MemoryGrow, MemoryCopy, MemoryFill, MemoryInit(u32), DataDrop(u32),
+            // Fused pairs, made by `fuse` from the hottest sequences Rust emits.
+            LocalGet2(u32, u32), LocalAddConst(u32, i32), LocalTeeGet(u32, u32), LocalSetGet(u32, u32),
+            I32AddConst(i32), I32ShlConst(i32), I32AddLocal(u32), I32AddTee(u32), I32AddSet(u32),
+            BrIfI32Eqz(Target), BrIfI32Eq(Target), BrIfI32Ne(Target), BrIfI32LtS(Target), BrIfI32LtU(Target),
+            BrIfI32GtS(Target), BrIfI32GtU(Target), BrIfI32LeS(Target), BrIfI32LeU(Target), BrIfI32GeS(Target),
+            BrIfI32GeU(Target),
             $($p,)* $($m(u32),)*
         }
 
@@ -87,10 +95,57 @@ ops! {
     I32Store I64Store F32Store F64Store I32Store8 I32Store16 I64Store8 I64Store16 I64Store32;
 }
 
+/// Merge two adjacent ops into one, if we have a fused form for the pair.
+fn fuse(a: Op, b: Op) -> Option<Op> {
+    Some(match (a, b) {
+        (Op::LocalGet(x), Op::LocalGet(y)) => Op::LocalGet2(x, y),
+        (Op::I32Const(c), Op::I32Add) => Op::I32AddConst(c),
+        (Op::I32Const(c), Op::I32Shl) => Op::I32ShlConst(c),
+        (Op::LocalGet(x), Op::I32AddConst(c)) => Op::LocalAddConst(x, c),
+        (Op::LocalGet(x), Op::I32Add) => Op::I32AddLocal(x),
+        (Op::I32Add, Op::LocalTee(x)) => Op::I32AddTee(x),
+        (Op::I32Add, Op::LocalSet(x)) => Op::I32AddSet(x),
+        (Op::LocalTee(x), Op::LocalGet(y)) => Op::LocalTeeGet(x, y),
+        (Op::LocalSet(x), Op::LocalGet(y)) => Op::LocalSetGet(x, y),
+        _ => return None,
+    })
+}
+
+/// A compare followed by `br_if` becomes one branch op.
+fn fuse_br_if(cmp: Op, t: Target) -> Option<Op> {
+    Some(match cmp {
+        Op::I32Eqz => Op::BrIfI32Eqz(t),
+        Op::I32Eq => Op::BrIfI32Eq(t),
+        Op::I32Ne => Op::BrIfI32Ne(t),
+        Op::I32LtS => Op::BrIfI32LtS(t),
+        Op::I32LtU => Op::BrIfI32LtU(t),
+        Op::I32GtS => Op::BrIfI32GtS(t),
+        Op::I32GtU => Op::BrIfI32GtU(t),
+        Op::I32LeS => Op::BrIfI32LeS(t),
+        Op::I32LeU => Op::BrIfI32LeU(t),
+        Op::I32GeS => Op::BrIfI32GeS(t),
+        Op::I32GeU => Op::BrIfI32GeU(t),
+        _ => return None,
+    })
+}
+
+/// Push an op, fusing it with the one before when allowed. `barrier` is the
+/// newest branch target: an op that something jumps to must stay its own op.
+fn emit(f: &mut Func, barrier: usize, op: Op) {
+    f.ops.push(op);
+    while f.ops.len() >= 2 && f.ops.len() - 1 > barrier {
+        let n = f.ops.len();
+        let Some(merged) = fuse(f.ops[n - 2], f.ops[n - 1]) else { break };
+        f.ops[n - 2] = merged;
+        f.ops.pop();
+    }
+}
+
 struct Func {
     nparams: u32,
     nlocals: u32, // includes params
     nresults: u32,
+    max_height: u32, // deepest operand stack the validator saw
     ops: Vec<Op>,
     table: Vec<Target>, // br_table entries
 }
@@ -249,7 +304,19 @@ struct Ctl {
 fn patch(f: &mut Func, p: Patch, pc: u32) {
     match p {
         Patch::Op(i) => match &mut f.ops[i] {
-            Op::Br(t) | Op::BrIf(t) => t.pc = pc,
+            Op::Br(t)
+            | Op::BrIf(t)
+            | Op::BrIfI32Eqz(t)
+            | Op::BrIfI32Eq(t)
+            | Op::BrIfI32Ne(t)
+            | Op::BrIfI32LtS(t)
+            | Op::BrIfI32LtU(t)
+            | Op::BrIfI32GtS(t)
+            | Op::BrIfI32GtU(t)
+            | Op::BrIfI32LeS(t)
+            | Op::BrIfI32LeU(t)
+            | Op::BrIfI32GeS(t)
+            | Op::BrIfI32GeU(t) => t.pc = pc,
             Op::BrIfNot(to) | Op::Jump(to) => *to = pc,
             _ => {}
         },
@@ -294,7 +361,7 @@ fn label(
 fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &FunctionBody) -> Result<Func, String> {
     let ty = &m.types[m.func_types[m.imports as usize + m.funcs.len()] as usize];
     let nparams = ty.params().len() as u32;
-    let mut f = Func { nparams, nlocals: nparams, nresults: ty.results().len() as u32, ops: vec![], table: vec![] };
+    let mut f = Func { nparams, nlocals: nparams, nresults: ty.results().len() as u32, max_height: 0, ops: vec![], table: vec![] };
     let mut locals = body.get_locals_reader().map_err(e)?;
     for _ in 0..locals.get_count() {
         let offset = locals.original_position() as u64;
@@ -303,6 +370,7 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
         f.nlocals = f.nlocals.checked_add(n).filter(|&n| n < 50_000).ok_or("too many locals")?;
     }
     let mut ctl = vec![Ctl { loop_start: None, patches: vec![], else_fix: None }];
+    let mut barrier = 0;
     let mut r = body.get_operators_reader().map_err(e)?;
     while !r.eof() {
         let offset = r.original_position() as u64;
@@ -314,6 +382,7 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
             Operator::Loop { .. } => {
                 ctl.push(Ctl { loop_start: Some(here as u32), patches: vec![], else_fix: None });
                 f.ops.push(Op::Tick);
+                barrier = here;
             }
             Operator::If { .. } => {
                 ctl.push(Ctl { loop_start: None, patches: vec![], else_fix: Some(here) });
@@ -326,6 +395,7 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
                 if let Some(i) = c.else_fix.take() {
                     patch(&mut f, Patch::Op(i), here as u32 + 1);
                 }
+                barrier = here + 1;
             }
             Operator::End => {
                 let c = ctl.pop().ok_or("unbalanced end")?;
@@ -335,6 +405,7 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
                 for p in c.patches.into_iter().chain(c.else_fix.map(Patch::Op)) {
                     patch(&mut f, p, here as u32);
                 }
+                barrier = here;
             }
             _ if dead => {}
             Operator::Br { relative_depth } => {
@@ -342,8 +413,14 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
                 f.ops.push(Op::Br(t));
             }
             Operator::BrIf { relative_depth } => {
-                let t = label(&fv, m, &mut ctl, *relative_depth, Patch::Op(here))?;
-                f.ops.push(Op::BrIf(t));
+                let dummy = Target { pc: 0, height: 0, keep: 0 };
+                if here > barrier && here > 0 && fuse_br_if(f.ops[here - 1], dummy).is_some() {
+                    let t = label(&fv, m, &mut ctl, *relative_depth, Patch::Op(here - 1))?;
+                    f.ops[here - 1] = fuse_br_if(f.ops[here - 1], t).unwrap();
+                } else {
+                    let t = label(&fv, m, &mut ctl, *relative_depth, Patch::Op(here))?;
+                    f.ops.push(Op::BrIf(t));
+                }
             }
             Operator::BrTable { targets } => {
                 let start = f.table.len() as u32;
@@ -355,32 +432,33 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
                 f.ops.push(Op::BrTable { start, len: depths.len() as u32 });
             }
             Operator::Return => f.ops.push(Op::Return),
-            Operator::Unreachable => f.ops.push(Op::Unreachable),
+            Operator::Unreachable => emit(&mut f, barrier, Op::Unreachable),
             Operator::Nop => {}
-            Operator::Call { function_index } => f.ops.push(Op::Call(*function_index)),
+            Operator::Call { function_index } => emit(&mut f, barrier, Op::Call(*function_index)),
             Operator::CallIndirect { type_index, table_index } => {
-                f.ops.push(Op::CallIndirect { ty: *type_index, table: *table_index })
+                emit(&mut f, barrier, Op::CallIndirect { ty: *type_index, table: *table_index })
             }
-            Operator::Drop => f.ops.push(Op::Drop),
-            Operator::Select | Operator::TypedSelect { .. } => f.ops.push(Op::Select),
-            Operator::LocalGet { local_index } => f.ops.push(Op::LocalGet(*local_index)),
-            Operator::LocalSet { local_index } => f.ops.push(Op::LocalSet(*local_index)),
-            Operator::LocalTee { local_index } => f.ops.push(Op::LocalTee(*local_index)),
-            Operator::GlobalGet { global_index } => f.ops.push(Op::GlobalGet(*global_index)),
-            Operator::GlobalSet { global_index } => f.ops.push(Op::GlobalSet(*global_index)),
-            Operator::I32Const { value } => f.ops.push(Op::I32Const(*value)),
-            Operator::I64Const { value } => f.ops.push(Op::I64Const(*value)),
-            Operator::F32Const { value } => f.ops.push(Op::F32Const(value.bits())),
-            Operator::F64Const { value } => f.ops.push(Op::F64Const(value.bits())),
-            Operator::MemorySize { mem: 0 } => f.ops.push(Op::MemorySize),
-            Operator::MemoryGrow { mem: 0 } => f.ops.push(Op::MemoryGrow),
-            Operator::MemoryCopy { dst_mem: 0, src_mem: 0 } => f.ops.push(Op::MemoryCopy),
-            Operator::MemoryFill { mem: 0 } => f.ops.push(Op::MemoryFill),
-            Operator::MemoryInit { data_index, mem: 0 } => f.ops.push(Op::MemoryInit(*data_index)),
-            Operator::DataDrop { data_index } => f.ops.push(Op::DataDrop(*data_index)),
-            other => f.ops.push(simple(other).unwrap_or(Op::Unsupported)),
+            Operator::Drop => emit(&mut f, barrier, Op::Drop),
+            Operator::Select | Operator::TypedSelect { .. } => emit(&mut f, barrier, Op::Select),
+            Operator::LocalGet { local_index } => emit(&mut f, barrier, Op::LocalGet(*local_index)),
+            Operator::LocalSet { local_index } => emit(&mut f, barrier, Op::LocalSet(*local_index)),
+            Operator::LocalTee { local_index } => emit(&mut f, barrier, Op::LocalTee(*local_index)),
+            Operator::GlobalGet { global_index } => emit(&mut f, barrier, Op::GlobalGet(*global_index)),
+            Operator::GlobalSet { global_index } => emit(&mut f, barrier, Op::GlobalSet(*global_index)),
+            Operator::I32Const { value } => emit(&mut f, barrier, Op::I32Const(*value)),
+            Operator::I64Const { value } => emit(&mut f, barrier, Op::I64Const(*value)),
+            Operator::F32Const { value } => emit(&mut f, barrier, Op::F32Const(value.bits())),
+            Operator::F64Const { value } => emit(&mut f, barrier, Op::F64Const(value.bits())),
+            Operator::MemorySize { mem: 0 } => emit(&mut f, barrier, Op::MemorySize),
+            Operator::MemoryGrow { mem: 0 } => emit(&mut f, barrier, Op::MemoryGrow),
+            Operator::MemoryCopy { dst_mem: 0, src_mem: 0 } => emit(&mut f, barrier, Op::MemoryCopy),
+            Operator::MemoryFill { mem: 0 } => emit(&mut f, barrier, Op::MemoryFill),
+            Operator::MemoryInit { data_index, mem: 0 } => emit(&mut f, barrier, Op::MemoryInit(*data_index)),
+            Operator::DataDrop { data_index } => emit(&mut f, barrier, Op::DataDrop(*data_index)),
+            other => emit(&mut f, barrier, simple(other).unwrap_or(Op::Unsupported)),
         }
         fv.op(offset, &op).map_err(e)?;
+        f.max_height = f.max_height.max(fv.operand_stack_height());
     }
     r.finish().map_err(e)?;
     Ok(f)
@@ -420,6 +498,7 @@ impl Engine for Interp {
             func: 0,
             pc: 0,
             fp: 0,
+            sp: 0,
             mem,
             max_pages,
             globals: m.globals.clone(),
@@ -503,6 +582,7 @@ pub struct Vm {
     func: u32,
     pc: u32,
     fp: u32,
+    sp: u32,
     mem: LinMem,
     max_pages: u32,
     globals: Vec<u64>,
@@ -524,9 +604,9 @@ impl CellVm for Vm {
         }
         self.stack.clear();
         self.frames.clear();
-        self.stack.extend_from_slice(args);
-        self.stack.resize(f.nlocals as usize, 0);
-        (self.func, self.pc, self.fp) = (func, 0, 0);
+        self.stack.resize(f.nlocals as usize + f.max_height as usize + SLACK, 0);
+        self.stack[..args.len()].copy_from_slice(args);
+        (self.func, self.pc, self.fp, self.sp) = (func, 0, 0, f.nlocals);
         self.state = State::Running;
         Ok(())
     }
@@ -553,7 +633,9 @@ impl CellVm for Vm {
 
     fn resume(&mut self, results: &[u64]) {
         if self.state == State::Host {
-            self.stack.extend_from_slice(results);
+            let sp = self.sp as usize;
+            self.stack[sp..sp + results.len()].copy_from_slice(results);
+            self.sp += results.len() as u32;
             self.state = State::Running;
         }
     }
@@ -660,43 +742,57 @@ const U32R: (f64, f64) = (0.0, 4294967296.0);
 const I64R: (f64, f64) = (-9223372036854775808.0, 9223372036854775808.0);
 const U64R: (f64, f64) = (0.0, 18446744073709551616.0);
 
-fn branch(s: &mut Vec<u64>, base: usize, t: Target) {
+/// Move the carried values down to the label's height. Returns the new sp.
+fn branch(s: &mut [u64], base: usize, sp: usize, t: Target) -> usize {
     let dst = base + t.height as usize;
     let keep = t.keep as usize;
-    let src = s.len() - keep;
+    let src = sp - keep;
     if dst != src {
-        s.copy_within(src.., dst);
+        s.copy_within(src..sp, dst);
     }
-    s.truncate(dst + keep);
+    dst + keep
 }
 
 impl Vm {
     fn exec(&mut self, mut fuel: u32) -> Result<Outcome, &'static str> {
         let m = self.m.clone();
-        let Vm { stack: s, frames, func, pc: spc, fp: sfp, mem, max_pages, globals, tables, dropped, state, .. } = self;
+        let Vm { stack: sv, frames, func, pc: spc, fp: sfp, sp: ssp, mem, max_pages, globals, tables, dropped, state, .. } = self;
         let mut fi = *func as usize;
         let mut f = &m.funcs[fi];
         let mut pc = *spc as usize;
         let mut fp = *sfp as usize;
+        let mut sp = *ssp as usize;
         let mut base = fp + f.nlocals as usize;
         let lm = mem;
         let mut mem: &mut [u8] = &mut lm.buf[..lm.len];
+        // Plain slices keep pointer and length in registers. Re-slice after any resize.
+        let mut s: &mut [u64] = &mut sv[..];
+        let mut ops: &[Op] = &f.ops;
 
         macro_rules! pop {
-            () => {
-                s.pop().unwrap()
-            };
+            () => {{
+                sp -= 1;
+                s[sp]
+            }};
+        }
+        macro_rules! push {
+            ($v:expr) => {{
+                let v = $v;
+                s[sp] = v;
+                sp += 1;
+            }};
         }
         macro_rules! save {
             ($pc:expr) => {{
                 *func = fi as u32;
                 *spc = $pc as u32;
                 *sfp = fp as u32;
+                *ssp = sp as u32;
             }};
         }
         macro_rules! un {
             ($from:ident, $to:ident, |$x:ident| $e:expr) => {{
-                let v = s.last_mut().unwrap();
+                let v = &mut s[sp - 1];
                 let $x = $from(*v);
                 *v = $to($e);
             }};
@@ -704,32 +800,40 @@ impl Vm {
         macro_rules! bin {
             ($from:ident, $to:ident, |$a:ident, $b:ident| $e:expr) => {{
                 let $b = $from(pop!());
-                let v = s.last_mut().unwrap();
+                let v = &mut s[sp - 1];
                 let $a = $from(*v);
                 *v = $to($e);
             }};
         }
-        macro_rules! addr {
-            ($off:expr, $n:expr) => {{
-                let a = pop!() as u32 as usize + $off as usize;
-                if a + $n > mem.len() {
-                    return Err("out of bounds memory access");
-                }
-                a
-            }};
-        }
         macro_rules! load {
             ($off:expr, $n:literal, |$b:ident| $e:expr) => {{
-                let a = addr!($off, $n);
-                let $b: [u8; $n] = mem[a..a + $n].try_into().unwrap();
-                s.push($e);
+                let a = pop!() as u32 as usize + $off as usize;
+                let $b: [u8; $n] = mem.get(a..a + $n).ok_or("out of bounds memory access")?.try_into().unwrap();
+                push!($e);
             }};
         }
         macro_rules! store {
             ($off:expr, $n:literal, |$v:ident| $e:expr) => {{
                 let $v = pop!();
-                let a = addr!($off, $n);
-                mem[a..a + $n].copy_from_slice(&$e[..$n]);
+                let a = pop!() as u32 as usize + $off as usize;
+                mem.get_mut(a..a + $n).ok_or("out of bounds memory access")?.copy_from_slice(&$e[..$n]);
+            }};
+        }
+        macro_rules! brc {
+            ($t:expr, |$a:ident| $cond:expr) => {{
+                let $a = pop!();
+                if $cond {
+                    sp = branch(s, base, sp, $t);
+                    pc = $t.pc as usize;
+                }
+            }};
+            ($t:expr, $from:ident, |$a:ident, $b:ident| $cond:expr) => {{
+                let $b = $from(pop!());
+                let $a = $from(pop!());
+                if $cond {
+                    sp = branch(s, base, sp, $t);
+                    pc = $t.pc as usize;
+                }
             }};
         }
         macro_rules! call {
@@ -737,7 +841,8 @@ impl Vm {
                 let idx = $idx as usize;
                 if idx < m.imports as usize {
                     let n = m.types[m.func_types[idx] as usize].params().len();
-                    let args = s.split_off(s.len() - n);
+                    let args = s[sp - n..sp].to_vec();
+                    sp -= n;
                     save!(pc);
                     *state = State::Host;
                     return Ok(Outcome::HostCall { import: idx as u32, args });
@@ -754,18 +859,26 @@ impl Vm {
                 frames.push(Frame { func: fi as u32, pc: pc as u32, fp: fp as u32 });
                 fi = idx - m.imports as usize;
                 f = &m.funcs[fi];
-                fp = s.len() - f.nparams as usize;
+                ops = &f.ops;
+                fp = sp - f.nparams as usize;
                 base = fp + f.nlocals as usize;
-                if base > MAX_STACK {
+                let need = base + f.max_height as usize + SLACK;
+                if need > MAX_STACK {
                     return Err("value stack exhausted");
                 }
-                s.resize(base, 0);
+                if s.len() < need {
+                    let grown = need.max(s.len() * 2).min(MAX_STACK);
+                    sv.resize(grown, 0);
+                    s = &mut sv[..];
+                }
+                s[fp + f.nparams as usize..base].fill(0);
+                sp = base;
                 pc = 0;
             }};
         }
 
         loop {
-            let op = f.ops[pc];
+            let op = ops[pc];
             pc += 1;
             match op {
                 Op::Tick => {
@@ -778,12 +891,12 @@ impl Vm {
                 Op::Unreachable => return Err("unreachable"),
                 Op::Unsupported => return Err("unsupported instruction"),
                 Op::Br(t) => {
-                    branch(s, base, t);
+                    sp = branch(s, base, sp, t);
                     pc = t.pc as usize;
                 }
                 Op::BrIf(t) => {
                     if pop!() as u32 != 0 {
-                        branch(s, base, t);
+                        sp = branch(s, base, sp, t);
                         pc = t.pc as usize;
                     }
                 }
@@ -796,22 +909,22 @@ impl Vm {
                 Op::BrTable { start, len } => {
                     let i = (pop!() as u32).min(len - 1);
                     let t = f.table[(start + i) as usize];
-                    branch(s, base, t);
+                    sp = branch(s, base, sp, t);
                     pc = t.pc as usize;
                 }
                 Op::Return => {
                     let n = f.nresults as usize;
-                    let src = s.len() - n;
-                    s.copy_within(src.., fp);
-                    s.truncate(fp + n);
+                    s.copy_within(sp - n..sp, fp);
+                    sp = fp + n;
                     match frames.pop() {
                         None => {
                             *state = State::Idle;
-                            return Ok(Outcome::Done(std::mem::take(s)));
+                            return Ok(Outcome::Done(s[..n].to_vec()));
                         }
                         Some(fr) => {
                             fi = fr.func as usize;
                             f = &m.funcs[fi];
+                            ops = &f.ops;
                             pc = fr.pc as usize;
                             fp = fr.fp as usize;
                             base = fp + f.nlocals as usize;
@@ -829,44 +942,39 @@ impl Vm {
                     if m.types[m.func_types[callee as usize] as usize] != m.types[ty as usize] {
                         return Err("indirect call type mismatch");
                     }
-                    call!(callee, s.push(i as u64));
+                    call!(callee, push!(i as u64));
                 }
-                Op::Drop => {
-                    s.pop();
-                }
+                Op::Drop => sp -= 1,
                 Op::Select => {
                     let c = pop!();
                     let b = pop!();
                     if c as u32 == 0 {
-                        *s.last_mut().unwrap() = b;
+                        s[sp - 1] = b;
                     }
                 }
-                Op::LocalGet(i) => s.push(s[fp + i as usize]),
+                Op::LocalGet(i) => push!(s[fp + i as usize]),
                 Op::LocalSet(i) => {
                     let v = pop!();
                     s[fp + i as usize] = v;
                 }
-                Op::LocalTee(i) => {
-                    let v = *s.last().unwrap();
-                    s[fp + i as usize] = v;
-                }
-                Op::GlobalGet(i) => s.push(globals[i as usize]),
+                Op::LocalTee(i) => s[fp + i as usize] = s[sp - 1],
+                Op::GlobalGet(i) => push!(globals[i as usize]),
                 Op::GlobalSet(i) => globals[i as usize] = pop!(),
-                Op::I32Const(v) => s.push(v as u32 as u64),
-                Op::I64Const(v) => s.push(v as u64),
-                Op::F32Const(v) => s.push(v as u64),
-                Op::F64Const(v) => s.push(v),
+                Op::I32Const(v) => push!(v as u32 as u64),
+                Op::I64Const(v) => push!(v as u64),
+                Op::F32Const(v) => push!(v as u64),
+                Op::F64Const(v) => push!(v),
 
-                Op::MemorySize => s.push((mem.len() / PAGE) as u64),
+                Op::MemorySize => push!((mem.len() / PAGE) as u64),
                 Op::MemoryGrow => {
                     let old = mem.len() / PAGE;
                     let new = old as u64 + pop!() as u32 as u64;
                     if new > *max_pages as u64 {
-                        s.push(u32::MAX as u64);
+                        push!(u32::MAX as u64);
                     } else {
                         lm.grow(new as usize * PAGE, *max_pages as usize * PAGE);
                         mem = &mut lm.buf[..lm.len];
-                        s.push(old as u64);
+                        push!(old as u64);
                     }
                 }
                 Op::MemoryCopy => {
@@ -907,6 +1015,47 @@ impl Vm {
                 Op::I64Store(o) | Op::F64Store(o) => store!(o, 8, |v| v.to_le_bytes()),
                 Op::I32Store8(o) | Op::I64Store8(o) => store!(o, 1, |v| v.to_le_bytes()),
                 Op::I32Store16(o) | Op::I64Store16(o) => store!(o, 2, |v| v.to_le_bytes()),
+
+                Op::LocalGet2(x, y) => {
+                    push!(s[fp + x as usize]);
+                    push!(s[fp + y as usize]);
+                }
+                Op::LocalAddConst(x, c) => push!((s[fp + x as usize] as u32).wrapping_add(c as u32) as u64),
+                Op::LocalTeeGet(x, y) => {
+                    s[fp + x as usize] = s[sp - 1];
+                    push!(s[fp + y as usize]);
+                }
+                Op::LocalSetGet(x, y) => {
+                    let v = pop!();
+                    s[fp + x as usize] = v;
+                    push!(s[fp + y as usize]);
+                }
+                Op::I32AddConst(c) => un!(u32_, ru32, |x| x.wrapping_add(c as u32)),
+                Op::I32ShlConst(c) => un!(u32_, ru32, |x| x.wrapping_shl(c as u32)),
+                Op::I32AddLocal(y) => {
+                    let b = s[fp + y as usize] as u32;
+                    un!(u32_, ru32, |x| x.wrapping_add(b))
+                }
+                Op::I32AddTee(y) => {
+                    bin!(u32_, ru32, |a, b| a.wrapping_add(b));
+                    s[fp + y as usize] = s[sp - 1];
+                }
+                Op::I32AddSet(y) => {
+                    bin!(u32_, ru32, |a, b| a.wrapping_add(b));
+                    let v = pop!();
+                    s[fp + y as usize] = v;
+                }
+                Op::BrIfI32Eqz(t) => brc!(t, |a| u32_(a) == 0),
+                Op::BrIfI32Eq(t) => brc!(t, u32_, |a, b| a == b),
+                Op::BrIfI32Ne(t) => brc!(t, u32_, |a, b| a != b),
+                Op::BrIfI32LtS(t) => brc!(t, i32_, |a, b| a < b),
+                Op::BrIfI32LtU(t) => brc!(t, u32_, |a, b| a < b),
+                Op::BrIfI32GtS(t) => brc!(t, i32_, |a, b| a > b),
+                Op::BrIfI32GtU(t) => brc!(t, u32_, |a, b| a > b),
+                Op::BrIfI32LeS(t) => brc!(t, i32_, |a, b| a <= b),
+                Op::BrIfI32LeU(t) => brc!(t, u32_, |a, b| a <= b),
+                Op::BrIfI32GeS(t) => brc!(t, i32_, |a, b| a >= b),
+                Op::BrIfI32GeU(t) => brc!(t, u32_, |a, b| a >= b),
 
                 Op::I32Eqz => un!(u32_, rb, |x| x == 0),
                 Op::I32Eq => bin!(u32_, rb, |a, b| a == b),

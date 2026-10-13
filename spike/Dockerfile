@@ -13,4 +13,7 @@ WORKDIR /combd/spike
 # reused heap memory that it must zero by hand (slow, and it touches pages).
 # Pinning it keeps every 1 MiB+ cell buffer as lazy zero pages from mmap.
 ENV MALLOC_MMAP_THRESHOLD_=131072
+# glibc also caps mmapped blocks at 65,536 by default. Past that, cell buffers
+# come from the heap and density falls apart (8.5 KB to 52 KB per idle cell).
+ENV MALLOC_MMAP_MAX_=4000000
 CMD ["./target/release/combd-spike", "all"]

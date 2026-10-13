@@ -2,7 +2,7 @@
 //!
 //!   cargo run --release -- all              every test, each in a fresh process
 //!   cargo run --release -- <test> <engine>  tests: compute startup crash density fairness
-//!                                           engines: interp wasmtime (compute also: native)
+//!                                           engines: interp wasmtime wasmtime-pool (compute also: native)
 
 #![forbid(unsafe_code)]
 
@@ -20,7 +20,10 @@ const SLICE: u32 = 2_500;
 /// Fuel (about one per wasm op) per slice for Wasmtime. Both are tuned so a
 /// spinning cell's slice is about 50 us on an M4 Max.
 const WT_FUEL: u64 = 1_000_000;
-const CELLS: usize = 10_000;
+/// How many cells the density and fairness tests use. `COMBD_CELLS` overrides it.
+fn cells() -> usize {
+    std::env::var("COMBD_CELLS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000)
+}
 
 fn wasm() -> Vec<u8> {
     std::fs::read(GUEST).expect("build the guest first: cd guest && cargo build --release --target wasm32-unknown-unknown")
@@ -144,8 +147,9 @@ fn crash<E: Engine>(name: &str, eng: &E, prog: &E::Program) {
 }
 
 fn density<E: Engine>(name: &str, eng: &E, prog: &E::Program) {
+    let n = cells();
     let before = rss_kb();
-    let mut cells: Vec<E::Vm> = (0..CELLS).map(|_| eng.spawn(prog).unwrap()).collect();
+    let mut cells: Vec<E::Vm> = (0..n).map(|_| eng.spawn(prog).unwrap()).collect();
     let idle = rss_kb();
     for vm in &mut cells {
         start(vm, "spin", &mut 0).unwrap();
@@ -153,9 +157,9 @@ fn density<E: Engine>(name: &str, eng: &E, prog: &E::Program) {
     }
     let paused = rss_kb();
     println!(
-        "density  {name:<9} {CELLS} cells: idle {:>6.1} KB/cell   paused mid-loop {:>6.1} KB/cell   (RSS {} MB)",
-        (idle - before) as f64 / CELLS as f64,
-        (paused - before) as f64 / CELLS as f64,
+        "density  {name:<9} {n} cells: idle {:>6.1} KB/cell   paused mid-loop {:>6.1} KB/cell   (RSS {} MB)",
+        (idle - before) as f64 / n as f64,
+        (paused - before) as f64 / n as f64,
         paused / 1024
     );
 }
@@ -183,7 +187,7 @@ where
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 sc.spawn(move || {
-                    let mut cells: Vec<E::Vm> = (t..CELLS).step_by(threads).map(|_| eng.spawn(prog).unwrap()).collect();
+                    let mut cells: Vec<E::Vm> = (t..cells()).step_by(threads).map(|_| eng.spawn(prog).unwrap()).collect();
                     let (job, budget) = match neighbor {
                         Neighbor::Quiet => ("", 0),
                         Neighbor::Spinner => ("spin", SLICE),
@@ -272,7 +276,8 @@ fn main() {
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["all"] => {
             for test in ["compute", "startup", "crash", "density", "fairness"] {
-                let engines: &[&str] = if test == "compute" { &["native", "interp", "wasmtime"] } else { &["interp", "wasmtime"] };
+                let engines: &[&str] =
+                    if test == "compute" { &["native", "interp", "wasmtime"] } else { &["interp", "wasmtime", "wasmtime-pool"] };
                 for e in engines {
                     // A fresh process per run keeps the memory numbers clean.
                     let ok = std::process::Command::new(std::env::current_exe().unwrap()).args([test, e]).status().unwrap();
@@ -283,8 +288,10 @@ fn main() {
         ["compute", "native"] => compute_native(),
         [test, "interp"] => run(test, "interp", &interp::Interp { max_pages: 16384 }),
         #[cfg(feature = "wasmtime")]
-        [test, "wasmtime"] => run(test, "wasmtime", &wt::Wt::new(WT_FUEL)),
-        _ => eprintln!("usage: combd-spike all | <compute|startup|crash|density|fairness> <interp|wasmtime|native>"),
+        [test, "wasmtime"] => run(test, "wasmtime", &wt::Wt::new(WT_FUEL, None)),
+        #[cfg(feature = "wasmtime")]
+        [test, "wasmtime-pool"] => run(test, "wt-pool", &wt::Wt::new(WT_FUEL, Some(cells() as u32 + 2_000))),
+        _ => eprintln!("usage: combd-spike all | <compute|startup|crash|density|fairness> <interp|wasmtime|wasmtime-pool|native>"),
     }
 }
 
@@ -308,7 +315,7 @@ mod tests {
     #[cfg(feature = "wasmtime")]
     #[test]
     fn interp_matches_wasmtime() {
-        assert_eq!(answers(&interp::Interp { max_pages: 16384 }), answers(&wt::Wt::new(WT_FUEL)));
+        assert_eq!(answers(&interp::Interp { max_pages: 16384 }), answers(&wt::Wt::new(WT_FUEL, None)));
     }
 
     #[test]

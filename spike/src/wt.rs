@@ -6,7 +6,10 @@ use crate::engine::{CellVm, Engine, Outcome};
 use std::future::Future;
 use std::pin::{pin, Pin};
 use std::task::{Context, Poll, Waker};
-use wasmtime::{Caller, Config, Instance, InstancePre, Linker, Memory, Module, Store, Val, ValType};
+use wasmtime::{
+    Caller, Config, Instance, InstanceAllocationStrategy, InstancePre, Linker, Memory, Module, PoolingAllocationConfig, Store,
+    Val, ValType,
+};
 
 pub struct Wt {
     engine: wasmtime::Engine,
@@ -16,9 +19,16 @@ pub struct Wt {
 impl Wt {
     /// `fuel_slice` is how much fuel (about one per wasm op) a cell runs before
     /// it yields.
-    pub fn new(fuel_slice: u64) -> Self {
+    /// `pool` turns on Wasmtime's pooling allocator, sized for `slots` live
+    /// cells. It is Wasmtime's fast path for many short-lived instances.
+    pub fn new(fuel_slice: u64, pool: Option<u32>) -> Self {
         let mut c = Config::new();
         c.consume_fuel(true);
+        if let Some(slots) = pool {
+            let mut p = PoolingAllocationConfig::new();
+            p.total_core_instances(slots).total_memories(slots).total_tables(slots).total_stacks(slots);
+            c.allocation_strategy(InstanceAllocationStrategy::Pooling(p));
+        }
         Wt { engine: wasmtime::Engine::new(&c).expect("wasmtime config"), fuel_slice }
     }
 }

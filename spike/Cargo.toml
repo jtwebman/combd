@@ -15,7 +15,7 @@ default = ["wasmtime"]
 [dependencies]
 combd-guest = { path = "../guest" }
 wasmparser = "0.261"
-wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std"] }
+wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
 
 [profile.release]
 lto = "thin"

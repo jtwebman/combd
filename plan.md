@@ -133,6 +133,28 @@ The test `fresh_cells_never_see_old_memory` guards this.
    network (only through our egress broker)
 4. Later, for hostile code: a microVM (like Firecracker) per tenant group
 
+## Stateless Workers too
+
+combd can run plain Workers (Cloudflare-style stateless handlers) as well as
+Durable Objects. A Worker is just a cell with no name and no storage:
+
+| | Durable Object cell | Worker |
+|---|---|---|
+| Identity | a name, like `chat/room-42` | none |
+| Where it runs | exactly one owner node | any node, many copies |
+| Storage | its own SQLite | none (talks to cells, or out via fetch) |
+| Needs leases, epochs, the bucket | yes | no, only to fetch the deploy |
+
+Workers skip the hardest part of combd (ownership and durability), so they are
+the easy half. A Worker reaches a Durable Object through a binding, like a DO
+stub on Cloudflare.
+
+Because spawning is so cheap (3 to 9 us for spawn plus first request in phase
+0), a Worker can get a **fresh instance for every request**. That is the
+strongest isolation there is: nothing leaks from one request to the next, not
+even a global variable. Keeping warm instances around becomes an option, not a
+need.
+
 ## The runtime: Erlang ideas on Wasmtime
 
 ### A cell is a process

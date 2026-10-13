@@ -1,158 +1,203 @@
 # Phase 0 results: the engine race
 
 Date: 2026-10-13. Machine: Apple M4 Max (14 cores: 10 performance, 4
-efficiency), 36 GB RAM, macOS 26.7.1. Rust 1.94.1.
-Wasmtime 47.0.4 (49 needs Rust 1.96).
+efficiency), 36 GB RAM, macOS 26.7.1. Linux runs use Docker on the same Mac:
+Linux 7.0 (LinuxKit), ARM64, 4 KB pages, 8 CPUs and 16 GB given to the VM.
+Rust 1.94.1. Wasmtime 47.0.4 (49 needs Rust 1.96).
 
 Same Rust cell (`guest/`), compiled once to `wasm32-unknown-unknown`, run on:
-- **interp**: our own interpreter, about 1,000 lines of safe Rust
+- **interp**: our own interpreter, about 1,200 lines of safe Rust
   (`#![forbid(unsafe_code)]`). `wasmparser` validates, we do the rest.
-- **wasmtime**: Wasmtime with fuel yields, through the same engine interface.
+- **wasmtime**: Wasmtime with default settings and fuel yields.
+- **wt-pool**: Wasmtime with its pooling allocator, its fast path for many
+  short-lived instances. This is the fair comparison.
 - **native**: the same Rust code compiled normally, as a baseline.
 
-Run it: `cd guest && cargo build --release --target wasm32-unknown-unknown`,
-then `cd spike && cargo run --release -- all`. Two full runs gave the same
-picture. The numbers below are from run 1, with run 2 in brackets when it
-differed in a way worth seeing.
+Run it:
+- macOS: `cd guest && cargo build --release --target wasm32-unknown-unknown`,
+  then `cd spike && cargo run --release -- all`.
+- Linux: `docker build -f spike/Dockerfile -t combd-spike .` from the repo
+  root, then `docker run --rm combd-spike`. All tests run during the build.
 
-## Scoreboard
+Numbers are from the latest run. Earlier runs gave the same picture.
 
-| Measure | interp (ours) | wasmtime | Winner |
-|---|---|---|---|
-| Load a module (validate + prepare) | **0.25 ms** | 22 ms | ours, ~85x |
-| Spawn a cell | **0.6 us** | 16 us [21] | ours, ~25x |
-| Spawn + first request | **5.5 us** | 20 us [24] | ours, ~4x |
-| Crash, then fresh cell serves a request | **5.4 us** | 17 us [19] | ours, ~3x |
-| Memory, idle cell | **20.5 KB** | 38.2 KB | ours, ~46% less |
-| Memory, cell paused mid-loop | **68.9 KB** | 86.8 KB | ours, ~21% less |
-| 10,000 paused cells, whole process | **675 MB** | 859 MB | ours |
-| Hello latency, quiet node, p50 / p99 | **11 / 75 us** [12 / 161] | 23 / 806 us [36 / 1440] | ours |
-| Hello latency, stuck neighbor, p50 / p99 | **36 / 296 us** [37 / 152] | 55 / 646 us [58 / 2418] | ours |
-| Snapshot a cell mid-call, resume the copy | **works** | not possible | ours |
-| Binary, stripped (gzipped) | **1.31 MB (0.56 MB)** | 7.55 MB (3.04 MB) | ours, ~5.5x smaller |
-| fib 30 | 37 ms | **2.6 ms** | wasmtime, 15x |
-| sieve 5,000,000 | 265 ms | **14 ms** | wasmtime, 19x |
-| sort 1,000,000 | 566 ms | **15 ms** | wasmtime, 39x |
+## Scoreboard: Linux
 
-Native Rust for the same three: 1.7 ms, 9.6 ms, 12.6 ms. Our interpreter is
-22x to 45x slower than native. Wasmtime is 1.2x to 1.5x slower than native.
+| Measure | interp (ours) | wasmtime | wt-pool | Winner |
+|---|---|---|---|---|
+| Load a module | **0.39 ms** | 26 ms | 25 ms | ours, ~65x |
+| Spawn a cell | 3.9 us | 3.9 us | **1.6 us** | wt-pool |
+| Spawn + first request | **8.8 us** | 44.5 us | 14.2 us | ours |
+| Crash, then fresh cell serves | **6.8 us** | 25.3 us | 9.4 us | ours |
+| Memory, idle cell | 8.5 KB | 6.0 KB | **5.7 KB** | wt-pool |
+| Memory, cell paused mid-loop | **21.4 KB** | 88.5 KB | 89.4 KB | ours, ~4x less |
+| 10,000 paused cells, whole process | **212 MB** | 873 MB | 884 MB | ours |
+| Hello, quiet, p50 / p99 | **7 / 80 us** | 140 / 2,094 us | 125 / 690 us | ours |
+| Hello, stuck neighbor, p50 / p99 | **24 / 183 us** | 197 / 2,295 us | 55 / 246 us | ours |
+| Hello, heavy neighbor, preemption off, p50 | 62,585 us | n/a | n/a | |
+| fib 30 | 26.8 ms | **4.4 ms** | (same) | wasmtime |
+| sieve 5,000,000 | 167 ms | **15.9 ms** | (same) | wasmtime |
+| sort 1,000,000 | 334 ms | **18.9 ms** | (same) | wasmtime |
 
-celld itself is not in this table yet. Running it means installing and
+wt-pool's "quiet" row runs first in its process, so it pays for first touch
+of its pool slots. Its "stuck neighbor" row reuses warm slots, which is why
+it looks better than "quiet".
+
+## Scoreboard: macOS
+
+| Measure | interp (ours) | wasmtime | wt-pool | Winner |
+|---|---|---|---|---|
+| Load a module | **0.27 ms** | 21.6 ms | 22.3 ms | ours, ~80x |
+| Spawn a cell | **0.6 us** | 24.8 us | 18.8 us | ours |
+| Spawn + first request | **3.4 us** | 31.1 us | 25.4 us | ours |
+| Crash, then fresh cell serves | **3.4 us** | 16.3 us | 18.4 us | ours |
+| Memory, idle cell | **20.5 KB** | 38.1 KB | 37.9 KB | ours |
+| Memory, cell paused mid-loop | **68.5 KB** | 86.7 KB | 86.5 KB | ours |
+| Hello, quiet, p50 / p99 | **11 / 57 us** | 33 / 1,752 us | 30 / 1,503 us | ours |
+| Hello, stuck neighbor, p50 / p99 | **24 / 85 us** | 62 / 1,395 us | 56 / 1,141 us | ours |
+| fib 30 / sieve / sort | 26 / 160 / 347 ms | **2.4 / 13.9 / 14.6 ms** | (same) | wasmtime |
+| Binary, stripped (gzipped) | **1.31 MB (0.56 MB)** | 7.55 MB (3.04 MB) | (same) | ours |
+| Snapshot a cell mid-call | **works** | not possible | not possible | ours |
+
+Native Rust (macOS): fib 1.8 ms, sieve 9.6 ms, sort 12.7 ms.
+
+On macOS the pooling allocator barely helps Wasmtime. On Linux it helps a lot:
+spawn, first request, and crash restart all get 2x to 3x faster, and its
+latency rows improve. That is the fair version of Wasmtime.
+
+celld itself is not in these tables yet. Running it means installing and
 running their binary, which needs a yes first.
 
 ## Fairness, the Erlang test
 
-10,000 cells stay resident across 14 threads. Each thread serves one hello at a
-time to its cells. In the "stuck neighbor" runs, each thread also hosts one cell
-in `loop {}`. Every new hello waits behind one full neighbor slice, the worst
-case. Slices are tuned to about 50 us for both engines.
+10,000 cells stay resident. Each thread serves one hello at a time to its
+cells. In the "stuck neighbor" rows, each thread also hosts one cell in
+`loop {}`, and every new hello waits behind one full neighbor slice (the worst
+case). Slices: about 20 us for ours, about 45 us for Wasmtime.
 
-| Neighbor | interp p50 | interp p99 | wasmtime p50 | wasmtime p99 |
-|---|---|---|---|---|
-| none | 11 us | 75 us | 23 us | 806 us |
-| `loop {}`, preemption on | 36 us | 296 us | 55 us | 646 us |
-| long sort, **preemption off** | **146,190 us** | **224,376 us** | n/a | n/a |
+A stuck cell costs its neighbors about one slice. Turn preemption off, and a
+neighbor doing a long sort costs ~63 ms (Linux) to ~80 ms (macOS) per hello,
+thousands of times worse. That is the case for BEAM-style scheduling,
+measured. (Wasmtime's yield interval is fixed per store, so only our engine
+can switch it off per call for that row.)
 
-A stuck cell costs its neighbors about one slice (~40 us). Turn preemption off
-and the same neighbor costs ~146 ms, about 4,000x worse. That is the whole case
-for BEAM-style scheduling, measured. (Wasmtime's yield interval is fixed per
-store, so only our engine can switch it off per call for this row.)
+Max latencies were sometimes several ms on every engine. That's the OS
+parking a busy thread now and then. Pinned threads on a real server should
+cut that.
 
-Max latencies (not shown) were 4 to 70 ms in some runs, on both engines.
-14 busy threads on a 10+4 core chip with a desktop OS running means the OS
-sometimes parks a thread. A Linux server with pinned threads should tell a
-cleaner story.
+## Making our interpreter faster
 
-## Linux (Docker)
+Instruction counts showed that 22% to 39% of all ops were `local.get`, and
+another 10% to 15% were `local.set` or `local.tee`. Each op was already cheap
+(under 1 ns, about 4 cycles). The gap is that a stack interpreter runs many
+more ops than a JIT runs machine instructions.
 
-Same code in a Docker container on the same Mac: Linux 7.0 (LinuxKit), ARM64,
-4 KB pages, 8 CPUs given to the VM. Build and run with
-`docker build -f spike/Dockerfile -t combd-spike .` then
-`docker run --rm combd-spike`. All tests pass inside the container. Two full
-runs, ranges shown.
-
-| Measure | interp (ours) | wasmtime | Winner |
+| Change | fib 30 | sieve | sort |
 |---|---|---|---|
-| Load a module | **0.35 ms** | 25 ms | ours, ~70x |
-| Spawn a cell | 4.9 to 8.8 us | **4.8 to 5.0 us** | about a tie |
-| Spawn + first request | **12 to 15 us** | 24 to 27 us | ours, ~2x |
-| Crash, then fresh cell serves | **8.8 to 9.6 us** | 15 us | ours, ~1.6x |
-| Memory, idle cell | 8.5 KB | **6.0 KB** | wasmtime |
-| Memory, cell paused mid-loop | **20.8 KB** | 86.6 KB | ours, ~4x less |
-| 10,000 paused cells, whole process | **207 MB** | 854 MB | ours, ~4x less |
-| Hello, quiet, p50 / p99 | **8 / 114 to 203 us** | 97 to 239 / 2,100 to 4,600 us | ours |
-| Hello, stuck neighbor, p50 / p99 | **37 / 79 to 252 us** | 211 / 1,900 to 2,400 us | ours |
-| Hello, heavy neighbor, preemption off, p50 | 102,000 to 106,000 us | n/a | |
-| fib 30 / sieve / sort | 40 / 295 / 568 ms | **2.7 / 16.5 / 16.5 ms** | wasmtime, 15x to 35x |
+| Phase 0 baseline | 40 ms | 270 ms | 570 ms |
+| Stack as a slice with an index, one bounds check per memory access | 35 ms | 255 ms | 480 ms |
+| Fused ops for the hottest pairs (see below) | **27 ms** | **165 ms** | **335 ms** |
+| **Total speedup** | **1.5x** | **1.6x** | **1.7x** |
 
-What changed on Linux:
-- **Paused cells shrank from 69 KB to 21 KB on our engine,** thanks to 4 KB
-  pages. Wasmtime stayed near 87 KB, likely because each paused call holds its
-  own fiber stack. 10,000 paused cells: 207 MB vs 854 MB.
-- **Our spawn got slower (0.6 us to ~5 us).** glibc serves each 1 MiB cell
-  buffer with its own `mmap`, and that system call is the cost.
-- **glibc needed one setting.** After big frees, glibc raises its mmap
-  threshold and starts serving 1 MiB blocks from its heap, which it then
-  zeroes by hand. Crash restart was 33 us until we pinned
-  `MALLOC_MMAP_THRESHOLD_=131072` (set in the Dockerfile). Then it dropped to
-  9 us. Zeroing still happens either way; the setting only moves it from
-  glibc's `memset` to the kernel's lazy zero pages.
-- **Wasmtime's latency is much worse here than on macOS** (p50 ~100 to 240 us
-  vs ~25 us). We run it with default settings and no pooling allocator, so
-  every call sets up a fresh async stack. A tuned Wasmtime would do better.
-  Treat its latency rows as "Wasmtime untuned".
+The fused ops:
+- two `local.get` at once,
+- `i32.add` / `i32.shl` by a constant,
+- local + constant,
+- add then `local.set` / `local.tee`,
+- `local.set` / `local.tee` then `local.get`,
+- an `i32` compare plus `br_if` as one branch.
+
+A fused op never spans a branch target.
+
+Gap to Wasmtime went from 15x to 39x, down to **11x to 24x** (macOS). The next
+big step is a register-based design: treat locals and stack slots as operands,
+so `local.get` mostly disappears. That is phase 1 work, still aiming at
+"within 5x".
+
+## Scaling past 10,000 cells (Linux)
+
+| Cells | Paused, per cell | Whole process |
+|---|---|---|
+| 10,000 | 21.4 KB | 212 MB |
+| 100,000 | 21.4 KB | 2.1 GB |
+| 200,000 | 21.4 KB | 4.2 GB |
+
+It scales in a straight line. Two walls showed up on the way:
+1. **glibc's mmap count.** glibc only hands out 65,536 separately mapped
+   blocks by default. Past that, cell buffers came from its heap and idle cells
+   jumped from 8.5 KB to 52 KB. Fix: `MALLOC_MMAP_MAX_=4000000` (in the
+   Dockerfile).
+2. **Linux's map limit.** `vm.max_map_count` is 262,144 here. Each cell's
+   buffer is one mapping, so one process tops out near 250,000 cells. Past
+   that, either raise the setting or put all cells in one big reserved region.
+   The second is what Wasmtime's pool does, and it needs `unsafe`, so it
+   belongs in the small audited FFI crate.
+
+At 21.4 KB each, a million paused cells is about 21 GB. That fits on an
+ordinary 32 to 64 GB server, once the map limit is handled.
 
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,
-whether the kernel zeroes the pages lazily or glibc zeroes them with `memset`.
+whether the kernel zeroes pages lazily or glibc zeroes them with `memset`.
 Safe Rust can't expose leftover memory at all (that takes `unsafe`, which is
 banned). The test `fresh_cells_never_see_old_memory` fills dead cells with a
 pattern and checks that new cells never see it.
 
+## What these numbers do not cover
+
+- **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A
+  cell holding 5 MB of state uses 5 MB. Memory per cell is the cell's own
+  working set. The engine adds very little on top. The way to run millions is
+  that most cells are idle at any moment, and idle cells hibernate (drop the
+  instance, keep SQLite on disk).
+- **CPU-heavy cells hit cores, not memory.** Preemption keeps things fair, but
+  it doesn't create CPU. And heavy compute is exactly where our engine is
+  weakest today (11x to 24x behind Wasmtime). For those cells, the fast-
+  interpreter work matters most, and Wasmtime behind the engine interface is
+  the escape hatch.
+- **No real storage yet.** These cells don't touch SQLite or the network. Real
+  requests will spend most of their time there, and that part is the same for
+  any engine.
+
 ## What we learned
 
 1. **The Erlang shape works.** Preemption holds, crashes stay contained, a
-   fresh cell is serving again in ~5 us, and mid-call snapshots work. Every
-   test passes on both engines with identical answers.
-2. **Our engine wins everything except raw compute,** and by a lot on startup,
-   spawn, crash recovery, binary size, and latency.
-3. **Raw compute is the real gap: 15x to 39x behind Wasmtime.** My earlier
-   guess was 3x to 10x. This is a naive first interpreter: a stack machine with
-   one big `match`, `Vec` push and pop on every op, and double bounds checks on
-   memory. The known fixes (register bytecode, fused ops, fewer checks) are the
-   first rung of the speed ladder in the plan. Mature interpreters like wasm3
-   and wasmi show what is possible.
-4. **Per-cell memory is mostly the guest's own pages, not the engine.** Both
-   engines land at 70 to 90 KB per paused cell. Apple Silicon uses 16 KB pages,
-   so a few touched pages add up fast. Linux on x86 uses 4 KB pages and should
-   be smaller. A slimmer guest (stack size, allocator) is the next lever.
-5. **Safe Rust can't reserve memory the way Wasmtime does.** Wasmtime reserves
-   address space with `mmap` and lets pages appear lazily. We tried reserving
-   1 GiB per cell with `calloc`. Spawn went from 0.6 us to 5.5 ms, because
-   macOS charges ~9 ms per GB to free and reuse big blocks. What we do now:
-   start at a 1 MiB buffer (macOS hands out lazy zero pages from 1 MiB up),
-   double on growth, and copy only chunks that hold data. Real `mmap`
-   reservation belongs in the small audited FFI crate the plan already allows.
+   fresh cell serves again in 3 to 7 us, and mid-call snapshots work.
+2. **Our engine wins almost everything except raw compute,** even against
+   pooled Wasmtime. Pooled Wasmtime spawns faster on Linux and has smaller
+   idle cells. We win load time, first request, crash restart, paused-cell
+   memory (~4x), latency, and binary size.
+3. **Raw compute is the real gap: 11x to 24x behind Wasmtime** after fusion.
+   Each op is already cheap, so the fix is running fewer ops (a register-based
+   design).
+4. **Per-cell memory is mostly the guest's own touched pages.** Linux 4 KB
+   pages: ~21 KB per paused cell. Apple Silicon 16 KB pages: ~69 KB.
+5. **The allocator matters a lot at scale.** macOS charges ~9 ms per GB to
+   free and reuse big zeroed blocks, which rules out reserving 1 GiB per cell.
+   On glibc, two settings (`MALLOC_MMAP_THRESHOLD_`, `MALLOC_MMAP_MAX_`) were
+   the difference between 9 us and 33 us crash restarts, and 8.5 KB and 52 KB
+   idle cells. Long term: one reserved region for all cells, in the audited
+   FFI crate.
 6. **A bug in our test cell, caught by the native baseline.** `i * i` on a
-   32-bit `usize` overflowed in the sieve. Both Wasm engines agreed with each
-   other, and correctly. Only comparing against native caught it. Keep the
-   native baseline in every future test.
+   32-bit `usize` overflowed. Both Wasm engines agreed with each other, and
+   correctly. Keep the native baseline in every test.
 
 ## Verdict
 
 **Keep our own interpreter as the default engine.** The things combd cares
 about most (many small cells, fast start, cheap crashes, fairness, small
-binary, snapshots) all came out in its favor. Close the compute gap in phase 1
-with a target: within 5x of Wasmtime on these three workloads. Keep Wasmtime
-behind the engine interface. It costs nothing to keep, and it gives cells that
-are heavy on compute a fast option.
+binary, snapshots) came out in its favor, even against pooled Wasmtime. Close
+the compute gap in phase 1 with a register-based design, aiming for within 5x
+of Wasmtime. Keep Wasmtime behind the engine interface for compute-heavy
+cells.
 
 ## Next
 
-1. Run the official Wasm spec test suite against the interpreter.
-2. Fast-interpreter work toward the 5x target. Profile `sort` first; it is the
-   worst at 39x.
-3. Same race on a real Linux x86 server (done on ARM64 in Docker, see above).
-   Also rerun Wasmtime with its pooling allocator for a fairer latency row.
-4. Add celld to the scoreboard (needs a yes to install and run it).
+1. Run the official Wasm spec test suite against the interpreter. The fused
+   ops make this more important, not less.
+2. Register-based interpreter, toward the 5x target.
+3. One reserved memory region for all cells (audited FFI crate), to get past
+   the per-process map limit.
+4. A real Linux x86 server with pinned threads.
+5. Add celld to the scoreboard (needs a yes to install and run it).
