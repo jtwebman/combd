@@ -228,6 +228,84 @@ spiky, and slow-host-call traffic before it ever runs for real.
 
 Each Worker only sees its own numbers, never another tenant's.
 
+## Bring your own database
+
+Cells and Workers need to reach Postgres, MySQL, and friends, not just their
+own SQLite. Cloudflare solves this with Hyperdrive. combd builds it in.
+
+### Why the host owns the pools
+
+There can be thousands of instances, and they come and go. If each one opened
+its own connection, 10,000 cells would mean 10,000 connections and a dead
+database. So the **host keeps the pools**: a few connections per node per
+database, shared by every instance on that node. A cell never holds a socket.
+It holds a `db` binding.
+
+### How a query flows
+
+1. The cell calls `db.query(sql, params)`, a host import.
+2. The engine returns `HostCall`, and the cell is simply paused. A paused cell
+   costs ~21 KB and no CPU, so waiting on the database is nearly free.
+3. The host borrows a pooled connection, runs the query, returns the
+   connection, and resumes the cell with the rows.
+
+```wit
+interface db {
+  resource transaction {
+    query: func(sql: string, params: list<value>) -> result<rows, db-error>;
+    commit: func() -> result<_, db-error>;
+    rollback: func();
+  }
+  query: func(binding: string, sql: string, params: list<value>) -> result<rows, db-error>;
+  begin: func(binding: string) -> result<transaction, db-error>;
+}
+```
+
+### Rules
+
+- **Transaction-mode pooling, like PgBouncer.** A connection is lent for one
+  query, or held for one transaction (an unforgeable `transaction` handle).
+- **Crash = rollback.** If a cell traps mid-transaction, the host rolls back
+  and returns the connection. Let it crash, and the database stays clean.
+- **Clean before reuse.** Session state (`SET`, temp tables, advisory locks)
+  is reset (`DISCARD ALL` on Postgres) before a connection goes back to the
+  pool, so nothing leaks between Workers that share a binding.
+- **Prepared statements are cached by the host** per connection, so cells
+  get the speed without managing names.
+- **Credentials never reach the cell.** They are an encrypted secret that only
+  the host decrypts. The database host must be in the binding config; the
+  egress broker blocks everything else.
+- **Fleet-wide connection cap.** You set "at most 200 connections" for the
+  whole fleet. Each node takes its share, using the live node count from the
+  bucket leases it already reads. No new coordination service.
+- **Backpressure, not pileups.** When the pool is busy, requests wait in a
+  queue with a deadline. If the database is down, a circuit breaker fails fast
+  instead of piling up.
+- **Timeouts:** per query, and a max transaction time, so a stuck cell can't
+  hold a connection forever.
+
+### Levers and visibility
+
+- Levers per binding: `max_connections` (fleet-wide), `min_idle`, query
+  timeout, max transaction time, queue deadline, and read-replica routing.
+- Query caching for reads, opt-in per binding with a TTL. Off by default,
+  because stale data is a correctness risk.
+- You can see: open, idle, and busy connections, pool wait time, query latency
+  p50 and p99, slow queries, and errors, per binding and per Worker. Auto mode
+  uses "time waiting on the database" to raise concurrency per instance.
+
+### Also: raw TCP
+
+For drivers or protocols we don't pool, a cell can open a TCP socket through
+the egress broker (like Cloudflare's `connect()`). No pooling help there, and
+it still obeys the allowlist.
+
+### Order
+
+Postgres first (most common), then MySQL. The host uses a well-tested Rust
+driver for the wire protocol. Each cell's own SQLite stays the default for
+per-cell state. A shared database is for data many cells need.
+
 ## The runtime: Erlang ideas on Wasmtime
 
 ### A cell is a process
@@ -478,8 +556,9 @@ hot cells later, the way BEAM did.
 3. **Fleet (D2).** Bucket leases, CAS ownership, epochs, routing between nodes
    over mTLS. Kill tests.
 4. **WebSockets** with hibernation.
-5. **Fast fleet writes (D3).** Peer proofs, only after D2 is solid.
-6. **More languages** (Python via componentize-py, Go via TinyGo, JS via
+5. **Bring your own database.** Host-owned pools, Postgres first.
+6. **Fast fleet writes (D3).** Peer proofs, only after D2 is solid.
+7. **More languages** (Python via componentize-py, Go via TinyGo, JS via
    StarlingMonkey) using the same WIT file. Not before the core is proven.
 
 Not planned: Node.js, V8, KV, R2, Queues, D1 (the Cloudflare product), Workflows,
