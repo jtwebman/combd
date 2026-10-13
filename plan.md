@@ -393,6 +393,49 @@ JS is too dynamic).
 2 MB, not 21 KB), and JS runs on two interpreters stacked. The JS spike
 measures both before we commit.
 
+## Languages right away (no JS needed)
+
+Any language that compiles to a plain Wasm module can run on our engine today.
+Most need a small set of WASI preview 1 calls (write to stdout and stderr,
+clock, random, args, env). combd provides those as safe host functions, with
+no real file or network access. Days of work, not months.
+
+| Language | Toolchain | Notes |
+|---|---|---|
+| Rust | `wasm32-unknown-unknown` / `wasm32-wasip1` | works today |
+| AssemblyScript | `asc` | TypeScript-like syntax, small fast Wasm. The bridge for JS developers moving off JS |
+| Go | TinyGo `-target=wasip1` | |
+| C / C++ | wasi-sdk | |
+| Zig | `zig build -target wasm32-wasi` | |
+
+Each gets a tiny SDK for the cell API (`fetch`, `storage.sql`, alarms, `db`)
+and an example cell. The JS path below does not block any of this.
+
+## Our own JS engine (long track)
+
+Bun did not write a JS engine. It runs on JavaScriptCore and built the runtime
+around it. Writing a *fast* JIT engine takes big teams a decade. Writing a
+*correct interpreter* has been done by small teams (QuickJS, Boa, Nova), and
+the hard part is the long tail of conformance.
+
+What would make ours worth it: **compile JS straight to our engine's own
+bytecode, not to Wasm.**
+- One interpreter instead of two (QuickJS in Wasm interprets an interpreter).
+- JS cells get reductions, fair preemption, let it crash, `snapshot_after_init`,
+  mid-call snapshots, and replayable crashes natively.
+- The JS heap lives in safe Rust: arena objects addressed by index, no
+  `unsafe`. A bug can't corrupt memory, and the heap is plain data, so
+  snapshots still work.
+- Strong oracles: test262 (50,000+ tests) plus differential runs against V8.
+
+Order and gates:
+1. Bridge first: QuickJS in Wasm (above), so JS users aren't blocked.
+2. Milestone 1: enough JS to run a Hono "hello" handler on our VM, with
+   snapshots and preemption. Race it against QuickJS in Wasm. **If it is not
+   clearly faster (target 5x or more), stop and keep QuickJS.**
+3. Milestone 2: Workers APIs, then conformance tracked as a test262 pass rate.
+4. Replace QuickJS once ours passes enough of test262 and wins the race.
+
 ## The runtime: Erlang ideas on Wasmtime
 
 ### A cell is a process
@@ -636,6 +679,8 @@ hot cells later, the way BEAM did.
    ~146 ms with preemption off. Verdict: keep our interpreter, and close the
    compute gap to within 5x of Wasmtime in phase 1. Still to do: add celld
    itself to the scoreboard.
+0a. **Languages right away.** WASI preview 1 shim on our engine, plus example
+   cells in AssemblyScript, TinyGo, C, and Zig.
 0b. **JS spike.** QuickJS compiled to Wasm, running a Hono-style JSON handler
    on our engine, on Wasmtime, and on Node (V8) as the baseline. Measure speed,
    memory per cell, and start time with and without `snapshot_after_init`. The
