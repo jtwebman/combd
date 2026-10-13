@@ -149,11 +149,20 @@ Workers skip the hardest part of combd (ownership and durability), so they are
 the easy half. A Worker reaches a Durable Object through a binding, like a DO
 stub on Cloudflare.
 
-Because spawning is so cheap (3 to 9 us for spawn plus first request in phase
-0), a Worker can get a **fresh instance for every request**. That is the
-strongest isolation there is: nothing leaks from one request to the next, not
-even a global variable. Keeping warm instances around becomes an option, not a
-need.
+**Warm instances are reused across requests,** like Cloudflare reuses
+isolates. Globals, caches, parsed config, and connection pools survive between
+requests, and init work runs once. Each node keeps a small pool of instances
+per Worker and grows it with load (one instance runs one handler at a time,
+unless the guest SDK interleaves requests with async).
+
+An instance is replaced, not reused, when it:
+- crashes (let it crash: the next request gets a fresh one),
+- goes over its memory limit,
+- belongs to an old deploy,
+- sits idle long enough to be evicted.
+
+Cheap spawning (3 to 9 us in phase 0) makes all of those fast, but it is not a
+reason to throw instances away on every request.
 
 ## The runtime: Erlang ideas on Wasmtime
 
