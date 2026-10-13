@@ -389,9 +389,11 @@ JS is too dynamic).
 3. A `node:http` shim so Express and Koa run. Cloudflare has done this since
    August 2025 (`httpServerHandler`), though not every middleware works.
 
-**Known costs:** JS cells are fatter than Rust cells (a JS heap of maybe 0.5 to
-2 MB, not 21 KB), and JS runs on two interpreters stacked. The JS spike
-measures both before we commit.
+**Measured in the JS spike (step 0b):** QuickJS on our interpreter is 230x
+to 525x slower than V8 per request, so JS cells run on the **Wasmtime tier by
+default** (8 to 46 us per request, 0.48 ms cold start). A JS cell is about
+410 KB. Snapshot copies don't save memory until pages are shared
+copy-on-write.
 
 ## Languages right away (no JS needed)
 
@@ -445,8 +447,9 @@ checkers. So we treat this as an experiment with a scoreboard, like phase 0.
    objects addressed by index, no `unsafe`). Goal: Hono "hello" on our VM, with
    snapshots and preemption, and a test262 pass rate on the board.
 2. Months 2 to 3: conformance and interpreter speed, nonstop.
-3. Gate: race it against QuickJS in Wasm. If it is not clearly faster
-   (target 5x or more), stop and keep QuickJS.
+3. Gate: it must beat QuickJS on Wasmtime (8 to 46 us per request in the JS
+   spike), and it is measured against V8 and Bun (0.5 to 5 us). If it can't
+   clearly beat QuickJS on Wasmtime, stop and keep QuickJS.
 4. Replace QuickJS once ours passes enough of test262 and wins the race.
 
 **Security rules for any JIT:** tests prove an engine gives right answers.
@@ -703,10 +706,14 @@ hot cells later, the way BEAM did.
    shim, plus the test cell in AssemblyScript, TinyGo, C, and Zig
    (`langs/`). All five languages, including Rust, pass all checks on both
    engines. See [spike/RESULTS.md](spike/RESULTS.md).
-0b. **JS spike.** QuickJS compiled to Wasm, running a Hono-style JSON handler
-   on our engine, on Wasmtime, and on Node (V8) as the baseline. Measure speed,
-   memory per cell, and start time with and without `snapshot_after_init`. The
-   numbers decide whether JS cells default to our engine or to Wasmtime.
+0b. **DONE 2026-10-13. JS spike.** QuickJS in Wasm, a Hono-style app, on our
+   engine, Wasmtime, Node, and Bun. QuickJS on our interpreter is 230x to 525x
+   slower than V8: not viable. QuickJS on Wasmtime is 8 to 46 us per request:
+   viable. **JS cells default to the Wasmtime tier.** See
+   [spike/RESULTS.md](spike/RESULTS.md).
+0c. **HTTP race against workerd and celld.** The same app as a real Worker and
+   Durable Object on workerd and celld, against combd, over HTTP: requests per
+   second, latency, cold start, and memory per Durable Object.
 1. **Spec + decision core + simulator** for ownership and the output gate. No
    network yet.
 2. **Single node (D1).** HTTP in, route to cell, SQLite, alarms, supervisor,

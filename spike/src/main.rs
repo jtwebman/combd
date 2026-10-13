@@ -2,6 +2,7 @@
 //!
 //!   cargo run --release -- all              every test, each in a fresh process
 //!   cargo run --release -- langs            every language's cell, on both engines
+//!   cargo run --release -- js               the JS spike: QuickJS cell on both engines vs Node
 //!   cargo run --release -- <test> <engine>  tests: compute startup crash density fairness
 //!                                           engines: interp wasmtime wasmtime-pool (compute also: native)
 
@@ -111,6 +112,78 @@ fn langs<E: Engine>(name: &str, eng: &E) -> bool {
         );
     }
     all_ok
+}
+
+const JS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../langs/js");
+
+fn js_cell() -> (Vec<u8>, Vec<String>) {
+    let wasm = std::fs::read(format!("{LANGS}/js.wasm")).expect("build langs/out first (see langs/README.md)");
+    let reqs = std::fs::read_to_string(format!("{JS_DIR}/requests.txt")).unwrap();
+    (wasm, reqs.lines().map(String::from).collect())
+}
+
+/// Spawn a JS cell and run its init (QuickJS boot + app.js).
+fn js_fresh<E: Engine>(eng: &E, prog: &E::Program) -> E::Vm {
+    let mut vm = eng.spawn(prog).unwrap();
+    init(&mut vm, &mut HostState::default()).unwrap();
+    vm
+}
+
+fn js_bench<E: Engine>(name: &str, eng: &E) {
+    let (wasm, reqs) = js_cell();
+    let t = Instant::now();
+    let prog = eng.load(&wasm).unwrap();
+    println!("js       {name:<9} load {:.2} ms", t.elapsed().as_secs_f64() * 1e3);
+    let n = 20;
+    let t = Instant::now();
+    for _ in 0..n {
+        let mut vm = js_fresh(eng, &prog);
+        request(&mut vm, &reqs[0], &mut HostState::default()).unwrap();
+    }
+    println!("js       {name:<9} cold, no snapshot (spawn + QuickJS boot + app + first request) {:.1} us", us(t.elapsed() / n));
+    let base = js_fresh(eng, &prog);
+    if base.snapshot().is_some() {
+        let n = 200;
+        let t = Instant::now();
+        for _ in 0..n {
+            let mut vm = base.snapshot().unwrap();
+            request(&mut vm, &reqs[0], &mut HostState::default()).unwrap();
+        }
+        println!("js       {name:<9} cold, from snapshot after init (copy + first request) {:.1} us", us(t.elapsed() / n));
+    }
+    let mut vm = js_fresh(eng, &prog);
+    let mut st = HostState::default();
+    for r in &reqs {
+        let label: String = r.chars().take(22).collect();
+        let iters = if r.starts_with("fib") { 3 } else { 200 };
+        for _ in 0..20.min(iters) {
+            request(&mut vm, r, &mut st).unwrap();
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            request(&mut vm, r, &mut st).unwrap();
+        }
+        let per = t.elapsed() / iters;
+        let out = request(&mut vm, r, &mut st).unwrap();
+        let head: String = out.chars().take(40).collect();
+        println!("js       {name:<9} {label:<22} {:>9.1} us   -> {} bytes: {head}", us(per), out.len());
+    }
+}
+
+fn js_mem<E: Engine>(name: &str, eng: &E) {
+    let (wasm, _) = js_cell();
+    let prog = eng.load(&wasm).unwrap();
+    let n = 1000;
+    let before = rss_kb();
+    let cells: Vec<E::Vm> = (0..n).map(|_| js_fresh(eng, &prog)).collect();
+    let after = rss_kb();
+    println!("js       {name:<9} memory per JS cell after init: {:.1} KB", (after - before) as f64 / n as f64);
+    if let Some(base) = cells[0].snapshot() {
+        let before = rss_kb();
+        let copies: Vec<E::Vm> = (0..n).map(|_| base.snapshot().unwrap()).collect();
+        let after = rss_kb();
+        println!("js       {name:<9} memory per JS cell copied from snapshot: {:.1} KB [{}]", (after - before) as f64 / n as f64, copies.len());
+    }
 }
 
 fn wasm() -> Vec<u8> {
@@ -388,6 +461,20 @@ fn main() {
             }
         }
         ["compute", "native"] => compute_native(),
+        ["js"] => {
+            let me = std::env::current_exe().unwrap();
+            for args in [["js-bench", "interp"], ["js-bench", "wasmtime"], ["js-mem", "interp"], ["js-mem", "wasmtime"]] {
+                assert!(std::process::Command::new(&me).args(args).status().unwrap().success());
+            }
+            let node = std::process::Command::new("node").args(["--expose-gc", &format!("{JS_DIR}/bench.mjs")]).status();
+            assert!(node.is_ok_and(|s| s.success()), "node baseline failed");
+        }
+        ["js-bench", "interp"] => js_bench("interp", &interp::Interp { max_pages: 16384 }),
+        ["js-mem", "interp"] => js_mem("interp", &interp::Interp { max_pages: 16384 }),
+        #[cfg(feature = "wasmtime")]
+        ["js-bench", "wasmtime"] => js_bench("wasmtime", &wt::Wt::new(WT_FUEL, None)),
+        #[cfg(feature = "wasmtime")]
+        ["js-mem", "wasmtime"] => js_mem("wasmtime", &wt::Wt::new(WT_FUEL, None)),
         ["langs"] => {
             let mut ok = langs("interp", &interp::Interp { max_pages: 16384 });
             #[cfg(feature = "wasmtime")]

@@ -172,6 +172,61 @@ on both engines with five checks each:
   Zig alone imports 27 WASI functions, mostly file-system calls its standard
   library pulls in. None of them get real access.
 
+## JavaScript (step 0b)
+
+QuickJS (quickjs-ng 0.17.0) compiled to Wasm with a small C wrapper
+(`langs/js/`), running a Hono-style app in plain JS: a router with path
+params, `JSON.parse` and `JSON.stringify`, three API routes. Same requests
+(`langs/js/requests.txt`) on four runtimes, all in Linux Docker on the same
+Mac. Every runtime returned byte-identical answers. Node 24.21 (V8) and Bun
+1.4.2 (JavaScriptCore) run the same `app.js` (`langs/js/bench.mjs`).
+
+Warm, per request (lower is better):
+
+| Request | ours (QuickJS on our interpreter) | QuickJS on Wasmtime | Node (V8) | Bun (JSC) |
+|---|---|---|---|---|
+| GET /api/users/42 | 253 us | 8.4 us | 1.1 us | **0.5 us** |
+| GET /api/users (20 users) | 997 us | 45.5 us | 1.9 us | **1.7 us** |
+| POST /api/orders (20 items) | 1,453 us | 46.0 us | 4.8 us | **3.4 us** |
+| fib 25 | 190,029 us | 7,830 us | 457 us | **300 us** |
+
+Cold start and memory:
+
+| | ours | QuickJS on Wasmtime | Node (V8) | Bun (JSC) |
+|---|---|---|---|---|
+| Cold, no snapshot | 9,666 us | 477 us | 302 us (new vm context) | **174 us** (new vm context) |
+| Cold, from snapshot after init | 772 us | n/a | n/a | n/a |
+| Memory per instance | 410 KB | 410 KB | 179 KB per context | 73 KB per context |
+
+The Node and Bun memory numbers are for a `vm` context, not a full isolate,
+so they are a lower bound. Real tenant isolation in V8 means an isolate per
+tenant (that is what workerd does). Testing workerd and celld directly is the
+next step.
+
+**Verdict: JS on our interpreter is not viable.** It is 230x to 525x slower
+than V8 per request, because QuickJS is an interpreter running on our
+interpreter. A simple GET at 253 us is about 4,000 requests per second per
+core.
+
+What does work:
+- **QuickJS on Wasmtime is viable for typical Workers:** 8 to 46 us per API
+  request. That's 8x to 24x behind V8, but still microseconds. It also cold
+  starts in 0.48 ms with no snapshot at all.
+- **Snapshot after init helps a lot on our engine** (12x faster cold start),
+  but not enough to catch Wasmtime.
+- **Snapshots don't save memory yet.** A copy costs the same ~410 KB as a
+  fresh cell, because we copy every page. Sharing pages copy-on-write needs
+  the audited memory crate.
+
+What this means for the plan:
+1. JS cells run on the Wasmtime tier by default. Our interpreter stays the
+   default for Rust, C, Zig, Go, and AssemblyScript cells.
+2. The gate for our own JS engine changes. It must beat QuickJS on Wasmtime
+   (8 to 46 us), and it should be measured against V8 and Bun (0.5 to 5 us),
+   not against QuickJS on our interpreter.
+3. The faster interpreter (register-based) matters even more now. Every
+   language, and any future JS engine on our VM, rides on it.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

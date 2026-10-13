@@ -1,0 +1,4 @@
+api GET /api/users/42
+api GET /api/users
+api POST /api/orders {"id":"ord-1001","customer":"user42","items":[{"sku":"sku-000","price":1.25,"qty":1},{"sku":"sku-001","price":2.0,"qty":2},{"sku":"sku-002","price":2.75,"qty":3},{"sku":"sku-003","price":3.5,"qty":4},{"sku":"sku-004","price":4.25,"qty":1},{"sku":"sku-005","price":5.0,"qty":2},{"sku":"sku-006","price":5.75,"qty":3},{"sku":"sku-007","price":6.5,"qty":4},{"sku":"sku-008","price":7.25,"qty":1},{"sku":"sku-009","price":8.0,"qty":2},{"sku":"sku-010","price":8.75,"qty":3},{"sku":"sku-011","price":9.5,"qty":4},{"sku":"sku-012","price":10.25,"qty":1},{"sku":"sku-013","price":11.0,"qty":2},{"sku":"sku-014","price":11.75,"qty":3},{"sku":"sku-015","price":12.5,"qty":4},{"sku":"sku-016","price":13.25,"qty":1},{"sku":"sku-017","price":14.0,"qty":2},{"sku":"sku-018","price":14.75,"qty":3},{"sku":"sku-019","price":15.5,"qty":4}]}
+fib 25

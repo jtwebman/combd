@@ -1,4 +1,4 @@
-# Builds the same test cell in Go, C, Zig, and AssemblyScript. From the repo root:
+# Builds the same test cell in Go, C, Zig, AssemblyScript, and JS (QuickJS). From the repo root:
 #   docker build -f langs/Dockerfile -o langs/out langs
 FROM tinygo/tinygo:0.42.0 AS go
 WORKDIR /src
@@ -14,11 +14,20 @@ RUN curl -fsSL https://ziglang.org/download/$ZIG/zig-aarch64-linux-$ZIG.tar.xz -
     && echo "$ZIG_SHA  zig.tar.xz" | sha256sum -c \
     && tar xf zig.tar.xz && mv zig-aarch64-linux-$ZIG /zig
 WORKDIR /src
+ARG QJS=0.17.0
+ARG QJS_SHA=559bc4c420475e55c7ab4510adbc562f55d7524d75e8e89d79ce4bb02f5687d9
+RUN curl -fsSL https://github.com/quickjs-ng/quickjs/archive/refs/tags/v$QJS.tar.gz -o qjs.tgz \
+    && echo "$QJS_SHA  qjs.tgz" | sha256sum -c \
+    && tar xzf qjs.tgz && mv quickjs-$QJS /qjs
 COPY c/ c/
 COPY zig/ zig/
+COPY js/ js/
 RUN mkdir -p /tmp/out \
     && /zig/zig cc -target wasm32-wasi -mexec-model=reactor -O2 -s -o /tmp/out/c.wasm c/cell.c \
-    && /zig/zig build-exe zig/cell.zig -target wasm32-wasi -fno-entry -rdynamic -O ReleaseFast -fstrip -femit-bin=/tmp/out/zig.wasm
+    && /zig/zig build-exe zig/cell.zig -target wasm32-wasi -fno-entry -rdynamic -O ReleaseFast -fstrip -femit-bin=/tmp/out/zig.wasm \
+    && /zig/zig cc -target wasm32-wasi -mexec-model=reactor -O2 -s -D_GNU_SOURCE -I/qjs \
+       -Wl,-z,stack-size=1048576 -o /tmp/out/js.wasm \
+       js/cell.c /qjs/quickjs.c /qjs/libregexp.c /qjs/libunicode.c /qjs/dtoa.c
 
 FROM node:24-slim AS as
 WORKDIR /src
