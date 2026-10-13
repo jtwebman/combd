@@ -245,12 +245,65 @@ directly and turn it into a log entry. Decide in the D1 spike.
    freeze a node, cut it off from the bucket, throttle the bucket to 429s.
 5. **Fuzzing** for the HTTP parser edge, the SQL layer, and the peer protocol.
 
+## The engine: our own Wasm interpreter (bold option)
+
+Instead of Wasmtime, write our own interpreter in safe Rust. This fits the
+Erlang idea better than a JIT does. BEAM itself started as an interpreter and
+only added a JIT (BeamAsm) in 2021.
+
+**Why it fits:**
+- **True reductions.** Count instructions and pause a cell at any instruction.
+  No epoch ticks, no fibers.
+- **A paused cell is plain data:** value stack, call frames, program counter,
+  and linear memory. No 2 MB fiber stack per cell, so many more paused cells
+  fit in RAM.
+- **Powers Wasmtime can't give:** snapshot a cell mid-request, move a running
+  cell to another node, and replay it exactly in the simulator. Native machine
+  code state can't be saved like that.
+- **Smaller attack surface.** No JIT means no codegen bugs (the 2023 Cranelift
+  sandbox escape is a whole class that goes away) and no writable+executable
+  memory. `#![forbid(unsafe_code)]` in the whole engine.
+- **Light and instant.** Tiny binary, no compile step on deploy.
+- **Strong test oracles.** The official Wasm spec test suite, plus
+  differential fuzzing: random modules from `wasm-smith`, run on ours and on
+  Wasmtime, results must match.
+
+**The costs:**
+- Pure compute runs roughly 3 to 10x slower than Wasmtime. Most cell time is in
+  SQLite and the network, which run native in the host. Heavy work (crypto,
+  compression) becomes host functions.
+- The core interpreter is the small part. The component model, WIT, and WASI
+  0.3 async are the big part. For Rust first, skip them: plain core Wasm
+  modules plus our own small import API. Add components later.
+- Decoding and validating Wasm is the front door, and a bug there is a
+  security bug. Use the Bytecode Alliance `wasmparser` crate for that (a
+  heavily fuzzed library, not a runtime). Everything after it is ours.
+
+**Design sketch:**
+- Translate each validated function once into our own compact internal
+  bytecode (register-based, with fused common ops). Don't interpret raw Wasm.
+- Every loop back-edge and call costs reductions. At zero, save state and
+  return `Yield` to the scheduler.
+- Explicit bounds checks on every memory access. Memory grows only through
+  our limiter.
+- Trap = return an error value. The host never panics because of guest code.
+
+**Prior art:** wasmi (Rust, fuel and resumable calls), wasm3 (fastest C
+interpreter, mostly in maintenance), Stitch (fast Rust interpreter), Pulley
+(Wasmtime's own interpreter mode), Wizard (research engine, in-place
+interpreter).
+
+**Decision:** lean toward our own interpreter. The spike races it against
+Wasmtime so real numbers decide. If we ever need raw speed, add a JIT tier for
+hot cells later, the way BEAM did.
+
 ## Build order (when we do build)
 
-0. **Spike (2 to 3 days).** One Rust cell in Wasmtime. Run 10,000 cells with
-   a few doing `loop {}`. Measure: do the others stay fast? Memory per idle
-   cell? Restart time after a crash? This proves or kills the Erlang idea with
-   real numbers.
+0. **Spike (1 to 2 weeks): the engine race.** A minimal interpreter (core Wasm,
+   enough to run one Rust cell) vs the same cell on Wasmtime. Run 10,000 cells
+   with a few doing `loop {}`. Measure: do the others stay fast? Memory per
+   paused cell? Restart time after a crash? Compute speed gap? This proves or
+   kills both the Erlang idea and our own engine with real numbers.
 1. **Spec + decision core + simulator** for ownership and the output gate. No
    network yet.
 2. **Single node (D1).** HTTP in, route to cell, SQLite, alarms, supervisor,
