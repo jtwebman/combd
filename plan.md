@@ -164,6 +164,70 @@ An instance is replaced, not reused, when it:
 Cheap spawning (3 to 9 us in phase 0) makes all of those fast, but it is not a
 reason to throw instances away on every request.
 
+## Levers and visibility (more than Cloudflare gives)
+
+Cloudflare must treat every customer the same and hide its internals. combd
+runs on your machines, so it can hand you the controls and show you
+everything. Our own interpreter makes the data cheap: it already sees every
+slice, every host call, and every byte of memory.
+
+### Levers you can set (per Worker or cell class)
+
+| Lever | What it does |
+|---|---|
+| `concurrency` | Max requests in flight per instance. 1 = strictly one at a time. Higher only helps guests that interleave async I/O. |
+| `min_warm` / `max_instances` | Instances kept warm, and a ceiling per node and per fleet. |
+| `recycle` | Replace an instance after N requests, an age, or a memory high-water mark (before it hits the hard limit). |
+| `cpu_per_request` | Reduction budget per request. Over it = trap. |
+| `slice` | Reductions per slice. Smaller = lower tail latency for neighbors, larger = more throughput. |
+| `weight` | Fair share of CPU against other Workers, like BEAM process priority. |
+| `memory_max` | Hard memory cap per instance. |
+| `snapshot_after_init` | Run init once, snapshot the instance, and start every new instance from that snapshot. New instances come up already warm. Only our engine can do this. |
+| placement | Pin to nodes or regions, or spread. |
+| egress | Allowlist of hosts the Worker may call. |
+
+### Auto mode: set a target, not a number
+
+Most people should not hand-tune these. In auto mode you set a goal, like
+"p99 under 50 ms" and maybe a cost cap ("at most 2 GB"), and a controller
+adjusts concurrency and instance counts in near real time (every 100 ms to
+1 s).
+
+What it watches, per Worker: arrival rate, queue wait, CPU (reductions) per
+request, time spent waiting on host calls (SQL, fetch), memory per instance,
+and crash rate.
+
+How it decides:
+- **Little's law:** requests in flight = arrival rate x latency. Divide by
+  concurrency to get the instances needed.
+- **I/O-bound** (most time waiting on host calls): raise concurrency per
+  instance, so one instance handles many waiting requests.
+- **CPU-bound:** keep concurrency at 1 and add instances, up to the cores.
+- Scale up when queue wait threatens the target. Scale down slowly when idle
+  (hysteresis, so it doesn't flap).
+- Respect `max_instances` and the cost cap, and say so when the target can't
+  be met.
+
+The controller is a pure function, `on_tick(stats) -> actions`, like the
+ownership decision core. So it gets tested in the simulator against bursty,
+spiky, and slow-host-call traffic before it ever runs for real.
+
+### What you can see
+
+- **Per request:** CPU (reductions) used, wall time, queue wait, time per host
+  call type (SQL, fetch, cell RPC), how often it was preempted, memory high
+  water, and which instance served it.
+- **Per instance:** age, requests served, memory now and peak, crashes.
+- **Live view:** `combd top`, like `htop`, or like Erlang's Observer. Every
+  Worker and hot cell, with its rates, latency, CPU, memory, and what the
+  auto controller is doing and why.
+- **Crash snapshots you can replay.** A cell is plain data, so when one
+  crashes combd can save it as it was at the crash and replay that exact run on
+  your laptop. Opt-in only: snapshots hold user data, so they are encrypted
+  and access-controlled.
+
+Each Worker only sees its own numbers, never another tenant's.
+
 ## The runtime: Erlang ideas on Wasmtime
 
 ### A cell is a process
