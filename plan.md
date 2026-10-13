@@ -355,6 +355,44 @@ Postgres first (most common), then MySQL. The host uses a well-tested Rust
 driver for the wire protocol. Each cell's own SQLite stays the default for
 per-cell state. A shared database is for data many cells need.
 
+## JavaScript
+
+Most Workers code is JS and TypeScript, so combd needs it to grow past Rust
+developers. No V8, and no JS engine in the host.
+
+**How: a JS engine compiled to Wasm, running as a normal cell.** Start with
+QuickJS (through `rquickjs`, like Shopify's Javy, about 870 KB of Wasm). Maybe
+move to SpiderMonkey (StarlingMonkey) later for speed and conformance, as
+Fermyon did. Every combd property still holds: sandbox, preemption, let it
+crash, snapshots, the same host API.
+
+Rejected: a native engine in the host (C in our process, no snapshots, and
+only V8 is fast), and compiling JS to Wasm ahead of time (Porffor is too young;
+JS is too dynamic).
+
+**Making it fast enough:**
+1. `snapshot_after_init`: boot QuickJS, load the bundle, run its setup, then
+   snapshot. Every new JS cell starts warm, with no parse time.
+2. Hot built-ins as native Rust host functions: `JSON.parse` /
+   `JSON.stringify`, crypto, URL, text encoding.
+3. CPU-heavy JS cells can use the Wasmtime tier behind the engine interface.
+4. Later: share the snapshot's pages copy-on-write between cells (needs the
+   audited memory crate), so a JS cell only pays for pages it changes.
+
+**What we support, in steps (the same target as Cloudflare):**
+1. Workers APIs: `fetch` handlers, `Request` / `Response` / `Headers` / `URL`,
+   streams, WebCrypto, and the Durable Object class with `storage.sql`,
+   alarms, and WebSockets. Hono, itty-router, and web-standard npm packages
+   work.
+2. A Node subset, driven by the most-used npm packages: `buffer`, `events`,
+   `util`, `crypto`, `stream`, `process.env`.
+3. A `node:http` shim so Express and Koa run. Cloudflare has done this since
+   August 2025 (`httpServerHandler`), though not every middleware works.
+
+**Known costs:** JS cells are fatter than Rust cells (a JS heap of maybe 0.5 to
+2 MB, not 21 KB), and JS runs on two interpreters stacked. The JS spike
+measures both before we commit.
+
 ## The runtime: Erlang ideas on Wasmtime
 
 ### A cell is a process
@@ -598,6 +636,10 @@ hot cells later, the way BEAM did.
    ~146 ms with preemption off. Verdict: keep our interpreter, and close the
    compute gap to within 5x of Wasmtime in phase 1. Still to do: add celld
    itself to the scoreboard.
+0b. **JS spike.** QuickJS compiled to Wasm, running a Hono-style JSON handler
+   on our engine, on Wasmtime, and on Node (V8) as the baseline. Measure speed,
+   memory per cell, and start time with and without `snapshot_after_init`. The
+   numbers decide whether JS cells default to our engine or to Wasmtime.
 1. **Spec + decision core + simulator** for ownership and the output gate. No
    network yet.
 2. **Single node (D1).** HTTP in, route to cell, SQLite, alarms, supervisor,
@@ -607,8 +649,9 @@ hot cells later, the way BEAM did.
 4. **WebSockets** with hibernation.
 5. **Bring your own database.** Host-owned pools, Postgres first.
 6. **Fast fleet writes (D3).** Peer proofs, only after D2 is solid.
-7. **More languages** (Python via componentize-py, Go via TinyGo, JS via
-   StarlingMonkey) using the same WIT file. Not before the core is proven.
+7. **JavaScript** (QuickJS in Wasm, Workers APIs first), then **more
+   languages** (Python via componentize-py, Go via TinyGo) using the same WIT
+   file. Not before the core is proven.
 
 Not planned: Node.js, V8, KV, R2, Queues, D1 (the Cloudflare product), Workflows,
 containers. Most can be built later as cells on top of the core.
