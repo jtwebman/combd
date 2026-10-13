@@ -1,0 +1,18 @@
+[package]
+name = "combd-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its own workspace, so its release profile (panic = abort) never touches the host.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

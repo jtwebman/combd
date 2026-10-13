@@ -355,18 +355,21 @@ enum Outcome { Done(Value), Yield, HostCall(HostCall), Trap(Trap) }
 
 The spike measures every row against a real celld node on the same machine.
 
-**Decision:** lean toward our own interpreter. The spike races it against
-Wasmtime so real numbers decide. If we ever need raw speed, add a JIT tier for
+**Decision (after the phase 0 race):** our own interpreter is the default
+engine. Wasmtime stays behind the engine interface as a fast-compute option.
+See [spike/RESULTS.md](spike/RESULTS.md). If we ever need raw speed, add a JIT tier for
 hot cells later, the way BEAM did.
 
 ## Build order (when we do build)
 
-0. **Spike (1 to 2 weeks): the engine race.** A minimal interpreter (core Wasm,
-   enough to run one Rust cell) vs the same cell on Wasmtime. Run 10,000 cells
-   with a few doing `loop {}`. Measure: do the others stay fast? Memory per
-   paused cell? Restart time after a crash? Compute speed gap? This proves or
-   kills both the Erlang idea and our own engine with real numbers. Also run
-   the same app on celld to fill in the scoreboard above.
+0. **DONE 2026-10-13. Spike: the engine race.** Results in
+   [spike/RESULTS.md](spike/RESULTS.md). Our interpreter beat Wasmtime on load
+   (~85x), spawn (~25x), crash restart (~3x), memory per cell, latency, binary
+   size (~5.5x smaller), and can snapshot mid-call. It lost on raw compute
+   (15x to 39x slower). Preemption works: a stuck neighbor costs ~40 us, versus
+   ~146 ms with preemption off. Verdict: keep our interpreter, and close the
+   compute gap to within 5x of Wasmtime in phase 1. Still to do: add celld
+   itself to the scoreboard.
 1. **Spec + decision core + simulator** for ownership and the output gate. No
    network yet.
 2. **Single node (D1).** HTTP in, route to cell, SQLite, alarms, supervisor,

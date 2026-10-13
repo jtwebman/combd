@@ -66,16 +66,18 @@ simple API can later open the door to Python, Go, JavaScript, and more.
 
 ## Where we are
 
-**At the very start.** There is no code yet, only a plan. We read celld closely,
-learned from what it got right and what it got wrong, and wrote down how we
-think combd should work.
+**At the very start.** We read celld closely, learned from what it got right
+and what it got wrong, and wrote down how we think combd should work.
 
 **[Read the plan.](plan.md)**
 
-The first step is a race. We run 10,000 cells at once on our own interpreter
-and on Wasmtime, make a few of them misbehave, and see if the rest stay fast.
-We also measure memory per cell, startup, crash recovery, and raw speed. If the
-numbers hold, we build.
+Then we ran the first experiment: a race between our own tiny interpreter and
+Wasmtime, with 10,000 cells and a few of them stuck in endless loops. The stuck
+cells cost their neighbors about 40 microseconds, instead of 146 milliseconds
+without preemption. Our interpreter started cells about 25 times faster,
+recovered from crashes about 3 times faster, used less memory, and came in
+5.5 times smaller. It is still far slower at raw math, and closing that gap is
+next. **[See the results.](spike/RESULTS.md)**
 
 ## Standing on shoulders
 
