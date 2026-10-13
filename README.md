@@ -51,6 +51,13 @@ abilities we hand it. Around that sit more walls: locked-down processes,
 encrypted and authenticated traffic between machines, and outbound requests
 that are denied unless allowed. Security is not a later phase.
 
+**Our own engine.** We plan to write our own WebAssembly interpreter in safe
+Rust. Because a running cell is just plain data to it, combd can pause a cell
+at any instruction, save it in the middle of a request, and even move it to
+another machine while it runs. No JIT also means a whole class of sandbox
+escape bugs can't happen. The engine sits behind a small interface, so a faster
+tier, or Wasmtime, can plug in later without changing anything else.
+
 **Yours.** It runs on your machines, and your state lives in your bucket. No
 vendor, no lock-in, no account to sign up for.
 
@@ -65,17 +72,19 @@ think combd should work.
 
 **[Read the plan.](plan.md)**
 
-The first step is a small experiment: run 10,000 cells at once, make a few of
-them misbehave, and see if the rest stay fast. If the numbers hold, we build.
+The first step is a race. We run 10,000 cells at once on our own interpreter
+and on Wasmtime, make a few of them misbehave, and see if the rest stay fast.
+We also measure memory per cell, startup, crash recovery, and raw speed. If the
+numbers hold, we build.
 
 ## Standing on shoulders
 
 combd is inspired by [celld](https://github.com/denoland/celld),
 [workerd](https://github.com/cloudflare/workerd), and
 [Erlang/OTP](https://www.erlang.org/). We use none of their code, but we owe
-them the ideas. For the engine, we are racing our own safe-Rust WebAssembly
-interpreter against [Wasmtime](https://wasmtime.dev/), and the numbers will
-decide.
+them the ideas. [Wasmtime](https://wasmtime.dev/) is the bar our engine has
+to race against, and the Bytecode Alliance's `wasmparser` checks every module
+before our engine runs it.
 
 ## License
 
