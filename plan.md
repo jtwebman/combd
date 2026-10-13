@@ -315,6 +315,46 @@ Speed ladder, stop when good enough: (1) faster interpreter (register
 bytecode, fused ops), (2) copy-and-patch baseline JIT like CPython's,
 (3) Cranelift optimizing tier for hot cells only.
 
+**Engine interface.** Worth having from day one, because the spike already
+has two engines (ours and Wasmtime), and tiers come later.
+
+```rust
+trait Engine {
+    fn load(&self, wasm: &[u8]) -> Result<Program>;   // validate + translate, once per deploy
+    fn spawn(&self, p: &Program, limits: Limits) -> Result<CellVm>;
+}
+
+trait CellVm {
+    fn run(&mut self, reductions: u32) -> Outcome;   // run until something happens
+    fn resume(&mut self, host_result: HostValue);
+    fn snapshot(&self) -> Option<Snapshot>;          // None if the engine can't
+}
+
+enum Outcome { Done(Value), Yield, HostCall(HostCall), Trap(Trap) }
+```
+
+- The engine never does I/O. It returns `HostCall` and waits for `resume`.
+  Same events-in, effects-out idea as the decision core, so engines stay
+  deterministic and simulator-friendly.
+- `snapshot` is optional so Wasmtime can still plug in.
+- Rule: nothing engine-specific ever reaches disk or the wire. (celld stores
+  KV values in V8's serialization format, which ties its data to V8 forever.)
+
+**Expected scoreboard vs celld (guesses until measured):**
+
+| Measure | Guess | Why |
+|---|---|---|
+| Memory per cell | big win | V8 isolates cost MBs; ours is a struct + linear memory |
+| Cells per GB | big win | follows from memory |
+| Cold start | win | no isolate setup, no compile |
+| Fairness, p99 under load | win | celld cells share isolate turn lanes, no default CPU limit |
+| Binary size | win | celld v0.6.2 ships ~22 MB gzipped, mostly V8 |
+| Raw compute | loss | V8 JIT vs our interpreter; Rust's leanness closes some gap |
+| Durable writes | tie | disk and network bound (~25 ms fleet, ~600 ms bucket in celld's lab) |
+| Warm request latency | tie or small win | celld p50 ~1.1 ms, mostly HTTP + SQLite |
+
+The spike measures every row against a real celld node on the same machine.
+
 **Decision:** lean toward our own interpreter. The spike races it against
 Wasmtime so real numbers decide. If we ever need raw speed, add a JIT tier for
 hot cells later, the way BEAM did.
@@ -325,7 +365,8 @@ hot cells later, the way BEAM did.
    enough to run one Rust cell) vs the same cell on Wasmtime. Run 10,000 cells
    with a few doing `loop {}`. Measure: do the others stay fast? Memory per
    paused cell? Restart time after a crash? Compute speed gap? This proves or
-   kills both the Erlang idea and our own engine with real numbers.
+   kills both the Erlang idea and our own engine with real numbers. Also run
+   the same app on celld to fill in the scoreboard above.
 1. **Spec + decision core + simulator** for ownership and the output gate. No
    network yet.
 2. **Single node (D1).** HTTP in, route to cell, SQLite, alarms, supervisor,
