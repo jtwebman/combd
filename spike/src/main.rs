@@ -22,6 +22,7 @@ mod wire;
 mod spectest;
 #[cfg(feature = "fuzz")]
 mod fuzz;
+mod fuzz_host;
 mod http;
 mod interp;
 #[cfg(feature = "wasmtime")]
@@ -374,6 +375,11 @@ fn finish<V: CellVm>(vm: &mut V, slice: u32, st: &mut HostState) -> Result<Vec<u
 
 /// Copy a request into the cell and begin `handle`. Nothing runs yet.
 fn start<V: CellVm>(vm: &mut V, req: &str, st: &mut HostState) -> Result<(), String> {
+    // A new request: a fresh host-time budget, wherever the engine keeps it.
+    st.host_time = Default::default();
+    if let Some(h) = vm.host_state() {
+        h.host_time = Default::default();
+    }
     vm.begin("alloc", &[req.len() as u64])?;
     let ptr = finish(vm, u32::MAX, st)?[0] as u32;
     if !vm.write(ptr, req.as_bytes()) {
@@ -720,6 +726,22 @@ fn main_with(args: &[&str]) {
             }
             println!("fuzz     no mismatches");
         }
+        // Fuzzing the host API: `fuzz-host N [start]`.
+        ["fuzz-host", n, ref rest @ ..] => {
+            let start: u64 = rest.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let n: u64 = n.parse().unwrap();
+            let t = Instant::now();
+            let st = fuzz_host::run(start..start + n, fuzz_host::SLOW);
+            println!("fuzz-host {n} seeds in {:.1} s: {} calls ({} crashed their cell), slowest {:?}: {}", t.elapsed().as_secs_f64(), st.calls, st.crashed, st.slowest.0, st.slowest.1);
+            for p in st.problems.iter().take(30) {
+                println!("fuzz-host PROBLEM {p}");
+            }
+            if !st.problems.is_empty() {
+                println!("fuzz-host {} problems", st.problems.len());
+                std::process::exit(1);
+            }
+            println!("fuzz-host no problems");
+        }
         // The AOT tier's fuzz batch: `fuzz-gen N [start]`, build, `fuzz-aot N [start]`.
         #[cfg(feature = "fuzz")]
         ["fuzz-dump", seed, out] => std::fs::write(out, fuzz::module(seed.parse().unwrap()).unwrap().0).unwrap(),
@@ -873,6 +895,53 @@ mod tests {
         let mut vm = eng.spawn(&prog).unwrap();
         vm.begin(export, &[]).unwrap();
         vm.run(u32::MAX)
+    }
+
+    /// A cell that loops over slow SQL is stopped: each statement after
+    /// 100 ms, and the request after a second of host time in all (the
+    /// cell's fuel doesn't count host time, so without this it could loop
+    /// for as long as it liked at almost no cost to itself).
+    #[test]
+    fn a_request_gets_a_second_of_host_time() {
+        let q = r#"{"q":"WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT count(*) FROM r"}"#;
+        let src = format!(r#"(module
+            (import "combd" "sql" (func $sql (param i32 i32) (result i32)))
+            (memory 1)
+            (data (i32.const 0) "{}")
+            (func (export "spin") (loop (drop (call $sql (i32.const 0) (i32.const {}))) (br 0))))"#, q.replace('"', "\\\""), q.len());
+        let dir = store::tempdir::Dir::new();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(store::Db::open(&dir.0.join("o.sqlite")).unwrap()));
+        db.lock().unwrap().begin().unwrap();
+        let mut st = HostState { db: Some(db), ..HostState::default() };
+        let eng = interp::Interp { max_pages: 16 };
+        let mut vm = eng.spawn(&eng.load(&wat::parse_str(&src).unwrap()).unwrap()).unwrap();
+        vm.begin("spin", &[]).unwrap();
+        let t = Instant::now();
+        let r = finish(&mut vm, SLICE, &mut st);
+        assert!(r.as_ref().is_err_and(|e| e.contains("host time")), "{r:?}");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    }
+
+    /// A cell picks the types of its own imports. One that declares a host
+    /// function with fewer parameters than it really takes must crash only
+    /// itself, never the host (it used to index past the arguments and panic).
+    #[test]
+    fn a_wrongly_typed_import_crashes_only_its_cell() {
+        let src = r#"(module
+            (import "combd" "sql" (func $sql (result i64)))
+            (import "wasi_snapshot_preview1" "fd_write" (func $w (param i32) (result i32)))
+            (memory 1)
+            (func (export "sql") (result i64) call $sql)
+            (func (export "write") (result i32) i32.const 1 call $w))"#;
+        let eng = interp::Interp { max_pages: 16 };
+        for export in ["sql", "write"] {
+            let r = eng.load(&wat::parse_str(src).unwrap()).and_then(|prog| {
+                let mut vm = eng.spawn(&prog)?;
+                vm.begin(export, &[])?;
+                finish(&mut vm, SLICE, &mut HostState::default())
+            });
+            assert!(r.is_err(), "{export}: {r:?}");
+        }
     }
 
     /// Regression, found by differential fuzzing (seed 6831): `big == extend(0)`

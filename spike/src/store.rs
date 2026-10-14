@@ -23,9 +23,11 @@
 //! - an authorizer denies ATTACH (it could open other files), PRAGMA, the
 //!   cell's own BEGIN / COMMIT / SAVEPOINT (the host owns transactions), and
 //!   any table named `_combd...` (the host's own, like the alarm),
-//! - limits cap the size of strings, SQL text, and expression depth,
-//! - a progress handler stops any one statement after `MAX_STEPS`, since
-//!   SQLite's CPU use isn't counted by the cell's fuel.
+//! - limits cap the size of values (2 MB, as Cloudflare's), SQL text, and
+//!   expression depth, and each object's file (`MAX_DB_BYTES`),
+//! - a progress handler stops any one statement after `MAX_STEPS` or
+//!   `MAX_STATEMENT`, since SQLite's CPU use isn't counted by the cell's fuel.
+//!   Steps alone aren't enough: one step can build a 2 MB string.
 
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
@@ -39,7 +41,14 @@ use std::sync::Arc;
 
 /// Progress callbacks (every 1,000 SQLite VM steps) before a statement is
 /// stopped: about 10 million steps, tens of milliseconds.
-const MAX_STEPS: u32 = 10_000;
+const MAX_STEPS: u32 = 100_000;
+/// How long one of a cell's statements may run.
+const MAX_STATEMENT: std::time::Duration = std::time::Duration::from_millis(100);
+/// The biggest value (string or blob) a cell can store or build.
+pub const MAX_VALUE: usize = 2 << 20;
+/// The biggest an object's database may grow. ponytail: one cap for every
+/// object; per-tenant quotas come with multi-tenancy.
+pub const MAX_DB_BYTES: i64 = 1 << 30;
 /// A WAL holding this many pages gets checkpointed, by the fsync threads
 /// (SQLite's own default is the same).
 pub const CHECKPOINT_PAGES: i32 = 1000;
@@ -62,6 +71,7 @@ pub struct Db {
     /// True while the host itself runs SQL (BEGIN, COMMIT).
     host: Arc<AtomicBool>,
     steps: Arc<AtomicU32>,
+    started: Arc<std::sync::Mutex<std::time::Instant>>,
 }
 
 /// Where an object's file lives. Names come from users, so the file name is
@@ -95,9 +105,12 @@ impl Db {
         conn.pragma_update(None, "trusted_schema", "OFF")?;
         // Many objects per node: keep each one's page cache small (256 KiB).
         conn.pragma_update(None, "cache_size", -256)?;
+        // Cap the object's file (per connection, so set at every open).
+        let page: i64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
+        conn.pragma_update(None, "max_page_count", MAX_DB_BYTES / page)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS _combd_alarm (id INTEGER PRIMARY KEY CHECK (id = 1), at INTEGER NOT NULL)")?;
         for (limit, v) in [
-            (Limit::SQLITE_LIMIT_LENGTH, MAX_RESULT as i32),
+            (Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE as i32),
             (Limit::SQLITE_LIMIT_SQL_LENGTH, 1 << 20),
             (Limit::SQLITE_LIMIT_EXPR_DEPTH, 100),
             (Limit::SQLITE_LIMIT_ATTACHED, 0),
@@ -131,11 +144,15 @@ impl Db {
             }
         }));
         let steps = Arc::new(AtomicU32::new(0));
-        let s = steps.clone();
-        conn.progress_handler(1000, Some(move || s.fetch_add(1, Relaxed) >= MAX_STEPS));
+        let started = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let (s, t, h) = (steps.clone(), started.clone(), host.clone());
+        // Every 100 VM steps (a step can be costly), for cell statements only.
+        conn.progress_handler(100, Some(move || {
+            !h.load(Relaxed) && (s.fetch_add(1, Relaxed) >= MAX_STEPS || t.lock().unwrap().elapsed() > MAX_STATEMENT)
+        }));
         let mut wal_path = path.as_os_str().to_owned();
         wal_path.push("-wal");
-        Ok(Db { conn, path: path.to_path_buf(), wal_path: wal_path.into(), wal: Default::default(), wrote: Default::default(), wal_pages: Default::default(), tail: std::cell::Cell::new((WAL_HEADER, 0)), host, steps })
+        Ok(Db { conn, path: path.to_path_buf(), wal_path: wal_path.into(), wal: Default::default(), wrote: Default::default(), wal_pages: Default::default(), tail: std::cell::Cell::new((WAL_HEADER, 0)), host, steps, started })
     }
 
     fn host_sql(&self, sql: &str) -> rusqlite::Result<()> {
@@ -196,6 +213,11 @@ impl Db {
         r.map(|_| ())
     }
 
+    /// The host's transaction is open (a cell can't end it).
+    pub fn in_transaction(&self) -> bool {
+        !self.conn.is_autocommit()
+    }
+
     pub fn rollback(&self) {
         self.wrote.set(false);
         if !self.conn.is_autocommit() {
@@ -229,6 +251,7 @@ impl Db {
             _ => return Err("p must be an array".into()),
         };
         self.steps.store(0, Relaxed);
+        *self.started.lock().unwrap() = std::time::Instant::now();
         let mut st = self.conn.prepare_cached(sql).map_err(|e| e.to_string())?;
         if !st.readonly() {
             self.wrote.set(true);
@@ -236,10 +259,21 @@ impl Db {
         let cols = st.column_count();
         let mut rows = st.query(rusqlite::params_from_iter(params)).map_err(|e| e.to_string())?;
         let mut out = vec![];
+        // Count the answer as it grows, and stop at MAX_RESULT: checking only
+        // at the end let one query hold gigabytes in the host first.
+        let mut size = 0usize;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             let mut r = Vec::with_capacity(cols);
             for i in 0..cols {
-                r.push(match row.get_ref(i).map_err(|e| e.to_string())? {
+                let v = row.get_ref(i).map_err(|e| e.to_string())?;
+                size += match v {
+                    ValueRef::Text(t) | ValueRef::Blob(t) => t.len() + 8,
+                    _ => 24,
+                };
+                if size > MAX_RESULT {
+                    return Err("result too large".into());
+                }
+                r.push(match v {
                     ValueRef::Null => Json::Null,
                     ValueRef::Integer(n) => json!(n),
                     ValueRef::Real(x) => json!(x),
