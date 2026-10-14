@@ -1368,6 +1368,11 @@ fn parse(c: &mut Conn) -> Result<Option<Req>, ()> {
     c.close_after |= close;
     let body = String::from_utf8_lossy(&c.rbuf[hlen..hlen + clen]);
     let (method, path) = (req.method.unwrap_or("GET"), req.path.unwrap_or("/"));
+    // Only standard methods: `ALARM` is how the host runs an object's alarm,
+    // and a client must never be able to fire one.
+    if !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].contains(&method) {
+        return Err(());
+    }
     let line = |kind: &str, path: &str| if body.is_empty() { format!("{kind} {method} {path}") } else { format!("{kind} {method} {path} {body}") };
     let r = if path == "/_combd/stats" {
         Req::Stats

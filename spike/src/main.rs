@@ -1086,6 +1086,8 @@ mod tests {
         assert_eq!(http(port, "GET", "/do/room1/msgs", ""), (200, "{\"msgs\":[\"hi\"]}".into()));
         // Objects are separate.
         assert_eq!(http(port, "GET", "/do/room2/count", ""), (200, "{\"count\":0}".into()));
+        // A client can't fire an object's alarm handler.
+        assert_eq!(http(port, "ALARM", "/do/room1/", "0").0, 400);
         // Many clients at once on one object: it runs them one at a time, and
         // none are lost or doubled.
         let answers: Vec<String> = (0..8)
