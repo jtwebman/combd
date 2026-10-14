@@ -158,6 +158,11 @@ pub mod api {
                 };
                 format!("201 {}", serde_json::to_string(&r).unwrap())
             }
+            // CPU-heavy on purpose: the bad neighbor in fairness tests.
+            ("GET", ["api", "fib", n]) => {
+                let n: u32 = n.parse::<u32>().unwrap_or(0).min(40);
+                format!("200 {{\"n\":{n},\"fib\":{}}}", super::fib(n))
+            }
             _ => "404 {\"error\":\"not found\"}".into(),
         }
     }

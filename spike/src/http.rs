@@ -1,16 +1,21 @@
-//! The HTTP/1.1 front for the race against workerd, celld, Bun, and Node.
+//! The HTTP/1.1 front for the races against workerd, celld, Bun, and Node.
 //!
-//! One event loop per thread (epoll on Linux, kqueue on macOS) and one warm
-//! cell per loop, run on the same thread as the I/O, so there's no context
-//! switch per request. `COMBD_THREADS` sets the loop count (default: cores).
+//! One event loop per thread (epoll on Linux, kqueue on macOS). Each loop is a
+//! small BEAM-style scheduler: a request takes a warm cell from the loop's pool
+//! and runs one slice (about 50 us) at a time. Between slices the loop checks
+//! for I/O and gives every other request its turn, so a CPU-heavy request
+//! can't hold the core. `COMBD_THREADS` sets the loop count (default: cores).
+//!
 //! `GET /api/users/42` becomes the cell request `api GET /api/users/42`, and the
 //! cell's answer `200 {...}` becomes the status line and body.
 
-use crate::engine::Engine;
+use crate::engine::{CellVm, Engine, Outcome};
 use crate::host::HostState;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
+use std::time::Duration;
 
 const LISTENER: Token = Token(usize::MAX);
 const MAX_REQUEST: usize = 1 << 20;
@@ -22,40 +27,27 @@ struct Conn {
     wpos: usize,
     writing: bool,
     close_after: bool,
+    /// A request from this connection is running; the next one waits.
+    busy: bool,
 }
 
-/// One warm cell, reused across requests like a Worker instance.
-struct Cell<'a, E: Engine> {
-    eng: &'a E,
-    prog: &'a E::Program,
+/// A warm cell, reused across requests like a Worker instance.
+struct Cell<E: Engine> {
     vm: E::Vm,
     st: HostState,
 }
 
-impl<'a, E: Engine> Cell<'a, E> {
-    fn new(eng: &'a E, prog: &'a E::Program) -> std::io::Result<Self> {
-        let mut vm = eng.spawn(prog).map_err(std::io::Error::other)?;
-        let mut st = HostState::default();
-        crate::init(&mut vm, &mut st).map_err(std::io::Error::other)?;
-        Ok(Cell { eng, prog, vm, st })
-    }
+fn fresh<E: Engine>(eng: &E, prog: &E::Program) -> std::io::Result<Cell<E>> {
+    let mut vm = eng.spawn(prog).map_err(std::io::Error::other)?;
+    let mut st = HostState::default();
+    crate::init(&mut vm, &mut st).map_err(std::io::Error::other)?;
+    Ok(Cell { vm, st })
+}
 
-    fn call(&mut self, req: &str) -> (u16, String) {
-        match crate::request(&mut self.vm, req, &mut self.st) {
-            Ok(answer) => {
-                let (code, rest) = answer.split_once(' ').unwrap_or(("500", ""));
-                (code.parse().unwrap_or(500), rest.to_string())
-            }
-            Err(trap) => {
-                eprintln!("cell trapped on {req:?}: {trap}");
-                // Let it crash: the next request gets a fresh cell.
-                if let Ok(fresh) = Cell::new(self.eng, self.prog) {
-                    *self = fresh;
-                }
-                (500, format!("{{\"error\":{trap:?}}}"))
-            }
-        }
-    }
+/// A request in flight.
+struct Task<E: Engine> {
+    conn: usize,
+    cell: Cell<E>,
 }
 
 pub fn serve<E>(eng: &E, prog: &E::Program, port: u16)
@@ -88,9 +80,14 @@ fn event_loop<E: Engine>(eng: &E, prog: &E::Program, mut listener: TcpListener) 
     poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
     let mut conns: Vec<Option<Conn>> = vec![];
     let mut free: Vec<usize> = vec![];
-    let mut cell = Cell::new(eng, prog)?;
+    let mut pool: Vec<Cell<E>> = vec![fresh(eng, prog)?];
+    let mut tasks: VecDeque<Task<E>> = VecDeque::new();
+    let mut touched: Vec<usize> = vec![];
     loop {
-        poll.poll(&mut events, None)?;
+        // Never block while requests are waiting to run.
+        let timeout = if tasks.is_empty() { None } else { Some(Duration::ZERO) };
+        poll.poll(&mut events, timeout)?;
+        touched.clear();
         for ev in events.iter() {
             if ev.token() == LISTENER {
                 loop {
@@ -102,7 +99,15 @@ fn event_loop<E: Engine>(eng: &E, prog: &E::Program, mut listener: TcpListener) 
                                 conns.len() - 1
                             });
                             poll.registry().register(&mut s, Token(id), Interest::READABLE)?;
-                            conns[id] = Some(Conn { s, rbuf: vec![], wbuf: vec![], wpos: 0, writing: false, close_after: false });
+                            conns[id] = Some(Conn {
+                                s,
+                                rbuf: vec![],
+                                wbuf: vec![],
+                                wpos: 0,
+                                writing: false,
+                                close_after: false,
+                                busy: false,
+                            });
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(_) => break, // another loop took it, or a transient error
@@ -112,24 +117,156 @@ fn event_loop<E: Engine>(eng: &E, prog: &E::Program, mut listener: TcpListener) 
             }
             let id = ev.token().0;
             let Some(c) = conns.get_mut(id).and_then(Option::as_mut) else { continue };
-            let mut closed = ev.is_readable() && read_all(c);
-            closed |= process(c, &mut cell);
-            closed |= flush(c);
-            closed |= c.close_after && c.wpos == c.wbuf.len();
-            if closed {
-                let _ = poll.registry().deregister(&mut c.s);
-                conns[id] = None;
-                free.push(id);
-            } else {
-                let want = c.wpos < c.wbuf.len();
-                if want != c.writing {
-                    let interest = if want { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
-                    poll.registry().reregister(&mut c.s, Token(id), interest)?;
-                    c.writing = want;
+            if ev.is_readable() && read_all(c) {
+                // The peer is done sending: answer what's buffered, then close.
+                c.close_after = true;
+            }
+            touched.push(id);
+        }
+        // Start the next request on every connection that has one ready.
+        for &id in &touched {
+            start_next(eng, prog, &mut conns, id, &mut pool, &mut tasks)?;
+            settle(&mut poll, &mut conns, &mut free, id)?;
+        }
+        // One round of the run queue: every request gets one slice.
+        for _ in 0..tasks.len() {
+            let mut t = tasks.pop_front().unwrap();
+            let answer = match t.cell.vm.run(crate::SLICE) {
+                Outcome::Yield => {
+                    tasks.push_back(t);
+                    continue;
                 }
+                Outcome::HostCall { import, args } => {
+                    match crate::serve(&mut t.cell.vm, import, &args, &mut t.cell.st) {
+                        Ok(()) => {
+                            tasks.push_back(t);
+                            continue;
+                        }
+                        Err(trap) => Err(trap),
+                    }
+                }
+                Outcome::Done(r) => {
+                    let a = crate::response(&t.cell.vm, &r);
+                    // Cells that export `release` free the answer once we've read it.
+                    if t.cell.vm.begin("release", &[r[0] >> 32, r[0] & 0xffff_ffff]).is_ok() {
+                        let _ = crate::finish(&mut t.cell.vm, u32::MAX, &mut t.cell.st);
+                    }
+                    Ok(a)
+                }
+                Outcome::Trap(trap) => Err(trap),
+            };
+            let (status, payload) = match answer {
+                Ok(a) => {
+                    pool.push(t.cell);
+                    let (code, rest) = a.split_once(' ').unwrap_or(("500", ""));
+                    (code.parse::<u16>().unwrap_or(500), rest.to_string())
+                }
+                Err(trap) => {
+                    // Let it crash: this cell is dropped; the pool makes a fresh one when needed.
+                    eprintln!("cell trapped: {trap}");
+                    (500, format!("{{\"error\":{trap:?}}}"))
+                }
+            };
+            let id = t.conn;
+            if let Some(c) = conns.get_mut(id).and_then(Option::as_mut) {
+                let _ = write!(c.wbuf, "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", payload.len());
+                c.wbuf.extend_from_slice(payload.as_bytes());
+                c.busy = false;
+                start_next(eng, prog, &mut conns, id, &mut pool, &mut tasks)?;
+                settle(&mut poll, &mut conns, &mut free, id)?;
             }
         }
     }
+}
+
+/// Flush what's buffered, then close or update write interest.
+fn settle(poll: &mut Poll, conns: &mut [Option<Conn>], free: &mut Vec<usize>, id: usize) -> std::io::Result<()> {
+    let Some(c) = conns.get_mut(id).and_then(Option::as_mut) else { return Ok(()) };
+    let closed = flush(c) || (c.close_after && !c.busy && c.wpos == c.wbuf.len());
+    if closed {
+        close(poll, conns, free, id);
+        return Ok(());
+    }
+    let want = c.wpos < c.wbuf.len();
+    if want != c.writing {
+        let interest = if want { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
+        poll.registry().reregister(&mut c.s, Token(id), interest)?;
+        c.writing = want;
+    }
+    Ok(())
+}
+
+fn close(poll: &mut Poll, conns: &mut [Option<Conn>], free: &mut Vec<usize>, id: usize) {
+    if let Some(mut c) = conns.get_mut(id).and_then(Option::take) {
+        let _ = poll.registry().deregister(&mut c.s);
+        free.push(id);
+    }
+}
+
+/// If the connection is idle and has a whole request buffered, give it a cell
+/// and queue it. A bad request gets a 400 and the connection closes.
+fn start_next<E: Engine>(
+    eng: &E,
+    prog: &E::Program,
+    conns: &mut [Option<Conn>],
+    id: usize,
+    pool: &mut Vec<Cell<E>>,
+    tasks: &mut VecDeque<Task<E>>,
+) -> std::io::Result<()> {
+    let Some(c) = conns.get_mut(id).and_then(Option::as_mut) else { return Ok(()) };
+    if c.busy {
+        return Ok(());
+    }
+    let req = match parse(c) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Ok(()),
+        Err(()) => {
+            eprintln!("bad request: {:?}", String::from_utf8_lossy(&c.rbuf[..c.rbuf.len().min(200)]));
+            c.rbuf.clear();
+            c.wbuf.extend_from_slice(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            c.close_after = true;
+            return Ok(());
+        }
+    };
+    let mut cell = match pool.pop() {
+        Some(cell) => cell,
+        None => fresh(eng, prog)?,
+    };
+    if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
+        eprintln!("cell trapped starting a request: {trap}");
+        c.wbuf.extend_from_slice(b"HTTP/1.1 500 OK\r\ncontent-length: 0\r\n\r\n");
+        return Ok(());
+    }
+    c.busy = true;
+    tasks.push_back(Task { conn: id, cell });
+    Ok(())
+}
+
+/// Take one whole request off the front of the read buffer, as a cell request.
+fn parse(c: &mut Conn) -> Result<Option<String>, ()> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut headers);
+    let hlen = match req.parse(&c.rbuf) {
+        Ok(httparse::Status::Complete(n)) => n,
+        Ok(httparse::Status::Partial) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let mut clen = 0usize;
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("content-length") {
+            clen = std::str::from_utf8(h.value).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        } else if h.name.eq_ignore_ascii_case("connection") && h.value.eq_ignore_ascii_case(b"close") {
+            c.close_after = true;
+        }
+    }
+    if c.rbuf.len() < hlen + clen {
+        return Ok(None); // the body hasn't all arrived yet
+    }
+    let body = String::from_utf8_lossy(&c.rbuf[hlen..hlen + clen]);
+    let (method, path) = (req.method.unwrap_or("GET"), req.path.unwrap_or("/"));
+    let r = if body.is_empty() { format!("api {method} {path}") } else { format!("api {method} {path} {body}") };
+    c.rbuf.drain(..hlen + clen);
+    Ok(Some(r))
 }
 
 /// Read until the socket would block. Returns true if the peer closed.
@@ -149,50 +286,6 @@ fn read_all(c: &mut Conn) -> bool {
             Err(_) => return true,
         }
     }
-}
-
-/// Answer every complete request in the read buffer. Returns true on a
-/// request we can't parse (the connection closes after a 400).
-fn process<E: Engine>(c: &mut Conn, cell: &mut Cell<E>) -> bool {
-    let mut used = 0;
-    let mut bad = false;
-    loop {
-        let mut headers = [httparse::EMPTY_HEADER; 32];
-        let mut req = httparse::Request::new(&mut headers);
-        let hlen = match req.parse(&c.rbuf[used..]) {
-            Ok(httparse::Status::Complete(n)) => n,
-            Ok(httparse::Status::Partial) => break,
-            Err(_) => {
-                bad = true;
-                break;
-            }
-        };
-        let mut clen = 0usize;
-        for h in req.headers.iter() {
-            if h.name.eq_ignore_ascii_case("content-length") {
-                clen = std::str::from_utf8(h.value).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
-            } else if h.name.eq_ignore_ascii_case("connection") && h.value.eq_ignore_ascii_case(b"close") {
-                c.close_after = true;
-            }
-        }
-        if c.rbuf.len() - used < hlen + clen {
-            break; // the body hasn't all arrived yet
-        }
-        let body = String::from_utf8_lossy(&c.rbuf[used + hlen..used + hlen + clen]);
-        let (method, path) = (req.method.unwrap_or("GET"), req.path.unwrap_or("/"));
-        let r = if body.is_empty() { format!("api {method} {path}") } else { format!("api {method} {path} {body}") };
-        let (status, payload) = cell.call(&r);
-        let _ = write!(c.wbuf, "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", payload.len());
-        c.wbuf.extend_from_slice(payload.as_bytes());
-        used += hlen + clen;
-    }
-    c.rbuf.drain(..used);
-    if bad {
-        eprintln!("bad request: {:?}", String::from_utf8_lossy(&c.rbuf[..c.rbuf.len().min(200)]));
-        c.wbuf.extend_from_slice(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
-        c.close_after = true;
-    }
-    false
 }
 
 /// Write until done or the socket would block. Returns true on a write error.

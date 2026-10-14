@@ -43,6 +43,22 @@ void combd_install(void) {
     sigaction(SIGBUS, &sa, &combd_prev_bus);
 }
 
+// A fiber that pauses mid-call takes its trap state with it, and puts it back
+// when it resumes, so another cell can run on this thread in between.
+void combd_trap_take(void **jmp, void **lo, void **hi) {
+    *jmp = combd_jmp;
+    *lo = combd_lo;
+    *hi = combd_hi;
+    combd_jmp = NULL;
+    combd_lo = combd_hi = NULL;
+}
+
+void combd_trap_put(void *jmp, void *lo, void *hi) {
+    combd_jmp = (sigjmp_buf *)jmp;
+    combd_lo = (unsigned char *)lo;
+    combd_hi = (unsigned char *)hi;
+}
+
 // Run cb(arg) with [lo, lo + len) as this thread's cell reservation.
 // Returns 0 if it finished, 1 if a guard-page fault turned into a trap.
 int combd_catch(combd_cb cb, void *arg, void *lo, size_t len) {

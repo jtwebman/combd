@@ -98,8 +98,8 @@ fn langs<E: Engine>(name: &str, eng: &E) -> bool {
             "spin",
             fresh().and_then(|(mut vm, mut st)| {
                 start(&mut vm, "spin", &mut st)?;
-                if name == "aot" {
-                    // Compiled cells can't pause yet: a spin must be killed at the CPU limit.
+                if name == "aot" && !cfg!(feature = "aot-guard") {
+                    // Without fibers, compiled cells can't pause: a spin is killed at the CPU limit.
                     return Ok(matches!(vm.run(SLICE), Outcome::Trap(t) if t.contains("OutOfFuel")));
                 }
                 Ok((0..50).all(|_| matches!(vm.run(SLICE), Outcome::Yield)))
@@ -718,6 +718,37 @@ mod tests {
             let got = request(&mut eng.spawn(&rs_prog).unwrap(), r, &mut HostState::default()).unwrap();
             assert_eq!(got, want, "{r}");
         }
+    }
+
+    /// A compiled cell yields mid-call (on a fiber) and resumes to the right answer.
+    #[cfg(feature = "aot-guard")]
+    #[test]
+    fn aot_yields_mid_call_and_resumes() {
+        let prog = aot::Aot.load(&wasm()).unwrap();
+        let mut vm = aot::Aot.spawn(&prog).unwrap();
+        let mut st = HostState::default();
+        start(&mut vm, "fib 27", &mut st).unwrap();
+        let mut yields = 0;
+        let r = loop {
+            match vm.run(100) {
+                Outcome::Yield => yields += 1,
+                Outcome::Done(r) => break r,
+                other => panic!("unexpected {:?}", matches!(other, Outcome::Trap(_))),
+            }
+        };
+        assert!(yields > 10, "only {yields} yields");
+        assert_eq!(response(&vm, &r), "196418");
+    }
+
+    /// A stuck compiled cell is still killed fast: the CPU limit is the backstop.
+    #[cfg(feature = "aot-lite")]
+    #[test]
+    fn aot_spin_is_killed_quickly() {
+        let prog = aot::Aot.load(&wasm()).unwrap();
+        let mut vm = aot::Aot.spawn(&prog).unwrap();
+        let t = Instant::now();
+        assert!(request(&mut vm, "spin", &mut HostState::default()).unwrap_err().contains("OutOfFuel"));
+        assert!(t.elapsed() < Duration::from_millis(500), "took {:?}", t.elapsed());
     }
 
     fn oob_traps_then_recovers<E: Engine>(eng: &E) {

@@ -10,8 +10,14 @@ use crate::host::{self, HostState, Mem};
 use combd_aot::rt::{Ctx, Host, Mem as AotMem};
 use combd_aot::Compiled;
 
-/// Ticks (loop iterations) one call may run before it is killed.
-const CPU_LIMIT: i64 = 2_000_000_000;
+/// Ticks (loop iterations) one call may run before it is killed: about 100 ms
+/// of tight-loop work. Compiled cells can't pause yet, so this is what keeps a
+/// stuck request from freezing its event loop (like Workers' CPU limit).
+/// `COMBD_CPU_LIMIT_TICKS` overrides it.
+fn cpu_limit() -> i64 {
+    static LIMIT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("COMBD_CPU_LIMIT_TICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000_000))
+}
 
 pub struct Aot;
 
@@ -63,10 +69,33 @@ impl Host for AotHost {
 }
 
 pub struct AotVm {
-    c: Ctx,
-    mem: AotMem,
+    /// The cell between calls. `None` while a call is in flight on its fiber.
+    state: Option<(Ctx, AotMem)>,
     m: &'static Compiled,
     pending: Option<(u32, Vec<u64>)>,
+    #[cfg(feature = "aot-guard")]
+    fiber: Option<combd_aot::fiber::Fiber<Ran>>,
+    #[cfg(feature = "aot-guard")]
+    spare: Option<corosensei::stack::DefaultStack>,
+}
+
+/// What a finished call hands back: the cell, and its result (`None` if a
+/// guard page turned an out-of-bounds access into a trap).
+#[cfg(feature = "aot-guard")]
+type Ran = (Ctx, AotMem, Option<Result<Vec<u64>, combd_aot::rt::Trap>>);
+
+/// Compiled-cell ticks per interpreter reduction. A run of 2,500 reductions is
+/// about 50 us either way.
+const TICKS_PER_REDUCTION: i64 = 20;
+
+/// `COMBD_NO_YIELD=1` turns pausing off (run each call to the end), to compare.
+fn no_yield() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("COMBD_NO_YIELD").is_some())
+}
+
+fn slice_for(reductions: u32) -> i64 {
+    if reductions == u32::MAX || no_yield() { i64::MAX } else { reductions as i64 * TICKS_PER_REDUCTION }
 }
 
 impl Engine for Aot {
@@ -81,7 +110,15 @@ impl Engine for Aot {
         let imports = m.imports.iter().map(|(md, n, r)| Import { module: md.to_string(), name: n.to_string(), results: *r }).collect();
         let host = Box::new(AotHost { imports, st: HostStateBox::default() });
         let (c, mem) = (m.new)(host).map_err(|t| t.to_string())?;
-        Ok(AotVm { c, mem, m, pending: None })
+        Ok(AotVm {
+            state: Some((c, mem)),
+            m,
+            pending: None,
+            #[cfg(feature = "aot-guard")]
+            fiber: None,
+            #[cfg(feature = "aot-guard")]
+            spare: None,
+        })
     }
 }
 
@@ -92,35 +129,83 @@ impl CellVm for AotVm {
         Ok(())
     }
 
-    fn run(&mut self, _reductions: u32) -> Outcome {
-        let Some((f, args)) = self.pending.take() else { return Outcome::Trap("cell is not running".into()) };
-        self.c.fuel = CPU_LIMIT;
+    fn run(&mut self, reductions: u32) -> Outcome {
         #[cfg(feature = "aot-guard")]
-        let result = {
-            let range = self.mem.range();
-            let (c, mem, call) = (&mut self.c, &mut self.mem, self.m.call);
-            match combd_aot::guard::catch(range, || call(c, mem, f, &args)) {
-                Some(r) => r,
-                None => return Outcome::Trap("out of bounds memory access (guard page)".into()),
+        {
+            // A call that can't pause (no slice) needs no fiber: run it right here.
+            if self.fiber.is_none() && slice_for(reductions) == i64::MAX {
+                let Some((f, args)) = self.pending.take() else { return Outcome::Trap("cell is not running".into()) };
+                let Some((c, mem)) = self.state.as_mut() else { return Outcome::Trap("cell is busy".into()) };
+                c.slice = i64::MAX;
+                c.budget = cpu_limit();
+                c.fuel = c.budget;
+                let range = mem.range();
+                let call = self.m.call;
+                return match combd_aot::guard::catch(range, || call(c, mem, f, &args)) {
+                    None => Outcome::Trap("out of bounds memory access (guard page)".into()),
+                    Some(Ok(v)) => Outcome::Done(v),
+                    Some(Err(combd_aot::rt::Trap::Host)) => Outcome::Trap(c.host_err.take().unwrap_or_default()),
+                    Some(Err(t)) => Outcome::Trap(t.to_string()),
+                };
             }
-        };
+            if self.fiber.is_none() {
+                let Some((f, args)) = self.pending.take() else { return Outcome::Trap("cell is not running".into()) };
+                let Some((mut c, mut mem)) = self.state.take() else { return Outcome::Trap("cell is busy".into()) };
+                c.slice = slice_for(reductions);
+                c.budget = cpu_limit();
+                c.fuel = c.slice.min(c.budget);
+                let call = self.m.call;
+                self.fiber = Some(combd_aot::fiber::Fiber::start(self.spare.take(), move || {
+                    let range = mem.range();
+                    let r = combd_aot::guard::catch(range, || call(&mut c, &mut mem, f, &args));
+                    (c, mem, r)
+                }));
+            }
+            let (step, stack) = self.fiber.as_mut().unwrap().resume();
+            if stack.is_some() {
+                self.spare = stack;
+            }
+            match step {
+                combd_aot::fiber::Step::Paused => Outcome::Yield,
+                combd_aot::fiber::Step::Done((mut c, mem, r)) => {
+                    self.fiber = None;
+                    let out = match r {
+                        None => Outcome::Trap("out of bounds memory access (guard page)".into()),
+                        Some(Ok(v)) => Outcome::Done(v),
+                        Some(Err(combd_aot::rt::Trap::Host)) => Outcome::Trap(c.host_err.take().unwrap_or_default()),
+                        Some(Err(t)) => Outcome::Trap(t.to_string()),
+                    };
+                    self.state = Some((c, mem));
+                    out
+                }
+            }
+        }
         #[cfg(not(feature = "aot-guard"))]
-        let result = (self.m.call)(&mut self.c, &mut self.mem, f, &args);
-        match result {
-            Ok(r) => Outcome::Done(r),
-            Err(combd_aot::rt::Trap::Host) => Outcome::Trap(self.c.host_err.take().unwrap_or_default()),
-            Err(t) => Outcome::Trap(t.to_string()),
+        {
+            let _ = reductions;
+            let Some((f, args)) = self.pending.take() else { return Outcome::Trap("cell is not running".into()) };
+            let Some((c, mem)) = self.state.as_mut() else { return Outcome::Trap("cell is busy".into()) };
+            // No fibers in this build: no pausing, so the whole budget is one slice.
+            c.slice = i64::MAX;
+            c.budget = cpu_limit();
+            c.fuel = c.budget;
+            match (self.m.call)(c, mem, f, &args) {
+                Ok(r) => Outcome::Done(r),
+                Err(combd_aot::rt::Trap::Host) => Outcome::Trap(c.host_err.take().unwrap_or_default()),
+                Err(t) => Outcome::Trap(t.to_string()),
+            }
         }
     }
 
     fn resume(&mut self, _results: &[u64]) {}
 
     fn read(&self, ptr: u32, len: u32) -> Option<Vec<u8>> {
-        self.mem.get(ptr as usize, len as usize).map(<[u8]>::to_vec)
+        self.state.as_ref()?.1.get(ptr as usize, len as usize).map(<[u8]>::to_vec)
     }
 
     fn write(&mut self, ptr: u32, bytes: &[u8]) -> bool {
-        match self.mem.get_mut(ptr as usize, bytes.len()) {
+        let Some((_, mem)) = self.state.as_mut() else { return false };
+        match mem.get_mut(ptr as usize, bytes.len()) {
             Some(to) => {
                 to.copy_from_slice(bytes);
                 true
@@ -134,11 +219,20 @@ impl CellVm for AotVm {
     }
 
     fn host_out(&self) -> Vec<u8> {
-        self.c.host.out()
+        self.state.as_ref().map_or_else(Vec::new, |(c, _)| c.host.out())
     }
 
     /// Between calls a compiled cell is plain data, so it can be copied.
     fn snapshot(&self) -> Option<AotVm> {
-        self.pending.is_none().then(|| AotVm { c: self.c.clone(), mem: self.mem.clone(), m: self.m, pending: None })
+        let (c, mem) = self.state.as_ref()?;
+        self.pending.is_none().then(|| AotVm {
+            state: Some((c.clone(), mem.clone())),
+            m: self.m,
+            pending: None,
+            #[cfg(feature = "aot-guard")]
+            fiber: None,
+            #[cfg(feature = "aot-guard")]
+            spare: None,
+        })
     }
 }

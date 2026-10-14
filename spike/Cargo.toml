@@ -16,17 +16,23 @@ aot = ["aot-lite", "combd-aot/js"]
 # The AOT tier with only the Rust cell: builds in seconds, for experiments.
 aot-lite = ["dep:combd-aot"]
 # The AOT tier with guard pages instead of bounds checks.
-aot-guard = ["aot", "combd-aot/guard"]
+aot-guard = ["aot", "combd-aot/guard", "dep:corosensei"]
 # EXPERIMENT ONLY: see combd-aot's `experiment-unchecked`.
 aot-unchecked-experiment = ["aot-lite", "combd-aot/experiment-unchecked"]
 
 [dependencies]
 combd-guest = { path = "../guest" }
 combd-aot = { path = "aot", optional = true, default-features = false }
+corosensei = { version = "0.3.4", optional = true }
 wasmparser = "0.261"
 # The HTTP front: epoll/kqueue event loop and hyper's request parser.
 mio = { version = "1", features = ["net", "os-poll"] }
 httparse = "1"
+# jsc: the JS-to-Rust compiler's parser.
+oxc_allocator = "=0.139.0"
+oxc_ast = "=0.139.0"
+oxc_parser = "=0.139.0"
+oxc_span = "=0.139.0"
 wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
 
 [profile.release]

@@ -38,6 +38,12 @@ app.post('/api/orders', (c) => {
   return { status: 201, body: { id: order.id, total: Math.round(total * 100) / 100, count: skus.length, skus } };
 });
 
+// CPU-heavy on purpose: the bad neighbor in fairness tests.
+app.get('/api/fib/:n', (c) => {
+  const n = Math.min(Number(c.params.n), 40);
+  return { status: 200, body: { n, fib: fib(n) } };
+});
+
 function dispatch(method, path, body) {
   for (const [m, { re, keys }, h] of routes) {
     if (m !== method) continue;

@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 libc = { version = "0.2", optional = true }
+corosensei = { version = "0.3.4", optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -23,4 +24,4 @@ js = []
 experiment-unchecked = []
 # Guard pages instead of bounds checks: `guard.rs` and `trap.c` hold the only
 # unsafe code. Generated code stays `forbid(unsafe_code)`.
-guard = ["dep:libc"]
+guard = ["dep:libc", "dep:corosensei"]

@@ -8,6 +8,9 @@
 
 #[cfg(feature = "guard")]
 #[allow(unsafe_code)]
+pub mod fiber;
+#[cfg(feature = "guard")]
+#[allow(unsafe_code)]
 pub mod guard;
 pub mod rt;
 

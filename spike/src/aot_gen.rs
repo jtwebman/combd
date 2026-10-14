@@ -325,7 +325,7 @@ fn gen_func(
                 if experiment("notick") {
                     format!("'b{next}: loop {{")
                 } else {
-                    format!("'b{next}: loop {{ fuel -= 1; if fuel < 0 {{ c.fuel = fuel; return Err(Trap::OutOfFuel); }}")
+                    format!("'b{next}: loop {{ fuel -= 1; if fuel < 0 {{ c.fuel = fuel; c.out_of_fuel()?; fuel = c.fuel; }}")
                 }
             }
             Operator::If { .. } => {

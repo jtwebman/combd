@@ -50,7 +50,12 @@ pub struct Ctx {
     pub table: Vec<Option<u32>>,
     pub data: &'static [&'static [u8]],
     pub dropped: Vec<bool>,
+    /// Ticks left in the current slice. Generated code keeps it in a register.
     pub fuel: i64,
+    /// Ticks per slice: how long a cell runs before it yields.
+    pub slice: i64,
+    /// Ticks left for the whole call before the cell is killed.
+    pub budget: i64,
     /// Calls trap when the native stack reaches below this address.
     pub stack_floor: usize,
     pub host: Box<dyn Host>,
@@ -66,6 +71,8 @@ impl Clone for Ctx {
             data: self.data,
             dropped: self.dropped.clone(),
             fuel: self.fuel,
+            slice: self.slice,
+            budget: self.budget,
             stack_floor: self.stack_floor,
             host: self.host.boxed_clone(),
             host_err: None,
@@ -92,6 +99,8 @@ impl Ctx {
             data,
             dropped: vec![false; data.len()],
             fuel: i64::MAX,
+            slice: i64::MAX,
+            budget: i64::MAX,
             stack_floor: 0,
             host,
             host_err: None,
@@ -126,6 +135,25 @@ impl Ctx {
         if stack_here() < self.stack_floor {
             return Err(Trap::CallStackExhausted);
         }
+        Ok(())
+    }
+
+    /// The current slice is used up. Yield to the scheduler if we're on a
+    /// fiber, or stop if the whole call's budget is gone.
+    #[cold]
+    #[inline(never)]
+    pub fn out_of_fuel(&mut self) -> Result<(), Trap> {
+        self.budget -= self.slice;
+        if self.budget <= 0 {
+            return Err(Trap::OutOfFuel);
+        }
+        #[cfg(feature = "guard")]
+        if crate::fiber::yield_now() {
+            self.fuel = self.slice;
+            return Ok(());
+        }
+        // Not on a fiber: no way to pause, so keep going until the budget runs out.
+        self.fuel = self.slice;
         Ok(())
     }
 
