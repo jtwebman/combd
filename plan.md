@@ -828,6 +828,10 @@ Next for this tier, biggest first:
    network yet.
 2. **Single node (D1).** HTTP in, route to cell, SQLite, alarms, supervisor,
    hibernation, egress broker, mTLS admin port.
+   **Started 2026-10-14:** objects, host SQLite with an authorizer, the output
+   gate, crash rollback, and the race against workerd and celld are done (see
+   [spike/RESULTS.md](spike/RESULTS.md)). Next: write coalescing, one fsync
+   per round, alarms, hibernation, objects across event loops.
 3. **Fleet (D2).** Bucket leases, CAS ownership, epochs, routing between nodes
    over mTLS. Kill tests.
 4. **WebSockets** with hibernation.

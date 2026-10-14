@@ -48,7 +48,10 @@ impl Db {
         let conn = Connection::open(path)?;
         // WAL with synchronous=FULL: a commit returns only after its fsync.
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
+        // EXPERIMENT ONLY, never ship: COMBD_EXPERIMENT_NO_FSYNC=1 measures
+        // what the fsync costs. It breaks the output gate's promise.
+        let sync = if std::env::var_os("COMBD_EXPERIMENT_NO_FSYNC").is_some() { "NORMAL" } else { "FULL" };
+        conn.pragma_update(None, "synchronous", sync)?;
         conn.pragma_update(None, "trusted_schema", "OFF")?;
         for (limit, v) in [
             (Limit::SQLITE_LIMIT_LENGTH, MAX_RESULT as i32),

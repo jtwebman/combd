@@ -600,6 +600,51 @@ What's next for JS speed, biggest first:
 3. **Cheaper AOT checks:** fuel and stack checks are about 20%. The call-graph
    analysis above can also prove where stack checks aren't needed.
 
+## Durable Objects on one node (D1)
+
+`/do/<name>/<path>` goes to one warm cell per object, with its own SQLite file
+in the host. Requests to an object run one at a time. Each request is one
+transaction, committed with an fsync before its answer is written (the output
+gate). A crash rolls the request back and drops the cell; the next request
+gets a fresh cell, which loads its state from storage. The cell's SQL is
+fenced in by a SQLite authorizer (no ATTACH, PRAGMA, or transactions of its
+own), size limits, and a step limit for runaway queries.
+
+Tests run real HTTP against the interpreter and AOT: state across requests,
+every answered write already on disk, crash rollback, reload after a crash,
+and 80 concurrent increments on one object with none lost or doubled.
+
+The race: the same counter object on combd (Rust cell), workerd, and celld
+(Cloudflare's JS API, `bench/do/`), one core each, 32 connections, Linux in
+Docker on a Mac (req/s):
+
+| | combd | workerd | celld |
+|---|---|---|---|
+| Write, one hot object | **5,462** (p99 15 ms) | 3,019 (p99 15 ms) | 821 (p99 1.5 s) |
+| Read, one hot object | **116,339** (p99 1.2 ms) | 13,977 (p99 1.6 s) | 10,936 (p99 40 ms) |
+| Write, 1,000 objects | **1,342** (p99 43 ms) | 234 (p99 245 ms) | 182 (p99 1.6 s) |
+
+combd is 1.8x workerd on hot writes, 8.3x on reads, and 5.7x on writes
+spread over many objects. workerd and celld also had socket timeouts.
+
+**fsync is about 90% of combd's write cost.** With the fsync turned off (an
+experiment switch, never for real use), writes go to 51,922 req/s on one
+object and 42,939 across 1,000. We didn't check how often workerd and celld
+fsync, so their write numbers may not be the same promise.
+
+What's next for writes:
+1. **Write coalescing on a busy object:** keep one transaction open across
+   the requests waiting in line, each in its own savepoint, then one fsync
+   releases all of their answers. A crash rolls back only its own savepoint.
+2. **One fsync for many objects:** a node log of each request's changes
+   (SQLite's session changesets), fsynced once per round, with the object
+   files written without fsync. The same changesets are what D2 and D3 ship
+   to the bucket and to peers.
+
+Not done yet: alarms, hibernation (evicting idle objects), objects on more
+than one event loop (for now, `/do/` needs `COMBD_THREADS=1`), and the
+Cloudflare JS API for objects (jsc doesn't compile classes yet).
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

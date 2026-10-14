@@ -101,6 +101,11 @@ With a CPU-heavy neighbor on the same core, it kept 35x to 56x Bun's
 throughput and 55x to 88x Node's, because combd keeps yielding while they
 can't.
 
+Durable Objects now run on a single node. Each object is a warm cell with its
+own SQLite file, and each answer waits until its writes are safely on disk.
+On one core, combd beat workerd's Durable Objects by 1.8x on writes, 8.3x on
+reads, and 5.7x on writes spread over 1,000 objects. It beat celld by more.
+
 ## Standing on shoulders
 
 combd is inspired by [celld](https://github.com/denoland/celld),

@@ -1,0 +1,8 @@
+{
+  "name": "room",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-09-01",
+  "no_bundle": true,
+  "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "Room" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
+}
