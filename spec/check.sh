@@ -10,19 +10,28 @@ if [ ! -f "$JAR" ]; then
     curl -sSL -o "$JAR" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
 fi
 echo "$SHA  $JAR" | shasum -a 256 -c - >/dev/null
-tlc() { java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -deadlock -metadir ".tools/states/$2" -config "$2.cfg" "$1.tla" 2>&1; }
-check() {
-    model=$1; shift
-    out=$(tlc "$model" "$model" || true)
+tlc() { java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -deadlock -metadir ".tools/states/$2" -config "$2.cfg" "$1.tla" 2>&1 || true; }
+# pass MODULE CFG: the correct protocol must check clean.
+pass() {
+    out=$(tlc "$1" "$2")
     if echo "$out" | grep -q "No error has been found"; then
-        echo "ok    $model: $(echo "$out" | grep -o '[0-9]* distinct states found, 0 states left' | cut -d' ' -f1) states, no errors"
+        echo "ok    $2: $(echo "$out" | grep -o '[0-9]* distinct states found, 0 states left' | cut -d' ' -f1) states, no errors"
     else
-        echo "FAIL  $model"; echo "$out" | tail -40; exit 1
+        echo "FAIL  $2"; echo "$out" | tail -40; exit 1
     fi
+}
+# fail MODULE CFG...: each known-bad version must break an invariant.
+fail() {
+    m=$1; shift
     for bug in "$@"; do
-        v=$(tlc "$model" "$bug" | grep -o 'Invariant [A-Za-z]* is violated' || true)
+        v=$(tlc "$m" "$bug" | grep -o 'Invariant [A-Za-z]* is violated' || true)
         if [ -n "$v" ]; then echo "ok    $bug: $v (as it must be)"; else echo "FAIL  $bug passed: the checker can't see this bug"; exit 1; fi
     done
 }
-check MCOwnership BugSkipProof BugLoadBeforeCas BugNoManifest BugReuseEpoch
-check MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest RepAckNoProof RepLateManifest
+pass MCOwnership MCOwnership
+fail MCOwnership BugSkipProof BugLoadBeforeCas BugNoManifest BugReuseEpoch
+pass MCReplication MCReplication
+fail MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest RepAckNoProof RepLateManifest
+# With a peer's disk lost once (the slow one: about 20 minutes).
+pass MCReplication RepWipe
+fail MCReplication RepTrustWiped RepWipeForgetsFence

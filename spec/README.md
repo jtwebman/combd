@@ -52,7 +52,28 @@ Eight known-bad versions must fail:
 | acknowledge what's uploaded without re-reading the record | NoLostAckedWrite |
 | a stale owner writes its manifest after a newer one | NoLostAckedWrite |
 
-Run `./check.sh` (needs Java; it fetches TLC 1.7.4 and checks its hash). The whole run takes about 3 minutes.
+**A peer that loses its disk** (`RepWipe.cfg`, at most one wipe: two lost
+disks at once really can lose writes). It comes back empty, having forgotten
+what it held and whom it fenced. So before it answers anything, it reads the
+ownership record (epoch R): it refuses every epoch below R, the fence it lost,
+and it speaks only for epochs after R. A fence's answer says which, and a new
+owner uses a tail only from a peer that can speak for the epoch it needs.
+TLC found a bug in the first try: "the peer has a log of that epoch since
+the wipe" isn't enough, because the owner may still be re-sending it, so the
+copy can be partial. 143.9 million states (with symmetry), no errors. Two
+more known-bad versions must fail:
+
+| Bug | Caught by |
+|---|---|
+| trust a wiped peer's tail for an epoch it may have lost | NoLostAckedWrite |
+| a wiped peer doesn't relearn its fence | NoLostAckedWrite |
+
+The peers are interchangeable, and so are the writes, so TLC checks one of
+each set of mirror-image states (`SYMMETRY`); that's sound for invariants,
+which is all we check.
+
+Run `./check.sh` (needs Java; it fetches TLC 1.7.4 and checks its hash). The
+whole run takes about 25 minutes, most of it the wipe model.
 
 Not modeled yet: reads (they pass the same gate as writes), leases and
 clocks (liveness only), many objects, and checkpoints of old epochs.
