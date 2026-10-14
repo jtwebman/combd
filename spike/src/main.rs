@@ -812,7 +812,14 @@ mod tests {
     }
 
     fn cfg(data: &std::path::Path, threads: usize) -> http::Config {
-        http::Config { threads, data: data.to_path_buf(), idle: Duration::from_secs(60), max_objects: 10_000, stop: Arc::default() }
+        http::Config {
+            threads,
+            data: data.to_path_buf(),
+            idle: Duration::from_secs(60),
+            max_objects: 10_000,
+            stop: Arc::default(),
+            sync_delay: Duration::ZERO,
+        }
     }
 
     fn stat(port: u16, key: &str) -> i64 {
@@ -884,6 +891,33 @@ mod tests {
         counts.sort();
         assert_eq!(counts, (1..=80).collect::<Vec<_>>());
         assert!(on_disk(&dir.0, "busy", "SELECT v FROM kv").contains("[[80]]"));
+        // Group commit: concurrent writers share fsyncs.
+        let (commits, fsyncs) = (stat(port, "commits"), stat(port, "fsyncs"));
+        assert!(fsyncs < commits, "{fsyncs} fsyncs for {commits} commits");
+    }
+
+    /// The output gate with a slow disk: no answer leaves before the fsync
+    /// that covers it, and a read waits behind a write that isn't on disk.
+    #[test]
+    fn answers_wait_for_the_fsync() {
+        let dir = store::tempdir::Dir::new();
+        let c = http::Config { sync_delay: Duration::from_millis(300), ..cfg(&dir.0, 1) };
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, c);
+        // Opening the object writes its tables, so the first answer waits too.
+        let t = Instant::now();
+        assert_eq!(http(port, "POST", "/do/g/incr", "").0, 200);
+        assert!(t.elapsed() >= Duration::from_millis(300), "answered in {:?}", t.elapsed());
+        // With nothing pending, a read goes right out.
+        let t = Instant::now();
+        assert_eq!(http(port, "GET", "/do/g/count", ""), (200, "{\"count\":1}".into()));
+        assert!(t.elapsed() < Duration::from_millis(250), "read took {:?}", t.elapsed());
+        // A read right behind a write waits for the write's fsync.
+        let w = std::thread::spawn(move || http(port, "POST", "/do/g/incr", ""));
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        assert_eq!(http(port, "GET", "/do/g/count", ""), (200, "{\"count\":2}".into()));
+        assert!(t.elapsed() >= Duration::from_millis(150), "read didn't wait: {:?}", t.elapsed());
+        assert_eq!(w.join().unwrap().0, 200);
     }
 
     #[test]

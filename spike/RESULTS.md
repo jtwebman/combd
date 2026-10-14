@@ -632,14 +632,39 @@ experiment switch, never for real use), writes go to 51,922 req/s on one
 object and 42,939 across 1,000. We didn't check how often workerd and celld
 fsync, so their write numbers may not be the same promise.
 
-What's next for writes:
-1. **Write coalescing on a busy object:** keep one transaction open across
-   the requests waiting in line, each in its own savepoint, then one fsync
-   releases all of their answers. A crash rolls back only its own savepoint.
-2. **One fsync for many objects:** a node log of each request's changes
-   (SQLite's session changesets), fsynced once per round, with the object
-   files written without fsync. The same changesets are what D2 and D3 ship
-   to the bucket and to peers.
+What we did about it: a group commit, below.
+
+### Group commit: one fsync for many writes
+
+Commits no longer fsync (WAL mode, synchronous=NORMAL). A pool of 16
+threads fsyncs each object's WAL file, at most one at a time per object, and
+every answer is held until an fsync covers its commit. Reads wait too if
+they may have seen a write that isn't on disk yet, as in Cloudflare's output
+gate. Each request is still its own transaction.
+
+One core each, same run (req/s):
+
+| | combd before | **combd now** | workerd | celld |
+|---|---|---|---|---|
+| Write, one hot object | 5,462 | **45,591** | 1,285 | 1,199 |
+| Read, one hot object | 116,339 | **112,344** | 14,620 | 11,212 |
+| Write, 1,000 objects | 1,342 | **3,511** | 421 | 157 |
+
+Hot writes went up 8.3x: about 12 commits shared each fsync (247,895
+commits, 20,788 fsyncs). Writes over many objects went up 2.6x, from fsyncs
+running at once. (workerd's hot writes vary a lot between runs on this busy
+Mac: 3,019 last time, 1,285 this time.)
+
+The test `answers_wait_for_the_fsync` slows every fsync to 300 ms and checks
+that no answer leaves before it, and that a read waits behind an unsynced
+write. With the hold removed, it fails (the answer left in 2.5 ms). A failed
+fsync drops the object and fails its held answers, since after a failed
+fsync nothing in memory can be trusted to be on disk.
+
+Open: the hot-write p99 rose to 96 ms (p50 0.43 ms). Our guess, not yet
+checked: SQLite's automatic checkpoint runs inside a commit on the event
+loop and fsyncs the database file. The fix would be to checkpoint from the
+fsync threads.
 
 ### Alarms, eviction, and more than one event loop
 
@@ -667,8 +692,8 @@ runs each: new 4,850 to 4,912 req/s (p99 11.5 to 12.5 ms), old 4,117 to
 4,771 (p99 12.6 to 38 ms). Stateless HTTP was the same within noise. On 2
 cores: 4,748 hot writes, 127,890 hot reads, 1,534 writes over 1,000 objects.
 
-Still to do: write coalescing and one fsync per round (above), and the
-Cloudflare JS API for objects (jsc doesn't compile classes yet).
+Still to do: the Cloudflare JS API for objects (jsc doesn't compile classes
+yet).
 
 ## Security: memory is always zero
 

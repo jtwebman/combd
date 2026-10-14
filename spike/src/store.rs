@@ -2,10 +2,16 @@
 //! the host. The cell sends SQL as JSON and gets rows back as JSON.
 //!
 //! Each request is one transaction: the host opens it before the request and
-//! commits it, with an fsync, before the response leaves (the output gate).
-//! If the cell crashes, the transaction rolls back. So a client that saw an
-//! answer can trust its writes are on disk, and a crash never leaves half a
-//! request behind.
+//! commits it after. If the cell crashes, the transaction rolls back, so a
+//! crash never leaves half a request behind.
+//!
+//! Durability is a group commit. The commit itself doesn't fsync (WAL mode,
+//! synchronous=NORMAL, which can lose recent commits on power loss but never
+//! corrupts). The host fsyncs the WAL file separately, off the event loop,
+//! and holds each answer until an fsync has covered its commit (the output
+//! gate). One fsync covers every commit made before it started, so a busy
+//! object pays one fsync for many requests, and many objects' fsyncs run at
+//! once. A client that saw an answer can trust its writes are on disk.
 //!
 //! SQLite runs in the host, so the cell's SQL is fenced in:
 //! - an authorizer denies ATTACH (it could open other files), PRAGMA, the
@@ -32,6 +38,12 @@ pub const MAX_RESULT: usize = 16 << 20;
 
 pub struct Db {
     conn: Connection,
+    wal_path: PathBuf,
+    /// The WAL file, opened at the first fsync. SQLite keeps it (same inode)
+    /// for as long as this connection is open.
+    wal: std::cell::OnceCell<Arc<std::fs::File>>,
+    /// The open transaction changed something.
+    wrote: std::cell::Cell<bool>,
     /// True while the host itself runs SQL (BEGIN, COMMIT).
     host: Arc<AtomicBool>,
     steps: Arc<AtomicU32>,
@@ -47,12 +59,9 @@ pub fn path_for(dir: &Path, name: &str) -> PathBuf {
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Db> {
         let conn = Connection::open(path)?;
-        // WAL with synchronous=FULL: a commit returns only after its fsync.
+        // Commits don't fsync; `wal_file` is fsynced by the host instead.
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        // EXPERIMENT ONLY, never ship: COMBD_EXPERIMENT_NO_FSYNC=1 measures
-        // what the fsync costs. It breaks the output gate's promise.
-        let sync = if std::env::var_os("COMBD_EXPERIMENT_NO_FSYNC").is_some() { "NORMAL" } else { "FULL" };
-        conn.pragma_update(None, "synchronous", sync)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "trusted_schema", "OFF")?;
         // Many objects per node: keep each one's page cache small (256 KiB).
         conn.pragma_update(None, "cache_size", -256)?;
@@ -94,7 +103,9 @@ impl Db {
         let steps = Arc::new(AtomicU32::new(0));
         let s = steps.clone();
         conn.progress_handler(1000, Some(move || s.fetch_add(1, Relaxed) >= MAX_STEPS));
-        Ok(Db { conn, host, steps })
+        let mut wal_path = path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        Ok(Db { conn, wal_path: wal_path.into(), wal: Default::default(), wrote: Default::default(), host, steps })
     }
 
     fn host_sql(&self, sql: &str) -> rusqlite::Result<()> {
@@ -105,12 +116,24 @@ impl Db {
     }
 
     pub fn begin(&self) -> rusqlite::Result<()> {
+        self.wrote.set(false);
         self.host_sql("BEGIN IMMEDIATE")
     }
 
-    /// The output gate: returns once the request's writes are on disk.
-    pub fn commit(&self) -> rusqlite::Result<()> {
-        self.host_sql("COMMIT")
+    /// Commit (no fsync). True if the transaction wrote anything, so the
+    /// answer must wait for an fsync.
+    pub fn commit(&self) -> rusqlite::Result<bool> {
+        self.host_sql("COMMIT")?;
+        Ok(self.wrote.replace(false))
+    }
+
+    /// The file to fsync to make commits durable.
+    pub fn wal_file(&self) -> std::io::Result<Arc<std::fs::File>> {
+        if let Some(f) = self.wal.get() {
+            return Ok(f.clone());
+        }
+        let f = Arc::new(std::fs::File::open(&self.wal_path)?);
+        Ok(self.wal.get_or_init(|| f).clone())
     }
 
     /// The object's alarm, in ms since the epoch.
@@ -123,6 +146,7 @@ impl Db {
 
     /// Set or clear the alarm, inside the open transaction.
     pub fn set_alarm(&self, at: Option<i64>) -> rusqlite::Result<()> {
+        self.wrote.set(true);
         self.host.store(true, Relaxed);
         let r = match at {
             Some(at) => self.conn.execute("INSERT OR REPLACE INTO _combd_alarm (id, at) VALUES (1, ?)", [at]),
@@ -133,6 +157,7 @@ impl Db {
     }
 
     pub fn rollback(&self) {
+        self.wrote.set(false);
         if !self.conn.is_autocommit() {
             let _ = self.host_sql("ROLLBACK");
         }
@@ -165,6 +190,9 @@ impl Db {
         };
         self.steps.store(0, Relaxed);
         let mut st = self.conn.prepare_cached(sql).map_err(|e| e.to_string())?;
+        if !st.readonly() {
+            self.wrote.set(true);
+        }
         let cols = st.column_count();
         let mut rows = st.query(rusqlite::params_from_iter(params)).map_err(|e| e.to_string())?;
         let mut out = vec![];
@@ -329,8 +357,11 @@ mod tests {
         q(&db, "INSERT INTO t VALUES (1)");
         db.rollback();
         db.begin().unwrap();
+        assert!(!db.commit().unwrap(), "a read-only request needs no fsync");
+        db.begin().unwrap();
         q(&db, "INSERT INTO t VALUES (2)");
-        db.commit().unwrap();
+        assert!(db.commit().unwrap());
+        db.wal_file().unwrap().sync_data().unwrap();
         assert_eq!(q(&db, "SELECT a FROM t"), r#"{"changes":1,"rows":[[2]]}"#);
     }
 }

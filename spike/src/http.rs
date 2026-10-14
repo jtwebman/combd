@@ -14,9 +14,14 @@
 //!   its name. A request that arrives on another loop is forwarded there, and
 //!   the answer comes back the same way.
 //! - **One request at a time,** in a warm cell with its own SQLite file (under
-//!   `COMBD_DATA`). Each request is a transaction, committed (fsynced) before
-//!   its answer is written: the output gate. A crash rolls it back and drops
-//!   the cell; the next request gets a fresh one, which loads from storage.
+//!   `COMBD_DATA`). Each request is a transaction. A crash rolls it back and
+//!   drops the cell; the next request gets a fresh one, which loads from
+//!   storage.
+//! - **The output gate, as a group commit.** Commits don't fsync. A pool of
+//!   threads fsyncs each object's WAL file, at most one at a time per object,
+//!   and an answer is held until an fsync has covered its commit (or, for a
+//!   read, every commit before it). One fsync releases everything that
+//!   committed while the last one ran, and many objects sync at once.
 //! - **Alarms.** A cell sets one with `alarm_set`; it commits with the request.
 //!   The owner runs `ALARM` when it's due. A failed alarm is retried with
 //!   backoff, up to `ALARM_TRIES` times.
@@ -49,6 +54,8 @@ const ALARM_TRIES: u32 = 6;
 const ALARM_BACKOFF_MS: i64 = 500;
 /// The loop wakes at least this often (alarms, eviction, stop).
 const TICK: Duration = Duration::from_millis(100);
+/// Threads that run fsyncs, so the event loops never wait on the disk.
+const SYNC_THREADS: usize = 16;
 
 pub struct Config {
     pub threads: usize,
@@ -59,6 +66,9 @@ pub struct Config {
     pub max_objects: usize,
     /// Set it to stop the server.
     pub stop: Arc<AtomicBool>,
+    /// Tests only: every fsync takes at least this long, to prove the output
+    /// gate waits for it.
+    pub sync_delay: Duration,
 }
 
 impl Config {
@@ -70,6 +80,7 @@ impl Config {
             idle: Duration::from_millis(num("COMBD_IDLE_MS", 60_000) as u64),
             max_objects: num("COMBD_MAX_OBJECTS", 10_000),
             stop: Arc::default(),
+            sync_delay: Duration::ZERO,
         }
     }
 }
@@ -83,12 +94,24 @@ struct Stats {
     alarms_fired: AtomicU64,
     alarms_failed: AtomicU64,
     forwarded: AtomicU64,
+    /// Commits that wrote something, and the fsyncs that made them durable.
+    commits: AtomicU64,
+    fsyncs: AtomicU64,
+}
+
+/// Make an object's commits up to `gen` durable, then tell loop `back`.
+struct SyncJob {
+    file: Arc<std::fs::File>,
+    obj: String,
+    gen: u64,
+    back: usize,
 }
 
 /// What the loops share.
 struct Shared {
     cfg: Config,
     peers: Vec<(Sender<Msg>, Arc<Waker>)>,
+    sync: Mutex<Sender<SyncJob>>,
     index: Mutex<AlarmIndex>,
     stats: Stats,
 }
@@ -113,6 +136,8 @@ enum Msg {
     Run { origin: Origin, obj: String, req: String },
     /// Here is the answer for one of your connections.
     Reply { who: Who, reply: (u16, String) },
+    /// An fsync finished: the object's commits up to `gen` are on disk.
+    Synced { obj: String, gen: u64, ok: bool },
 }
 
 struct Conn {
@@ -170,6 +195,12 @@ struct Object<E: Engine> {
     /// Requests waiting their turn.
     waiting: VecDeque<(Origin, String)>,
     last_used: Instant,
+    /// Commits that wrote (numbered), and how many of them are on disk.
+    committed: u64,
+    synced: u64,
+    syncing: bool,
+    /// Answers waiting for an fsync: (the commit they need, origin, answer).
+    held: Vec<(u64, Origin, (u16, String))>,
 }
 
 /// A parsed request.
@@ -214,7 +245,24 @@ where
         peers.push((tx, waker));
         inboxes.push(rx);
     }
-    let sh = Shared { cfg, peers, index, stats: Stats::default() };
+    let (sync_tx, sync_rx) = channel::<SyncJob>();
+    let sync_rx = Arc::new(Mutex::new(sync_rx));
+    let no_fsync = std::env::var_os("COMBD_EXPERIMENT_NO_FSYNC").is_some();
+    let delay = cfg.sync_delay;
+    for _ in 0..SYNC_THREADS {
+        let (rx, peers) = (sync_rx.clone(), peers.clone());
+        std::thread::spawn(move || loop {
+            let Ok(job) = rx.lock().unwrap().recv() else { return };
+            // EXPERIMENT ONLY, never ship: COMBD_EXPERIMENT_NO_FSYNC measures
+            // what the fsync costs. It breaks the output gate's promise.
+            std::thread::sleep(delay);
+            let ok = no_fsync || job.file.sync_data().is_ok();
+            let (tx, waker) = &peers[job.back];
+            let _ = tx.send(Msg::Synced { obj: job.obj, gen: job.gen, ok });
+            let _ = waker.wake();
+        });
+    }
+    let sh = Shared { cfg, peers, sync: Mutex::new(sync_tx), index, stats: Stats::default() };
     let sh = &sh;
     std::thread::scope(|sc| {
         for (me, (poll, inbox)) in polls.into_iter().zip(inboxes).enumerate() {
@@ -339,8 +387,9 @@ impl<E: Engine> Loop<'_, E> {
                     Outcome::Trap(trap) => Err(trap),
                 };
                 let origin = t.origin;
-                let reply = self.finish_task(t, answer);
-                self.deliver(origin, reply)?;
+                if let Some(reply) = self.finish_task(t, answer) {
+                    self.deliver(origin, reply)?;
+                }
             }
         }
         Ok(())
@@ -379,6 +428,7 @@ impl<E: Engine> Loop<'_, E> {
             match m {
                 Msg::Run { origin, obj, req } => self.submit(origin, obj, req),
                 Msg::Reply { who, reply } => self.deliver(Origin::Local(who), reply)?,
+                Msg::Synced { obj, gen, ok } => self.synced(&obj, gen, ok)?,
             }
         }
         Ok(())
@@ -405,11 +455,12 @@ impl<E: Engine> Loop<'_, E> {
     }
 
     /// A request is done: put its cell back (or drop it after a crash), close
-    /// its object's transaction, and say what to answer.
-    fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> (u16, String) {
+    /// its object's transaction, and say what to answer now. `None`: the
+    /// answer is held until an fsync covers it.
+    fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> Option<(u16, String)> {
         let Task { mut cell, obj, origin } = t;
         let Some(name) = obj else {
-            return match answer {
+            return Some(match answer {
                 Ok(a) => {
                     self.pool.push(cell);
                     split_answer(&a)
@@ -419,7 +470,7 @@ impl<E: Engine> Loop<'_, E> {
                     eprintln!("cell trapped: {trap}");
                     (500, format!("{{\"error\":{trap:?}}}"))
                 }
-            };
+            });
         };
         let o = self.objects.get_mut(&name).expect("object of a running task");
         o.busy = false;
@@ -427,6 +478,7 @@ impl<E: Engine> Loop<'_, E> {
         let dirty = std::mem::take(&mut cell.host().alarm_dirty) || matches!(origin, Origin::Alarm { .. });
         let mut ok = false;
         let mut new_alarm = None;
+        let mut wrote = false;
         let reply = {
             let db = o.db.lock().unwrap();
             match answer {
@@ -438,11 +490,11 @@ impl<E: Engine> Loop<'_, E> {
                             eprintln!("object {name:?}: alarm index: {e}");
                         }
                     }
-                    // The output gate: the answer goes out only once its writes are on disk.
                     match db.commit() {
-                        Ok(()) => {
+                        Ok(w) => {
                             o.cell = Some(cell);
                             ok = true;
+                            wrote = w;
                             new_alarm = alarm;
                             split_answer(&a)
                         }
@@ -473,8 +525,74 @@ impl<E: Engine> Loop<'_, E> {
         if let Origin::Alarm { tries, .. } = origin {
             self.alarm_done(&name, ok, tries);
         }
+        // The output gate: an answer leaves only once every commit up to now
+        // is on disk, its own included. Reads wait too, since they may have
+        // seen a write that isn't on disk yet.
+        let mut out = Some(reply);
+        if let Some(o) = self.objects.get_mut(&name) {
+            if wrote {
+                o.committed += 1;
+                self.sh.stats.commits.fetch_add(1, Relaxed);
+            }
+            if ok && o.committed > o.synced {
+                o.held.push((o.committed, origin, out.take().unwrap()));
+                self.kick_sync(&name);
+            }
+        }
         self.next_waiting(&name);
-        reply
+        out
+    }
+
+    /// Start an fsync for an object if it has commits that aren't on disk
+    /// and none is running.
+    fn kick_sync(&mut self, name: &str) {
+        let Some(o) = self.objects.get_mut(name) else { return };
+        if o.syncing || o.committed <= o.synced {
+            return;
+        }
+        let file = o.db.lock().unwrap().wal_file();
+        let gen = o.committed;
+        match file {
+            Ok(file) => {
+                o.syncing = true;
+                self.sh.stats.fsyncs.fetch_add(1, Relaxed);
+                let job = SyncJob { file, obj: name.to_string(), gen, back: self.me };
+                let _ = self.sh.sync.lock().unwrap().send(job);
+            }
+            Err(e) => {
+                eprintln!("object {name:?}: can't open its WAL to fsync: {e}");
+                let _ = self.synced(name, gen, false);
+            }
+        }
+    }
+
+    /// An fsync finished: release the answers it covers.
+    fn synced(&mut self, name: &str, gen: u64, ok: bool) -> std::io::Result<()> {
+        let Some(o) = self.objects.get_mut(name) else { return Ok(()) };
+        o.syncing = false;
+        let ready: Vec<(Origin, (u16, String))> = if ok {
+            o.synced = o.synced.max(gen);
+            let synced = o.synced;
+            let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut o.held).into_iter().partition(|(g, _, _)| *g <= synced);
+            o.held = rest;
+            done.into_iter().map(|(_, origin, reply)| (origin, reply)).collect()
+        } else {
+            // After a failed fsync, nothing in memory can be trusted to be on
+            // disk (the "fsyncgate" lesson). Fail what's held, and drop the
+            // object so the next request reads what's really there.
+            eprintln!("object {name:?}: fsync failed, dropping it");
+            let o = self.objects.remove(name).unwrap();
+            self.sh.stats.objects_live.fetch_sub(1, Relaxed);
+            let mut failed: Vec<(Origin, (u16, String))> =
+                o.held.into_iter().map(|(_, origin, _)| (origin, (500, "{\"error\":\"storage\"}".to_string()))).collect();
+            failed.extend(o.waiting.into_iter().map(|(origin, _)| (origin, (503, "{\"error\":\"storage\"}".to_string()))));
+            failed
+        };
+        for (origin, reply) in ready {
+            self.deliver(origin, reply)?;
+        }
+        self.kick_sync(name);
+        Ok(())
     }
 
     /// After an alarm ran: forget its retries, or schedule the next one.
@@ -501,6 +619,11 @@ impl<E: Engine> Loop<'_, E> {
             } else {
                 db.rollback();
             }
+            drop(db);
+            if let Some(o) = self.objects.get_mut(name) {
+                o.committed += 1;
+            }
+            self.kick_sync(name);
         }
     }
 
@@ -519,7 +642,7 @@ impl<E: Engine> Loop<'_, E> {
     fn sweep(&mut self) {
         self.last_sweep = Instant::now();
         let idle = self.sh.cfg.idle;
-        let free = |o: &Object<E>| !o.busy && o.waiting.is_empty();
+        let free = |o: &Object<E>| !o.busy && o.waiting.is_empty() && !o.syncing && o.held.is_empty();
         let mut gone: Vec<String> = self.objects.iter().filter(|(_, o)| free(o) && o.last_used.elapsed() >= idle).map(|(n, _)| n.clone()).collect();
         let over = self.objects.len().saturating_sub(gone.len()).saturating_sub(self.sh.cfg.max_objects);
         if over > 0 {
@@ -610,13 +733,15 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
                     s.alarms_fired.load(Relaxed),
                     s.alarms_failed.load(Relaxed),
-                    s.forwarded.load(Relaxed)
+                    s.forwarded.load(Relaxed),
+                    s.commits.load(Relaxed),
+                    s.fsyncs.load(Relaxed)
                 );
                 self.queue_reply(who, (200, body));
             }
@@ -661,7 +786,17 @@ impl<E: Engine> Loop<'_, E> {
             };
             self.sh.stats.objects_live.fetch_add(1, Relaxed);
             self.sh.stats.objects_opened.fetch_add(1, Relaxed);
-            let o = Object { cell: None, db: Arc::new(Mutex::new(db)), busy: false, waiting: VecDeque::new(), last_used: Instant::now() };
+            let o = Object {
+                cell: None,
+                db: Arc::new(Mutex::new(db)),
+                busy: false,
+                waiting: VecDeque::new(),
+                last_used: Instant::now(),
+                committed: 0,
+                synced: 0,
+                syncing: false,
+                held: vec![],
+            };
             self.objects.insert(name.clone(), o);
         }
         let o = self.objects.get_mut(&name).unwrap();

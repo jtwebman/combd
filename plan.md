@@ -832,8 +832,11 @@ Next for this tier, biggest first:
    gate, crash rollback, and the race against workerd and celld are done (see
    [spike/RESULTS.md](spike/RESULTS.md)). Then alarms (with retries, and
    found again after a restart), eviction of idle objects, one owner per
-   object across event loops, and `/_combd/stats`. Next: write coalescing,
-   one fsync per round.
+   object across event loops, and `/_combd/stats`. Then a group commit (one
+   fsync for many writes, answers held until covered): hot writes 8.3x
+   faster. Next: checkpoints off the event loop, then the spec and simulator
+   for D2. Real Linux VMs for honest disk numbers soon; a worldwide set for
+   soak tests once D3 works in the simulator.
 3. **Fleet (D2).** Bucket leases, CAS ownership, epochs, routing between nodes
    over mTLS. Kill tests.
 4. **WebSockets** with hibernation.
