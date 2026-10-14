@@ -79,6 +79,9 @@ const BUILTINS: &[(&str, &str)] = &[
     ("console.log", "console_log"),
     ("combd.counter", "combd_counter"),
 ];
+/// Methods with a direct entry point in `combd_jsrt::b::m` (keep in sync with `m::NAMES`).
+const DIRECT_METHODS: &[&str] =
+    &["push", "slice", "map", "forEach", "reduce", "join", "indexOf", "split", "toUpperCase", "toLowerCase", "replace", "exec", "test"];
 const CONSTRUCTORS: &[(&str, &str)] = &[("RegExp", "new_regexp"), ("Error", "new_error")];
 
 fn builtin(table: &[(&str, &'static str)], name: &str) -> Option<&'static str> {
@@ -819,6 +822,9 @@ impl<'s> C<'s> {
                     }
                 }
                 let recv = self.eref(&m.object)?;
+                if DIRECT_METHODS.contains(&method) {
+                    return Ok(format!("rt::b::m::{method}({recv}, {})?", self.args(&c.arguments)?));
+                }
                 return Ok(format!("rt::call_method({recv}, {method:?}, {})?", self.args(&c.arguments)?));
             }
             _ => {}

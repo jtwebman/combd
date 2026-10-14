@@ -156,18 +156,26 @@ fn api_bench<E: Engine>(name: &str, eng: &E, lang: &str) {
     let mut vm = eng.spawn(&prog).unwrap();
     let mut st = HostState::default();
     init(&mut vm, &mut st).unwrap();
-    for r in reqs.iter().filter(|r| r.starts_with("api")) {
+    let only = std::env::var("COMBD_BENCH_ONLY").unwrap_or_default();
+    for r in reqs.iter().filter(|r| r.starts_with("api") && (only.is_empty() || r.split(' ').nth(2) == Some(only.as_str()))) {
         let label: String = r.chars().take(22).collect();
         for _ in 0..200 {
             request(&mut vm, r, &mut st).unwrap();
         }
         let n: u32 = std::env::var("COMBD_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
-        let t = Instant::now();
-        for _ in 0..n {
-            request(&mut vm, r, &mut st).unwrap();
-        }
+        // Best of five rounds: a laptop's noise only ever adds time.
+        let best = (0..5)
+            .map(|_| {
+                let t = Instant::now();
+                for _ in 0..n {
+                    request(&mut vm, r, &mut st).unwrap();
+                }
+                t.elapsed() / n
+            })
+            .min()
+            .unwrap();
         let out = request(&mut vm, r, &mut st).unwrap();
-        println!("{lang:>4}-api {name:<9} {label:<22} {:>9.2} us   -> {} bytes", us(t.elapsed() / n), out.len());
+        println!("{lang:>4}-api {name:<9} {label:<22} {:>9.2} us   -> {} bytes", us(best), out.len());
     }
 }
 
@@ -236,7 +244,9 @@ fn start<V: CellVm>(vm: &mut V, req: &str, st: &mut HostState) -> Result<(), Str
 
 fn response<V: CellVm>(vm: &V, r: &[u64]) -> String {
     let r = r[0];
-    String::from_utf8_lossy(&vm.read((r >> 32) as u32, r as u32).unwrap_or_default()).into_owned()
+    let b = vm.read((r >> 32) as u32, r as u32).unwrap_or_default();
+    // The fast check first; lossy decoding only for bad bytes.
+    String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn request<V: CellVm>(vm: &mut V, req: &str, st: &mut HostState) -> Result<String, String> {
@@ -685,6 +695,7 @@ mod tests {
                     other => panic!("{lang}: unexpected {:?}", matches!(other, Outcome::Trap(_))),
                 }
             };
+            eprintln!("{lang}: fib 27 yielded {yields} times");
             assert!(yields > 10, "{lang}: only {yields} yields");
             assert_eq!(response(&vm, &r), "196418", "{lang}");
         }

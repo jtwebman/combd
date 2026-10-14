@@ -164,6 +164,8 @@ pub fn regexp(src: &str, flags: &str) -> R {
 
 // ---- array methods ----
 
+// `m::*` passes a constant name, so inlining folds each switch to one arm.
+#[inline(always)]
 pub fn array_method(a: &Arr, o: &Value, name: &str, args: &[Value]) -> R {
     // Callbacks may touch the array, so never hold a borrow across one.
     let item = |i: usize| a.borrow().get(i).cloned();
@@ -231,11 +233,12 @@ pub fn array_method(a: &Arr, o: &Value, name: &str, args: &[Value]) -> R {
 
 // ---- string methods ----
 
+#[inline(always)]
 pub fn string_method(o: &Value, s: &str, name: &str, args: &[Value]) -> R {
     match name {
         "indexOf" => {
             let needle = to_str(&arg(args, 0));
-            let from = byte_of(s, rel_index(&arg(args, 1), u16_len(s), 0));
+            let from = if args.len() < 2 { 0 } else { byte_of(s, rel_index(&args[1], u16_len(s), 0)) };
             let hit = match needle.as_bytes() {
                 &[c] => s.as_bytes()[from..].iter().position(|&b| b == c),
                 _ => s[from..].find(&needle),
@@ -243,6 +246,19 @@ pub fn string_method(o: &Value, s: &str, name: &str, args: &[Value]) -> R {
             Ok(Value::Num(hit.map_or(-1.0, |b| u16_of(s, from + b) as f64)))
         }
         "slice" => {
+            // The common case, slice(i) or slice(i, j) with i, j >= 0, needs no length.
+            if let (Value::Num(st), end) = (arg(args, 0), arg(args, 1)) {
+                let e = match end {
+                    Value::Undef => Some(f64::INFINITY),
+                    Value::Num(e) => Some(e),
+                    _ => None,
+                };
+                if let Some(e) = e.filter(|e| *e >= 0.0 && st >= 0.0) {
+                    let sb = byte_of(s, st as usize);
+                    let eb = if e.is_infinite() { s.len() } else { byte_of(s, e as usize) };
+                    return Ok(if sb >= eb { Value::Lit("") } else { Value::copy(&s[sb..eb]) });
+                }
+            }
             let n = u16_len(s);
             let st = rel_index(&arg(args, 0), n, 0);
             let e = rel_index(&arg(args, 1), n, n);
@@ -272,6 +288,8 @@ pub fn string_method(o: &Value, s: &str, name: &str, args: &[Value]) -> R {
             };
             Ok(Value::arr(parts))
         }
+        "toUpperCase" if s.is_ascii() => Ok(Value::str(s.to_ascii_uppercase())),
+        "toLowerCase" if s.is_ascii() => Ok(Value::str(s.to_ascii_lowercase())),
         "toUpperCase" => Ok(Value::str(s.to_uppercase())),
         "toLowerCase" => Ok(Value::str(s.to_lowercase())),
         "replace" => replace(s, &arg(args, 0), &arg(args, 1)),
@@ -309,10 +327,11 @@ fn replace(s: &str, pat: &Value, with: &Value) -> R {
                 m.captures.iter().map(|c| c.clone().map_or(Value::Undef, |c| Value::copy(&s[c]))).collect()
             };
             if r.global {
-                for m in r.re.find_iter(s) {
+                let all: Vec<regress::Match> = if s.is_ascii() { r.re.find_iter_ascii(s).collect() } else { r.re.find_iter(s).collect() };
+                for m in all {
                     sub(m.start(), m.end(), caps(&m), &mut out)?;
                 }
-            } else if let Some(m) = r.re.find(s) {
+            } else if let Some(m) = find(&r.re, s) {
                 sub(m.start(), m.end(), caps(&m), &mut out)?;
             }
         }
@@ -329,11 +348,29 @@ fn replace(s: &str, pat: &Value, with: &Value) -> R {
 
 // ---- regex methods ----
 
+#[inline(always)]
+/// regress has a faster matcher for ASCII text.
+fn find(re: &regress::Regex, s: &str) -> Option<regress::Match> {
+    if s.is_ascii() {
+        re.find_ascii(s)
+    } else {
+        re.find(s)
+    }
+}
+
 pub fn regexp_method(r: &Re, name: &str, args: &[Value]) -> R {
-    let s = to_str(&arg(args, 0));
+    let a0 = arg(args, 0);
+    let owned;
+    let s = match a0.as_str() {
+        Some(s) => s,
+        None => {
+            owned = to_str(&a0);
+            &owned
+        }
+    };
     match name {
         // ponytail: the match array has no `index`, `input`, or `groups`.
-        "exec" => Ok(match r.re.find(&s) {
+        "exec" => Ok(match find(&r.re, s) {
             None => Value::Null,
             Some(m) => {
                 let mut v = vec![Value::copy(&s[m.range()])];
@@ -341,7 +378,35 @@ pub fn regexp_method(r: &Re, name: &str, args: &[Value]) -> R {
                 Value::arr(v)
             }
         }),
-        "test" => Ok(Value::Bool(r.re.find(&s).is_some())),
+        "test" => Ok(Value::Bool(find(&r.re, s).is_some())),
         _ => Err(unsupported(&format!("RegExp.prototype.{name}"))),
     }
+}
+
+/// Built-in methods by name, for call sites that name one: `x.push(..)`
+/// compiles to `m::push(x, ..)`, with no string matching at run time.
+pub mod m {
+    use super::*;
+
+    macro_rules! direct {
+        ($($name:ident)*) => {$(
+            #[allow(non_snake_case)]
+            pub fn $name(o: &Value, args: &[Value]) -> R {
+                let name = stringify!($name);
+                match o {
+                    Value::Arr(a) => array_method(a, o, name, args),
+                    Value::Lit(s) => string_method(o, s, name, args),
+                    Value::Str(s) => string_method(o, s, name, args),
+                    Value::Re(r) => regexp_method(r, name, args),
+                    _ => call_method(o, name, args),
+                }
+            }
+        )*};
+    }
+
+    direct! { push slice map forEach reduce join indexOf split toUpperCase toLowerCase replace exec test }
+
+    /// The names above, for jsc.
+    pub const NAMES: &[&str] =
+        &["push", "slice", "map", "forEach", "reduce", "join", "indexOf", "split", "toUpperCase", "toLowerCase", "replace", "exec", "test"];
 }

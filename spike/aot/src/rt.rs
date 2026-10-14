@@ -44,9 +44,13 @@ pub trait Host {
 /// Everything a compiled cell owns, except its linear memory. Memory is passed
 /// to every compiled function as its own argument, so LLVM can keep its
 /// pointer and length in registers.
+/// The most Wasm globals a module may have. A fixed array means a global
+/// (the stack pointer, mostly) is one load: no bounds check, no indirection.
+pub const MAX_GLOBALS: usize = 64;
+
 pub struct Ctx {
     pub max_pages: u32,
-    pub globals: Vec<u64>,
+    pub globals: [u64; MAX_GLOBALS],
     pub table: Vec<Option<u32>>,
     pub data: &'static [&'static [u8]],
     pub dropped: Vec<bool>,
@@ -66,7 +70,7 @@ impl Clone for Ctx {
     fn clone(&self) -> Self {
         Ctx {
             max_pages: self.max_pages,
-            globals: self.globals.clone(),
+            globals: self.globals,
             table: self.table.clone(),
             data: self.data,
             dropped: self.dropped.clone(),
@@ -94,7 +98,7 @@ impl Ctx {
         }
         let c = Ctx {
             max_pages,
-            globals: vec![],
+            globals: [0; MAX_GLOBALS],
             table: vec![],
             data,
             dropped: vec![false; data.len()],
@@ -275,7 +279,27 @@ pub fn copy(m: &mut Mem, dst: u64, src: u64, n: u64) -> Result<(), Trap> {
     if s + n > m.len() || d + n > m.len() {
         return Err(Trap::OutOfBounds);
     }
-    m.bytes().copy_within(s..s + n, d);
+    let b = m.bytes();
+    // Small copies (string pieces, mostly) skip the memmove call: two
+    // overlapping loads, then two stores, so overlap is fine too.
+    macro_rules! two {
+        ($t:ty, $w:literal) => {{
+            let lo = <$t>::from_le_bytes(b[s..s + $w].try_into().unwrap());
+            let hi = <$t>::from_le_bytes(b[s + n - $w..s + n].try_into().unwrap());
+            b[d..d + $w].copy_from_slice(&lo.to_le_bytes());
+            b[d + n - $w..d + n].copy_from_slice(&hi.to_le_bytes());
+        }};
+    }
+    match n {
+        0 => {}
+        1..=3 => {
+            let (x, y, z) = (b[s], b[s + n / 2], b[s + n - 1]);
+            (b[d], b[d + n / 2], b[d + n - 1]) = (x, y, z);
+        }
+        4..=7 => two!(u32, 4),
+        8..=16 => two!(u64, 8),
+        _ => b.copy_within(s..s + n, d),
+    }
     Ok(())
 }
 

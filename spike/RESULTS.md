@@ -508,6 +508,98 @@ The Rust cell beats Bun by 1.32x to 1.38x on every route, and the POST route
 first route showed a 27 ms p99 in this run, against 0.23 ms in the last. The
 other routes stayed under 0.4 ms.
 
+## JavaScript through jsc, our JS-to-Rust compiler
+
+QuickJS is gone. `jsc` (`jsc/`) parses `langs/js/app.js` with oxc and writes
+a Rust crate that builds to an ordinary Wasm cell, so the AOT tier gives it
+yields, guard pages, and let-it-crash. Its runtime (`jsc/rt`) has a dynamic
+`Value`, insertion-ordered objects, JS number printing, JSON, and regex
+(regress). The compiled app answers every request byte for byte like Node
+(`js_matches_node`) and passes all five language checks on the interpreter
+and the AOT tier. Anything outside the subset stops the build with a line
+number.
+
+What made it fast, in order of effect:
+- **A size-class allocator** in the cell (free lists, no system malloc on the
+  hot path).
+- **Typed twins for number code.** A function that only does number math also
+  gets an `f64` version. fib(25), native: 1,288 us to 253 us (Node: 466 us).
+- **Faster JSON:** escape checks 8 bytes at a time, no copy for plain strings,
+  shared keys, an exact fast path for short decimals. Orders: 10.2 to 7.2 us.
+- **Less copying:** operators and parameters borrow instead of copy, small
+  memory copies skip memmove, string index math scans only what it needs.
+- **Inline caches** for `o.k`, and direct calls for built-in methods.
+
+In-process, macOS, AOT with guard pages (us per request, best of 5):
+
+| | combd JS cell | combd Rust cell | Node 24 (V8) |
+|---|---|---|---|
+| GET /api/users/42 | 1.6 | 0.55 | 0.7 |
+| GET /api/users | 3.8 | 1.34 | 1.6 |
+| POST /api/orders | 7.1 | 3.5 | 4.4 |
+
+Natively, the same compiled JS runs users/42 in 0.71 us, level with Node.
+The AOT layer costs about 2.3x on this code. Most of that is the wasm32
+calling rules (a 16-byte `Value` goes through memory, not registers), plus
+fuel ticks and stack checks (about 20% together, measured by turning them
+off).
+
+HTTP, Linux (Docker on the same Mac), one core per server, 32 connections
+(req/s):
+
+| | combd Rust | **combd JS** | Bun 1.4 | Node 24 | celld | workerd |
+|---|---|---|---|---|---|---|
+| GET /api/users/42 | 199,801 | **153,429** | 168,622 | 76,300 | 44,808 | 35,778 |
+| GET /api/users | 182,970 | **103,279** | 151,073 | 72,819 | 40,054 | 32,092 |
+| POST /api/orders | 114,357 | **66,907** | 87,949 | 50,717 | 38,914 | 28,280 |
+| p99, worst route | 0.51 ms | **1.61 ms** | 2.37 ms | 15.2 ms | 6.3 ms | 1.16 s |
+
+**The JS cell beats Node on every route (1.3x to 2x), and celld and workerd
+by 2x to 4x.** It is 1.7x to 3.4x faster than the old QuickJS cell. It still
+loses to Bun: by 9% on users/42, 32% on users, and 24% on orders. The Rust
+cell beats Bun on every route.
+
+Fairness, one core, a neighbor hammering `/api/fib/32` (req/s on the fast
+route, and p99):
+
+| | Alone | With heavy neighbor |
+|---|---|---|
+| combd Rust | 211,828 to 214,615, 0.13 to 0.15 ms | **40,274 to 46,506, 0.54 to 0.57 ms** |
+| combd Rust, yielding off | 219,713, 0.12 ms | 706, 24.7 ms |
+| **combd JS** | 153,605 to 162,147, 0.16 ms | **15,875 to 25,652, 1.23 to 1.60 ms** |
+| Bun | 145,122, 4.45 ms | 459, 65 ms |
+| Node | 77,966, 0.52 ms | 291, 519 ms |
+| celld | 43,432, 2.24 ms | 329, 54 ms |
+| workerd | 36,918, 235 ms | 407, 599 ms |
+
+Under a bad neighbor, the combd JS cell keeps 35x to 56x Bun's throughput and
+55x to 88x Node's, with a p99 40x to 50x lower than Bun's.
+
+Ranges are from three runs. This laptop was shared and busy (load average
+about 7), so runs vary. One run gave the Rust cell a 52.7 ms p99 with the
+neighbor; the reruns gave 0.57 ms, so we count it as noise but keep watching
+it (the same kind of outlier showed up once before).
+
+**A security bug found on the way.** In the AOT tier, a function with no loop
+never spent fuel, so plain recursion could run without yielding and without
+hitting the CPU limit. Rust's fib hid it, because LLVM turns it into a loop.
+The JS fib twin is plain recursion, and the yield test caught it (0 yields).
+Now aot-gen reads the whole call graph and spends fuel at every call that can
+recurse, at every indirect call, and on entry to any function whose work
+without a tick could be large. Small helpers stay tick-free. The fairness runs
+above show it holds under load. A check: the old rule (tick on every entry)
+and the new one yield exactly as often on fib 27 (317 times), and fib 30
+takes the same time under both (`COMBD_AOT_EXPERIMENT=entrytick`).
+
+What's next for JS speed, biggest first:
+1. **Memory without refcounts.** Dropping values is about 20% of the JS cell's
+   time. A per-request region that is reset after the request (with values
+   that escape copied out) would remove most of it.
+2. **Shapes:** objects from the same literal share a key layout, so they
+   store only values.
+3. **Cheaper AOT checks:** fuel and stack checks are about 20%. The call-graph
+   analysis above can also prove where stack checks aren't needed.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

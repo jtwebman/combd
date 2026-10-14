@@ -222,21 +222,15 @@ pub fn num_to(x: f64, out: &mut String) {
     } else if x.is_infinite() {
         out.push_str(if x > 0.0 { "Infinity" } else { "-Infinity" });
     } else if x.fract() == 0.0 && x.abs() < 1e15 {
-        let mut n = x.abs() as u64;
-        let mut buf = [0u8; 20];
-        let mut i = buf.len();
-        loop {
-            i -= 1;
-            buf[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-            if n == 0 {
-                break;
-            }
-        }
         if x < 0.0 {
             out.push('-');
         }
-        out.push_str(std::str::from_utf8(&buf[i..]).unwrap());
+        let a = x.abs();
+        if a < 4294967296.0 {
+            push_digits(a as u32 as u64, out); // 32-bit division is cheaper in Wasm
+        } else {
+            push_digits(a as u64, out);
+        }
     } else if x.abs() >= 1e21 || x.abs() < 1e-6 {
         // Both use the shortest digits that round-trip; JS writes "e+21".
         let s = format!("{x:e}");
@@ -249,6 +243,21 @@ pub fn num_to(x: f64, out: &mut String) {
     } else {
         let _ = write!(out, "{x}");
     }
+}
+
+fn push_digits(mut n: u64, out: &mut String) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    // Safety: only ASCII digits were written.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
 }
 
 pub fn write_str(v: &Value, out: &mut String) {
@@ -332,8 +341,13 @@ fn u16_len(s: &str) -> usize {
 /// The byte offset of UTF-16 index `i`. ponytail: an index inside a surrogate
 /// pair rounds up to the next character.
 fn byte_of(s: &str, i: usize) -> usize {
-    if s.is_ascii() {
-        return i.min(s.len());
+    // Only the part before `i` matters.
+    if i >= s.len() {
+        if s.is_ascii() {
+            return s.len();
+        }
+    } else if s.as_bytes()[..i].is_ascii() {
+        return i;
     }
     let mut units = 0;
     for (b, c) in s.char_indices() {
@@ -346,7 +360,7 @@ fn byte_of(s: &str, i: usize) -> usize {
 }
 
 fn u16_of(s: &str, byte: usize) -> usize {
-    if s.is_ascii() {
+    if s.as_bytes()[..byte].is_ascii() {
         byte
     } else {
         s[..byte].encode_utf16().count()
@@ -692,7 +706,8 @@ pub mod cell {
     /// `ptr, len` must be a buffer from `alloc`, filled by the host.
     pub unsafe fn handle(ptr: *mut u8, len: u32) -> u64 {
         let req = Vec::from_raw_parts(ptr, len as usize, len as usize);
-        let v = answer(&String::from_utf8_lossy(&req));
+        let req = String::from_utf8(req).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+        let v = answer(&req);
         let out: Box<[u8]> = match v.as_str() {
             Some(s) => s.as_bytes().into(),
             None => to_str(&v).into_bytes().into(),
@@ -764,6 +779,12 @@ mod tests {
         assert_eq!(r.as_str(), Some("é"));
         let r = b::string_method(&s, s.as_str().unwrap(), "indexOf", &[Value::Lit("x")]).unwrap();
         assert_eq!(to_num(&r), 7.0);
+        let r = b::string_method(&s, s.as_str().unwrap(), "slice", &[Value::Num(5.0)]).unwrap();
+        assert_eq!(r.as_str(), Some("😀x"));
+        let r = b::string_method(&s, s.as_str().unwrap(), "slice", &[Value::Num(-1.0)]).unwrap();
+        assert_eq!(r.as_str(), Some("x"));
+        let r = b::string_method(&s, s.as_str().unwrap(), "slice", &[Value::Num(3.0), Value::Num(1.0)]).unwrap();
+        assert_eq!(r.as_str(), Some(""));
     }
 
     #[test]
@@ -772,5 +793,13 @@ mod tests {
         let v = json::parse(src).unwrap();
         assert_eq!(to_str(&json::stringify(&v)), r#"{"a":2,"b":[true,null,"x\né😀"],"c":{"d":-1500}}"#);
         assert!(json::parse("{bad").is_err());
+        let v = json::parse(r#"[2.75, -0.1, 0.3, 123456789012345, 1234567890123456789, 1e3, -0]"#).unwrap();
+        assert_eq!(to_str(&json::stringify(&v)), "[2.75,-0.1,0.3,123456789012345,1234567890123456800,1000,0]");
+        let v = json::parse(r#"[{"a":"x","b":"\u0041"},{"a":"y","b":"z"}]"#).unwrap();
+        assert_eq!(to_str(&json::stringify(&v)), r#"[{"a":"x","b":"A"},{"a":"y","b":"z"}]"#);
+        let tricky = Value::Lit("plain long text, then a quote: \" and a tab\t and \\ end");
+        assert_eq!(to_str(&json::stringify(&tricky)), r#""plain long text, then a quote: \" and a tab\t and \\ end""#);
+        assert_eq!(to_str(&json::stringify(&Value::Lit("12345678\u{1}"))), r#""12345678\u0001""#);
+        assert_eq!(to_str(&json::stringify(&Value::Num(-4294967297.0))), "-4294967297");
     }
 }

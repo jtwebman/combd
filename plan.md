@@ -379,6 +379,12 @@ apps use web-standard APIs (`fetch`, `Request`, `Response`, `URL`, `Headers`,
 compatibility, if ever, is a library of shims on top, as Cloudflare and Deno
 did it.
 
+**Status (2026-10-13): step 1 works.** jsc compiles `app.js`, matches Node
+byte for byte, beats Node over HTTP on every route, and trails Bun by 9% to
+32%. Under a heavy neighbor it keeps 35x to 56x Bun's throughput. Numbers in
+`spike/RESULTS.md`. Next for speed: per-request memory regions instead of
+refcounts, shapes, and cheaper AOT checks.
+
 **What we support, in steps:**
 1. The `app.js` subset, behind our cell interface (`handle(request)`).
 2. Workers APIs: `fetch` handlers, `Request` / `Response` / `Headers` / `URL`,

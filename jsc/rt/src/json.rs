@@ -4,7 +4,7 @@
 use super::*;
 
 pub fn parse(s: &str) -> R {
-    let mut p = P { src: s, s: s.as_bytes(), i: 0 };
+    let mut p = P { src: s, s: s.as_bytes(), i: 0, keys: vec![] };
     p.ws();
     let v = p.value()?;
     p.ws();
@@ -18,6 +18,8 @@ struct P<'a> {
     src: &'a str,
     s: &'a [u8],
     i: usize,
+    /// Keys seen so far: arrays of objects repeat the same few keys.
+    keys: Vec<Rc<str>>,
 }
 
 impl P<'_> {
@@ -61,10 +63,10 @@ impl P<'_> {
                         if self.s.get(self.i) != Some(&b'"') {
                             return Err(self.err());
                         }
-                        let k = self.string()?;
+                        let k = self.key()?;
                         self.eat(b':')?;
                         let v = self.value()?;
-                        o.put(Key::Rc(k.into()), v);
+                        o.put(Key::Rc(k), v);
                         self.ws();
                         match self.s.get(self.i) {
                             Some(b',') => self.i += 1,
@@ -100,7 +102,7 @@ impl P<'_> {
                 }
                 Ok(Value::arr(a))
             }
-            Some(b'"') => Ok(Value::str(self.string()?)),
+            Some(b'"') => Ok(Value::Str(self.rc_string()?)),
             Some(b't') => self.word("true", Value::Bool(true)),
             Some(b'f') => self.word("false", Value::Bool(false)),
             Some(b'n') => self.word("null", Value::Null),
@@ -141,7 +143,8 @@ impl P<'_> {
                 return Err(self.err());
             }
         }
-        Ok(Value::Num(self.src[start..self.i].parse().unwrap()))
+        let t = &self.src[start..self.i];
+        Ok(Value::Num(fast_decimal(t).unwrap_or_else(|| t.parse().unwrap())))
     }
     fn hex4(&mut self) -> Result<u32, Value> {
         let h = self.s.get(self.i..self.i + 4).and_then(|h| std::str::from_utf8(h).ok());
@@ -149,6 +152,38 @@ impl P<'_> {
         self.i += 4;
         Ok(v)
     }
+    /// The end of a string with no escapes, if this one is that simple.
+    fn plain_end(&self) -> Option<usize> {
+        let rest = &self.s[self.i + 1..];
+        let j = rest.iter().position(|&c| matches!(c, b'"' | b'\\' | 0..=0x1f))?;
+        (rest[j] == b'"').then_some(self.i + 1 + j)
+    }
+
+    fn rc_string(&mut self) -> Result<Rc<str>, Value> {
+        if let Some(end) = self.plain_end() {
+            let r = Rc::from(&self.src[self.i + 1..end]);
+            self.i = end + 1;
+            return Ok(r);
+        }
+        Ok(self.string()?.into())
+    }
+
+    fn key(&mut self) -> Result<Rc<str>, Value> {
+        if let Some(end) = self.plain_end() {
+            let k = &self.src[self.i + 1..end];
+            self.i = end + 1;
+            if let Some(hit) = self.keys.iter().find(|c| &***c == k) {
+                return Ok(hit.clone());
+            }
+            let rc: Rc<str> = Rc::from(k);
+            if self.keys.len() < 16 {
+                self.keys.push(rc.clone());
+            }
+            return Ok(rc);
+        }
+        Ok(self.string()?.into())
+    }
+
     fn string(&mut self) -> Result<String, Value> {
         self.i += 1; // the opening quote
         let mut out = String::new();
@@ -200,6 +235,23 @@ impl P<'_> {
             }
         }
     }
+}
+
+/// `123` or `-4.25`: a whole number of at most 15 digits divided by a power of
+/// ten is exact in f64, so one division rounds correctly (Clinger's fast path).
+fn fast_decimal(t: &str) -> Option<f64> {
+    let (neg, digits) = match t.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, t),
+    };
+    let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    if int.len() + frac.len() > 15 || frac.contains(['e', 'E']) || int.contains(['e', 'E']) {
+        return None;
+    }
+    const POW10: [f64; 16] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15];
+    let m = int.bytes().chain(frac.bytes()).fold(0u64, |m, b| m * 10 + (b - b'0') as u64);
+    let x = m as f64 / POW10[frac.len()];
+    Some(if neg { -x } else { x })
 }
 
 /// JSON.stringify(v): undefined when v has no JSON form, like JS.
@@ -256,10 +308,27 @@ fn write(v: &Value, out: &mut String) -> bool {
     true
 }
 
+/// Any byte below 0x20, or a quote or backslash? Eight bytes at a time.
+fn needs_escape(b: &[u8]) -> bool {
+    const L: u64 = 0x0101_0101_0101_0101;
+    const H: u64 = 0x8080_8080_8080_8080;
+    let zero = |x: u64| x.wrapping_sub(L) & !x & H;
+    let mut words = b.chunks_exact(8);
+    for w in &mut words {
+        let x = u64::from_le_bytes(w.try_into().unwrap());
+        // A byte below 0x20 (exact for bytes under 0x80; others can't match anyway).
+        let low = x.wrapping_sub(L * 0x20) & !x & H;
+        if low | zero(x ^ (L * b'"' as u64)) | zero(x ^ (L * b'\\' as u64)) != 0 {
+            return true;
+        }
+    }
+    words.remainder().iter().any(|&c| c < 0x20 || c == b'"' || c == b'\\')
+}
+
 fn quote(s: &str, out: &mut String) {
     out.push('"');
     let b = s.as_bytes();
-    if !b.iter().any(|&c| c < 0x20 || c == b'"' || c == b'\\') {
+    if !needs_escape(b) {
         out.push_str(s);
         out.push('"');
         return;

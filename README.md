@@ -80,8 +80,9 @@ recovered from crashes about 3 times faster, used less memory, and came in
 next. **[See the results.](spike/RESULTS.md)**
 
 Cells already run in five languages: Rust, C, Zig, Go (TinyGo), and
-AssemblyScript (TypeScript-like). See [langs/](langs/). JavaScript is next,
-through our own JS-to-Rust compiler.
+AssemblyScript (TypeScript-like). See [langs/](langs/). JavaScript runs
+through our own JS-to-Rust compiler, [jsc](jsc/), which turns an app into a
+normal Wasm cell. Its answers match Node byte for byte.
 
 We also built our own ahead-of-time compiler. It turns Wasm into plain safe
 Rust, so the Rust compiler proves the sandbox holds. Then it becomes machine
@@ -93,6 +94,12 @@ written in Rust and able to be preempted and crash safely, handled 1.3x to
 1.6x more requests than Bun on every test. It beat celld by up to 5x and
 workerd by up to 7x, with tail latency under half a millisecond.
 **[See the race.](spike/RESULTS.md)**
+
+The same app in JavaScript, compiled by jsc, beat Node on every route (1.3x
+to 2x) and celld and workerd by 2x to 4x. It is still 9% to 32% behind Bun.
+With a CPU-heavy neighbor on the same core, it kept 35x to 56x Bun's
+throughput and 55x to 88x Node's, because combd keeps yielding while they
+can't.
 
 ## Standing on shoulders
 

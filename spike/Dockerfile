@@ -10,11 +10,15 @@ WORKDIR /combd
 COPY guest guest
 COPY spike spike
 COPY langs langs
+COPY jsc jsc
 RUN cd guest && cargo build --locked --release --target wasm32-unknown-unknown
+# The JS cell: langs/js/app.js through jsc.
+RUN ./jsc/build.sh
 # AOT builds are keyed by the Wasm's hash, so generate them from the Wasm built here.
 RUN cd spike && cargo build --locked --release \
     && case "$FEATURES" in aot*) \
          ./target/release/combd-spike aot-gen ../guest/target/wasm32-unknown-unknown/release/combd_guest.wasm aot/src/gen_rust.rs \
+         && ./target/release/combd-spike aot-gen ../jsc/out/app/target/wasm32-unknown-unknown/release/combd_js_app.wasm aot/src/gen_js.rs \
          && cargo build --locked --release --features "$FEATURES";; esac \
     && cargo test --locked --release --features "$FEATURES"
 WORKDIR /combd/spike

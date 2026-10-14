@@ -40,6 +40,9 @@ struct Info {
     active: Vec<(usize, u32)>,
     exports: Vec<(String, u32)>,
     indirect: BTreeSet<u32>,
+    /// Per defined function, for placing fuel ticks: (index, has a loop,
+    /// direct callees, size in operators).
+    fns: Vec<(u32, bool, Vec<u32>, usize)>,
 }
 
 fn const_val(expr: &ConstExpr, globals: &[u64]) -> Result<u64, String> {
@@ -110,6 +113,9 @@ pub fn generate(wasm: &[u8], source: &str) -> Result<String, String> {
             Payload::GlobalSection(r) => {
                 for g in r {
                     let val = const_val(&g.map_err(e)?.init_expr, &m.globals)?;
+                    if m.globals.len() == 64 {
+                        return Err("more than 64 globals is not supported".into());
+                    }
                     m.globals.push(val);
                 }
             }
@@ -162,6 +168,7 @@ pub fn generate(wasm: &[u8], source: &str) -> Result<String, String> {
             _ => {}
         }
     }
+    let funcs = place_ticks(&m, &funcs);
     Ok(module_text(&m, &funcs, source, crate_hash(wasm)) + &names)
 }
 
@@ -203,7 +210,9 @@ fn module_text(m: &Info, funcs: &str, source: &str, hash: u64) -> String {
     o.push_str("];\n\n");
     let _ = writeln!(o, "fn new(host: Box<dyn rt::Host>) -> Result<(Ctx, rt::Mem), Trap> {{");
     let _ = writeln!(o, "    let (mut c, mut m) = Ctx::new({}, {}, DATA, host)?;", m.mem.0, m.mem.1);
-    let _ = writeln!(o, "    c.globals = vec!{:?};", m.globals);
+    for (i, g) in m.globals.iter().enumerate() {
+        let _ = writeln!(o, "    c.globals[{i}] = {g:#x};");
+    }
     let _ = writeln!(o, "    c.table = vec![None; {}];", m.table.unwrap_or(0));
     for (off, fs) in &m.elems {
         let _ = writeln!(o, "    c.init_elem({off}, &{fs:?})?;");
@@ -301,8 +310,11 @@ fn gen_func(
     let mut ctl: Vec<(Lk, u32)> = vec![(Lk::Root, 0)];
     let mut next = 0u32;
     let mut max_h = 0usize;
+    let mut callees = vec![];
+    let mut size = 0usize;
     let mut r = body.get_operators_reader().map_err(e)?;
     while !r.eof() {
+        size += 1;
         let offset = r.original_position() as u64;
         let op = r.read().map_err(e)?;
         let h = fv.operand_stack_height() as usize;
@@ -378,12 +390,13 @@ fn gen_func(
                     return Err("multi-value calls are not supported".into());
                 }
                 let a: Vec<String> = (h - n..h).map(|i| format!("s{i}")).collect();
-                let x = if f < m.imports.len() {
-                    format!("c.import(m, {f}, &[{}])?", a.join(", "))
+                let (x, mark) = if f < m.imports.len() {
+                    (format!("c.import(m, {f}, &[{}])?", a.join(", ")), String::new())
                 } else {
-                    format!("f{f}(c, m, sb{})?", a.iter().map(|x| format!(", {x}")).collect::<String>())
+                    callees.push(f as u32);
+                    (format!("f{f}(c, m, sb{})?", a.iter().map(|x| format!(", {x}")).collect::<String>()), format!("/*T{idx}:{f}*/"))
                 };
-                if cr == 1 { format!("c.fuel = fuel; s{} = {x}; fuel = c.fuel;", h - n) } else { format!("c.fuel = fuel; {x}; fuel = c.fuel;") }
+                if cr == 1 { format!("{mark}c.fuel = fuel; s{} = {x}; fuel = c.fuel;", h - n) } else { format!("{mark}c.fuel = fuel; {x}; fuel = c.fuel;") }
             }
             Operator::CallIndirect { type_index, table_index } => {
                 if *table_index != 0 {
@@ -396,8 +409,9 @@ fn gen_func(
                 }
                 m.indirect.insert(*type_index);
                 let a: String = (h - 1 - n..h - 1).map(|i| format!(", s{i}")).collect();
+                // An indirect call can go anywhere, recursion included: always tick.
                 let x = format!("ci{type_index}(c, m, sb, s{}{a})?", h - 1);
-                if cr == 1 { format!("c.fuel = fuel; s{} = {x}; fuel = c.fuel;", h - 1 - n) } else { format!("c.fuel = fuel; {x}; fuel = c.fuel;") }
+                if cr == 1 { format!("/*TI{idx}*/c.fuel = fuel; s{} = {x}; fuel = c.fuel;", h - 1 - n) } else { format!("/*TI{idx}*/c.fuel = fuel; {x}; fuel = c.fuel;") }
             }
             Operator::LocalGet { local_index } => format!("s{h} = l{local_index};"),
             Operator::LocalSet { local_index } | Operator::LocalTee { local_index } => {
@@ -461,23 +475,17 @@ fn gen_func(
         }
     }
     // Fuel lives in a register; it is saved to the cell only around calls and
-    // returns. Loops spend it at their heads. A function that calls others
-    // also spends it on entry: recursion with no loop (fib) can still run for
-    // ages, and it must yield and hit the CPU limit like anything else. A leaf
-    // with no loops does bounded work, so it needs none of this.
+    // returns. Loops spend it at their heads. `place_ticks` decides where else
+    // to spend it, once it can see the whole call graph: `/*E..*/` marks the
+    // entry and `/*T..*/` each call.
     let has_loop = b.contains(": loop {");
-    let has_call = b.contains("(c, m, sb");
     if has_loop {
         out.push_str("let mut fuel = c.fuel;\n");
-        if has_call && !experiment("notick") {
-            out.push_str("fuel -= 1; if fuel < 0 { c.fuel = fuel; c.out_of_fuel()?; fuel = c.fuel; }\n");
-        }
     } else {
         b = b.replace("c.fuel = fuel; ", "").replace(" fuel = c.fuel;", "");
-        if has_call && !experiment("notick") {
-            out.push_str("c.fuel -= 1; if c.fuel < 0 { c.out_of_fuel()?; }\n");
-        }
     }
+    let _ = writeln!(out, "/*E{idx}*/");
+    m.fns.push((idx, has_loop, callees, size));
     for i in 0..nl {
         if i < np {
             let _ = writeln!(out, "let mut l{i}: u64 = p{i};");
@@ -673,4 +681,133 @@ fn un_expr(op: &Operator) -> Option<&'static str> {
         I64TruncSatF64U => "(f64::from_bits(%a) as u64)",
         _ => return None,
     })
+}
+
+/// Most operators a function may run, callees included, before it must spend
+/// fuel. At 50 us slices this is noise, and it keeps tiny helpers tick-free.
+const TICK_FREE_WORK: usize = 4096;
+
+/// Spend fuel wherever long work could run without passing a loop head:
+/// - every call that can recurse (inside a cycle of the call graph),
+/// - every indirect call (it could recurse too),
+/// - the entry of any function whose worst-case work without a tick is big.
+///   Loop-free code can still blow up: f calls g twice, g calls h twice...
+///
+/// So any stretch with no tick is bounded, and a recursive call (fib) always
+/// ticks. A small helper, or the common path of a drop, never does.
+fn place_ticks(m: &Info, funcs: &str) -> String {
+    let off = m.imports.len() as u32;
+    let n = m.fns.len();
+    let at = |f: u32| (f - off) as usize;
+    // Tarjan's SCCs: they come out callees first.
+    struct T<'a> {
+        fns: &'a [(u32, bool, Vec<u32>, usize)],
+        off: u32,
+        index: Vec<usize>,
+        low: Vec<usize>,
+        on: Vec<bool>,
+        stack: Vec<usize>,
+        next: usize,
+        scc: Vec<usize>,
+        order: Vec<Vec<usize>>,
+    }
+    fn visit(t: &mut T, v: usize) {
+        t.index[v] = t.next;
+        t.low[v] = t.next;
+        t.next += 1;
+        t.stack.push(v);
+        t.on[v] = true;
+        for &g in &t.fns[v].2 {
+            let w = (g - t.off) as usize;
+            if t.index[w] == usize::MAX {
+                visit(t, w);
+                t.low[v] = t.low[v].min(t.low[w]);
+            } else if t.on[w] {
+                t.low[v] = t.low[v].min(t.index[w]);
+            }
+        }
+        if t.low[v] == t.index[v] {
+            let mut comp = vec![];
+            loop {
+                let w = t.stack.pop().unwrap();
+                t.on[w] = false;
+                t.scc[w] = t.order.len();
+                comp.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            t.order.push(comp);
+        }
+    }
+    let mut t = T {
+        fns: &m.fns,
+        off,
+        index: vec![usize::MAX; n],
+        low: vec![0; n],
+        on: vec![false; n],
+        stack: vec![],
+        next: 0,
+        scc: vec![0; n],
+        order: vec![],
+    };
+    for v in 0..n {
+        if t.index[v] == usize::MAX {
+            visit(&mut t, v);
+        }
+    }
+    // Worst-case work before the first tick. A callee that ticks on entry
+    // counts as zero: its tick starts a new stretch.
+    let mut work = vec![0usize; n];
+    let mut entry_tick = vec![false; n];
+    for comp in &t.order {
+        for &v in comp {
+            let mut w = m.fns[v].3;
+            for &g in &m.fns[v].2 {
+                let g = at(g);
+                if t.scc[g] != t.scc[v] && !entry_tick[g] {
+                    w = w.saturating_add(work[g]);
+                }
+            }
+            work[v] = w;
+            // EXPERIMENT ONLY: `entrytick` is the old rule, a tick on entry to
+            // every function that calls.
+            entry_tick[v] = if experiment("entrytick") { !m.fns[v].2.is_empty() } else { w > TICK_FREE_WORK };
+        }
+    }
+    let tick = |f: u32| {
+        if experiment("notick") {
+            ""
+        } else if m.fns[at(f)].1 {
+            "fuel -= 1; if fuel < 0 { c.fuel = fuel; c.out_of_fuel()?; fuel = c.fuel; } "
+        } else {
+            "c.fuel -= 1; if c.fuel < 0 { c.out_of_fuel()?; } "
+        }
+    };
+    let mut out = String::with_capacity(funcs.len());
+    let mut rest = funcs;
+    while let Some(i) = rest.find("/*") {
+        out.push_str(&rest[..i]);
+        let end = i + rest[i..].find("*/").unwrap() + 2;
+        let mark = &rest[i + 2..end - 2];
+        if let Some(f) = mark.strip_prefix("TI") {
+            out.push_str(tick(f.parse().unwrap()));
+        } else if let Some(f) = mark.strip_prefix('E') {
+            let f: u32 = f.parse().unwrap();
+            if entry_tick[at(f)] {
+                out.push_str(tick(f));
+            }
+        } else if let Some(fg) = mark.strip_prefix('T') {
+            let (f, g) = fg.split_once(':').unwrap();
+            let (f, g): (u32, u32) = (f.parse().unwrap(), g.parse().unwrap());
+            if t.scc[at(f)] == t.scc[at(g)] && !experiment("entrytick") {
+                out.push_str(tick(f));
+            }
+        } else {
+            out.push_str(&rest[i..end]); // not ours
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
