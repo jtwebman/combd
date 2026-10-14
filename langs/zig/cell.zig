@@ -20,6 +20,13 @@ fn print(msg: []const u8) void {
     _ = wasi.fd_write(1, &iov, iov.len, &written);
 }
 
+/// The host calls this after reading an answer. Every answer is a 64-byte buffer.
+export fn release(ptr: [*]u8, len: u32) void {
+    _ = len;
+    const buf: []u8 = ptr[0..64];
+    gpa.free(buf);
+}
+
 /// Returns the response as (ptr << 32) | len.
 export fn handle(ptr: [*]u8, len: u32) u64 {
     const req = ptr[0..len];

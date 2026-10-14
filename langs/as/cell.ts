@@ -17,6 +17,11 @@ function respond(out: string): u64 {
   return (<u64>changetype<usize>(buf) << 32) | <u64>buf.byteLength;
 }
 
+/** The host calls this after reading an answer. */
+export function release(ptr: usize, len: u32): void {
+  __unpin(ptr);
+}
+
 /** Returns the response as (ptr << 32) | len. */
 export function handle(ptr: usize, len: u32): u64 {
   const req = String.UTF8.decodeUnsafe(ptr, len);

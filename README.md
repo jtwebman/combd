@@ -85,9 +85,14 @@ See [langs/](langs/).
 
 We also built our own ahead-of-time compiler. It turns Wasm into plain safe
 Rust, so the Rust compiler proves the sandbox holds. Then it becomes machine
-code for any CPU. A sandboxed Rust cell on it, one that can be preempted and
-crashes safely, ties or beats Bun on two of our three API tests and beats
-Node on all three. It's 3x faster than the same cell on Wasmtime.
+code for any CPU.
+
+Then we raced it over HTTP, one CPU core each, against workerd, celld, Bun,
+and Node. Every server ran the same small API app. A sandboxed combd cell,
+written in Rust and able to be preempted and crash safely, handled 1.3x to
+1.6x more requests than Bun on every test. It beat celld by up to 5x and
+workerd by up to 7x, with tail latency under half a millisecond.
+**[See the race.](spike/RESULTS.md)**
 
 ## Standing on shoulders
 

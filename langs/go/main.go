@@ -31,6 +31,13 @@ func alloc(n uint32) uint32 {
 	return uint32(p)
 }
 
+// release lets go of an answer once the host has read it.
+//
+//go:wasmexport release
+func release(ptr, n uint32) {
+	delete(keep, uintptr(ptr))
+}
+
 // handle returns the response as (ptr << 32) | len.
 //
 //go:wasmexport handle

@@ -292,7 +292,13 @@ mod cell {
         p
     }
 
-    /// Returns the response as (ptr << 32) | len. The response is leaked on purpose.
+    /// The host calls this after reading an answer, so the cell can free it.
+    #[no_mangle]
+    pub extern "C" fn release(ptr: *mut u8, len: u32) {
+        drop(unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, len as usize)) });
+    }
+
+    /// Returns the response as (ptr << 32) | len. The host frees it with `release`.
     #[no_mangle]
     pub extern "C" fn handle(ptr: *mut u8, len: u32) -> u64 {
         let req = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };

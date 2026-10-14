@@ -287,7 +287,12 @@ fn response<V: CellVm>(vm: &V, r: &[u64]) -> String {
 fn request<V: CellVm>(vm: &mut V, req: &str, st: &mut HostState) -> Result<String, String> {
     start(vm, req, st)?;
     let r = finish(vm, SLICE, st)?;
-    Ok(response(vm, &r))
+    let answer = response(vm, &r);
+    // Cells that export `release` free the answer once we've read it.
+    if vm.begin("release", &[r[0] >> 32, r[0] & 0xffff_ffff]).is_ok() {
+        finish(vm, u32::MAX, st)?;
+    }
+    Ok(answer)
 }
 
 fn rss_kb() -> u64 {
@@ -713,6 +718,20 @@ mod tests {
             let got = request(&mut eng.spawn(&rs_prog).unwrap(), r, &mut HostState::default()).unwrap();
             assert_eq!(got, want, "{r}");
         }
+    }
+
+    /// Regression: answers used to leak, so a busy cell hit its memory limit
+    /// after about a million list requests and crashed.
+    #[test]
+    fn answers_are_released() {
+        let eng = interp::Interp { max_pages: 16384 };
+        let prog = eng.load(&wasm()).unwrap();
+        let mut vm = eng.spawn(&prog).unwrap();
+        let mut st = HostState::default();
+        for _ in 0..30_000 {
+            request(&mut vm, "api GET /api/users", &mut st).unwrap(); // 730 bytes each
+        }
+        assert!(vm.read(16 << 20, 1).is_none(), "memory grew past 16 MiB: answers are leaking");
     }
 
     /// Every language cell built by `langs/Dockerfile` must pass on our engine.

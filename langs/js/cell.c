@@ -55,6 +55,9 @@ __attribute__((constructor)) static void boot(void) {
 
 __attribute__((export_name("alloc"))) void *cell_alloc(uint32_t len) { return malloc(len ? len : 1); }
 
+// The host calls this after reading an answer.
+__attribute__((export_name("release"))) void cell_release(char *p, uint32_t len) { free(p); }
+
 // Returns the response as (ptr << 32) | len. An uncaught JS error crashes the cell.
 __attribute__((export_name("handle"))) uint64_t handle(char *req, uint32_t len) {
     JSValue arg = JS_NewStringLen(ctx, req, len);

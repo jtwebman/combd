@@ -10,6 +10,9 @@ static uint64_t fib(uint32_t n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
 
 __attribute__((export_name("alloc"))) void *cell_alloc(uint32_t len) { return malloc(len ? len : 1); }
 
+// The host calls this after reading an answer.
+__attribute__((export_name("release"))) void cell_release(char *p, uint32_t len) { free(p); }
+
 // Returns the response as (ptr << 32) | len.
 __attribute__((export_name("handle"))) uint64_t handle(char *req, uint32_t len) {
     char cmd[64] = {0};

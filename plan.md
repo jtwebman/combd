@@ -836,9 +836,11 @@ Next for this tier, biggest first:
    slower than V8: not viable. QuickJS on Wasmtime is 8 to 46 us per request:
    viable. **JS cells default to the Wasmtime tier.** See
    [spike/RESULTS.md](spike/RESULTS.md).
-0c. **HTTP race against workerd and celld.** The same app as a real Worker and
-   Durable Object on workerd and celld, against combd, over HTTP: requests per
-   second, latency, cold start, and memory per Durable Object.
+0c. **DONE 2026-10-13. HTTP race against workerd, celld, Bun, and Node.** Per
+   core, a Rust cell on combd beat Bun on every route (1.3x to 1.6x), celld by
+   2.7x to 5.3x, and workerd by 3.9x to 6.8x, with sub-millisecond p99. See
+   [spike/RESULTS.md](spike/RESULTS.md). Still to race: Durable Objects with
+   state, cold start over HTTP, and memory per object at scale.
 1. **Spec + decision core + simulator** for ownership and the output gate. No
    network yet.
 2. **Single node (D1).** HTTP in, route to cell, SQLite, alarms, supervisor,

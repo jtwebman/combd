@@ -47,6 +47,7 @@ impl<'a, E: Engine> Cell<'a, E> {
                 (code.parse().unwrap_or(500), rest.to_string())
             }
             Err(trap) => {
+                eprintln!("cell trapped on {req:?}: {trap}");
                 // Let it crash: the next request gets a fresh cell.
                 if let Ok(fresh) = Cell::new(self.eng, self.prog) {
                     *self = fresh;
@@ -187,6 +188,7 @@ fn process<E: Engine>(c: &mut Conn, cell: &mut Cell<E>) -> bool {
     }
     c.rbuf.drain(..used);
     if bad {
+        eprintln!("bad request: {:?}", String::from_utf8_lossy(&c.rbuf[..c.rbuf.len().min(200)]));
         c.wbuf.extend_from_slice(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
         c.close_after = true;
     }

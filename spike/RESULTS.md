@@ -399,6 +399,60 @@ What's left between us and native, biggest first:
    - Wasm SIMD support in the generator.
 3. Small fixed costs per call and per loop, already mostly squeezed.
 
+## The HTTP race: combd vs workerd, celld, Bun, and Node (Linux)
+
+The real competitors are servers, so this race is HTTP end to end
+(`bench/http/run.sh`).
+- **Same app everywhere:** `langs/js/app.js` plus a standard Worker `fetch`
+  handler, on workerd 1.20260929.1, celld v0.6.2, Bun 1.4.2, and Node 24.21
+  (its own `http` server, its best case).
+- **combd** runs the Rust cell (same routes, byte-identical answers) and the
+  JS cell (QuickJS), both on our AOT tier.
+- **Fairness:** every server gets one CPU core in Docker. `wrk` runs from its
+  own container: 32 connections, 3 s warmup, 10 s per route.
+
+Requests per second per core (higher is better), and p99 latency:
+
+| Server | GET /api/users/42 | GET /api/users | POST /api/orders | p99 |
+|---|---|---|---|---|
+| **combd, Rust cell** | **225,350** | **169,508** | **104,413** | **0.23 to 0.40 ms** |
+| Bun | 138,062 | 128,785 | 79,085 | 1.8 to 4.3 ms |
+| Node | 77,685 | 67,703 | 48,097 | 1.1 to 1.5 ms |
+| combd, JS cell (QuickJS) | 72,494 | 26,130 | 22,635 | 1.5 to 3.8 ms |
+| celld | 42,619 | 37,803 | 38,324 | 3.1 to 4.9 ms |
+| workerd | 33,207 | 29,496 | 26,580 | 600 to 990 ms |
+
+- **A sandboxed, preemptible Rust cell on combd beats Bun on every route**
+  (1.3x to 1.6x), with 5x to 10x better tail latency.
+- **It beats celld by 2.7x to 5.3x and workerd by 3.9x to 6.8x.**
+- **The QuickJS cell beats celld and workerd on the simple route** (about 2x)
+  but loses on the JSON-heavy ones. That's the QuickJS ceiling again: JS needs
+  its own compiler.
+- workerd's p99 is very high under this load on one core. We used it as
+  shipped and did not tune it.
+- `wrk` reported a few socket timeouts on several servers (combd 31, Bun 9,
+  workerd 1, out of millions). Not investigated yet.
+
+**The front door was most of the battle.** The first run used one thread per
+connection: 46k req/s and a 75 ms p99, because 32 threads were fighting over
+one core. A `mio` event loop with the cell on the same thread (no context
+switch per request) took it to 212k req/s and a 0.25 ms p99.
+
+**The arena allocator** (opt-in, per request, in the Rust cell) cut the
+JSON-parsing route from 4.5 to about 4.0 us on its own (12%).
+
+**A leak, found by let-it-crash.** In the first event-loop run, wrk saw exactly
+one failed response on each of two routes. The trap log showed why: the cell
+hit its 1 GiB memory limit and trapped. The test calling convention never
+freed answers, so after about a million list requests the memory was full. One
+request failed and a fresh cell took over, which is let-it-crash working as
+designed, but it was still a bug.
+
+The fix: cells can now export `release(ptr, len)`, which the host calls after
+reading each answer. All six language cells have it. The test
+`answers_are_released` fails without the fix. The rerun: **zero traps and
+zero failed responses across 4.9 million requests.**
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,
