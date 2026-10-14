@@ -325,12 +325,23 @@ fn all_memory<V: CellVm>(vm: &V) -> Vec<u8> {
     out
 }
 
+/// Whether memory must match after a trap too. Not for the guard-page AOT
+/// tier: LLVM may drop or merge a store around a load it doesn't know can
+/// fault (`aot-cases/precise_traps.wat`, `dead_store`). That's invisible in
+/// combd, because a trapped cell is never used again (`http::finish_task`);
+/// results, traps, and memory after every call that succeeds must still match.
+const MEMORY_AT_TRAP: bool = !cfg!(feature = "aot-guard");
+
 /// One seed on two engines, `a` (ours) and `b`, compared call by call.
 fn pair<A: Engine, B: Engine>(seed: u64, a: &A, b: &B, types: &wasmtime::Engine, st: &mut Stats) -> Result<(), String> {
-    let (bin, mut rng) = module(seed)?;
-    let (Ok(ma), Ok(mb)) = (a.load(&bin), b.load(&bin)) else { return Ok(()) };
+    let (bin, rng) = module(seed)?;
+    pair_bin(&bin, rng, a, b, types, st)
+}
+
+fn pair_bin<A: Engine, B: Engine>(bin: &[u8], mut rng: Rng, a: &A, b: &B, types: &wasmtime::Engine, st: &mut Stats) -> Result<(), String> {
+    let (Ok(ma), Ok(mb)) = (a.load(bin), b.load(bin)) else { return Ok(()) };
     st.modules += 1;
-    let wm = Module::new(types, &bin).map_err(|e| e.to_string())?;
+    let wm = Module::new(types, bin).map_err(|e| e.to_string())?;
     let funcs: Vec<(String, wasmtime::FuncType)> = wm.exports().filter_map(|e| Some((e.name().to_string(), e.ty().func()?.clone()))).collect();
     for (name, ty) in funcs {
         for _ in 0..3 {
@@ -351,6 +362,9 @@ fn pair<A: Engine, B: Engine>(seed: u64, a: &A, b: &B, types: &wasmtime::Engine,
             }
             if matches!(x, Got::Trap(_)) {
                 st.traps += 1;
+                if !MEMORY_AT_TRAP {
+                    continue;
+                }
             }
             let (ma, mb) = (all_memory(&va), all_memory(&vb));
             if ma != mb {
@@ -371,6 +385,19 @@ pub fn gen_aot(seeds: std::ops::Range<u64>, crate_src: &std::path::Path) -> Stat
     let mut st = Stats::default();
     let mut list = String::from("//! Fuzz modules from `combd-spike fuzz-gen`. Not in git.\n\n");
     let mut names = vec![];
+    // The hand-written cases first, as `c0`, `c1`, ...
+    for (i, bin) in cases().into_iter().enumerate() {
+        let src = crate::aot_gen::generate(&bin, &format!("aot case {i}")).expect("an AOT case must compile");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("c{i}.rs")), src).unwrap();
+        list.push_str(&format!("#[path = \"fuzz/c{i}.rs\"]\nmod c{i};\n"));
+        names.push(format!("c{i}::MODULE"));
+    }
+    if seeds.is_empty() && names.len() == cases().len() {
+        // `fuzz-gen 0`: clear everything out.
+        names.clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     for seed in seeds {
         let Ok((bin, _)) = module(seed) else { continue };
         if ENGINE.load(&bin).is_err() {
@@ -397,11 +424,23 @@ pub fn gen_aot(seeds: std::ops::Range<u64>, crate_src: &std::path::Path) -> Stat
     st
 }
 
+/// The hand-written AOT cases, `aot-cases/*.wat`, in name order.
+fn cases() -> Vec<Vec<u8>> {
+    let mut paths: Vec<_> = std::fs::read_dir("aot-cases").map(|r| r.filter_map(|e| Some(e.ok()?.path())).collect()).unwrap_or_default();
+    paths.sort();
+    paths.into_iter().filter(|p| p.extension().is_some_and(|x| x == "wat")).map(|p| wat::parse_file(&p).expect("a valid case")).collect()
+}
+
 /// The AOT tier against our interpreter, for the seeds `fuzz-gen` built in.
 #[cfg(feature = "aot-lite")]
 pub fn run_aot(seeds: std::ops::Range<u64>) -> Stats {
     let types = wasmtime::Engine::default();
     let mut st = Stats::default();
+    for (i, bin) in cases().into_iter().enumerate() {
+        if let Err(e) = pair_bin(&bin, Rng::new(i as u64), &ENGINE, &crate::aot::Aot, &types, &mut st) {
+            st.mismatches.push((u64::MAX - i as u64, format!("aot case {i}: {e}")));
+        }
+    }
     for seed in seeds {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pair(seed, &ENGINE, &crate::aot::Aot, &types, &mut st)));
         match r.unwrap_or_else(|_| Err("a panic outside the cell".into())) {

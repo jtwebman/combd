@@ -124,6 +124,10 @@ the full story; the short version:
   testsuite and random modules raced against Wasmtime found a wrong answer
   in our interpreter, and loads our fast compiled tier skipped instead of
   trapping. None let a cell reach outside its sandbox; all are fixed.
+- **The real danger was the host doing work a cell doesn't pay for.**
+  Fuzzing the host API found one cell could panic the host or eat seconds of
+  CPU and gigabytes of memory and disk. And any client could crash a server
+  with one bad header. Every host-side cost has its own cap now.
 - **Network splits never broke a write,** but they showed three ways a
   cut-off node held its clients too long. All three are fixed.
 - **Benchmarks on a busy laptop swing 2x to 5x.** We only trust runs that

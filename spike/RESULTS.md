@@ -1133,8 +1133,8 @@ not a bug; both get the same cap now.
 Still open: stores. LLVM may also move a store across one that faults, so
 memory at a trap could differ from Wasm's. The fuzzer compares memory after
 every trap and hasn't seen it in 1,270 modules, but that's not proof. Also
-not done yet: Wasmtime against the AOT tier directly, and fuzzing the host
-API, the HTTP parser, and the peer protocol.
+not done yet: Wasmtime against the AOT tier directly. (The host API, HTTP,
+and the wire are fuzzed now: see the next section.)
 
 **Multi-value in the AOT tier.** A compiled function with two or more
 results now returns `Result<[u64; N], Trap>`; one with 0 or 1 still returns
@@ -1145,6 +1145,53 @@ slots; blocks with several results already worked. Only imports with more
 than one result are still refused: the host interface returns one value.
 The same 1,700 fuzz seeds that had 153 modules refused now compile all
 1,270, and both AOT builds agree with the interpreter on every call.
+
+## Fuzzing the boundaries: the host API, HTTP, and the wire
+
+The sandbox wall is the host API: a cell calls host functions with pointers,
+lengths, and SQL it picked, and it even picks their types. `combd-spike
+fuzz-host N` makes random calls against a real object database: right and
+wrong arities, edge-value pointers and lengths, real iov arrays, hostile SQL,
+memories from 0 bytes to 64 MiB. After each call: the host never panics, no
+call takes over 250 ms, the alarm changes only through `alarm_set`, the
+host's transaction is still open, and no stray file appears. To make sure
+the fuzzer can see them, each bug below was put back and caught.
+
+| Bug | What one cell could do | Fix |
+|---|---|---|
+| Wrongly typed import | import `sql` with no parameters: the host indexed past its arguments and **panicked** | host calls never index arguments blindly |
+| `fd_write` | 20,000 iovs over 64 MiB: **seconds** of host time, at almost no fuel | copy only what fits under the 64 KB cap; at most 1,024 iovs |
+| Big answers | 200 rows of 15 MB: **3.8 GB** of host memory before the size check | count the answer as it grows |
+| Big values, slow steps | one statement wrote **2.9 GB** to disk; one step can build a 15 MB string, so the step limit allowed seconds | values up to 2 MB (as Cloudflare's), 100 ms per statement, 1 GiB per object |
+| Lost transaction | hitting those limits makes SQLite roll back the whole transaction: the request lost its earlier writes while the host thought it was open | that crashes the cell, so the request fails as a whole |
+| Host time per request | a cell looping over slow SQL paid almost nothing (fuel counts its own instructions) | 1 s of host time per request |
+
+After the fixes: 200,000 hostile calls, no problems; the slowest was a SQL
+statement at the 100 ms limit. One surprise on the way: the broken
+`fd_write` copied about 70 GB/s from a 1 MB memory (it stays in cache), so it
+only showed as slow with big memories. The fuzzer now uses those too.
+
+**HTTP.** Any client could crash the event loop: `Content-Length:
+18446744073709551615` wrapped `hlen + clen` past `usize::MAX`, and slicing
+the body panicked. Now a bad length, or two that disagree, is refused (RFC
+9112), and so is a body over the request cap. A test damages valid requests
+200,000 ways (flipped bytes, garbage, cut-offs, lying lengths) and the
+parser never panics.
+
+**The wire.** 100,000 damaged frames (flipped bytes, lying lengths,
+cut-offs) and 200 damaged peer logs: no panics, and whatever decodes, the
+peer store takes. The decoder was bounds-checked from the start, and it held.
+
+**Stores at a trap, in the guard-page AOT tier.** Hand-written cases
+(`spike/aot-cases/precise_traps.wat`) store, trap, and store again. One
+fails on the guard-page build: LLVM drops a store that a later one
+overwrites, not knowing the load between them can fault, so memory at the
+trap isn't what Wasm says. That's invisible in combd: a trapped cell is
+never used again (stateless cells are dropped; an object's cell goes back
+only after a request succeeds). So it's documented as an invariant rather
+than paid for on every store. The bounds-checked build is exact, and both
+builds still must match the interpreter on results, traps, and memory
+after every call that succeeds.
 
 ## Security: memory is always zero
 

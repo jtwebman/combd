@@ -448,6 +448,65 @@ fn fatal(e: std::io::Error) -> ! {
 mod tests {
     use super::*;
 
+    /// Frames from another node, damaged at random (a buggy or compromised
+    /// peer): decoding never panics, and whatever decodes, the peer store
+    /// takes without panicking. A damaged peer log replays without panicking.
+    #[test]
+    fn mangled_frames_and_logs_never_panic() {
+        let mut rng = crate::sim::Rng::new(3);
+        let ents = |rng: &mut crate::sim::Rng| (0..rng.below(4)).map(|_| vec![rng.next() as u8; rng.below(40) as usize]).collect::<Vec<_>>();
+        let mut store = PeerStore::default();
+        for i in 0..100_000u64 {
+            let f = match rng.below(5) {
+                0 => Frame::Forward { id: rng.next(), name: "room".into(), req: "do GET /".into() },
+                1 => Frame::Reply { id: rng.next(), status: 200, body: "{}".into() },
+                2 => Frame::Peer { id: 1, call: PeerCall::Append { obj: rng.below(4) as u128, epoch: rng.below(5) as u32, from: rng.below(8), ents: ents(&mut rng), trunc: rng.below(8) } },
+                3 => Frame::Peer { id: 2, call: PeerCall::Fence { obj: rng.below(4) as u128, epoch: rng.below(5) as u32 } },
+                _ => Frame::PeerReply { id: 3, res: PeerRes::Tails { born: 1, tails: vec![Tail { epoch: 1, from: 2, ents: ents(&mut rng) }] } },
+            };
+            let mut b = f.encode();
+            for _ in 0..1 + rng.below(3) {
+                let at = 4 + rng.below(b.len() as u64 - 3) as usize;
+                match rng.below(4) {
+                    0 if at < b.len() => b[at] ^= 1 << rng.below(8),
+                    1 => b.insert(at.min(b.len()), rng.next() as u8),
+                    2 => b.truncate(at),
+                    _ => {
+                        let n = rng.below(b.len() as u64) as usize;
+                        b[..4].copy_from_slice(&(n as u32).to_le_bytes()); // a length that lies
+                    }
+                }
+            }
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Ok(Frame::Peer { call, .. }) = Frame::read(&mut &b[..]) {
+                    store.handle(call);
+                }
+            }));
+            assert!(r.is_ok(), "case {i}: {b:x?}");
+        }
+        // A peer log with damage in the middle replays what it can.
+        let dir = std::env::temp_dir().join(format!("combd-peers-fuzz-{}", std::process::id()));
+        for i in 0..200u64 {
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut d = DiskPeers::open(&dir, false).unwrap();
+            for e in 1..20u32 {
+                d.handle(PeerCall::Append { obj: 1, epoch: e / 5 + 1, from: 1, ents: ents(&mut rng), trunc: 0 }, &mut |_| None).unwrap();
+            }
+            drop(d);
+            let p = dir.join("peers.log");
+            let mut bytes = std::fs::read(&p).unwrap();
+            let at = rng.below(bytes.len() as u64) as usize;
+            bytes[at] ^= 1 << rng.below(8);
+            if rng.chance(0.3) {
+                bytes.truncate(rng.below(bytes.len() as u64) as usize);
+            }
+            std::fs::write(&p, bytes).unwrap();
+            let r = std::panic::catch_unwind(|| DiskPeers::open(&dir, false).map(|_| ()));
+            assert!(matches!(r, Ok(Ok(()))), "log {i}: {r:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn peer_store_survives_restarts_torn_records_and_compaction() {
         let dir = std::env::temp_dir().join(format!("combd-peers-{}", std::process::id()));

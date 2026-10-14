@@ -120,6 +120,15 @@ interpreter); results, traps, and every byte of memory must match.
   but Wasm says it must trap. Fixed the way wasm2c does: an empty asm keeps
   every load. It costs 2% to 5%.
 
+**The host API was the weak wall.** Fuzzing it found that one cell could
+panic the host (a wrongly typed import), burn seconds of host CPU
+(`fd_write`), or take gigabytes of host memory and disk (SQL). The fix
+pattern every time: a cell's fuel only counts its own instructions, so
+everything the host does for a cell needs its own cap. Values are now 2 MB
+(as Cloudflare's), statements 100 ms, objects 1 GiB, and host time 1 s per
+request. Fuzzing HTTP found that any client could crash the event loop with
+a huge `Content-Length`.
+
 **Benchmarks on a busy laptop lie.** Runs of the same build swung 2x to 5x
 while other work ran on the machine. Only runs that alternate A and B can
 be compared. Honest totals need quiet Linux machines.
@@ -665,7 +674,9 @@ Fuzzers find those on purpose.
 **Status, 2026-10-14:** item 1 runs (`combd-spike fuzz`, `aot-fuzz.sh`), along
 with the official spec testsuite (`spectest.sh`), and both found real bugs
 (see "What building taught us"). The AOT tier handles multi-value now too.
-Still to do: Wasmtime against the AOT tier directly, and items 2 to 5.
+Item 4 (the host API) and the HTTP parser and wire are fuzzed too
+(`fuzz-host`, and tests). Still to do: Wasmtime against the AOT tier
+directly, and items 2, 3, and 5.
 
 The list:
 

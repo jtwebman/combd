@@ -900,6 +900,10 @@ impl<E: Engine> Loop<'_, E> {
     /// A request is done: put its cell back (or drop it after a crash), close
     /// its object's transaction, and say what to answer now. `None`: the
     /// answer is held until an fsync covers it.
+    ///
+    /// A cell that trapped is never used again. Its memory is half an
+    /// operation, and the guard-page AOT tier doesn't promise it's exact
+    /// at a trap either (LLVM may drop a store around a load that faults).
     fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> Option<(u16, String)> {
         let Task { mut cell, obj, origin } = t;
         let Some(name) = obj else {
@@ -1667,29 +1671,47 @@ fn split_answer(a: &str) -> (u16, String) {
 
 /// Take one whole request off the front of the read buffer.
 fn parse(c: &mut Conn) -> Result<Option<Req>, ()> {
+    parse_buf(&mut c.rbuf, &mut c.close_after)
+}
+
+/// `parse` on just the bytes read so far (and the connection's close flag),
+/// so it can be tested and fuzzed without a socket.
+fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool) -> Result<Option<Req>, ()> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
-    let hlen = match req.parse(&c.rbuf) {
+    let hlen = match req.parse(rbuf) {
         Ok(httparse::Status::Complete(n)) => n,
         Ok(httparse::Status::Partial) => return Ok(None),
         Err(_) => return Err(()),
     };
-    let mut clen = 0usize;
+    let mut clen: Option<usize> = None;
     let mut close = false;
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("content-length") {
-            clen = std::str::from_utf8(h.value).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+            // A bad length, or two that disagree, is refused (RFC 9112): read
+            // as 0, the body would be taken for the next request.
+            let v: usize = std::str::from_utf8(h.value).ok().and_then(|v| v.trim().parse().ok()).ok_or(())?;
+            if clen.is_some_and(|c| c != v) {
+                return Err(());
+            }
+            clen = Some(v);
         } else if h.name.eq_ignore_ascii_case("connection") && h.value.eq_ignore_ascii_case(b"close") {
             close = true;
         }
     }
-    if c.rbuf.len() < hlen + clen {
+    // Checked: a huge length used to wrap `hlen + clen` past usize::MAX, and
+    // slicing the body then panicked the event loop (any client could).
+    let clen = clen.unwrap_or(0);
+    if clen > MAX_REQUEST - hlen.min(MAX_REQUEST) {
+        return Err(());
+    }
+    if rbuf.len() < hlen + clen {
         // The body hasn't all arrived yet. Don't act on `connection: close`
         // until it has, or the idle connection gets closed under the request.
         return Ok(None);
     }
-    c.close_after |= close;
-    let body = String::from_utf8_lossy(&c.rbuf[hlen..hlen + clen]);
+    *close_after |= close;
+    let body = String::from_utf8_lossy(&rbuf[hlen..hlen + clen]);
     let (method, path) = (req.method.unwrap_or("GET"), req.path.unwrap_or("/"));
     // Only standard methods: `ALARM` is how the host runs an object's alarm,
     // and a client must never be able to fire one.
@@ -1716,7 +1738,7 @@ fn parse(c: &mut Conn) -> Result<Option<Req>, ()> {
     } else {
         Req::Cell(line("api", path))
     };
-    c.rbuf.drain(..hlen + clen);
+    rbuf.drain(..hlen + clen);
     Ok(Some(r))
 }
 
@@ -1753,4 +1775,73 @@ fn flush(c: &mut Conn) -> bool {
     c.wbuf.clear();
     c.wpos = 0;
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed `buf` to the parser as the event loop does: requests until it
+    /// needs more bytes or refuses. Err(()) if it panicked.
+    fn drain(buf: &[u8]) -> Result<usize, ()> {
+        let mut rbuf = buf.to_vec();
+        let mut close = false;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut n = 0;
+            while let Ok(Some(_)) = parse_buf(&mut rbuf, &mut close) {
+                n += 1;
+            }
+            n
+        }))
+        .map_err(|_| ())
+    }
+
+    /// Any client could send this: `hlen + clen` wrapped past usize::MAX,
+    /// and slicing the body panicked the event loop.
+    #[test]
+    fn a_huge_content_length_is_refused() {
+        for v in ["18446744073709551615", "18446744073709551000", "99999999999999999999999", "-1"] {
+            let req = format!("POST /do/x/incr HTTP/1.1\r\ncontent-length: {v}\r\n\r\nhi");
+            assert!(drain(req.as_bytes()).is_ok(), "content-length {v}");
+        }
+    }
+
+    /// Valid requests, damaged at random: the parser must never panic.
+    #[test]
+    fn mangled_requests_never_panic_the_parser() {
+        let base: &[&[u8]] = &[
+            b"GET /api/users/42 HTTP/1.1\r\nhost: x\r\n\r\n",
+            b"POST /do/room/msg HTTP/1.1\r\ncontent-length: 5\r\n\r\nhello",
+            b"GET /do/id/0190b5a2-7c3e-7000-8000-000000000000/count HTTP/1.1\r\n\r\n",
+            b"POST /do/new HTTP/1.1\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+            b"GET /_combd/stats HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n",
+        ];
+        let lens: &[&[u8]] = &[b"18446744073709551615", b"0", b"1", b"4294967296", b"-5", b" 3 ", b"3,3", b"999999999999"];
+        let mut rng = crate::sim::Rng::new(1);
+        for i in 0..200_000u64 {
+            let mut b = base[rng.below(base.len() as u64) as usize].to_vec();
+            for _ in 0..1 + rng.below(4) {
+                let at = rng.below(b.len() as u64 + 1) as usize;
+                match rng.below(7) {
+                    0 if !b.is_empty() => {
+                        let k = at.min(b.len() - 1);
+                        b[k] ^= 1 << rng.below(8);
+                    }
+                    1 => b.insert(at, rng.next() as u8),
+                    2 => b.truncate(at),
+                    3 => b.splice(at..at, b"\r\n".iter().copied()).for_each(drop),
+                    4 => {
+                        let mut h = b"content-length: ".to_vec();
+                        h.extend_from_slice(lens[rng.below(lens.len() as u64) as usize]);
+                        h.extend_from_slice(b"\r\n");
+                        let p = b.windows(2).position(|w| w == b"\r\n").map_or(0, |p| p + 2);
+                        b.splice(p..p, h).for_each(drop);
+                    }
+                    5 => b.extend((0..rng.below(64)).map(|_| rng.next() as u8)),
+                    _ => b.extend_from_slice(&b.clone()),
+                }
+            }
+            assert!(drain(&b).is_ok(), "case {i}: {:?}", String::from_utf8_lossy(&b));
+        }
+    }
 }
