@@ -1,7 +1,12 @@
 # combd: plan
 
-Status: thinking and research only. Nothing is built yet.
-Updated: 2026-10-13
+Status: building. The spikes grew into a working runtime: Durable Objects on
+one node (D1) and across a fleet (D2, and D3 for fast writes).
+Updated: 2026-10-14
+
+This plan was written before we built anything. Most of it held up. Where
+building taught us something, the section below says what changed and why,
+and the rest of the plan is updated to match.
 
 ## The one-line idea
 
@@ -20,6 +25,82 @@ and restarts clean. State lives in SQLite and a bucket you own.
 - **Security is not a later phase.** Built in from the first commit.
 - **Correctness is proven, not hoped for.** Formal spec and deterministic
   simulation come before features.
+
+## What building taught us
+
+Each of these started as a line in this plan, met real code or a real test,
+and changed. Numbers and details are in [spike/RESULTS.md](spike/RESULTS.md).
+
+**Our own engine was the right bet, with one gap.** We planned our own Wasm
+interpreter and kept it: against Wasmtime it won load time (about 85x),
+cell start (about 25x), crash restart (about 3x), memory, and binary size.
+It lost raw compute badly (15x to 39x), so we added an ahead-of-time tier
+that turns Wasm into safe Rust. Over HTTP, a combd cell beat Bun by 1.3x to
+1.6x per core.
+
+**JavaScript: compile it, don't interpret it.** A QuickJS spike showed
+interpreted JS can't beat Bun, not even native QuickJS. So we dropped
+QuickJS and wrote jsc, which compiles JS to a normal Wasm cell. It beats
+Node on every route; it's still 9% to 32% behind Bun.
+
+**Capturing writes: SQLite's own WAL, not a custom VFS.** The plan left this
+open. Reading the WAL's committed frames (the Litestream and LiteFS way)
+covers everything, schema changes too, with no VFS to maintain.
+
+**fsync was 90% of the cost of a write.** So answers now wait on a group
+commit (one fsync covers many writes): hot writes went up 8.3x. The event
+loop never fsyncs, and checkpoints run off the loop too.
+
+**"S3-compatible" isn't one thing.** MinIO stopped publishing images, so we
+use Silo (a MinIO fork). SeaweedFS passed one-at-a-time tests but let 2 to 6
+of 16 racing writers win one conditional write, which would let two nodes
+own one object. So every node runs a 16-writer race against its bucket at
+startup, and refuses to serve on one that fails.
+
+**The fleet must not hit Erlang's walls.** Asking "what about 100, 1,000,
+10,000 nodes, or worldwide?" gave us the scaling rules below: no full mesh,
+no chatty heartbeats, no global registry, small frames, timeouts measured
+per peer.
+
+**D3 came sooner than planned, because the scaling rules demand it.** The
+plan said "fast fleet writes, only after D2 is solid." D2 was solid, and a
+bucket round trip per write can't scale in cost or speed. So we built D3
+right after, the same careful way: spec, then simulator, then real nodes.
+- **Every peer must confirm, not "1 or 2".** One fenced peer is what stops
+  an old owner, and that only works if an acknowledgement needs them all.
+- **A dead peer slows writes, it doesn't stop them.** A write the bucket
+  already has can be acknowledged the D2 way.
+- **TLA+ found a real bug in the first design.** A new owner skipped the
+  fence because the old epoch had no manifest yet; the old owner then wrote
+  one late and served writes that were lost. Fix: fence unless the old
+  epoch was sealed.
+- **The spec asked for something a node can't do.** It read "which epoch has
+  a manifest" at the instant of the fence. Now the peer hands back every
+  epoch's tail, and the owner picks after listing the bucket.
+- **The simulator found a bug the spec couldn't,** because the cleanup that
+  caused it wasn't in the spec: peers drop old epochs' logs, which broke an
+  owner that froze and woke late. Fix: stop when a newer manifest exists.
+  Both are in the spec now.
+- **The result:** on the cluster, about 1.6x the writes and half the p50
+  (14 ms vs 28 ms), every object correct.
+
+**A peer that loses its disk is a real risk.** If it came back as the same
+node, its empty store would answer a fence knowing nothing. For now a node
+whose peer store is gone, but whose lease shows it ran before, refuses to
+start. The real fix needs its own spec work.
+
+**Network splits found three ways we held clients too long.** Safety held
+through every split, in the simulator and on the cluster. But an owner cut
+off from the bucket gave its objects up on the first lost upload; a node
+that couldn't reach the bucket kept clients waiting forever; and one cut
+off from everything but its clients held them until they timed out. Fixed
+all three: D3 keeps serving on its peers, cut-off nodes say "retry" fast,
+and nothing waits longer than a lease. With the owner cut off from the
+bucket, D3's typical stall went from 4.7 s to 1.3 s.
+
+**Benchmarks on a busy laptop lie.** Runs of the same build swung 2x to 5x
+while other work ran on the machine. Only runs that alternate A and B can
+be compared. Honest totals need quiet Linux machines.
 
 ## What happened (the news)
 
@@ -543,14 +624,15 @@ passed its spec and simulator.
 |---|---|---|---|
 | **D1: single node** | local fsync done. Bucket backup runs async. | very fast (~1 ms) | last few seconds, only if the disk dies |
 | **D2: fleet, bucket proof** | the bucket has it and ownership is re-checked | slow (~hundreds of ms, many writes share one upload) | nothing acknowledged |
-| **D3: fleet, peer proof** | 1 or 2 peers fsynced it | fast (~25 ms in celld's lab) | nothing acknowledged |
+| **D3: fleet, peer proof** | every peer of the object (2 by default) has it on disk; if one is down, the D2 proof instead | fast (~14 ms p50 on our Docker cluster, vs ~28 ms for D2) | nothing acknowledged, as long as a peer's disk survives |
 
-D1 is honest and simple, and good for many apps. D3 is where celld's hardest
-code lives (node logs, sealing, takeover recovery). We earn it last.
+All three are built. D1 is honest and simple, and good for many apps. D3 is
+where celld's hardest code lives (node logs, sealing, takeover recovery). We
+planned to earn it last; we built it right after D2, because the scaling
+rules need it, and gave it the same spec, simulator, and kill tests first.
 
-**Capturing writes:** celld diffs SQLite's WAL file, Litestream style. A simpler
-option for us: a custom SQLite VFS in the host, so we see every page write
-directly and turn it into a log entry. Decide in the D1 spike.
+**Capturing writes (decided):** read the WAL's committed frames, Litestream
+style. A custom VFS turned out not to be needed.
 
 ## Fuzzing: catch the bugs normal tests miss
 
@@ -592,8 +674,11 @@ a permanent regression test.
    latency, CAS races, and lost replies. Clocks that drift. A crash at every
    await. Seeded, so any failure replays exactly. Wasm is deterministic enough
    to include real cells in the sim, which celld couldn't do with V8.
-4. **Kill tests on real machines:** SIGKILL mid-write and delete the local disk,
-   freeze a node, cut it off from the bucket, throttle the bucket to 429s.
+4. **Kill tests on real machines:** SIGKILL mid-write, freeze a node, cut it
+   off from the bucket, from the other nodes, or both (all done, every
+   object correct). Still to do: delete a node's disk (today it must come
+   back as a new node), one-way splits on real machines, and a bucket that
+   throttles with 429s.
 5. **Fuzzing** for the HTTP parser edge, the SQL layer, and the peer protocol.
 
 ## The engine: our own Wasm interpreter (bold option)
@@ -885,12 +970,16 @@ What changes as the fleet grows:
    **D3, 2026-10-14:** spec (TLC, 39.9M states), core and simulator
    (50,000 seeds), and real nodes (peer wire, on-disk peer store). On the
    cluster D3 roughly doubles writes through a node kill and halves p50.
+   **Network splits, 2026-10-14:** 80,000 simulator seeds with splits, and
+   cluster cuts (bucket, nodes, both) keep every object correct; three
+   availability fixes came out of it.
    Next: handle a peer that lost its disk (spec first), then quiet Linux
    machines for honest numbers. See
    [spike/RESULTS.md](spike/RESULTS.md).
 4. **WebSockets** with hibernation.
 5. **Bring your own database.** Host-owned pools, Postgres first.
-6. **Fast fleet writes (D3).** Peer proofs, only after D2 is solid.
+6. **Fast fleet writes (D3).** Done early, as part of step 3 (see "What
+   building taught us").
 7. **JavaScript** (our JS-to-Rust compiler, Workers APIs next), then **more
    languages** (Python, Go) using the same cell interface. Not before the core
    is proven.
@@ -909,6 +998,11 @@ containers. Most can be built later as cells on top of the core.
 - **Multi-tenant from day one, or single-tenant first?** Recommend: design
   every boundary for hostile tenants, but ship single-tenant first. Later, run
   a separate process per tenant with seccomp/landlock as a second wall.
+- **A peer that loses its disk.** Today it must rejoin as a new node. Better:
+  a store that knows it's new, so the next owner uses another peer's tail.
+  Spec first.
+- **Lease and hint tuning under splits.** A node cut off from everything but
+  its clients still costs about 3 s, mostly one lease plus routing hints.
 - **Message format between cells.** Plain bytes (simple) or WIT types (safer,
   typed). Lean toward WIT types.
 ## Name and shipping

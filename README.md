@@ -66,51 +66,64 @@ simple API can later open the door to Python, Go, JavaScript, and more.
 
 ## Where we are
 
-**At the very start.** We read celld closely, learned from what it got right
-and what it got wrong, and wrote down how we think combd should work.
+**Further along than we planned.** We started by reading celld closely and
+writing down how we think combd should work. **[Read the plan.](plan.md)**
+Then we built, and kept score. **[See the results.](spike/RESULTS.md)**
 
-**[Read the plan.](plan.md)**
+**The engine.** We wrote our own WebAssembly interpreter and raced it against
+Wasmtime with 10,000 cells, some stuck in endless loops. The stuck cells cost
+their neighbors about 40 microseconds, instead of 146 milliseconds without
+preemption. Our interpreter started cells about 25 times faster, recovered
+from crashes about 3 times faster, used less memory, and came in 5.5 times
+smaller. It was far slower at raw math, so we also built an ahead-of-time
+compiler that turns Wasm into plain safe Rust. The Rust compiler then proves
+the sandbox holds, and it becomes machine code for any CPU.
 
-Then we ran the first experiment: a race between our own tiny interpreter and
-Wasmtime, with 10,000 cells and a few of them stuck in endless loops. The stuck
-cells cost their neighbors about 40 microseconds, instead of 146 milliseconds
-without preemption. Our interpreter started cells about 25 times faster,
-recovered from crashes about 3 times faster, used less memory, and came in
-5.5 times smaller. It is still far slower at raw math, and closing that gap is
-next. **[See the results.](spike/RESULTS.md)**
+**Languages.** Cells run in Rust, C, Zig, Go (TinyGo), and AssemblyScript
+(see [langs/](langs/)). JavaScript runs through our own JS-to-Rust compiler,
+[jsc](jsc/), and its answers match Node byte for byte.
 
-Cells already run in five languages: Rust, C, Zig, Go (TinyGo), and
-AssemblyScript (TypeScript-like). See [langs/](langs/). JavaScript runs
-through our own JS-to-Rust compiler, [jsc](jsc/), which turns an app into a
-normal Wasm cell. Its answers match Node byte for byte.
+**Speed over HTTP**, one CPU core each, the same small API app everywhere:
+- **A combd cell in Rust** handled 1.3x to 1.6x more requests than Bun. It
+  beat celld by up to 5x and workerd by up to 7x, with tail latency under
+  half a millisecond.
+- **The same app in JavaScript**, compiled by jsc, beat Node on every route
+  and celld and workerd by 2x to 4x. It's still 9% to 32% behind Bun.
+- **With a CPU-heavy neighbor on the same core**, it kept 35x to 56x Bun's
+  throughput, because combd keeps yielding and Bun can't.
 
-We also built our own ahead-of-time compiler. It turns Wasm into plain safe
-Rust, so the Rust compiler proves the sandbox holds. Then it becomes machine
-code for any CPU.
+**Durable Objects on one node.** Each object is a warm cell with its own
+SQLite file, and each answer waits until its writes are safely on disk. On
+one core, combd beat workerd's Durable Objects by 1.8x on writes, 8.3x on
+reads, and 5.7x on writes spread over 1,000 objects.
 
-Then we raced it over HTTP, one CPU core each, against workerd, celld, Bun,
-and Node. Every server ran the same small API app. A sandboxed combd cell,
-written in Rust and able to be preempted and crash safely, handled 1.3x to
-1.6x more requests than Bun on every test. It beat celld by up to 5x and
-workerd by up to 7x, with tail latency under half a millisecond.
-**[See the race.](spike/RESULTS.md)**
+**Durable Objects across a fleet.** Several combd nodes share one S3 bucket,
+which decides who owns each object. Writes are confirmed by two peer nodes,
+so they don't wait on the bucket, and the bucket gets them in batches. Kill
+a node, freeze it, or cut it off from the network, and another takes over
+with every acknowledged write intact. Each part is checked four ways: a
+TLA+ spec, a deterministic simulator with crashes, lost messages, and
+network splits, a real cluster with kill tests, and known-bad versions that
+must fail every one of them.
 
-The same app in JavaScript, compiled by jsc, beat Node on every route (1.3x
-to 2x) and celld and workerd by 2x to 4x. It is still 9% to 32% behind Bun.
-With a CPU-heavy neighbor on the same core, it kept 35x to 56x Bun's
-throughput and 55x to 88x Node's, because combd keeps yielding while they
-can't.
+## What surprised us
 
-Durable Objects now run on a single node. Each object is a warm cell with its
-own SQLite file, and each answer waits until its writes are safely on disk.
-On one core, combd beat workerd's Durable Objects by 1.8x on writes, 8.3x on
-reads, and 5.7x on writes spread over 1,000 objects. It beat celld by more.
+Building changed the plan. The [plan](plan.md#what-building-taught-us) has
+the full story; the short version:
 
-Objects also run across a fleet now: several combd nodes sharing one S3
-bucket, which decides who owns each object. Kill a node or freeze it, and
-another takes over with every acknowledged write intact. The protocol is
-checked three ways: a TLA+ spec, a deterministic simulator with crashes and
-lost messages, and a real cluster with kill tests.
+- **Interpreting JavaScript can't beat Bun,** so we compile it instead.
+- **fsync was 90% of a write.** Sharing one fsync across many writes made
+  hot writes 8.3x faster.
+- **"S3-compatible" isn't one standard.** One popular server let several
+  writers win the same conditional write. Every node now tests its bucket
+  for that before it serves.
+- **The checkers earned their keep.** The TLA+ spec found a real bug in our
+  fast-write design, and the simulator found another the spec couldn't see.
+  Both were fixed before any real node ran that code.
+- **Network splits never broke a write,** but they showed three ways a
+  cut-off node held its clients too long. All three are fixed.
+- **Benchmarks on a busy laptop swing 2x to 5x.** We only trust runs that
+  alternate A and B, and real totals need quiet Linux machines.
 
 ## Standing on shoulders
 
