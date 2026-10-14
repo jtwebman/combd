@@ -29,8 +29,20 @@
 //!   per loop, leave memory. They come back from storage when needed.
 //!
 //! `GET /_combd/stats` shows what the node is doing.
+//!
+//! **Fleet mode (D2),** when `COMBD_S3` is set (see `fleet.rs`): many nodes
+//! share one bucket, and the bucket decides who owns each object. Each loop
+//! runs a decision core (`own.rs`) for its objects. The core says when to
+//! run a request, seal its changes (changed SQLite pages), and restore an
+//! object from the bucket. An answer leaves only after its changes are in the
+//! bucket and a fresh read of the ownership record shows we still own the
+//! object: the output gate for D2, instead of a local fsync. A request for an
+//! object another node owns is forwarded there over the wire. ponytail:
+//! alarms and eviction are D1-only for now.
 
 use crate::engine::{CellVm, Engine, Outcome};
+use crate::fleet::{FleetCfg, Frame};
+use crate::own::{self, Act, Core, Effect};
 use crate::host::{now_ms, HostState};
 use crate::store::{self, AlarmIndex, Db};
 use mio::net::{TcpListener, TcpStream};
@@ -122,7 +134,43 @@ struct Shared {
     sync: Mutex<Sender<SyncJob>>,
     index: Mutex<AlarmIndex>,
     stats: Stats,
+    fleet: Option<FleetShared>,
 }
+
+/// Fleet mode: what the loops share.
+struct FleetShared {
+    cfg: FleetCfg,
+    /// Bucket work, done by a pool of threads.
+    jobs: Mutex<Sender<Job>>,
+    /// Connections to other nodes, by node.
+    links: Mutex<HashMap<own::Node, Link>>,
+    next_id: AtomicU64,
+    start: Instant,
+}
+
+enum Job {
+    Call { op: own::OpId, call: own::Call, back: usize },
+    Fetch { obj: own::Obj, act: Act, segs: Vec<String>, back: usize },
+}
+
+/// A connection to another node.
+#[derive(Clone)]
+struct Link {
+    tx: Sender<Frame>,
+    /// Forwarded requests waiting for a reply on it: frame id -> the loop waiting.
+    waiting: Arc<Mutex<HashMap<u64, usize>>>,
+    /// The connection broke: everything waiting on it got a 503.
+    dead: Arc<AtomicBool>,
+}
+
+/// A forwarded request with no reply by then gets a 503 (the peer may be
+/// frozen), so the client can retry.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bucket I/O is slow and parallel; these threads do it.
+const BUCKET_THREADS: usize = 32;
+/// How many times a request may be forwarded between nodes.
+const MAX_HOPS: u8 = 1;
 
 /// Which connection a request answers: (slot, generation).
 type Who = (usize, u64);
@@ -136,6 +184,10 @@ enum Origin {
     Remote(usize, Who),
     /// An alarm firing (due at `at`), on its `tries`-th retry.
     Alarm { at: i64, tries: u32 },
+    /// Fleet mode: a request the decision core started.
+    Fleet(own::ReqId),
+    /// Fleet mode: a request another node forwarded (connection, frame id).
+    Wire(u64, u64),
 }
 
 /// Between loops.
@@ -148,6 +200,25 @@ enum Msg {
     Synced { obj: String, gen: u64, ok: bool },
     /// The object's checkpoint finished; it can run requests again.
     Checkpointed { obj: String },
+    /// Fleet mode: a bucket call's result.
+    Bucket { op: own::OpId, res: own::Res },
+    /// Fleet mode: an object's segments, for a restore.
+    Fetched { obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String> },
+    /// Fleet mode: another node forwarded us a request.
+    WireIn { conn: u64, tx: Sender<Frame>, id: u64, name: String, req: String },
+    /// Fleet mode: the answer to a request we forwarded.
+    WireReply { id: u64, reply: (u16, String) },
+}
+
+/// Fleet mode: a request the decision core knows about.
+struct FReq {
+    origin: Origin,
+    name: String,
+    cell_req: String,
+    hops: u8,
+    act: Act,
+    /// The answer, held until the core says it's proven.
+    resp: Option<(u16, String)>,
 }
 
 struct Conn {
@@ -297,7 +368,15 @@ where
             }
         });
     }
-    let sh = Shared { cfg, peers, sync: Mutex::new(sync_tx), index, stats: Stats { checkpoints, fsyncs_slow: slow, fsync_max_us: max_us, ..Stats::default() } };
+    let fleet = FleetCfg::from_env().map(|fc| start_fleet(fc, &peers, cfg.threads));
+    let sh = Shared {
+        cfg,
+        peers,
+        sync: Mutex::new(sync_tx),
+        index,
+        stats: Stats { checkpoints, fsyncs_slow: slow, fsync_max_us: max_us, ..Stats::default() },
+        fleet,
+    };
     let sh = &sh;
     std::thread::scope(|sc| {
         for (me, (poll, inbox)) in polls.into_iter().zip(inboxes).enumerate() {
@@ -319,6 +398,13 @@ where
                     free: vec![],
                     next_gen: 0,
                     last_sweep: Instant::now(),
+                    core: sh.fleet.as_ref().map(|f| Core::new(f.cfg.node, own::Bugs::default())),
+                    freqs: HashMap::new(),
+                    next_req: 0,
+                    names: HashMap::new(),
+                    wire_conns: HashMap::new(),
+                    wire_out: HashMap::new(),
+                    last_tick: Instant::now(),
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l)) {
                     eprintln!("event loop stopped: {e}");
@@ -348,6 +434,78 @@ struct Loop<'a, E: Engine> {
     free: Vec<usize>,
     next_gen: u64,
     last_sweep: Instant,
+    // Fleet mode only.
+    core: Option<Core>,
+    freqs: HashMap<own::ReqId, FReq>,
+    next_req: own::ReqId,
+    /// Object ids back to names.
+    names: HashMap<own::Obj, String>,
+    /// Peers' connections to us, to answer their forwarded requests.
+    wire_conns: HashMap<u64, Sender<Frame>>,
+    /// Requests we forwarded: frame id -> where the answer goes, and when it gives up.
+    wire_out: HashMap<u64, (Origin, Instant)>,
+    last_tick: Instant,
+}
+
+/// Fleet mode: check the bucket, then start the bucket pool and the wire.
+fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize) -> FleetShared {
+    // The startup storage test: never serve on a bucket that can't do CAS.
+    if let Err(e) = fc.s3.check() {
+        eprintln!("combd     the bucket at {} failed the storage test: {e}", fc.s3.host);
+        std::process::exit(1);
+    }
+    println!("combd     node {} in a fleet, bucket {} passed the storage test", fc.node, fc.s3.host);
+    let (tx, rx) = channel::<Job>();
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..BUCKET_THREADS {
+        let (rx, loops, s3) = (rx.clone(), loops.to_vec(), fc.s3.clone());
+        std::thread::spawn(move || loop {
+            let Ok(job) = rx.lock().unwrap().recv() else { return };
+            let (back, msg) = match job {
+                Job::Call { op, call, back } => (back, Msg::Bucket { op, res: crate::fleet::run_call(&s3, &call) }),
+                Job::Fetch { obj, act, segs, back } => (back, Msg::Fetched { obj, act, data: crate::fleet::fetch(&s3, &segs) }),
+            };
+            let (tx, waker) = &loops[back];
+            let _ = tx.send(msg);
+            let _ = waker.wake();
+        });
+    }
+    // The wire: peers connect and forward requests; each frame goes to the
+    // loop that owns its object.
+    let wl = std::net::TcpListener::bind(("0.0.0.0", fc.wire_port)).expect("bind the wire port");
+    let loops = loops.to_vec();
+    std::thread::spawn(move || {
+        for (n, s) in wl.incoming().flatten().enumerate() {
+            let _ = s.set_nodelay(true);
+            let (wtx, wrx) = channel::<Frame>();
+            let mut w = s.try_clone().expect("clone a wire connection");
+            std::thread::spawn(move || {
+                while let Ok(f) = wrx.recv() {
+                    if f.write(&mut w).is_err() {
+                        return;
+                    }
+                }
+            });
+            let loops = loops.clone();
+            let mut r = std::io::BufReader::new(s);
+            std::thread::spawn(move || {
+                while let Ok(f) = Frame::read(&mut r) {
+                    if let Frame::Forward { id, name, req } = f {
+                        let (tx, waker) = &loops[owner(&name, threads)];
+                        let _ = tx.send(Msg::WireIn { conn: n as u64, tx: wtx.clone(), id, name, req });
+                        let _ = waker.wake();
+                    }
+                }
+            });
+        }
+    });
+    FleetShared {
+        cfg: fc,
+        jobs: Mutex::new(tx),
+        links: Mutex::new(HashMap::new()),
+        next_id: AtomicU64::new(1),
+        start: Instant::now(),
+    }
 }
 
 impl<E: Engine> Loop<'_, E> {
@@ -392,9 +550,22 @@ impl<E: Engine> Loop<'_, E> {
                 self.start_next(id)?;
                 self.settle(id)?;
             }
-            self.fire_alarms();
-            if self.last_sweep.elapsed() >= TICK {
-                self.sweep();
+            if self.core.is_some() {
+                let late: Vec<u64> = self.wire_out.iter().filter(|(_, (_, t))| t.elapsed() >= FORWARD_TIMEOUT).map(|(id, _)| *id).collect();
+                for id in late {
+                    let (origin, _) = self.wire_out.remove(&id).unwrap();
+                    self.deliver(origin, (503, "{\"error\":\"owner didn't answer\"}".into()))?;
+                }
+                // Loop 0 keeps the node's lease alive.
+                if self.me == 0 && self.last_tick.elapsed() >= Duration::from_millis(own::RENEW_MS) {
+                    self.last_tick = Instant::now();
+                    self.core_on(own::Event::Tick);
+                }
+            } else {
+                self.fire_alarms();
+                if self.last_sweep.elapsed() >= TICK {
+                    self.sweep();
+                }
             }
             // One round of the run queue: every request gets one slice.
             for _ in 0..self.tasks.len() {
@@ -471,6 +642,17 @@ impl<E: Engine> Loop<'_, E> {
                     self.next_waiting(&obj);
                     self.kick_sync(&obj);
                 }
+                Msg::Bucket { op, res } => self.core_on(own::Event::Reply { op, res }),
+                Msg::Fetched { obj, act, data } => self.fetched(obj, act, data),
+                Msg::WireIn { conn, tx, id, name, req } => {
+                    self.wire_conns.entry(conn).or_insert(tx);
+                    self.submit(Origin::Wire(conn, id), name, req);
+                }
+                Msg::WireReply { id, reply } => {
+                    if let Some((origin, _)) = self.wire_out.remove(&id) {
+                        self.deliver(origin, reply)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -492,7 +674,13 @@ impl<E: Engine> Loop<'_, E> {
                 let _ = tx.send(Msg::Reply { who, reply });
                 waker.wake()
             }
-            Origin::Alarm { .. } => Ok(()), // `finish_task` already handled it
+            Origin::Alarm { .. } | Origin::Fleet(_) => Ok(()), // `finish_task` already handled it
+            Origin::Wire(conn, id) => {
+                if let Some(tx) = self.wire_conns.get(&conn) {
+                    let _ = tx.send(Frame::Reply { id, status: reply.0, body: reply.1 });
+                }
+                Ok(())
+            }
         }
     }
 
@@ -514,6 +702,9 @@ impl<E: Engine> Loop<'_, E> {
                 }
             });
         };
+        if let Origin::Fleet(req) = origin {
+            return self.fleet_finish(name, req, cell, answer);
+        }
         let o = self.objects.get_mut(&name).expect("object of a running task");
         o.busy = false;
         o.last_used = Instant::now();
@@ -835,7 +1026,14 @@ impl<E: Engine> Loop<'_, E> {
 
     /// Run a request on an object this loop owns, now or after the ones ahead of it.
     fn submit(&mut self, origin: Origin, name: String, req: String) {
+        if self.core.is_some() && !matches!(origin, Origin::Fleet(_)) {
+            let hops = if matches!(origin, Origin::Wire(..)) { 1 } else { 0 };
+            return self.fleet_request(origin, name, req, hops);
+        }
         if !self.objects.contains_key(&name) {
+            if self.core.is_some() {
+                return; // dropped while its request waited; the core failed it
+            }
             let db = match Db::open(&store::path_for(&self.sh.cfg.data, &name)) {
                 Ok(db) => db,
                 Err(e) => {
@@ -920,6 +1118,231 @@ impl<E: Engine> Loop<'_, E> {
         self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()) });
         Ok(true)
     }
+}
+
+impl<E: Engine> Loop<'_, E> {
+    fn core_now(&self) -> u64 {
+        self.sh.fleet.as_ref().map_or(0, |f| f.start.elapsed().as_millis() as u64)
+    }
+
+    /// Hand the core an event, then do what it says.
+    fn core_on(&mut self, ev: own::Event) {
+        let now = self.core_now();
+        let effects = self.core.as_mut().expect("fleet mode").on(now, ev);
+        for e in effects {
+            self.effect(e);
+        }
+    }
+
+    fn fleet_request(&mut self, origin: Origin, name: String, cell_req: String, hops: u8) {
+        self.next_req += 1;
+        let req = self.next_req;
+        let obj = own::obj_id(&name);
+        self.names.insert(obj, name.clone());
+        self.freqs.insert(req, FReq { origin, name, cell_req, hops, act: 0, resp: None });
+        self.core_on(own::Event::Request { obj, req });
+    }
+
+    fn job(&self, job: Job) {
+        let _ = self.sh.fleet.as_ref().unwrap().jobs.lock().unwrap().send(job);
+    }
+
+    fn effect(&mut self, e: Effect) {
+        match e {
+            Effect::Call { op, call } => self.job(Job::Call { op, call, back: self.me }),
+            Effect::Answer { req, ans } => {
+                let Some(fr) = self.freqs.remove(&req) else { return };
+                let reply = match ans {
+                    own::Answer::Done { .. } => fr.resp.unwrap_or((500, "{\"error\":\"no answer\"}".into())),
+                    own::Answer::Failed => (503, "{\"error\":\"retry\"}".into()),
+                    own::Answer::Redirect(n) if fr.hops < MAX_HOPS => return self.forward(n, fr),
+                    own::Answer::Redirect(_) => (503, "{\"error\":\"retry\"}".into()),
+                };
+                let _ = self.deliver(fr.origin, reply);
+            }
+            Effect::Run { obj: _, act, req } => {
+                let Some(fr) = self.freqs.get_mut(&req) else { return };
+                fr.act = act;
+                let (name, cell_req) = (fr.name.clone(), fr.cell_req.clone());
+                self.submit(Origin::Fleet(req), name, cell_req);
+            }
+            Effect::Seal { obj, act } => {
+                let Some(name) = self.names.get(&obj).cloned() else { return };
+                let Some(o) = self.objects.get(&name) else { return };
+                let changes = {
+                    let db = o.db.lock().unwrap();
+                    let c = db.seal();
+                    // Checkpoint right after a seal, never mid-request.
+                    if c.is_ok() && !o.busy && db.wants_checkpoint() {
+                        let _ = db.checkpoint_local();
+                    }
+                    c
+                };
+                match changes {
+                    Ok(changes) => self.core_on(own::Event::Sealed { obj, act, changes }),
+                    Err(e) => {
+                        eprintln!("object {name:?}: seal failed: {e}");
+                        self.objects.remove(&name);
+                    }
+                }
+            }
+            Effect::Restore { obj, act, segs } => self.job(Job::Fetch { obj, act, segs, back: self.me }),
+            Effect::Drop { obj } => {
+                if let Some(name) = self.names.get(&obj) {
+                    if self.objects.remove(name).is_some() {
+                        self.sh.stats.objects_live.fetch_sub(1, Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// An object's segments arrived: rebuild its database, then serve.
+    fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>) {
+        let Some(name) = self.names.get(&obj).cloned() else { return };
+        let path = store::path_for(&self.sh.cfg.data, &name);
+        if self.objects.remove(&name).is_some() {
+            self.sh.stats.objects_live.fetch_sub(1, Relaxed);
+        }
+        let db = data.and_then(|segs| store::restore(&path, &segs).map_err(|e| e.to_string())).and_then(|()| Db::open(&path).map_err(|e| e.to_string()));
+        let ok = match db {
+            Ok(db) => {
+                self.sh.stats.objects_live.fetch_add(1, Relaxed);
+                self.sh.stats.objects_opened.fetch_add(1, Relaxed);
+                let o = Object {
+                    cell: None,
+                    db: Arc::new(Mutex::new(db)),
+                    busy: false,
+                    waiting: VecDeque::new(),
+                    last_used: Instant::now(),
+                    committed: 0,
+                    synced: 0,
+                    syncing: false,
+                    held: vec![],
+                    checkpointing: false,
+                };
+                self.objects.insert(name, o);
+                true
+            }
+            Err(e) => {
+                eprintln!("object {name:?}: restore failed: {e}");
+                false
+            }
+        };
+        self.core_on(own::Event::Restored { obj, act, ok });
+    }
+
+    /// A request the core ran is done: commit locally (no fsync: the bucket
+    /// is what makes it durable), hold the answer, and tell the core.
+    fn fleet_finish(&mut self, name: String, req: own::ReqId, cell: Cell<E>, answer: Result<String, String>) -> Option<(u16, String)> {
+        let Some(o) = self.objects.get_mut(&name) else { return None };
+        o.busy = false;
+        o.last_used = Instant::now();
+        let (reply, changed) = {
+            let db = o.db.lock().unwrap();
+            match answer {
+                Ok(a) => match db.commit() {
+                    Ok(w) => {
+                        o.cell = Some(cell);
+                        (split_answer(&a), w)
+                    }
+                    Err(e) => {
+                        eprintln!("object {name:?}: commit failed: {e}");
+                        db.rollback();
+                        ((500, "{\"error\":\"storage\"}".into()), false)
+                    }
+                },
+                Err(trap) => {
+                    eprintln!("object {name:?} trapped: {trap}");
+                    db.rollback();
+                    ((500, format!("{{\"error\":{trap:?}}}")), false)
+                }
+            }
+        };
+        let act = self.freqs.get_mut(&req).map(|fr| {
+            fr.resp = Some(reply);
+            fr.act
+        });
+        self.next_waiting(&name);
+        if let Some(act) = act {
+            self.core_on(own::Event::Ran { obj: own::obj_id(&name), act, req, changed });
+        }
+        None
+    }
+
+    /// Send a request to the node that owns its object, over the wire.
+    fn forward(&mut self, node: own::Node, fr: FReq) {
+        let f = self.sh.fleet.as_ref().unwrap();
+        let id = f.next_id.fetch_add(1, Relaxed);
+        let link = {
+            let mut links = f.links.lock().unwrap();
+            match links.get(&node).filter(|l| !l.dead.load(Relaxed)) {
+                Some(l) => Some(l.clone()),
+                None => f.cfg.peers.get(&node).and_then(|addr| connect(addr, self.sh.peers.clone())).inspect(|l| {
+                    links.insert(node, l.clone());
+                }),
+            }
+        };
+        let Some(link) = link else {
+            let _ = self.deliver(fr.origin, (503, "{\"error\":\"owner unreachable\"}".into()));
+            return;
+        };
+        self.sh.stats.forwarded.fetch_add(1, Relaxed);
+        link.waiting.lock().unwrap().insert(id, self.me);
+        self.wire_out.insert(id, (fr.origin, Instant::now()));
+        if link.tx.send(Frame::Forward { id, name: fr.name, req: fr.cell_req }).is_err() {
+            link.dead.store(true, Relaxed);
+            link.waiting.lock().unwrap().remove(&id);
+            if let Some((origin, _)) = self.wire_out.remove(&id) {
+                let _ = self.deliver(origin, (503, "{\"error\":\"owner unreachable\"}".into()));
+            }
+        }
+    }
+}
+
+/// Open a wire connection to a peer: a writer thread fed by the link's
+/// sender, and a reader thread that routes replies to the waiting loops. If
+/// the connection breaks, everything waiting on it gets a 503 at once.
+fn connect(addr: &str, loops: Vec<(Sender<Msg>, Arc<Waker>)>) -> Option<Link> {
+    use std::net::ToSocketAddrs;
+    // Try every address the name gives (localhost may be IPv6 first).
+    let tos = addr.to_socket_addrs().map_err(|e| eprintln!("wire: can't resolve {addr}: {e}")).ok()?;
+    let Some(s) = tos.into_iter().find_map(|to| std::net::TcpStream::connect_timeout(&to, Duration::from_millis(500)).ok()) else {
+        eprintln!("wire: can't reach {addr}");
+        return None;
+    };
+    let _ = s.set_nodelay(true);
+    let mut w = s.try_clone().ok()?;
+    let (tx, rx) = channel::<Frame>();
+    std::thread::spawn(move || {
+        while let Ok(f) = rx.recv() {
+            if f.write(&mut w).is_err() {
+                return;
+            }
+        }
+    });
+    let link = Link { tx, waiting: Arc::default(), dead: Arc::default() };
+    let (waiting, dead) = (link.waiting.clone(), link.dead.clone());
+    let mut r = std::io::BufReader::new(s);
+    std::thread::spawn(move || {
+        let send = |back: usize, id: u64, reply: (u16, String)| {
+            let (tx, waker) = &loops[back];
+            let _ = tx.send(Msg::WireReply { id, reply });
+            let _ = waker.wake();
+        };
+        while let Ok(f) = Frame::read(&mut r) {
+            if let Frame::Reply { id, status, body } = f {
+                if let Some(back) = waiting.lock().unwrap().remove(&id) {
+                    send(back, id, (status, body));
+                }
+            }
+        }
+        dead.store(true, Relaxed);
+        for (id, back) in waiting.lock().unwrap().drain() {
+            send(back, id, (503, "{\"error\":\"owner went away\"}".into()));
+        }
+    });
+    Some(link)
 }
 
 fn split_answer(a: &str) -> (u16, String) {

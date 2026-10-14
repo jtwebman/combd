@@ -24,7 +24,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-pub type Obj = u32;
+/// An object's id: a 128-bit hash of its name (`obj_id`), like Cloudflare's
+/// `idFromName`. Bucket keys use it in hex.
+pub type Obj = u128;
 pub type Node = u32;
 pub type ReqId = u64;
 pub type OpId = u64;
@@ -150,21 +152,30 @@ pub struct Bugs {
     pub reuse_epoch: bool,
 }
 
+/// An object's id from its name: the first 128 bits of SHA-256.
+pub fn obj_id(name: &str) -> Obj {
+    use sha2::{Digest, Sha256};
+    u128::from_be_bytes(Sha256::digest(name.as_bytes())[..16].try_into().unwrap())
+}
+
 pub fn own_key(o: Obj) -> String {
-    format!("own/{o}")
+    format!("own/{o:032x}")
 }
 pub fn lease_key(n: Node) -> String {
     format!("lease/{n}")
 }
+pub fn obj_prefix(o: Obj) -> String {
+    format!("obj/{o:032x}/")
+}
 pub fn manifest_key(o: Obj, e: u32) -> String {
-    format!("obj/{o}/e{e:08}/m")
+    format!("obj/{o:032x}/e{e:08}/m")
 }
 fn seg_key(o: Obj, e: u32, k: u32) -> String {
-    format!("obj/{o}/e{e:08}/s{k:08}")
+    format!("obj/{o:032x}/e{e:08}/s{k:08}")
 }
 /// The epoch and the part (`m` or `s...`) of an object key.
 pub fn parse_key(o: Obj, k: &str) -> Option<(u32, &str)> {
-    let rest = k.strip_prefix(&format!("obj/{o}/e"))?;
+    let rest = k.strip_prefix(&format!("obj/{o:032x}/e"))?;
     let (e, part) = rest.split_once('/')?;
     Some((e.parse().ok()?, part))
 }
@@ -249,6 +260,9 @@ pub struct Core {
     renewing: bool,
     /// Other nodes' heartbeats as we last saw them: (value, when it changed, by our clock).
     seen: HashMap<Node, (u64, u64)>,
+    /// Who owned an object when we last checked, and when (our clock). For
+    /// routing only: a fresh hint skips the bucket and redirects at once.
+    hints: HashMap<Obj, (Node, u64)>,
     out: Vec<Effect>,
 }
 
@@ -265,6 +279,7 @@ impl Core {
             lease: 0,
             renewing: false,
             seen: HashMap::new(),
+            hints: HashMap::new(),
             out: vec![],
         }
     }
@@ -299,7 +314,7 @@ impl Core {
                     self.call(Wait::LeaseRead, Call::Get(lease_key(self.node)));
                 }
             }
-            Event::Request { obj, req } => self.request(obj, req),
+            Event::Request { obj, req } => self.request(now, obj, req),
             Event::Ran { obj, act, req, changed } => {
                 if let Some(s) = self.serving(obj, act) {
                     if s.running.remove(&req) {
@@ -354,7 +369,15 @@ impl Core {
         }
     }
 
-    fn request(&mut self, o: Obj, req: ReqId) {
+    fn request(&mut self, now: u64, o: Obj, req: ReqId) {
+        if matches!(self.st(o).phase, Phase::Idle) {
+            if let Some(&(n, t)) = self.hints.get(&o) {
+                if now.saturating_sub(t) < LEASE_MS {
+                    return self.answer(req, Answer::Redirect(n));
+                }
+                self.hints.remove(&o);
+            }
+        }
         let st = self.st(o);
         match &st.phase {
             Phase::Serving(_) => self.run(o, req),
@@ -458,6 +481,7 @@ impl Core {
                 if now.saturating_sub(e.1) >= LEASE_MS {
                     self.cas(o, Some(etag), r.epoch + 1);
                 } else {
+                    self.hints.insert(o, (r.node, now));
                     let st = self.st(o);
                     st.phase = Phase::Idle;
                     let rs: Vec<ReqId> = st.waiting.drain(..).collect();
@@ -526,7 +550,7 @@ impl Core {
             (w @ (Wait::Prove(..) | Wait::ReadRec(_) | Wait::ReadBack(..) | Wait::List(..)), Res::Lost) => {
                 let call = match &w {
                     Wait::Prove(o, _) | Wait::ReadRec(o) | Wait::ReadBack(o, _) => Call::Get(own_key(*o)),
-                    Wait::List(o, _) => Call::List(format!("obj/{o}/")),
+                    Wait::List(o, _) => Call::List(obj_prefix(*o)),
                     _ => unreachable!(),
                 };
                 self.call(w, call);
@@ -544,7 +568,7 @@ impl Core {
 
     fn cas(&mut self, o: Obj, etag: Option<String>, next: u32) {
         if self.bugs.load_before_cas {
-            self.call(Wait::EarlyList(o, etag, next), Call::List(format!("obj/{o}/")));
+            self.call(Wait::EarlyList(o, etag, next), Call::List(obj_prefix(o)));
         } else {
             self.send_cas(o, etag, next);
         }
@@ -566,7 +590,7 @@ impl Core {
             self.write_manifest(o, e, base);
             return;
         }
-        self.call(Wait::List(o, e), Call::List(format!("obj/{o}/")));
+        self.call(Wait::List(o, e), Call::List(obj_prefix(o)));
     }
 
     /// From a listing: the last epoch before `e` with a manifest, plus that

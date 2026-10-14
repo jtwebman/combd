@@ -519,7 +519,7 @@ impl Sim {
 fn parse_manifest(k: &str) -> Option<(Obj, u32)> {
     let rest = k.strip_prefix("obj/")?;
     let (o, _) = rest.split_once('/')?;
-    let o: Obj = o.parse().ok()?;
+    let o = Obj::from_str_radix(o, 16).ok()?;
     match parse_key(o, k)? {
         (e, "m") => Some((o, e)),
         _ => None,

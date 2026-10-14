@@ -11,6 +11,7 @@
 mod aot;
 mod aot_gen;
 mod engine;
+mod fleet;
 mod host;
 mod own;
 mod s3;
