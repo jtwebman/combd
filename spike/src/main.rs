@@ -13,6 +13,7 @@ mod aot_gen;
 mod engine;
 mod host;
 mod own;
+mod s3;
 mod sim;
 mod store;
 mod http;
@@ -492,6 +493,17 @@ fn main_with(args: &[&str]) {
         ["api-bench", "wasmtime", lang] => api_bench("wasmtime", &wt::Wt::new(WT_FUEL, None), lang),
         #[cfg(feature = "aot-lite")]
         ["api-bench", "aot", lang] => api_bench("aot", &aot::Aot, lang),
+        // The startup storage test, on its own: COMBD_S3=http://host:port ...
+        ["s3-check"] => {
+            let s3 = s3::S3::from_env().expect("set COMBD_S3 (and COMBD_S3_KEY, COMBD_S3_SECRET)");
+            match s3.check() {
+                Ok(()) => println!("s3-check {}: conditional writes hold, also under a 16-way race", s3.host),
+                Err(e) => {
+                    println!("s3-check {}: UNSAFE: {e}", s3.host);
+                    std::process::exit(1);
+                }
+            }
+        }
         // The D2 ownership simulator: `sim [seeds] [bug]`.
         ["sim", ..] => {
             let n: u64 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(1000);

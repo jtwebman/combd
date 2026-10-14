@@ -30,6 +30,10 @@ httparse = "1"
 # Durable Object storage: one SQLite file per object, in the host.
 rusqlite = { version = "0.37", features = ["bundled", "hooks", "limits"] }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+# The bucket client: SigV4 signing.
+sha2 = "0.10"
+hmac = "0.12"
 wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
 
 [profile.release]
