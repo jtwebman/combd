@@ -97,11 +97,19 @@ struct Stats {
     /// Commits that wrote something, and the fsyncs that made them durable.
     commits: AtomicU64,
     fsyncs: AtomicU64,
+    checkpoints: Arc<AtomicU64>,
+    /// fsync times: slow ones (10 ms or more), and the slowest, in us.
+    fsyncs_slow: Arc<AtomicU64>,
+    fsync_max_us: Arc<AtomicU64>,
 }
 
 /// Make an object's commits up to `gen` durable, then tell loop `back`.
 struct SyncJob {
     file: Arc<std::fs::File>,
+    db_path: PathBuf,
+    /// Checkpoint after the fsync. The object is paused (no request runs on
+    /// it), so the checkpoint copies the whole WAL and the WAL can restart.
+    ckpt: bool,
     obj: String,
     gen: u64,
     back: usize,
@@ -138,6 +146,8 @@ enum Msg {
     Reply { who: Who, reply: (u16, String) },
     /// An fsync finished: the object's commits up to `gen` are on disk.
     Synced { obj: String, gen: u64, ok: bool },
+    /// The object's checkpoint finished; it can run requests again.
+    Checkpointed { obj: String },
 }
 
 struct Conn {
@@ -201,6 +211,8 @@ struct Object<E: Engine> {
     syncing: bool,
     /// Answers waiting for an fsync: (the commit they need, origin, answer).
     held: Vec<(u64, Origin, (u16, String))>,
+    /// Paused for a checkpoint: requests wait until it's done.
+    checkpointing: bool,
 }
 
 /// A parsed request.
@@ -249,20 +261,43 @@ where
     let sync_rx = Arc::new(Mutex::new(sync_rx));
     let no_fsync = std::env::var_os("COMBD_EXPERIMENT_NO_FSYNC").is_some();
     let delay = cfg.sync_delay;
+    let checkpoints = Arc::new(AtomicU64::new(0));
+    let (slow, max_us) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     for _ in 0..SYNC_THREADS {
-        let (rx, peers) = (sync_rx.clone(), peers.clone());
+        let (rx, peers, checkpoints) = (sync_rx.clone(), peers.clone(), checkpoints.clone());
+        let (slow, max_us) = (slow.clone(), max_us.clone());
         std::thread::spawn(move || loop {
             let Ok(job) = rx.lock().unwrap().recv() else { return };
             // EXPERIMENT ONLY, never ship: COMBD_EXPERIMENT_NO_FSYNC measures
             // what the fsync costs. It breaks the output gate's promise.
             std::thread::sleep(delay);
+            let t = Instant::now();
             let ok = no_fsync || job.file.sync_data().is_ok();
+            let us = t.elapsed().as_micros() as u64;
+            max_us.fetch_max(us, Relaxed);
+            if us >= 10_000 {
+                slow.fetch_add(1, Relaxed);
+            }
+            // Release the answers first; the checkpoint doesn't hold them up.
             let (tx, waker) = &peers[job.back];
-            let _ = tx.send(Msg::Synced { obj: job.obj, gen: job.gen, ok });
+            let _ = tx.send(Msg::Synced { obj: job.obj.clone(), gen: job.gen, ok });
             let _ = waker.wake();
+            // Keep the WAL small, here instead of on the event loop.
+            if job.ckpt {
+                if ok {
+                    match store::checkpoint(&job.db_path) {
+                        Ok(()) => {
+                            checkpoints.fetch_add(1, Relaxed);
+                        }
+                        Err(e) => eprintln!("object {:?}: checkpoint: {e}", job.obj),
+                    }
+                }
+                let _ = tx.send(Msg::Checkpointed { obj: job.obj });
+                let _ = waker.wake();
+            }
         });
     }
-    let sh = Shared { cfg, peers, sync: Mutex::new(sync_tx), index, stats: Stats::default() };
+    let sh = Shared { cfg, peers, sync: Mutex::new(sync_tx), index, stats: Stats { checkpoints, fsyncs_slow: slow, fsync_max_us: max_us, ..Stats::default() } };
     let sh = &sh;
     std::thread::scope(|sc| {
         for (me, (poll, inbox)) in polls.into_iter().zip(inboxes).enumerate() {
@@ -429,6 +464,13 @@ impl<E: Engine> Loop<'_, E> {
                 Msg::Run { origin, obj, req } => self.submit(origin, obj, req),
                 Msg::Reply { who, reply } => self.deliver(Origin::Local(who), reply)?,
                 Msg::Synced { obj, gen, ok } => self.synced(&obj, gen, ok)?,
+                Msg::Checkpointed { obj } => {
+                    if let Some(o) = self.objects.get_mut(&obj) {
+                        o.checkpointing = false;
+                    }
+                    self.next_waiting(&obj);
+                    self.kick_sync(&obj);
+                }
             }
         }
         Ok(())
@@ -547,16 +589,28 @@ impl<E: Engine> Loop<'_, E> {
     /// and none is running.
     fn kick_sync(&mut self, name: &str) {
         let Some(o) = self.objects.get_mut(name) else { return };
-        if o.syncing || o.committed <= o.synced {
+        if o.syncing || o.checkpointing {
             return;
         }
-        let file = o.db.lock().unwrap().wal_file();
+        let (file, db_path, wants) = {
+            let db = o.db.lock().unwrap();
+            if o.committed <= o.synced && !db.wants_checkpoint() {
+                return;
+            }
+            (db.wal_file(), db.path().to_path_buf(), db.wants_checkpoint())
+        };
+        // Pause the object for a checkpoint only between requests.
+        let ckpt = wants && !o.busy;
+        if o.committed <= o.synced && !ckpt {
+            return;
+        }
         let gen = o.committed;
         match file {
             Ok(file) => {
                 o.syncing = true;
+                o.checkpointing = ckpt;
                 self.sh.stats.fsyncs.fetch_add(1, Relaxed);
-                let job = SyncJob { file, obj: name.to_string(), gen, back: self.me };
+                let job = SyncJob { file, db_path, ckpt, obj: name.to_string(), gen, back: self.me };
                 let _ = self.sh.sync.lock().unwrap().send(job);
             }
             Err(e) => {
@@ -642,7 +696,7 @@ impl<E: Engine> Loop<'_, E> {
     fn sweep(&mut self) {
         self.last_sweep = Instant::now();
         let idle = self.sh.cfg.idle;
-        let free = |o: &Object<E>| !o.busy && o.waiting.is_empty() && !o.syncing && o.held.is_empty();
+        let free = |o: &Object<E>| !o.busy && o.waiting.is_empty() && !o.syncing && o.held.is_empty() && !o.checkpointing;
         let mut gone: Vec<String> = self.objects.iter().filter(|(_, o)| free(o) && o.last_used.elapsed() >= idle).map(|(n, _)| n.clone()).collect();
         let over = self.objects.len().saturating_sub(gone.len()).saturating_sub(self.sh.cfg.max_objects);
         if over > 0 {
@@ -660,6 +714,9 @@ impl<E: Engine> Loop<'_, E> {
 
     /// Start the next request queued on an object, skipping closed connections.
     fn next_waiting(&mut self, name: &str) {
+        if self.objects.get(name).is_some_and(|o| o.checkpointing || o.busy) {
+            return;
+        }
         while let Some((origin, req)) = self.objects.get_mut(name).and_then(|o| o.waiting.pop_front()) {
             if let Origin::Local(who) = origin {
                 if self.conn(who).is_none() {
@@ -733,7 +790,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -741,7 +798,10 @@ impl<E: Engine> Loop<'_, E> {
                     s.alarms_failed.load(Relaxed),
                     s.forwarded.load(Relaxed),
                     s.commits.load(Relaxed),
-                    s.fsyncs.load(Relaxed)
+                    s.fsyncs.load(Relaxed),
+                    s.checkpoints.load(Relaxed),
+                    s.fsyncs_slow.load(Relaxed),
+                    s.fsync_max_us.load(Relaxed)
                 );
                 self.queue_reply(who, (200, body));
             }
@@ -796,11 +856,12 @@ impl<E: Engine> Loop<'_, E> {
                 synced: 0,
                 syncing: false,
                 held: vec![],
+                checkpointing: false,
             };
             self.objects.insert(name.clone(), o);
         }
         let o = self.objects.get_mut(&name).unwrap();
-        if o.busy {
+        if o.busy || o.checkpointing {
             o.waiting.push_back((origin, req));
             return;
         }

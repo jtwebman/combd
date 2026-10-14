@@ -661,10 +661,45 @@ write. With the hold removed, it fails (the answer left in 2.5 ms). A failed
 fsync drops the object and fails its held answers, since after a failed
 fsync nothing in memory can be trusted to be on disk.
 
-Open: the hot-write p99 rose to 96 ms (p50 0.43 ms). Our guess, not yet
-checked: SQLite's automatic checkpoint runs inside a commit on the event
-loop and fsyncs the database file. The fix would be to checkpoint from the
-fsync threads.
+### Checkpoints off the event loop
+
+Our guess was that the hot-write p99 (96 ms) came from SQLite's automatic
+checkpoint running inside commits on the event loop. Moving checkpoints took
+four tries, and the guess turned out wrong. What we learned on the way:
+
+1. **A busy timeout on the object's connection** slept on the event loop
+   whenever the writer tried to restart the WAL during a checkpoint. Hot
+   writes fell 5x. Removed.
+2. **That wasn't all of it: SQLite still fsynced inside commits,** to sync
+   the WAL header after each restart (`pagerWalFrames`, found by profiling).
+   The object's connection now runs at synchronous=OFF. That's safe because
+   every sync happens elsewhere, in order: our fsync threads sync the whole
+   WAL before any answer leaves, checkpoints use their own connection at
+   NORMAL, and closing switches back to NORMAL first.
+3. **Truncating the WAL (`journal_size_limit`) made every fsync slow:** a
+   file that grows must also sync its size. The WAL now keeps its size.
+4. **A background checkpoint can't catch up with a busy object,** so the WAL
+   never restarted and checkpoints ran nonstop. Now the object alone pauses
+   while its checkpoint runs on an fsync thread (a few ms, once per about
+   1,000 pages). The event loop and other objects keep going.
+
+Old (auto-checkpoint on the loop) and new, alternating, three runs each, one
+core (req/s):
+
+| | Old | New |
+|---|---|---|
+| Write, one hot object | 46,467 to 50,899 | **52,481 to 55,995** |
+| Write, 1,000 objects | 807 to 1,048 | **1,117 to 1,804** |
+
+The event loop no longer calls fsync at all (checked by profiling), and the
+WAL stays bounded (about 10 MB).
+
+**The p99 tail is the disk, not checkpoints.** New stats (`fsyncs_slow`,
+`fsync_max_us`) show 3 to 7 fsyncs of 10 ms or more out of about 40,000 in
+10 seconds, the slowest 38 to 59 ms. Each one holds every answer waiting on
+it. Hot-write p99 in those runs: 9 to 16 ms, p50 0.41 to 0.45 ms. This is
+Docker's virtual disk on a busy Mac; a real Linux server will tell us what a
+real disk does.
 
 ### Alarms, eviction, and more than one event loop
 

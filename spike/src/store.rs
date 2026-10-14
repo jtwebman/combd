@@ -5,13 +5,19 @@
 //! commits it after. If the cell crashes, the transaction rolls back, so a
 //! crash never leaves half a request behind.
 //!
-//! Durability is a group commit. The commit itself doesn't fsync (WAL mode,
-//! synchronous=NORMAL, which can lose recent commits on power loss but never
-//! corrupts). The host fsyncs the WAL file separately, off the event loop,
+//! Durability is a group commit. The object's own connection never syncs
+//! (WAL mode, synchronous=OFF), so a commit is just a write. The host fsyncs
+//! the WAL file separately, off the event loop,
 //! and holds each answer until an fsync has covered its commit (the output
 //! gate). One fsync covers every commit made before it started, so a busy
 //! object pays one fsync for many requests, and many objects' fsyncs run at
 //! once. A client that saw an answer can trust its writes are on disk.
+//!
+//! Checkpoints (copying the WAL back into the database file) are off the
+//! event loop too: SQLite's automatic ones are turned off, and the fsync
+//! threads run a passive checkpoint (it never blocks the writer) once the WAL
+//! holds `CHECKPOINT_PAGES` pages. The WAL file is never truncated: a file
+//! that keeps its size fsyncs much faster than one that grows.
 //!
 //! SQLite runs in the host, so the cell's SQL is fenced in:
 //! - an authorizer denies ATTACH (it could open other files), PRAGMA, the
@@ -33,17 +39,23 @@ use std::sync::Arc;
 /// Progress callbacks (every 1,000 SQLite VM steps) before a statement is
 /// stopped: about 10 million steps, tens of milliseconds.
 const MAX_STEPS: u32 = 10_000;
+/// A WAL holding this many pages gets checkpointed, by the fsync threads
+/// (SQLite's own default is the same).
+pub const CHECKPOINT_PAGES: i32 = 1000;
 /// The biggest answer a cell can get back, and the biggest SQL it can send.
 pub const MAX_RESULT: usize = 16 << 20;
 
 pub struct Db {
     conn: Connection,
+    path: PathBuf,
     wal_path: PathBuf,
     /// The WAL file, opened at the first fsync. SQLite keeps it (same inode)
     /// for as long as this connection is open.
     wal: std::cell::OnceCell<Arc<std::fs::File>>,
     /// The open transaction changed something.
     wrote: std::cell::Cell<bool>,
+    /// Pages in the WAL after the last commit.
+    wal_pages: std::cell::Cell<i32>,
     /// True while the host itself runs SQL (BEGIN, COMMIT).
     host: Arc<AtomicBool>,
     steps: Arc<AtomicU32>,
@@ -59,9 +71,24 @@ pub fn path_for(dir: &Path, name: &str) -> PathBuf {
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Db> {
         let conn = Connection::open(path)?;
-        // Commits don't fsync; `wal_file` is fsynced by the host instead.
+        // This connection never syncs, not even the WAL header after a
+        // restart (that was an fsync inside commits, on the event loop). It's
+        // safe because every sync happens elsewhere, in the right order:
+        // - commits: the fsync threads sync the whole WAL file, header
+        //   included, before any answer leaves,
+        // - checkpoints: `checkpoint` uses its own connection at NORMAL, which
+        //   syncs the WAL before writing the database file, and that file after,
+        // - close: `Drop` switches back to NORMAL first, because SQLite
+        //   checkpoints when the last connection closes.
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "synchronous", "OFF")?;
+        // Checkpoints happen on the fsync threads (see `checkpoint`).
+        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        // Count the WAL's pages after each commit, to know when to checkpoint.
+        conn.wal_hook(Some(note_wal_pages));
+        // No busy timeout: a passive checkpoint never takes the write lock,
+        // and when it holds a read lock the writer just skips restarting the
+        // WAL. A timeout here would sleep on the event loop instead.
         conn.pragma_update(None, "trusted_schema", "OFF")?;
         // Many objects per node: keep each one's page cache small (256 KiB).
         conn.pragma_update(None, "cache_size", -256)?;
@@ -105,7 +132,7 @@ impl Db {
         conn.progress_handler(1000, Some(move || s.fetch_add(1, Relaxed) >= MAX_STEPS));
         let mut wal_path = path.as_os_str().to_owned();
         wal_path.push("-wal");
-        Ok(Db { conn, wal_path: wal_path.into(), wal: Default::default(), wrote: Default::default(), host, steps })
+        Ok(Db { conn, path: path.to_path_buf(), wal_path: wal_path.into(), wal: Default::default(), wrote: Default::default(), wal_pages: Default::default(), host, steps })
     }
 
     fn host_sql(&self, sql: &str) -> rusqlite::Result<()> {
@@ -124,7 +151,17 @@ impl Db {
     /// answer must wait for an fsync.
     pub fn commit(&self) -> rusqlite::Result<bool> {
         self.host_sql("COMMIT")?;
+        self.wal_pages.set(WAL_PAGES.with(|p| p.get()));
         Ok(self.wrote.replace(false))
+    }
+
+    /// The WAL is big enough to checkpoint.
+    pub fn wants_checkpoint(&self) -> bool {
+        self.wal_pages.get() >= CHECKPOINT_PAGES
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The file to fsync to make commits durable.
@@ -214,6 +251,25 @@ impl Db {
     }
 }
 
+thread_local! {
+    /// Set by SQLite's WAL hook during a commit, on the committing thread.
+    static WAL_PAGES: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+fn note_wal_pages(_: &rusqlite::hooks::Wal, pages: std::ffi::c_int) -> rusqlite::Result<()> {
+    WAL_PAGES.with(|p| p.set(pages));
+    Ok(())
+}
+
+/// Copy an object's WAL back into its database file. Runs on an fsync thread
+/// with its own connection. Passive: it copies what it can without blocking
+/// the object's writer, which then restarts the WAL from the top.
+pub fn checkpoint(path: &Path) -> rusqlite::Result<()> {
+    let conn = Connection::open(path)?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+}
+
 /// Which objects have alarms, so a restarted node finds them without opening
 /// every object. Each object's own storage is the truth; this is a hint. It's
 /// written before the object commits, so it can hold an extra entry (checked
@@ -241,6 +297,13 @@ impl AlarmIndex {
         let mut st = self.0.prepare("SELECT name, at FROM alarms")?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        self.host.store(true, Relaxed);
+        let _ = self.conn.pragma_update(None, "synchronous", "NORMAL");
     }
 }
 
@@ -338,6 +401,29 @@ mod tests {
         db.set_alarm(Some(456)).unwrap();
         db.commit().unwrap();
         assert_eq!(db.alarm(), Some(456));
+    }
+
+    #[test]
+    fn checkpoints_keep_the_wal_small() {
+        let (_d, db) = db();
+        q(&db, "CREATE TABLE t(a)");
+        let wal_len = || db.wal_file().unwrap().metadata().unwrap().len();
+        let mut max = 0;
+        for i in 0..400 {
+            db.begin().unwrap();
+            let big = format!("{{\"q\":\"INSERT INTO t VALUES (?)\",\"p\":[\"{}\"]}}", "x".repeat(40_000));
+            db.exec_json(big.as_bytes());
+            db.commit().unwrap();
+            if db.wants_checkpoint() {
+                checkpoint(db.path()).unwrap();
+            }
+            max = max.max(wal_len());
+        }
+        // 16 MB written; the WAL never held much more than one checkpoint's worth.
+        let page = 4096;
+        assert!(max < 2 * CHECKPOINT_PAGES as u64 * page, "WAL grew to {max} bytes");
+        eprintln!("largest WAL: {max} bytes");
+        assert!(q(&db, "SELECT count(*) FROM t").contains("[[400]]"));
     }
 
     #[test]
