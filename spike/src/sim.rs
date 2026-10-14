@@ -7,6 +7,10 @@
 //! - requests and replies get lost (the caller times out and can't tell),
 //! - a peer store doesn't answer while its node is down or frozen (it keeps
 //!   its entries: it's on disk),
+//! - with `splits`, the network splits for 0.5 to 5 s at a time: a node cut
+//!   off from the bucket (both ways, or one way), from the other nodes, or
+//!   from both while clients still reach it; the nodes in two groups; or one
+//!   node's messages to another dropped one way,
 //! - clocks run fast or slow, by up to 10%,
 //! - processes crash, and their supervisor starts a new one,
 //! - processes freeze; the supervisor may start a new one, and the frozen
@@ -64,12 +68,14 @@ pub struct Settings {
     pub freeze: f64,
     /// Peers per object: 0 is D2, 2 is D3.
     pub replicas: usize,
+    /// Lasting network splits, about one every 3 s.
+    pub splits: bool,
     pub bugs: Bugs,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, bugs: Bugs::default() }
+        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, bugs: Bugs::default() }
     }
 }
 
@@ -86,6 +92,10 @@ pub struct Stats {
     pub bucket_acks: u64,
     pub fences: u64,
     pub tail_entries: u64,
+    pub splits: u64,
+    /// The longest time any object went without an acknowledged write, in ms
+    /// (while traffic was running).
+    pub max_gap: u64,
 }
 
 /// A call's give-up time: after this, the caller hears `Lost`.
@@ -106,7 +116,12 @@ enum Msg {
     Tick(usize),
     Restart(Node),
     Thaw(usize),
+    /// Start the next network split.
+    Split,
 }
+
+/// One end of a network link: a node, or the bucket (`None`).
+type End = Option<Node>;
 
 /// What a process holds for one object it serves: its data.
 #[derive(Default)]
@@ -146,6 +161,10 @@ pub struct Sim {
     version: u64,
     /// Each node's peer store: on disk, so it outlives the node's processes.
     stores: HashMap<Node, PeerStore>,
+    /// Links that are down: (from, to, until).
+    cuts: Vec<(End, End, u64)>,
+    /// When each object last had a write acknowledged.
+    last_ack: HashMap<Obj, u64>,
     procs: Vec<Proc>,
     /// The process a node's traffic goes to (its supervisor's latest).
     current: HashMap<Node, usize>,
@@ -193,6 +212,8 @@ impl Sim {
             bucket: BTreeMap::new(),
             version: 0,
             stores: HashMap::new(),
+            cuts: vec![],
+            last_ack: HashMap::new(),
             procs: vec![],
             current: HashMap::new(),
             next_req: 0,
@@ -206,6 +227,10 @@ impl Sim {
         };
         for n in 0..sim.s.nodes {
             sim.spawn(n);
+        }
+        if sim.s.splits {
+            let t = 500 + sim.rng.below(3000);
+            sim.at(t, Msg::Split);
         }
         for c in 0..sim.s.clients {
             let t = sim.rng.below(100);
@@ -294,15 +319,27 @@ impl Sim {
                 }
             }
             Msg::Bucket(p, op, call, lose_reply) => {
+                let n = Some(self.procs[p].node);
+                if self.cut(n, None) {
+                    self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
+                    return Ok(());
+                }
                 let res = self.apply(&call);
-                if !lose_reply {
+                if self.cut(None, n) {
+                    // It happened, but the node never hears.
+                    self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
+                } else if !lose_reply {
                     let d = self.latency();
                     self.at(d, Msg::Proc(p, Event::Reply { op, res }));
                 }
             }
             Msg::Peer(p, op, node, call, lose_reply) => {
                 let up = self.current.get(&node).is_some_and(|&q| self.procs[q].alive && !self.procs[q].frozen);
-                if !up {
+                let from = self.procs[p].node;
+                if !up || self.cut(Some(from), Some(node)) {
+                    self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
+                } else if self.cut(Some(node), Some(from)) {
+                    self.stores.entry(node).or_default().handle(call);
                     self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
                 } else if !lose_reply {
                     let res = Res::Peer(self.stores.entry(node).or_default().handle(call));
@@ -319,6 +356,13 @@ impl Sim {
                 }
             }
             Msg::Restart(n) => self.spawn(n),
+            Msg::Split => {
+                if self.faulty() {
+                    self.split();
+                    let t = 1000 + self.rng.below(4000);
+                    self.at(t, Msg::Split);
+                }
+            }
             Msg::Thaw(p) => {
                 self.procs[p].frozen = false;
                 for ev in std::mem::take(&mut self.procs[p].held) {
@@ -327,6 +371,52 @@ impl Sim {
             }
         }
         Ok(())
+    }
+
+    fn cut(&self, from: End, to: End) -> bool {
+        // A node's own peer store is its own disk: no network in between.
+        from != to && self.cuts.iter().any(|&(a, b, until)| a == from && b == to && self.now < until)
+    }
+
+    /// Cut some links for 0.5 to 5 s.
+    fn split(&mut self) {
+        self.stats.splits += 1;
+        let until = self.now + 500 + self.rng.below(4500);
+        let nodes = self.s.nodes as u64;
+        let n = self.rng.below(nodes) as Node;
+        let others: Vec<Node> = (0..self.s.nodes).filter(|&m| m != n).collect();
+        let mut links: Vec<(End, End)> = vec![];
+        match self.rng.below(7) {
+            // Cut off from the bucket: both ways, requests only, replies only.
+            0 => links.extend([(Some(n), None), (None, Some(n))]),
+            1 => links.push((Some(n), None)),
+            2 => links.push((None, Some(n))),
+            // Cut off from the other nodes.
+            3 => links.extend(others.iter().flat_map(|&m| [(Some(n), Some(m)), (Some(m), Some(n))])),
+            // Cut off from everything but its clients.
+            4 => {
+                links.extend([(Some(n), None), (None, Some(n))]);
+                links.extend(others.iter().flat_map(|&m| [(Some(n), Some(m)), (Some(m), Some(n))]));
+            }
+            // Two groups of nodes; both still reach the bucket.
+            5 => {
+                let side: Vec<bool> = (0..self.s.nodes).map(|m| m == n || self.rng.chance(0.4)).collect();
+                for a in 0..self.s.nodes {
+                    for b in 0..self.s.nodes {
+                        if side[a as usize] != side[b as usize] {
+                            links.push((Some(a), Some(b)));
+                        }
+                    }
+                }
+            }
+            // One way: n's messages to m are dropped, m's to n get through.
+            _ => {
+                let m = others[self.rng.below(others.len() as u64) as usize];
+                links.push((Some(n), Some(m)));
+            }
+        }
+        self.cuts.retain(|c| c.2 > self.now);
+        self.cuts.extend(links.into_iter().map(|(a, b)| (a, b, until)));
     }
 
     fn maybe_fault(&mut self, p: usize) {
@@ -513,6 +603,12 @@ impl Sim {
                             return Err(format!("write {w} acknowledged but not in its own history"));
                         }
                         self.acked.insert(w, (pd.obj, epoch, self.now));
+                        if let Some(&t) = self.last_ack.get(&pd.obj) {
+                            if self.now <= self.s.duration {
+                                self.stats.max_gap = self.stats.max_gap.max(self.now - t);
+                            }
+                        }
+                        self.last_ack.insert(pd.obj, self.now);
                         self.stats.writes_acked += 1;
                     }
                     None => {
@@ -583,9 +679,13 @@ fn parse_manifest(k: &str) -> Option<(Obj, u32)> {
 
 /// Run `seeds` seeds; the first failing seed and why.
 pub fn run_many(seeds: std::ops::Range<u64>, replicas: usize, bugs: Bugs) -> (Stats, Option<(u64, String)>) {
+    run_with(seeds, &|| Settings { replicas, bugs, ..Settings::default() })
+}
+
+pub fn run_with(seeds: std::ops::Range<u64>, settings: &dyn Fn() -> Settings) -> (Stats, Option<(u64, String)>) {
     let mut total = Stats::default();
     for seed in seeds {
-        let mut sim = Sim::new(seed, Settings { replicas, bugs, ..Settings::default() });
+        let mut sim = Sim::new(seed, settings());
         let r = sim.run();
         for p in &sim.procs {
             total.peer_acks += p.core.stats.peer_acks;
@@ -601,6 +701,8 @@ pub fn run_many(seeds: std::ops::Range<u64>, replicas: usize, bugs: Bugs) -> (St
         total.epochs += s.epochs;
         total.crashes += s.crashes;
         total.freezes += s.freezes;
+        total.splits += s.splits;
+        total.max_gap = total.max_gap.max(s.max_gap);
         if let Err(e) = r {
             return (total, Some((seed, e)));
         }
@@ -636,6 +738,15 @@ mod tests {
         // Mostly the fast way; takeovers really fence and recover tails.
         assert!(s.peer_acks > 2 * s.bucket_acks && s.bucket_acks > 0, "{s:?}");
         assert!(s.fences > 50 && s.tail_entries > 50, "{s:?}");
+    }
+
+    #[test]
+    fn splits_keep_every_invariant() {
+        for replicas in [0, 2] {
+            let (s, bad) = run_with(0..300, &|| Settings { replicas, splits: true, ..Settings::default() });
+            assert!(bad.is_none(), "replicas {replicas}: {bad:?}");
+            assert!(s.splits > 1000 && s.writes_acked > 10_000, "{s:?}");
+        }
     }
 
     /// Each known-bad version must be caught, or the oracle is blind.

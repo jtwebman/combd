@@ -976,6 +976,51 @@ peer store is gone refuses to start. The real fix (a store that knows it's
 new, and an owner that then uses another peer's tail) needs its own spec
 work first. Also, a peer no longer skips ahead past what the bucket has.
 
+## Network splits
+
+**In the simulator** (`combd-spike sim N none 2 splits`, or `only-splits`
+for no other faults). A split lasts 0.5 to 5 s and comes about every 3 s.
+It cuts off a node from the bucket (both ways, requests only, or replies
+only), from the other nodes, or from everything but its clients. It can also
+split the nodes into two groups, or drop one node's messages to another
+one way.
+
+**Safety: 80,000 seeds, every invariant held.** D2 and D3, with splits on
+top of the other faults and with splits alone: 13.1 million acknowledged
+writes through 526,000 splits. With splits as the only fault, all nine
+planted bugs are still caught. The scary case, an owner cut off from the
+bucket but still reaching its peers, is exactly where the no-fence bug
+fails, on seed 0.
+
+**Availability: the splits found three ways we held clients too long.**
+Measured as the longest time an object went without an acknowledged write,
+median over 100 seeds, one kind of split at a time:
+
+| Split | D2 before | D2 after | D3 before | D3 after |
+|---|---|---|---|---|
+| node cut off from the bucket | 5.3 s | 3.2 s | 4.7 s | 1.3 s |
+| node cut off from everything but clients | 5.3 s | 3.2 s | 5.6 s | 3.4 s |
+| node cut off from the other nodes | 1.1 s | 1.1 s | 1.2 s | 1.2 s |
+| two groups of nodes | 1.1 s | 1.1 s | 1.2 s | 1.2 s |
+| one way, node to node | 1.0 s | 1.0 s | 1.1 s | 1.1 s |
+
+The fixes:
+1. **D3 keeps serving when an upload is lost.** The peers hold the entries,
+   so the owner retries on the next tick instead of giving the object up.
+   The retry is the exact same segment: the lost one may have landed, and
+   two segments must never overlap.
+2. **A node that can't reach the bucket fails its requests now** instead of
+   retrying forever, so clients go to another node. All six simulated
+   clients had ended up stuck on one cut-off node, stalling even objects on
+   healthy nodes.
+3. **A request unconfirmed for a whole lease gets "retry".** A node cut off
+   from everything but its clients can't confirm anything; it shouldn't
+   hold them.
+
+What's left in the 3 s cases is the lease plus routing hints: other nodes
+keep sending clients to the cut-off owner for about a lease before they
+decide it's gone. That's tuning, not safety.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

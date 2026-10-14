@@ -649,7 +649,7 @@ fn main_with(args: &[&str]) {
                 }
             }
         }
-        // The ownership simulator: `sim [seeds|A..B] [bug|none] [replicas]`.
+        // The ownership simulator: `sim [seeds|A..B] [bug|none] [replicas] [splits|only-splits]`.
         ["sim", ..] => {
             // `N` seeds from 0, or `A..B` to replay some.
             let seeds = match args.get(1).and_then(|v| v.split_once("..")) {
@@ -671,7 +671,16 @@ fn main_with(args: &[&str]) {
             }
             let replicas = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
             let t = Instant::now();
-            let (stats, bad) = sim::run_many(seeds, replicas, bugs);
+            // `splits`: add network splits; `only-splits`: splits and no other faults.
+            let splits = matches!(args.get(4).copied(), Some("splits" | "only-splits"));
+            let only = args.get(4) == Some(&"only-splits");
+            let (stats, bad) = sim::run_with(seeds, &|| {
+                let mut s = sim::Settings { replicas, bugs, splits, ..Default::default() };
+                if only {
+                    (s.lost, s.crash, s.freeze) = (0.0, 0.0, 0.0);
+                }
+                s
+            });
             println!("sim      {n} seeds in {:.1} s: {stats:?}", t.elapsed().as_secs_f64());
             if let Some((seed, why)) = bad {
                 println!("sim      seed {seed} broke an invariant: {why}");

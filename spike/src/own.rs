@@ -357,9 +357,9 @@ enum Wait {
     PrevManifest(Obj, u32, Vec<String>, u64, u32),
     TailSeg(Obj, u32, Vec<String>),
     Manifest(Obj, u32),
-    /// Serving: an upload up to entry N, a peer append (peer index, round),
-    /// a proof (round, entries uploaded).
-    Upload(Obj, u32, u64),
+    /// Serving: an upload up to entry N (a retry?), a peer append (peer
+    /// index, round), a proof (round, entries uploaded).
+    Upload(Obj, u32, u64, bool),
     Append(Obj, u32, usize, u64),
     Prove(Obj, u32, u64, u64),
     /// Marking the record sealed; nothing waits on it.
@@ -408,6 +408,8 @@ struct PeerSt {
 struct Pend {
     need: u64,
     round: u64,
+    /// When it started waiting (our clock).
+    since: u64,
     reqs: Vec<ReqId>,
 }
 
@@ -424,6 +426,11 @@ struct Serve {
     /// Entries `uploaded + 1 ..= made`.
     ents: VecDeque<Vec<u8>>,
     uploading: bool,
+    /// D3: an upload was lost. Wait for a tick, then send the very same one
+    /// again (up to this entry): it may have landed, and two segments must
+    /// never overlap.
+    upload_wait: bool,
+    retry_upto: Option<u64>,
     /// Rounds count up; every new `Pend` gets the next one.
     round: u64,
     proving: bool,
@@ -500,6 +507,8 @@ pub struct Core {
     /// routing only: a fresh hint skips the bucket and redirects at once.
     hints: HashMap<Obj, (Node, u64)>,
     pub stats: CoreStats,
+    /// The time of the event being handled.
+    now: u64,
     out: Vec<Effect>,
 }
 
@@ -526,6 +535,7 @@ impl Core {
             seen: HashMap::new(),
             hints: HashMap::new(),
             stats: CoreStats::default(),
+            now: 0,
             out: vec![],
         }
     }
@@ -596,6 +606,7 @@ impl Core {
     }
 
     pub fn on(&mut self, now: u64, ev: Event) -> Vec<Effect> {
+        self.now = now;
         match ev {
             Event::Tick => {
                 if self.renews && !self.renewing {
@@ -603,9 +614,21 @@ impl Core {
                     self.call(Wait::LeaseRead, Call::Get(lease_key(self.node)));
                 }
                 let live: Vec<Obj> = self.objs.iter().filter(|(_, st)| matches!(st.phase, Phase::Serving(_))).map(|(&o, _)| o).collect();
+                let lease_ms = self.lease_ms;
                 for o in live {
+                    let mut late = vec![];
                     if let Phase::Serving(s) = &mut self.st(o).phase {
                         s.peers.iter_mut().for_each(|p| p.retry = p.down);
+                        s.upload_wait = false;
+                        // Unconfirmed for a whole lease: we're likely cut
+                        // off. Don't hold the clients; "retry" sends them
+                        // elsewhere. (It may still commit: that's allowed.)
+                        while s.pends.front().is_some_and(|f| now.saturating_sub(f.since) > lease_ms) {
+                            late.extend(s.pends.pop_front().unwrap().reqs);
+                        }
+                    }
+                    for r in late {
+                        self.answer(r, Answer::Failed);
                     }
                     self.kick(o);
                 }
@@ -627,7 +650,7 @@ impl Core {
                     s.made += 1;
                     s.ents.push_back(changes);
                     s.round += 1;
-                    s.pends.push_back(Pend { need: s.made, round: s.round, reqs });
+                    s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs });
                     self.flush(obj);
                     self.kick(obj);
                 }
@@ -677,6 +700,8 @@ impl Core {
             uploaded: 0,
             ents: VecDeque::new(),
             uploading: false,
+            upload_wait: false,
+            retry_upto: None,
             round: 0,
             proving: false,
             proof: (0, 0),
@@ -723,6 +748,7 @@ impl Core {
     /// Turn what has run into an entry (a seal), or, for reads only, into a
     /// wait for the next confirmation.
     fn flush(&mut self, o: Obj) {
+        let now = self.now;
         let Phase::Serving(s) = &mut self.st(o).phase else { return };
         if s.sealing.is_some() || s.batch.is_empty() {
             return;
@@ -734,7 +760,7 @@ impl Core {
             self.out.push(Effect::Seal { obj: o, act });
         } else {
             s.round += 1;
-            s.pends.push_back(Pend { need: s.made, round: s.round, reqs });
+            s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs });
             self.kick(o);
         }
     }
@@ -769,10 +795,12 @@ impl Core {
             peer_calls.push((Wait::Append(o, e, i, s.round), p.node, PeerCall::Append { obj: o, epoch: e, from, ents, trunc }));
         }
         let mut calls = vec![];
-        if !s.uploading && s.uploaded < s.made {
+        if !s.uploading && !s.upload_wait && s.uploaded < s.made {
             s.uploading = true;
-            let seg = Val::Seg(frame(&s.ents));
-            calls.push((Wait::Upload(o, e, s.made), Call::Put(seg_key(o, e, s.made), seg, Cond::IfAbsent)));
+            let upto = s.retry_upto.unwrap_or(s.made);
+            let seg = Val::Seg(frame(s.ents.iter().take((upto - s.uploaded) as usize)));
+            let retry = s.retry_upto.is_some();
+            calls.push((Wait::Upload(o, e, upto, retry), Call::Put(seg_key(o, e, upto), seg, Cond::IfAbsent)));
         }
         // The bucket way: only with no peers, or one that's down.
         if let Some(f) = s.pends.front() {
@@ -991,9 +1019,12 @@ impl Core {
             }
 
             // ---- 3. serve ----
-            (Wait::Upload(o, e, upto), Res::Put(Ok(_))) => {
+            // On a retry, "already there" means the lost one landed: only
+            // this epoch's owner writes its keys.
+            (Wait::Upload(o, e, upto, retry), Res::Put(r)) if r.is_ok() || retry => {
                 let Some(s) = self.serving_in(o, e) else { return };
                 s.uploading = false;
+                s.retry_upto = None;
                 s.ents.drain(..(upto - s.uploaded) as usize);
                 s.uploaded = upto;
                 self.kick(o);
@@ -1032,25 +1063,27 @@ impl Core {
                 s.proving = false;
                 self.kick(o);
             }
-            // Bare reads are safe to repeat.
-            (w @ (Wait::ReadRec(_) | Wait::ReadBack(..) | Wait::List(..)), Res::Lost) => {
-                let call = match &w {
-                    Wait::ReadRec(o) | Wait::ReadBack(o, _) => Call::Get(own_key(*o)),
-                    Wait::List(o, _) => Call::List(obj_prefix(*o)),
-                    _ => unreachable!(),
-                };
-                self.call(w, call);
+            // D3: a lost upload while serving. The peers hold the entries,
+            // so keep serving and try again on the next tick.
+            (Wait::Upload(o, e, upto, _), Res::Lost) if self.serving_in(o, e).is_some_and(|s| !s.peers.is_empty()) => {
+                let s = self.serving_in(o, e).unwrap();
+                s.uploading = false;
+                s.upload_wait = true;
+                s.retry_upto = Some(upto);
             }
-            // A lost or refused upload while serving: give the object up. Its
-            // acknowledged entries are on the peers or already uploaded.
-            (Wait::Upload(o, e, _), _) => {
+            // D2 (nothing can be acknowledged without the bucket), or a
+            // refused upload: give the object up. Its acknowledged entries
+            // are on the peers or already uploaded.
+            (Wait::Upload(o, e, ..), _) => {
                 if self.serving_in(o, e).is_some() {
                     self.drop_obj(o);
                 }
             }
-            // Anything else while starting (a lost manifest, a failed
-            // condition, a missing manifest): give the object up. Safe, and
-            // the client retries.
+            // Anything else while starting (a lost read or write, a failed
+            // condition, a missing manifest): give the object up, and fail
+            // its requests now. A node that can't reach the bucket mustn't
+            // hold clients; they retry, maybe on another node. Safe: a
+            // claim given up is just an epoch nobody serves.
             (w, _) => {
                 if let Some(o) = w.obj() {
                     if matches!(self.st(o).phase, Phase::Starting) {
