@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "aot")]
+#[cfg(feature = "aot-lite")]
 mod aot;
 mod aot_gen;
 mod engine;
@@ -175,6 +175,44 @@ fn js_bench<E: Engine>(name: &str, eng: &E) {
         let out = request(&mut vm, r, &mut st).unwrap();
         let head: String = out.chars().take(40).collect();
         println!("js       {name:<9} {label:<22} {:>9.1} us   -> {} bytes: {head}", us(per), out.len());
+    }
+}
+
+/// The same API requests as the JS cell, on the Rust cell.
+fn api_bench<E: Engine>(name: &str, eng: &E) {
+    let (_, reqs) = js_cell();
+    let prog = eng.load(&wasm()).unwrap();
+    let mut vm = eng.spawn(&prog).unwrap();
+    let mut st = HostState::default();
+    for r in reqs.iter().filter(|r| r.starts_with("api")) {
+        let label: String = r.chars().take(22).collect();
+        for _ in 0..200 {
+            request(&mut vm, r, &mut st).unwrap();
+        }
+        let n = 5000;
+        let t = Instant::now();
+        for _ in 0..n {
+            request(&mut vm, r, &mut st).unwrap();
+        }
+        let out = request(&mut vm, r, &mut st).unwrap();
+        println!("rust-api {name:<9} {label:<22} {:>9.2} us   -> {} bytes", us(t.elapsed() / n), out.len());
+    }
+}
+
+fn api_bench_native() {
+    let (_, reqs) = js_cell();
+    for r in reqs.iter().filter(|r| r.starts_with("api")) {
+        let label: String = r.chars().take(22).collect();
+        for _ in 0..200 {
+            combd_guest::run(r, || 1);
+        }
+        let n = 5000;
+        let t = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(combd_guest::run(std::hint::black_box(r), || 1));
+        }
+        let out = combd_guest::run(r, || 1);
+        println!("rust-api {:<9} {label:<22} {:>9.2} us   -> {} bytes", "native", us(t.elapsed() / n), out.len());
     }
 }
 
@@ -469,6 +507,12 @@ fn main() {
             }
         }
         ["compute", "native"] => compute_native(),
+        ["api-bench", "native"] => api_bench_native(),
+        ["api-bench", "interp"] => api_bench("interp", &interp::Interp { max_pages: 16384 }),
+        #[cfg(feature = "wasmtime")]
+        ["api-bench", "wasmtime"] => api_bench("wasmtime", &wt::Wt::new(WT_FUEL, None)),
+        #[cfg(feature = "aot-lite")]
+        ["api-bench", "aot"] => api_bench("aot", &aot::Aot),
         ["aot-gen", input, output] => {
             let wasm = std::fs::read(input).unwrap();
             match aot_gen::generate(&wasm, input) {
@@ -482,13 +526,13 @@ fn main() {
                 }
             }
         }
-        #[cfg(feature = "aot")]
+        #[cfg(feature = "aot-lite")]
         ["js-bench", "aot"] => js_bench("aot", &aot::Aot),
-        #[cfg(feature = "aot")]
+        #[cfg(feature = "aot-lite")]
         ["js-mem", "aot"] => js_mem("aot", &aot::Aot),
-        #[cfg(feature = "aot")]
+        #[cfg(feature = "aot-lite")]
         ["langs", "aot"] => std::process::exit(if langs("aot", &aot::Aot) { 0 } else { 1 }),
-        #[cfg(feature = "aot")]
+        #[cfg(feature = "aot-lite")]
         [test, "aot"] => run(test, "aot", &aot::Aot),
         ["js"] => {
             let me = std::env::current_exe().unwrap();
@@ -544,7 +588,7 @@ mod tests {
         assert_eq!(answers(&interp::Interp { max_pages: 16384 }), answers(&wt::Wt::new(WT_FUEL, None)));
     }
 
-    #[cfg(feature = "aot")]
+    #[cfg(feature = "aot-lite")]
     #[test]
     fn aot_matches_interp() {
         assert_eq!(answers(&aot::Aot), answers(&interp::Interp { max_pages: 16384 }));
@@ -625,6 +669,27 @@ mod tests {
             local.get $x                       ;; 3
             i32.sub))"#;
         assert!(matches!(run_wat(src, "f"), Outcome::Done(r) if r == [7]));
+    }
+
+    /// The Rust API routes must answer byte-for-byte like the JS app.
+    #[test]
+    fn rust_api_matches_js() {
+        let Ok(js) = std::fs::read(format!("{LANGS}/js.wasm")) else {
+            eprintln!("skipping: build langs/out first");
+            return;
+        };
+        let (_, reqs) = js_cell();
+        let eng = interp::Interp { max_pages: 16384 };
+        let js_prog = eng.load(&js).unwrap();
+        let rs_prog = eng.load(&wasm()).unwrap();
+        for r in reqs.iter().filter(|r| r.starts_with("api")) {
+            let mut jvm = eng.spawn(&js_prog).unwrap();
+            let mut st = HostState::default();
+            init(&mut jvm, &mut st).unwrap();
+            let want = request(&mut jvm, r, &mut st).unwrap();
+            let got = request(&mut eng.spawn(&rs_prog).unwrap(), r, &mut HostState::default()).unwrap();
+            assert_eq!(got, want, "{r}");
+        }
     }
 
     /// Every language cell built by `langs/Dockerfile` must pass on our engine.

@@ -12,11 +12,15 @@ resolver = "3"
 [features]
 default = ["wasmtime"]
 # The AOT tier. Needs spike/aot/src/gen_*.rs, made by `aot.sh`.
-aot = ["dep:combd-aot"]
+aot = ["aot-lite", "combd-aot/js"]
+# The AOT tier with only the Rust cell: builds in seconds, for experiments.
+aot-lite = ["dep:combd-aot"]
+# EXPERIMENT ONLY: see combd-aot's `experiment-unchecked`.
+aot-unchecked-experiment = ["aot-lite", "combd-aot/experiment-unchecked"]
 
 [dependencies]
 combd-guest = { path = "../guest" }
-combd-aot = { path = "aot", optional = true }
+combd-aot = { path = "aot", optional = true, default-features = false }
 wasmparser = "0.261"
 wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
 

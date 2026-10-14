@@ -3,10 +3,11 @@
 //! Memory safety comes from rustc: no `unsafe` anywhere, every memory access is
 //! bounds-checked, and every trap is an `Err` passed back up the call chain.
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "experiment-unchecked"), forbid(unsafe_code))]
 
 pub mod rt;
 
+#[cfg(feature = "js")]
 mod gen_js;
 mod gen_rust;
 
@@ -14,12 +15,15 @@ mod gen_rust;
 pub struct Compiled {
     pub hash: u64,
     pub imports: &'static [(&'static str, &'static str, u32)],
-    pub new: fn(Box<dyn rt::Host>) -> Result<rt::Ctx, rt::Trap>,
+    pub new: fn(Box<dyn rt::Host>) -> Result<(rt::Ctx, rt::Mem), rt::Trap>,
     pub export: fn(&str) -> Option<u32>,
-    pub call: fn(&mut rt::Ctx, u32, &[u64]) -> Result<Vec<u64>, rt::Trap>,
+    pub call: fn(&mut rt::Ctx, &mut rt::Mem, u32, &[u64]) -> Result<Vec<u64>, rt::Trap>,
 }
 
+#[cfg(feature = "js")]
 pub static MODULES: &[Compiled] = &[gen_rust::MODULE, gen_js::MODULE];
+#[cfg(not(feature = "js"))]
+pub static MODULES: &[Compiled] = &[gen_rust::MODULE];
 
 /// FNV-1a, the cache key for "is there an AOT build of these bytes?".
 pub fn hash(wasm: &[u8]) -> u64 {

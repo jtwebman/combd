@@ -7,7 +7,7 @@
 
 use crate::engine::{CellVm, Engine, Import, Outcome};
 use crate::host::{self, HostState, Mem};
-use combd_aot::rt::{Ctx, Host};
+use combd_aot::rt::{Ctx, Host, Mem as AotMem};
 use combd_aot::Compiled;
 
 /// Ticks (loop iterations) one call may run before it is killed.
@@ -64,6 +64,7 @@ impl Host for AotHost {
 
 pub struct AotVm {
     c: Ctx,
+    mem: AotMem,
     m: &'static Compiled,
     pending: Option<(u32, Vec<u64>)>,
 }
@@ -79,7 +80,8 @@ impl Engine for Aot {
     fn spawn(&self, m: &&'static Compiled) -> Result<AotVm, String> {
         let imports = m.imports.iter().map(|(md, n, r)| Import { module: md.to_string(), name: n.to_string(), results: *r }).collect();
         let host = Box::new(AotHost { imports, st: HostStateBox::default() });
-        Ok(AotVm { c: (m.new)(host).map_err(|t| t.to_string())?, m, pending: None })
+        let (c, mem) = (m.new)(host).map_err(|t| t.to_string())?;
+        Ok(AotVm { c, mem, m, pending: None })
     }
 }
 
@@ -93,8 +95,9 @@ impl CellVm for AotVm {
     fn run(&mut self, _reductions: u32) -> Outcome {
         let Some((f, args)) = self.pending.take() else { return Outcome::Trap("cell is not running".into()) };
         self.c.fuel = CPU_LIMIT;
-        match (self.m.call)(&mut self.c, f, &args) {
+        match (self.m.call)(&mut self.c, &mut self.mem, f, &args) {
             Ok(r) => Outcome::Done(r),
+            Err(combd_aot::rt::Trap::Host) => Outcome::Trap(self.c.host_err.take().unwrap_or_default()),
             Err(t) => Outcome::Trap(t.to_string()),
         }
     }
@@ -102,11 +105,11 @@ impl CellVm for AotVm {
     fn resume(&mut self, _results: &[u64]) {}
 
     fn read(&self, ptr: u32, len: u32) -> Option<Vec<u8>> {
-        self.c.mem.get(ptr as usize..(ptr as usize).checked_add(len as usize)?).map(<[u8]>::to_vec)
+        self.mem.get(ptr as usize, len as usize).map(<[u8]>::to_vec)
     }
 
     fn write(&mut self, ptr: u32, bytes: &[u8]) -> bool {
-        match self.c.mem.get_mut(ptr as usize..ptr as usize + bytes.len()) {
+        match self.mem.get_mut(ptr as usize, bytes.len()) {
             Some(to) => {
                 to.copy_from_slice(bytes);
                 true
@@ -125,6 +128,6 @@ impl CellVm for AotVm {
 
     /// Between calls a compiled cell is plain data, so it can be copied.
     fn snapshot(&self) -> Option<AotVm> {
-        self.pending.is_none().then(|| AotVm { c: self.c.clone(), m: self.m, pending: None })
+        self.pending.is_none().then(|| AotVm { c: self.c.clone(), mem: self.mem.clone(), m: self.m, pending: None })
     }
 }

@@ -433,7 +433,16 @@ checkers. So we treat this as an experiment with a scoreboard, like phase 0.
   per instance, tail latency, and short requests, even where V8 still wins
   long-running compute.
 
-**The harness comes first (week 1), before the engine:**
+**Measured (2026-10-13): QuickJS can't get us there.** Native QuickJS is 3x to
+9x behind Node per request, and 15x on compute. So our engine must be a
+compiler, not an interpreter. combd already compiles at deploy, so the best
+shot is **compiling the app's own JS/TypeScript ahead of time** to the same
+safe-Rust target the AOT tier uses. It would use TypeScript types where they
+exist (like Meta's Static Hermes), with shapes and inline caches for dynamic
+code. The bar: the Rust version of the same routes already runs at 0.46 to
+4.7 us on our AOT tier.
+
+**The harness comes first, before the engine:**
 - test262 runner (50,000+ conformance tests), tracked as a pass rate.
 - Differential runner: every program on our engine, Node (V8), and Bun (JSC).
   Outputs must match.
@@ -757,15 +766,26 @@ escape its sandbox, so a generator bug can't become a security bug. It beat
 Wasmtime on fib, sieve, and every JS API route, and cold starts a JS cell from
 a snapshot in 53 us. See [spike/RESULTS.md](spike/RESULTS.md).
 
-Next for this tier:
-1. Pass linear memory as its own argument so LLVM keeps the base in a
-   register (memory-heavy code is 1.7x behind Wasmtime).
-2. Only zero locals that are read before they're written (recursive QuickJS
-   is 4x behind).
-3. Lazy memory growth, like the interpreter (a fresh JS cell is 1.6 MB).
-4. Pausing mid-call: a stack per cell first, deopt to the interpreter later.
-5. Guard pages instead of bounds checks, in the audited `unsafe` crate.
-6. Maybe a Zig or C backend if rustc compile time hurts. The safe Rust
+**Racing Bun (2026-10-13):** a sandboxed, preemptible Rust cell on this
+tier ties or beats Bun on two of three API routes and beats Node on all three.
+Native QuickJS loses to Node and Bun, so JS throughput needs a JS compiler,
+not a faster QuickJS (see "Our own JS engine"). Details in
+[spike/RESULTS.md](spike/RESULTS.md).
+
+Done: 1-byte traps (results in registers), memory as its own argument, a stack
+budget in a register, fuel in a register, one bounds check per access, lazy
+zero-skipping snapshot copies.
+
+Next for this tier, biggest first:
+1. **Guard pages instead of bounds checks** (about 30% left), in the audited
+   `unsafe` crate: reserve, map live memory only, turn faults into traps.
+2. **Pausing mid-call:** a stack per cell first, deopt to the interpreter
+   later.
+3. **SDK: an opt-in per-request arena allocator** for Rust cells (bump
+   allocation, reset per request). It could beat native code that uses
+   malloc.
+4. **Wasm SIMD** in the generator.
+5. Maybe a Zig or C backend if rustc compile time hurts. The safe Rust
    backend stays the reference.
 
 ## Build order (when we do build)

@@ -7,3 +7,11 @@ description = "combd's AOT tier: Wasm modules compiled to plain safe Rust by `co
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = ["js"]
+# The QuickJS cell. Off for quick experiments, since it takes minutes to build.
+js = []
+# EXPERIMENT ONLY, NEVER SHIP: skips bounds checks with `unsafe`, to measure
+# what they cost. Generated code needs COMBD_AOT_EXPERIMENT=unchecked.
+experiment-unchecked = []

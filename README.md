@@ -85,8 +85,9 @@ See [langs/](langs/).
 
 We also built our own ahead-of-time compiler. It turns Wasm into plain safe
 Rust, so the Rust compiler proves the sandbox holds. Then it becomes machine
-code for any CPU. It beat Wasmtime on most of our tests, and starts a
-JavaScript cell from a snapshot in 53 microseconds, faster than Node or Bun.
+code for any CPU. A sandboxed Rust cell on it, one that can be preempted and
+crashes safely, ties or beats Bun on two of our three API tests and beats
+Node on all three. It's 3x faster than the same cell on Wasmtime.
 
 ## Standing on shoulders
 

@@ -331,6 +331,74 @@ What it shows:
   at a CPU limit instead of being paused. Pausing needs a stack per cell or
   deopt to the interpreter (see the plan).
 
+## Racing Bun: compiled handlers (Linux)
+
+QuickJS can't win on JS throughput. Native QuickJS (gcc `-O2`, computed
+gotos, `langs/js/Dockerfile.native`) is the ceiling, and it loses to Node and
+Bun:
+
+| | Native QuickJS | Our AOT QuickJS | Node | Bun |
+|---|---|---|---|---|
+| GET /api/users/42 | 2.9 us | 6.3 us | 1.1 us | 0.5 to 0.9 us |
+| GET /api/users | 15.6 us | 29.6 us | 1.9 to 2.0 us | 1.7 to 2.4 us |
+| POST /api/orders | 22.5 us | 36.5 us | 4.8 to 4.9 us | 3.4 to 3.9 us |
+| fib 25 | 4.8 ms | 11.9 ms | 0.43 ms | 0.32 ms |
+
+So we wrote the same three routes in Rust (`guest/src/lib.rs`, `api` module:
+path routing and serde), with answers byte-for-byte equal to the JS app. The
+test `rust_api_matches_js` checks that. All runs are in the same Docker VM;
+Bun and Node ranges are from two separate runs.
+
+| | Native Rust | **Rust on combd AOT** | Rust on Wasmtime | Bun (JS) | Node (JS) |
+|---|---|---|---|---|---|
+| GET /api/users/42 | 0.17 us | **0.46 us** | 1.42 us | 0.5 to 0.9 us | 1.1 us |
+| GET /api/users | 0.79 us | **1.89 us** | 3.14 us | 1.7 to 2.4 us | 1.9 to 2.0 us |
+| POST /api/orders | 2.40 us | **4.71 us** | 6.92 us | 3.4 to 3.9 us | 4.8 to 4.9 us |
+
+**A sandboxed, preemptible, crash-safe Rust cell on combd ties or beats Bun on
+two of the three routes, and beats Node on all three.** It's 3x faster than the
+same cell on Wasmtime. Bun still wins the JSON-parsing route by about 1.2x to
+1.4x.
+
+### Where our overhead goes (macOS)
+
+We turned each safety feature off in turn (`COMBD_AOT_EXPERIMENT`, an
+experiment-only switch that never ships):
+
+| Variant | GET user | GET users | fib 30 | sieve | sort |
+|---|---|---|---|---|---|
+| Full safety, before tuning | 0.64 us | 2.21 us | 2.2 ms | 11.7 ms | 24.8 ms |
+| No CPU ticks | 0.57 us | 2.20 us | 2.2 ms | 10.6 ms | 22.1 ms |
+| + no stack checks | 0.60 us | 2.19 us | 1.4 ms | 10.3 ms | 23.8 ms |
+| + no bounds checks (unsafe) | 0.41 us | 1.51 us | 1.4 ms | 8.7 ms | 15.2 ms |
+| Native Rust | 0.24 us | 0.91 us | 1.8 ms | 10.6 ms | 13.5 ms |
+| **Full safety, after tuning** | **0.53 us** | **1.81 us** | **1.9 ms** | **10.5 ms** | **20.0 ms** |
+
+Bounds checks cost the most (about 30%). The stack check was 36% on
+call-heavy code. Ticks were about 10%. The tuning, all still safe:
+- **Results come back in registers.** `Trap` is one byte now, so
+  `Result<u64, Trap>` fits in two registers.
+- **Memory is its own argument.** LLVM keeps its pointer and length in
+  registers instead of reloading them from the cell state.
+- **The stack budget rides in a register.** Each function subtracts a
+  conservative frame estimate. Big frames also check the real stack.
+- **Fuel stays in a local** and is saved only around calls, and only in
+  functions that have loops.
+- **One bounds check per access, not two.** Snapshot copies skip zero chunks
+  with a vectorized OR-fold.
+
+What's left between us and native, biggest first:
+1. **Bounds checks (about 30%).** The fix is guard pages: reserve address
+   space, map only the live memory, and turn a fault into a trap. This is what
+   Wasmtime and V8 do. It needs `unsafe` and a signal handler, so it belongs
+   in the small audited crate.
+2. **The guest's own code.** Rust compiled to Wasm uses dlmalloc and no SIMD.
+   Ideas:
+   - an opt-in per-request arena allocator in the combd Rust SDK (a bump
+     pointer, reset after each request),
+   - Wasm SIMD support in the generator.
+3. Small fixed costs per call and per loop, already mostly squeezed.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

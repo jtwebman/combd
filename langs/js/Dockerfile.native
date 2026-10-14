@@ -1,0 +1,11 @@
+# The QuickJS ceiling: native QuickJS on the same app. From the repo root:
+#   docker build -f langs/js/Dockerfile.native -t combd-qjs-native langs/js && docker run --rm combd-qjs-native
+FROM gcc:15.2.0-bookworm
+ARG QJS=0.17.0
+ARG QJS_SHA=559bc4c420475e55c7ab4510adbc562f55d7524d75e8e89d79ce4bb02f5687d9
+WORKDIR /b
+RUN curl -fsSL https://github.com/quickjs-ng/quickjs/archive/refs/tags/v$QJS.tar.gz -o qjs.tgz \
+    && echo "$QJS_SHA  qjs.tgz" | sha256sum -c && tar xzf qjs.tgz && mv quickjs-$QJS /qjs
+COPY app.js native.c requests.txt ./
+RUN gcc -std=gnu2x -O2 -D_GNU_SOURCE -I/qjs -o native native.c /qjs/quickjs.c /qjs/libregexp.c /qjs/libunicode.c /qjs/dtoa.c -lm
+CMD ["./native"]
