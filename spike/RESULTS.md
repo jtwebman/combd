@@ -778,6 +778,74 @@ failed and clients retried. That's the next thing to measure with gentler
 faults, along with real cells (Wasm is deterministic enough to run inside the
 simulator) and a real executor on many nodes, with MinIO as the bucket.
 
+## D2 on real machines: a fleet on a shared bucket
+
+The decision core now runs in real nodes (fleet mode, when `COMBD_S3` is set),
+with the bucket as the only coordinator.
+
+**The bucket.** A small S3 client (`spike/src/s3.rs`: SigV4, get, conditional
+put, list). Before serving, every node runs a storage test that races 16
+writers on one `If-Match` and one `If-None-Match`; exactly one may win each.
+
+| S3 server | One request at a time | 16-writer races |
+|---|---|---|
+| Silo (a MinIO fork; MinIO no longer publishes images) | pass | pass |
+| RustFS | pass | pass |
+| SeaweedFS 3.97 | pass | **fail: 2 to 6 of 16 won one CAS** |
+
+SeaweedFS would let two nodes own one object, and a one-at-a-time check
+wouldn't catch it. A node refuses to serve on a bucket that fails.
+
+**The data.** A segment is the set of SQLite pages that changed, read from the
+WAL's committed frames, newest copy of each (the Litestream / LiteFS way). It
+covers everything, schema changes included. A new owner restores by writing
+the pages of every segment its manifest lists into a fresh file. The local
+file is a cache, so local commits don't fsync. The output gate is the
+bucket: an answer leaves only after its segment is uploaded and a fresh read
+of the ownership record shows we still own the object.
+
+**The wire.** Nodes keep long-lived TCP connections to each other with
+length-prefixed binary frames (`spike/src/fleet.rs`). A request for an object
+another node owns is forwarded there, one hop at most, and the answer comes
+back the same way. A broken connection fails its waiting requests with a 503
+at once; a forward with no reply in 2 s does too.
+
+**Ids.** An object id is 128 bits: the hash of its name (`/do/<name>`, like
+`idFromName`), or a UUIDv7 from `/do/new` (`/do/id/<uuid>`, like
+`newUniqueId`). Bucket keys always use a hash, so time-ordered UUIDv7s still
+spread across the bucket.
+
+**The cluster test** (`bench/cluster/run.sh`): Silo and three combd nodes in
+Docker, one core each. `combd-spike fleet-load` sends increments to random
+objects through random nodes, then checks every object: acknowledged <=
+count <= acknowledged + failed. The low side means no acknowledged write was
+lost; the high side means none was applied twice. (A failed answer may still
+have been applied, like a timeout.) 32 clients, 50 objects, 15 s each:
+
+| Test | Acknowledged writes/s | Failed | Longest failure stretch | Every object correct |
+|---|---|---|---|---|
+| Steady | 1,288 | 4 | 0 ms | yes |
+| SIGKILL a node at 5 s, restart at 8 s | 1,065 | 1,525 | 3.0 s | yes |
+| Freeze a node for 4 s (`docker pause`) | 705 | 19 | 41 ms | yes |
+
+p50 is about 20 ms per write: an upload and a proof read per batch, on Silo
+in Docker on a Mac. The D3 peer path (1 or 2 peers fsync and confirm) is what
+brings that down.
+
+Bugs the cluster found, fixed:
+1. **The event loop died on EINTR.** A frozen node woke to SIGCONT, `poll`
+   returned "interrupted", and the loop treated it as fatal. It now waits
+   again. D1 had the same bug.
+2. **Every node ran the storage test on the same key** (process id 1 in every
+   container, same second). Their races collided and two nodes refused to
+   start. The key is random now.
+3. **A forward to a dead node hung until the client gave up.** A broken link
+   now fails its waiting requests at once.
+4. **`localhost` resolved to IPv6 first,** but the wire listened on IPv4, so
+   peers couldn't connect. Every resolved address is tried now.
+
+Not in fleet mode yet: alarms, eviction, and the D3 peer path.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

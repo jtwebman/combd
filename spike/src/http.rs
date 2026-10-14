@@ -291,6 +291,33 @@ enum Req {
     Cell(String),
     Object(String, String),
     Stats,
+    /// A new object id.
+    NewId,
+}
+
+/// A UUIDv7 (RFC 9562): 48 bits of Unix ms, then random bits. It sorts by
+/// creation time, so ids are handy in logs and listings; bucket keys hash it
+/// (`own::obj_id`), so new objects still spread across the bucket instead of
+/// piling onto one key range. ponytail: no ordering within one ms.
+pub fn uuid_v7() -> String {
+    let ms = now_ms() as u64 & 0xffff_ffff_ffff;
+    let mut r = [0u8; 10];
+    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut r));
+    let mut b = [0u8; 16];
+    b[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
+    b[6..].copy_from_slice(&r);
+    b[6] = 0x70 | (b[6] & 0x0f); // version 7
+    b[8] = 0x80 | (b[8] & 0x3f); // variant 10
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+}
+
+/// Any well-formed UUID, lowercased.
+fn parse_uuid(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let ok = b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| if [8, 13, 18, 23].contains(&i) { *c == b'-' } else { c.is_ascii_hexdigit() });
+    ok.then(|| s.to_ascii_lowercase())
 }
 
 /// The loop that owns an object.
@@ -1001,6 +1028,7 @@ impl<E: Engine> Loop<'_, E> {
                 );
                 self.queue_reply(who, (200, body));
             }
+            Req::NewId => self.queue_reply(who, (200, format!("{{\"id\":\"{}\"}}", uuid_v7()))),
             Req::Cell(cell_req) => {
                 let mut cell = match self.pool.pop() {
                     Some(cell) => cell,
@@ -1384,6 +1412,13 @@ fn parse(c: &mut Conn) -> Result<Option<Req>, ()> {
     let line = |kind: &str, path: &str| if body.is_empty() { format!("{kind} {method} {path}") } else { format!("{kind} {method} {path} {body}") };
     let r = if path == "/_combd/stats" {
         Req::Stats
+    } else if path == "/do/new" {
+        Req::NewId
+    } else if let Some(rest) = path.strip_prefix("/do/id/") {
+        // `/do/id/<uuid>/<rest>`: an object made by `/do/new`. Its name gets an
+        // `id:` prefix, so it can never meet an object named the same way.
+        let (id, sub) = rest.split_once('/').map_or((rest, "/".to_string()), |(n, s)| (n, format!("/{s}")));
+        Req::Object(format!("id:{}", parse_uuid(id).ok_or(())?), line("do", &sub))
     } else if let Some(rest) = path.strip_prefix("/do/") {
         // `/do/<name>/<rest>`: a Durable Object request.
         let (name, sub) = rest.split_once('/').map_or((rest, "/".to_string()), |(n, s)| (n, format!("/{s}")));

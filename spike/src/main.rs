@@ -1026,6 +1026,35 @@ mod tests {
         String::from_utf8(db.exec_json(format!("{{\"q\":{sql:?}}}").as_bytes())).unwrap()
     }
 
+    #[test]
+    fn uuid_v7s_are_well_formed_and_sort_by_time() {
+        let a = http::uuid_v7();
+        std::thread::sleep(Duration::from_millis(2));
+        let b = http::uuid_v7();
+        for u in [&a, &b] {
+            assert_eq!(u.len(), 36);
+            assert_eq!(&u[14..15], "7", "version 7: {u}");
+            assert!("89ab".contains(&u[19..20]), "variant 10: {u}");
+        }
+        assert!(a < b, "{a} should sort before {b}");
+        assert_ne!(a, http::uuid_v7());
+    }
+
+    /// Objects by id: `/do/new` hands one out, `/do/id/<uuid>` reaches it.
+    #[test]
+    fn objects_by_uuid() {
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, cfg(&dir.0, 2));
+        let (code, body) = http(port, "GET", "/do/new", "");
+        assert_eq!(code, 200);
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+        assert_eq!(http(port, "POST", &format!("/do/id/{id}/incr"), ""), (200, "{\"count\":1}".into()));
+        assert_eq!(http(port, "POST", &format!("/do/id/{}/incr", id.to_uppercase()), ""), (200, "{\"count\":2}".into()));
+        // A plain object with the same text as a name is a different object.
+        assert_eq!(http(port, "GET", &format!("/do/{id}/count"), ""), (200, "{\"count\":0}".into()));
+        assert_eq!(http(port, "GET", "/do/id/not-a-uuid/count", "").0, 400);
+    }
+
     /// Durable Objects: state lives across requests, every answered write is
     /// on disk (the output gate), and a crash rolls its request back.
     fn objects_keep_state_and_roll_back_crashes<E: Engine + Sync + Send + 'static>(eng: E, threads: usize)

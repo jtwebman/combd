@@ -843,6 +843,10 @@ Next for this tier, biggest first:
    soak tests once D3 works in the simulator.
 3. **Fleet (D2).** Bucket leases, CAS ownership, epochs, routing between nodes
    over mTLS. Kill tests.
+   **Running 2026-10-14:** three nodes on Silo in Docker; SIGKILL and freeze
+   tests keep every object correct. Wire is plain TCP so far (mTLS next);
+   alarms and eviction are D1-only so far. See
+   [spike/RESULTS.md](spike/RESULTS.md).
 4. **WebSockets** with hibernation.
 5. **Bring your own database.** Host-owned pools, Postgres first.
 6. **Fast fleet writes (D3).** Peer proofs, only after D2 is solid.

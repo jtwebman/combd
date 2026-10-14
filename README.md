@@ -106,6 +106,12 @@ own SQLite file, and each answer waits until its writes are safely on disk.
 On one core, combd beat workerd's Durable Objects by 1.8x on writes, 8.3x on
 reads, and 5.7x on writes spread over 1,000 objects. It beat celld by more.
 
+Objects also run across a fleet now: several combd nodes sharing one S3
+bucket, which decides who owns each object. Kill a node or freeze it, and
+another takes over with every acknowledged write intact. The protocol is
+checked three ways: a TLA+ spec, a deterministic simulator with crashes and
+lost messages, and a real cluster with kill tests.
+
 ## Standing on shoulders
 
 combd is inspired by [celld](https://github.com/denoland/celld),
