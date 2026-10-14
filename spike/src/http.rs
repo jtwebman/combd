@@ -51,7 +51,7 @@
 //!   only the objects that place onto it.
 
 use crate::engine::{CellVm, Engine, Outcome};
-use crate::fleet::{FleetCfg, Frame};
+use crate::fleet::{DiskPeers, FleetCfg, Frame};
 use crate::wire::{self, Wire};
 use crate::own::{self, Act, Core, Effect};
 use crate::host::{now_ms, HostState};
@@ -127,6 +127,12 @@ struct Stats {
     /// fsync times: slow ones (10 ms or more), and the slowest, in us.
     fsyncs_slow: Arc<AtomicU64>,
     fsync_max_us: Arc<AtomicU64>,
+    /// Fleet mode: batches acknowledged by the peers (D3) or the bucket
+    /// (D2), takeovers that fenced, and entries recovered from peers.
+    peer_acks: AtomicU64,
+    bucket_acks: AtomicU64,
+    fences: AtomicU64,
+    tail_entries: AtomicU64,
 }
 
 /// Make an object's commits up to `gen` durable, then tell loop `back`.
@@ -158,6 +164,8 @@ struct FleetShared {
     jobs: Mutex<Sender<Job>>,
     /// The wire to other nodes (mTLS).
     wire: Wire,
+    /// This node's peer store (D3), on its own thread.
+    peer_store: Mutex<Sender<(own::PeerCall, PeerBack)>>,
     next_id: AtomicU64,
     start: Instant,
 }
@@ -170,6 +178,13 @@ enum Job {
     Index { name: String, obj: own::Obj, old: Option<i64>, new: Option<i64>, back: usize },
     /// The due alarms in the index.
     AlarmScan { back: usize },
+}
+
+/// Where a peer store answer goes: back over the wire (connection, frame
+/// id), or to a loop on this node (loop, id).
+enum PeerBack {
+    Wire(usize, u64),
+    Loop(usize, u64),
 }
 
 fn alarm_prefix(obj: own::Obj) -> String {
@@ -236,6 +251,8 @@ enum Msg {
     WireIn { conn: usize, id: u64, name: String, req: String },
     /// Fleet mode: the answer to a request we forwarded.
     WireReply { id: u64, reply: (u16, String) },
+    /// Fleet mode: the answer to a peer call (`None`: lost).
+    PeerReply { id: u64, res: Option<own::PeerRes> },
 }
 
 /// Fleet mode: a request the decision core knows about.
@@ -448,7 +465,7 @@ where
             }
         });
     }
-    let fleet = cfg.fleet.take().map(|fc| start_fleet(fc, &peers, cfg.threads));
+    let fleet = cfg.fleet.take().map(|fc| start_fleet(fc, &peers, cfg.threads, &cfg.data));
     let sh = Shared {
         cfg,
         peers,
@@ -478,11 +495,20 @@ where
                     free: vec![],
                     next_gen: 0,
                     last_sweep: Instant::now(),
-                    core: sh.fleet.as_ref().map(|f| Core::with_lease(f.cfg.node, own::Bugs::default(), f.cfg.lease_ms)),
+                    core: sh.fleet.as_ref().map(|f| {
+                        let mut fleet: Vec<own::Node> = f.cfg.peers.keys().copied().chain([f.cfg.node]).collect();
+                        fleet.sort();
+                        fleet.dedup();
+                        let mut c = Core::with_lease(f.cfg.node, own::Bugs::default(), f.cfg.lease_ms).replicate(fleet, f.cfg.replicas);
+                        // Loop 0 keeps the node's lease alive.
+                        c.renews = me == 0;
+                        c
+                    }),
                     freqs: HashMap::new(),
                     next_req: 0,
                     names: HashMap::new(),
                     wire_out: HashMap::new(),
+                    peer_out: HashMap::new(),
                     rtt: HashMap::new(),
                     alarm_fire: HashMap::new(),
                     last_scan: Instant::now(),
@@ -525,6 +551,9 @@ struct Loop<'a, E: Engine> {
     /// Requests we forwarded: frame id -> where the answer goes, the node, when
     /// it was sent, and when it gives up.
     wire_out: HashMap<u64, (Origin, own::Node, Instant, Duration)>,
+    /// Peer calls out: frame id -> the core's op, the node, when sent, and
+    /// when it gives up.
+    peer_out: HashMap<u64, (own::OpId, own::Node, Instant, Duration)>,
     /// Each peer's round trip: (smoothed, variation), in seconds.
     rtt: HashMap<own::Node, (f64, f64)>,
     /// Alarms loop 0 fired from the index: name -> (due, tries, not again before).
@@ -534,7 +563,7 @@ struct Loop<'a, E: Engine> {
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
-fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize) -> FleetShared {
+fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize, data: &std::path::Path) -> FleetShared {
     // The startup storage test: never serve on a bucket that can't do CAS.
     if let Err(e) = fc.s3.check() {
         eprintln!("combd     the bucket at {} failed the storage test: {e}", fc.s3.host);
@@ -600,12 +629,42 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
             std::process::exit(1);
         }
     };
-    let sink = LoopSink { loops: loops.to_vec(), threads };
+    // The peer store first: the wire hands it calls as soon as it's up. A
+    // node that has run before (its lease is in the bucket) but lost its
+    // peer store must not come back as the same node: it would answer
+    // fences knowing nothing, and acknowledged writes could be lost.
+    // ponytail: the fix is a store that knows it's new, and an owner that
+    // then uses another peer's tail. Until then, a lost disk needs a new
+    // node number.
+    let fresh = !data.join("peers/peers.log").exists();
+    if fresh && fc.replicas > 0 && matches!(fc.s3.get(&own::lease_key(fc.node)), Ok(Some(_))) {
+        eprintln!("combd     node {} has run before but its peer store ({}) is gone; start it as a new node number", fc.node, data.join("peers").display());
+        std::process::exit(1);
+    }
+    let disk = DiskPeers::open(&data.join("peers")).unwrap_or_else(|e| {
+        eprintln!("combd     can't open the peer store: {e}");
+        std::process::exit(1);
+    });
+    let (ptx, prx) = channel();
+    let sink = LoopSink { loops: loops.to_vec(), threads, peer_store: ptx.clone() };
     let wire = wire::start(fc.wire_port, fc.peers.clone(), tls, sink).expect("start the wire");
+    let (w, ls) = (wire.clone(), loops.to_vec());
+    crate::fleet::serve_peers(disk, prx, move |back, res| match back {
+        PeerBack::Wire(conn, id) => w.reply(conn, Frame::PeerReply { id, res }),
+        PeerBack::Loop(lp, id) => {
+            let (tx, waker) = &ls[lp];
+            let _ = tx.send(Msg::PeerReply { id, res: Some(res) });
+            let _ = waker.wake();
+        }
+    });
+    if fc.replicas > 0 {
+        println!("combd     D3: {} peers per object", fc.replicas);
+    }
     FleetShared {
         cfg: fc,
         jobs: Mutex::new(tx),
         wire,
+        peer_store: Mutex::new(ptx),
         next_id: AtomicU64::new(1),
         start: Instant::now(),
     }
@@ -664,9 +723,15 @@ impl<E: Engine> Loop<'_, E> {
                     let (origin, ..) = self.wire_out.remove(&id).unwrap();
                     self.deliver(origin, (503, "{\"error\":\"owner didn't answer\"}".into()))?;
                 }
-                // Loop 0 keeps the node's lease alive.
+                let late: Vec<u64> = self.peer_out.iter().filter(|(_, (_, _, t, limit))| t.elapsed() >= *limit).map(|(id, _)| *id).collect();
+                for id in late {
+                    let (op, ..) = self.peer_out.remove(&id).unwrap();
+                    self.core_on(own::Event::Reply { op, res: own::Res::Lost });
+                }
+                // Every loop ticks its core (to retry quiet peers); only
+                // loop 0's renews the node's lease.
                 let renew = self.sh.fleet.as_ref().map_or(own::RENEW_MS, |f| f.cfg.lease_ms / 3);
-                if self.me == 0 && self.last_tick.elapsed() >= Duration::from_millis(renew) {
+                if self.last_tick.elapsed() >= Duration::from_millis(renew) {
                     self.last_tick = Instant::now();
                     self.core_on(own::Event::Tick);
                 }
@@ -775,6 +840,14 @@ impl<E: Engine> Loop<'_, E> {
                     if let Some((origin, node, sent, _)) = self.wire_out.remove(&id) {
                         self.measured(node, sent.elapsed());
                         self.deliver(origin, reply)?;
+                    }
+                }
+                Msg::PeerReply { id, res } => {
+                    if let Some((op, node, sent, _)) = self.peer_out.remove(&id) {
+                        if res.is_some() && node != self.sh.fleet.as_ref().unwrap().cfg.node {
+                            self.measured(node, sent.elapsed());
+                        }
+                        self.core_on(own::Event::Reply { op, res: res.map_or(own::Res::Lost, own::Res::Peer) });
                     }
                 }
             }
@@ -1108,7 +1181,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -1119,7 +1192,11 @@ impl<E: Engine> Loop<'_, E> {
                     s.fsyncs.load(Relaxed),
                     s.checkpoints.load(Relaxed),
                     s.fsyncs_slow.load(Relaxed),
-                    s.fsync_max_us.load(Relaxed)
+                    s.fsync_max_us.load(Relaxed),
+                    s.peer_acks.load(Relaxed),
+                    s.bucket_acks.load(Relaxed),
+                    s.fences.load(Relaxed),
+                    s.tail_entries.load(Relaxed)
                 );
                 self.queue_reply(who, (200, body));
             }
@@ -1260,7 +1337,14 @@ impl<E: Engine> Loop<'_, E> {
     /// Hand the core an event, then do what it says.
     fn core_on(&mut self, ev: own::Event) {
         let now = self.core_now();
-        let effects = self.core.as_mut().expect("fleet mode").on(now, ev);
+        let core = self.core.as_mut().expect("fleet mode");
+        let was = core.stats;
+        let effects = core.on(now, ev);
+        let (st, now) = (&self.sh.stats, core.stats);
+        st.peer_acks.fetch_add(now.peer_acks - was.peer_acks, Relaxed);
+        st.bucket_acks.fetch_add(now.bucket_acks - was.bucket_acks, Relaxed);
+        st.fences.fetch_add(now.fences - was.fences, Relaxed);
+        st.tail_entries.fetch_add(now.tail_entries - was.tail_entries, Relaxed);
         for e in effects {
             self.effect(e);
         }
@@ -1330,7 +1414,16 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }
             Effect::Restore { obj, act, segs } => self.job(Job::Fetch { obj, act, segs, back: self.me }),
-            Effect::Peer { .. } => unreachable!("real nodes run D2 until the peer wire lands"),
+            Effect::Peer { op, node, call } => {
+                let f = self.sh.fleet.as_ref().unwrap();
+                let id = f.next_id.fetch_add(1, Relaxed);
+                self.peer_out.insert(id, (op, node, Instant::now(), self.forward_limit(node)));
+                if node == f.cfg.node {
+                    let _ = f.peer_store.lock().unwrap().send((call, PeerBack::Loop(self.me, id)));
+                } else {
+                    f.wire.send(node, Frame::Peer { id, call }, self.me);
+                }
+            }
             Effect::Drop { obj } => {
                 if let Some(name) = self.names.get(&obj) {
                     if self.objects.remove(name).is_some() {
@@ -1527,6 +1620,7 @@ impl<E: Engine> Loop<'_, E> {
 struct LoopSink {
     loops: Vec<(Sender<Msg>, Arc<Waker>)>,
     threads: usize,
+    peer_store: Sender<(own::PeerCall, PeerBack)>,
 }
 
 impl wire::Sink for LoopSink {
@@ -1538,6 +1632,14 @@ impl wire::Sink for LoopSink {
     fn reply(&self, back: usize, id: u64, reply: (u16, String)) {
         let (tx, waker) = &self.loops[back];
         let _ = tx.send(Msg::WireReply { id, reply });
+        let _ = waker.wake();
+    }
+    fn peer(&self, conn: usize, id: u64, call: own::PeerCall) {
+        let _ = self.peer_store.send((call, PeerBack::Wire(conn, id)));
+    }
+    fn peer_reply(&self, back: usize, id: u64, res: Option<own::PeerRes>) {
+        let (tx, waker) = &self.loops[back];
+        let _ = tx.send(Msg::PeerReply { id, res });
         let _ = waker.wake();
     }
 }

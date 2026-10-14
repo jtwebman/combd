@@ -8,12 +8,12 @@
 //! Without certificates, a node refuses to join a fleet unless
 //! `COMBD_WIRE_INSECURE=1` asks for plain TCP.
 //!
-//! Frames (`fleet::Frame`) go in both directions on a connection: forwards out,
-//! replies back. If a connection breaks, every request waiting on it gets a
-//! 503 at once.
+//! Frames (`fleet::Frame`) go in both directions on a connection: forwards
+//! and peer calls out, replies back. If a connection breaks, every request
+//! waiting on it gets a 503 at once, and every peer call hears "lost".
 
-use crate::fleet::Frame;
-use crate::own::Node;
+use crate::fleet::{Frame, MAX_FRAME};
+use crate::own::{Node, PeerCall, PeerRes};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use rustls::pki_types::pem::PemObject;
@@ -98,6 +98,10 @@ pub trait Sink: Send + 'static {
     fn forward(&self, conn: usize, id: u64, name: String, req: String);
     /// The answer to a request loop `back` forwarded (a 503 if the link broke).
     fn reply(&self, back: usize, id: u64, reply: (u16, String));
+    /// A peer called our peer store; answer with `Wire::reply(conn, ..)`.
+    fn peer(&self, conn: usize, id: u64, call: PeerCall);
+    /// The answer to a peer call loop `back` made (`None`: lost).
+    fn peer_reply(&self, back: usize, id: u64, res: Option<PeerRes>);
 }
 
 enum Cmd {
@@ -133,9 +137,10 @@ struct Conn {
     rbuf: Vec<u8>,
     /// Plain mode only: bytes not written yet.
     wbuf: Vec<u8>,
-    /// Outgoing links: the node, and forwards waiting for a reply (id -> loop).
+    /// Outgoing links: the node, and calls waiting for a reply (id -> loop,
+    /// and whether it's a peer call).
     node: Option<Node>,
-    waiting: HashMap<u64, usize>,
+    waiting: HashMap<u64, (usize, bool)>,
     writing: bool,
 }
 
@@ -223,18 +228,20 @@ impl<S: Sink> Hub<S> {
         match c {
             Cmd::Reply { conn, frame } => self.queue(conn, &frame.encode()),
             Cmd::Send { node, frame, back } => {
-                let id = match &frame {
-                    Frame::Forward { id, .. } | Frame::Reply { id, .. } => *id,
-                };
+                let (id, peer) = (frame.id(), matches!(frame, Frame::Peer { .. }));
                 let conn = match self.links.get(&node) {
                     Some(&c) => Some(c),
                     None => self.connect(node),
                 };
                 let Some(conn) = conn else {
-                    self.sink.reply(back, id, (503, "{\"error\":\"owner unreachable\"}".into()));
+                    if peer {
+                        self.sink.peer_reply(back, id, None);
+                    } else {
+                        self.sink.reply(back, id, (503, "{\"error\":\"owner unreachable\"}".into()));
+                    }
                     return;
                 };
-                self.conns.get_mut(&conn).unwrap().waiting.insert(id, back);
+                self.conns.get_mut(&conn).unwrap().waiting.insert(id, (back, peer));
                 self.queue(conn, &frame.encode());
             }
         }
@@ -358,7 +365,7 @@ impl<S: Sink> Hub<S> {
             }
             let n = u32::from_le_bytes(c.rbuf[..4].try_into().unwrap()) as usize;
             if c.rbuf.len() < 4 + n {
-                if n > 16 << 20 {
+                if n > MAX_FRAME {
                     return self.fail(id);
                 }
                 break;
@@ -368,8 +375,14 @@ impl<S: Sink> Hub<S> {
             match frame {
                 Ok(Frame::Forward { id: fid, name, req }) if c.node.is_none() => self.sink.forward(id, fid, name, req),
                 Ok(Frame::Reply { id: fid, status, body }) if c.node.is_some() => {
-                    if let Some(back) = c.waiting.remove(&fid) {
+                    if let Some((back, _)) = c.waiting.remove(&fid) {
                         self.sink.reply(back, fid, (status, body));
+                    }
+                }
+                Ok(Frame::Peer { id: fid, call }) if c.node.is_none() => self.sink.peer(id, fid, call),
+                Ok(Frame::PeerReply { id: fid, res }) if c.node.is_some() => {
+                    if let Some((back, _)) = c.waiting.remove(&fid) {
+                        self.sink.peer_reply(back, fid, Some(res));
                     }
                 }
                 _ => return self.fail(id), // garbage, or a frame going the wrong way
@@ -392,8 +405,12 @@ impl<S: Sink> Hub<S> {
                 self.links.remove(&n);
             }
         }
-        for (fid, back) in c.waiting {
-            self.sink.reply(back, fid, (503, "{\"error\":\"owner went away\"}".into()));
+        for (fid, (back, peer)) in c.waiting {
+            if peer {
+                self.sink.peer_reply(back, fid, None);
+            } else {
+                self.sink.reply(back, fid, (503, "{\"error\":\"owner went away\"}".into()));
+            }
         }
     }
 }
@@ -418,6 +435,19 @@ mod tests {
         fn reply(&self, _back: usize, id: u64, reply: (u16, String)) {
             let _ = self.got.send((id, reply));
         }
+        /// Answers every peer call with `Have(id)`.
+        fn peer(&self, conn: usize, id: u64, _call: PeerCall) {
+            if let Some(w) = self.wire.lock().unwrap().as_ref() {
+                w.reply(conn, Frame::PeerReply { id, res: PeerRes::Have(id) });
+            }
+        }
+        fn peer_reply(&self, _back: usize, id: u64, res: Option<PeerRes>) {
+            let status = match res {
+                Some(PeerRes::Have(n)) if n == id => 200,
+                _ => 503,
+            };
+            let _ = self.got.send((id, (status, "peer".into())));
+        }
     }
 
     fn hub(port: u16, peers: &HashMap<Node, String>, tls: Option<Tls>) -> (Wire, Receiver<(u64, (u16, String))>) {
@@ -439,12 +469,16 @@ mod tests {
         let (_b, _rb) = hub(base + 1, &peers, Some(load_tls(&dir.0.join("fleet"), 1).unwrap()));
         a.send(1, Frame::Forward { id: 7, name: "room".into(), req: "do GET /count".into() }, 0);
         assert_eq!(ra.recv_timeout(Duration::from_secs(5)).unwrap(), (7, (200, "room:do GET /count".into())));
+        a.send(1, Frame::Peer { id: 10, call: PeerCall::Fence { obj: 1, epoch: 2 } }, 0);
+        assert_eq!(ra.recv_timeout(Duration::from_secs(5)).unwrap(), (10, (200, "peer".into())));
 
         // A node with a certificate from another CA gets nothing through.
         let (x, rx) = hub(base + 2, &peers, Some(load_tls(&dir.0.join("other"), 0).unwrap()));
         x.send(1, Frame::Forward { id: 8, name: "room".into(), req: "do GET /count".into() }, 0);
         let (id, (status, _)) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!((id, status), (8, 503), "a stranger's request must fail");
+        x.send(1, Frame::Peer { id: 11, call: PeerCall::Fence { obj: 1, epoch: 2 } }, 0);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), (11, (503, "peer".into())), "a stranger's peer call is lost");
 
         // Nor does a plain-TCP node.
         let (p, rp) = hub(base + 3, &peers, None);

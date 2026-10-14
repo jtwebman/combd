@@ -2,30 +2,33 @@
 //! a fleet (when `COMBD_S3` is set).
 //!
 //! - The bucket: the decision core's calls (`own::Call`) done on S3.
-//! - The wire: how nodes talk to each other. Long-lived TCP connections
-//!   carrying length-prefixed binary frames, so a request that lands on the
-//!   wrong node is forwarded to its owner instead of bouncing the client.
-//!   ponytail: plain TCP, inside a private network. mTLS before nodes cross
-//!   networks.
+//! - The wire: how nodes talk to each other. Long-lived mTLS connections
+//!   carrying length-prefixed binary frames: requests forwarded to an
+//!   object's owner, and D3 peer calls.
+//! - The peer store on disk (`DiskPeers`): the entries this node keeps for
+//!   other nodes' objects, in a log file with group commit.
 //!
 //! Settings:
 //! - `COMBD_NODE`: this node's number.
 //! - `COMBD_PEERS`: `0=host:7100,1=host:7100,...`, every node's wire address.
 //! - `COMBD_WIRE_PORT`: where this node listens for peers (default 7100).
 //! - `COMBD_LEASE_MS`: how long a silent node keeps its objects (default 10 s).
+//! - `COMBD_REPLICAS`: peers per object for D3 fast writes (default 0: D2).
 //! - `COMBD_WIRE_CERTS`: the wire's certificates (`combd-spike wire-certs`),
 //!   or `COMBD_WIRE_INSECURE=1` for plain TCP.
 //! - `COMBD_S3`, `COMBD_S3_KEY`, `COMBD_S3_SECRET`, `COMBD_S3_BUCKET`: the bucket.
 
-use crate::own::{Call, Cond, Node, Res, Val};
+use crate::own::{Call, Cond, Node, PeerCall, PeerRes, PeerStore, Res, Tail, Val};
 use crate::s3::{self, S3};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 pub struct FleetCfg {
     pub node: Node,
     /// `COMBD_LEASE_MS` (default 10 s), renewed every third of it.
     pub lease_ms: u64,
+    pub replicas: usize,
     pub s3: S3,
     pub peers: HashMap<Node, String>,
     pub wire_port: u16,
@@ -48,9 +51,10 @@ impl FleetCfg {
             .collect();
         let wire_port = std::env::var("COMBD_WIRE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7100);
         let lease_ms = std::env::var("COMBD_LEASE_MS").ok().and_then(|p| p.parse().ok()).unwrap_or(10_000);
+        let replicas = std::env::var("COMBD_REPLICAS").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
         let wire_certs = std::env::var("COMBD_WIRE_CERTS").ok().map(Into::into);
         let insecure = std::env::var("COMBD_WIRE_INSECURE").as_deref() == Ok("1");
-        Some(FleetCfg { node, lease_ms, s3, peers, wire_port, wire_certs, insecure })
+        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure })
     }
 }
 
@@ -95,9 +99,115 @@ pub enum Frame {
     Forward { id: u64, name: String, req: String },
     /// Its answer.
     Reply { id: u64, status: u16, body: String },
+    /// A call to this node's peer store, and its answer.
+    Peer { id: u64, call: PeerCall },
+    PeerReply { id: u64, res: PeerRes },
 }
 
-const MAX_FRAME: usize = 16 << 20;
+impl Frame {
+    pub fn id(&self) -> u64 {
+        match self {
+            Frame::Forward { id, .. } | Frame::Reply { id, .. } | Frame::Peer { id, .. } | Frame::PeerReply { id, .. } => *id,
+        }
+    }
+}
+
+fn put_ents(b: &mut Vec<u8>, ents: &[Vec<u8>]) {
+    let f = crate::own::frame(ents);
+    b.extend_from_slice(&(f.len() as u32).to_le_bytes());
+    b.extend_from_slice(&f);
+}
+
+/// Reads little-endian fields off the front; `None` when it runs short.
+struct Rd<'a>(&'a [u8]);
+
+impl Rd<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let (a, b) = (self.0.get(..n)?, self.0.get(n..)?);
+        self.0 = b;
+        Some(a)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn u128(&mut self) -> Option<u128> {
+        Some(u128::from_le_bytes(self.take(16)?.try_into().ok()?))
+    }
+    fn ents(&mut self) -> Option<Vec<Vec<u8>>> {
+        let n = self.u32()? as usize;
+        crate::own::unframe(self.take(n)?)
+    }
+}
+
+pub fn encode_call(c: &PeerCall, b: &mut Vec<u8>) {
+    match c {
+        PeerCall::Append { obj, epoch, from, ents, trunc } => {
+            b.push(1);
+            b.extend_from_slice(&obj.to_le_bytes());
+            b.extend_from_slice(&epoch.to_le_bytes());
+            b.extend_from_slice(&from.to_le_bytes());
+            b.extend_from_slice(&trunc.to_le_bytes());
+            put_ents(b, ents);
+        }
+        PeerCall::Fence { obj, epoch } => {
+            b.push(2);
+            b.extend_from_slice(&obj.to_le_bytes());
+            b.extend_from_slice(&epoch.to_le_bytes());
+        }
+    }
+}
+
+fn decode_call(r: &mut Rd) -> Option<PeerCall> {
+    Some(match r.u8()? {
+        1 => PeerCall::Append { obj: r.u128()?, epoch: r.u32()?, from: r.u64()?, trunc: r.u64()?, ents: r.ents()? },
+        2 => PeerCall::Fence { obj: r.u128()?, epoch: r.u32()? },
+        _ => return None,
+    })
+}
+
+fn encode_res(res: &PeerRes, b: &mut Vec<u8>) {
+    match res {
+        PeerRes::Have(n) => {
+            b.push(1);
+            b.extend_from_slice(&n.to_le_bytes());
+        }
+        PeerRes::Refused => b.push(2),
+        PeerRes::Tails(ts) => {
+            b.push(3);
+            b.extend_from_slice(&(ts.len() as u32).to_le_bytes());
+            for t in ts {
+                b.extend_from_slice(&t.epoch.to_le_bytes());
+                b.extend_from_slice(&t.from.to_le_bytes());
+                put_ents(b, &t.ents);
+            }
+        }
+    }
+}
+
+fn decode_res(r: &mut Rd) -> Option<PeerRes> {
+    Some(match r.u8()? {
+        1 => PeerRes::Have(r.u64()?),
+        2 => PeerRes::Refused,
+        3 => {
+            let n = r.u32()?;
+            let mut ts = vec![];
+            for _ in 0..n {
+                ts.push(Tail { epoch: r.u32()?, from: r.u64()?, ents: r.ents()? });
+            }
+            PeerRes::Tails(ts)
+        }
+        _ => return None,
+    })
+}
+
+// ponytail: a fence's tails must fit too; they're small while uploads keep up.
+pub const MAX_FRAME: usize = 64 << 20;
 
 impl Frame {
     /// `[u32 length][u8 kind][u64 id][...]`, little-endian.
@@ -116,6 +226,16 @@ impl Frame {
                 b.extend_from_slice(&id.to_le_bytes());
                 b.extend_from_slice(&status.to_le_bytes());
                 b.extend_from_slice(body.as_bytes());
+            }
+            Frame::Peer { id, call } => {
+                b.push(3);
+                b.extend_from_slice(&id.to_le_bytes());
+                encode_call(call, &mut b);
+            }
+            Frame::PeerReply { id, res } => {
+                b.push(4);
+                b.extend_from_slice(&id.to_le_bytes());
+                encode_res(res, &mut b);
             }
         }
         let n = (b.len() - 4) as u32;
@@ -145,9 +265,146 @@ impl Frame {
                 let status = u16::from_le_bytes(b.get(9..11).ok_or_else(|| bad("short frame"))?.try_into().unwrap());
                 Ok(Frame::Reply { id, status, body: text(&b[11..])? })
             }
+            3 => {
+                let mut r = Rd(&b[9..]);
+                match decode_call(&mut r) {
+                    Some(call) if r.0.is_empty() => Ok(Frame::Peer { id, call }),
+                    _ => Err(bad("bad peer call")),
+                }
+            }
+            4 => {
+                let mut r = Rd(&b[9..]);
+                match decode_res(&mut r) {
+                    Some(res) if r.0.is_empty() => Ok(Frame::PeerReply { id, res }),
+                    _ => Err(bad("bad peer reply")),
+                }
+            }
             _ => Err(bad("unknown frame kind")),
         }
     }
+}
+
+/// The peer store, kept in a log file: every call that changed it, each as
+/// `[u32 length][4 bytes of SHA-256][call]`. Startup replays the log and
+/// cuts off a torn last record. When the log grows past `COMPACT`, it's
+/// rewritten from a snapshot (usually small: peers drop what's uploaded).
+pub struct DiskPeers {
+    pub store: PeerStore,
+    path: PathBuf,
+    file: std::fs::File,
+    size: u64,
+    dirty: bool,
+}
+
+const COMPACT: u64 = 64 << 20;
+
+fn record(c: &PeerCall) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut body = vec![];
+    encode_call(c, &mut body);
+    let mut b = (body.len() as u32).to_le_bytes().to_vec();
+    b.extend_from_slice(&Sha256::digest(&body)[..4]);
+    b.extend_from_slice(&body);
+    b
+}
+
+impl DiskPeers {
+    pub fn open(dir: &Path) -> std::io::Result<DiskPeers> {
+        use sha2::{Digest, Sha256};
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("peers.log");
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        let mut store = PeerStore::default();
+        let mut at = 0;
+        while let Some(h) = bytes.get(at..at + 8) {
+            let n = u32::from_le_bytes(h[..4].try_into().unwrap()) as usize;
+            let Some(body) = bytes.get(at + 8..at + 8 + n) else { break };
+            if Sha256::digest(body)[..4] != h[4..8] {
+                break;
+            }
+            let mut r = Rd(body);
+            let Some(c) = decode_call(&mut r) else { break };
+            store.handle(c);
+            at += 8 + n;
+        }
+        if at < bytes.len() {
+            eprintln!("combd     peers.log: cut a torn record at byte {at} of {}", bytes.len());
+        }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        file.set_len(at as u64)?;
+        file.sync_all()?;
+        Ok(DiskPeers { store, path, file, size: at as u64, dirty: false })
+    }
+
+    /// Apply a call; it's durable after the next `sync`.
+    pub fn handle(&mut self, c: PeerCall) -> std::io::Result<PeerRes> {
+        let rec = record(&c);
+        let res = self.store.handle(c);
+        if res != PeerRes::Refused {
+            self.file.write_all(&rec)?;
+            self.size += rec.len() as u64;
+            self.dirty = true;
+        }
+        Ok(res)
+    }
+
+    pub fn sync(&mut self) -> std::io::Result<()> {
+        if std::mem::take(&mut self.dirty) {
+            self.file.sync_data()?;
+        }
+        if self.size > COMPACT {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Write a snapshot beside the log, fsync it, and swap it in.
+    fn compact(&mut self) -> std::io::Result<()> {
+        let tmp = self.path.with_extension("tmp");
+        let mut b = vec![];
+        for c in self.store.snapshot() {
+            b.extend_from_slice(&record(&c));
+        }
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&b)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &self.path)?;
+        if let Some(dir) = self.path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        self.file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
+        self.size = b.len() as u64;
+        Ok(())
+    }
+}
+
+/// The peer store's thread: take every call waiting, apply them, one fsync,
+/// then answer them all (group commit). An answer means it's on disk.
+pub fn serve_peers<B: Send + 'static>(mut disk: DiskPeers, rx: std::sync::mpsc::Receiver<(PeerCall, B)>, answer: impl Fn(B, PeerRes) + Send + 'static) {
+    std::thread::spawn(move || {
+        while let Ok(first) = rx.recv() {
+            let mut batch = vec![first];
+            batch.extend(rx.try_iter());
+            let done: Vec<(B, PeerRes)> = batch
+                .into_iter()
+                .map(|(c, back)| {
+                    let res = disk.handle(c).unwrap_or_else(|e| fatal(e));
+                    (back, res)
+                })
+                .collect();
+            disk.sync().unwrap_or_else(|e| fatal(e));
+            for (back, res) in done {
+                answer(back, res);
+            }
+        }
+    });
+}
+
+/// A peer store that can't write can't promise anything: stop the node
+/// rather than answer without the entry on disk.
+fn fatal(e: std::io::Error) -> ! {
+    eprintln!("combd     the peer store can't write: {e}");
+    std::process::exit(1);
 }
 
 #[cfg(test)]
@@ -155,10 +412,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn peer_store_survives_restarts_torn_records_and_compaction() {
+        let dir = std::env::temp_dir().join(format!("combd-peers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = |d: &mut DiskPeers, epoch, from, n: u8| d.handle(PeerCall::Append { obj: 7, epoch, from, ents: vec![vec![n; 100]], trunc: 0 }).unwrap();
+        let fence = |d: &mut DiskPeers, epoch| d.handle(PeerCall::Fence { obj: 7, epoch }).unwrap();
+        let mut d = DiskPeers::open(&dir).unwrap();
+        app(&mut d, 1, 1, 1);
+        app(&mut d, 1, 2, 2);
+        fence(&mut d, 2);
+        d.sync().unwrap();
+        let want = fence(&mut d, 2);
+        drop(d);
+        // A torn record at the end (a crash mid-write) is cut off.
+        std::fs::OpenOptions::new().append(true).open(dir.join("peers.log")).unwrap().write_all(&[50, 0, 0, 0, 1, 2]).unwrap();
+        let mut d = DiskPeers::open(&dir).unwrap();
+        assert_eq!(fence(&mut d, 2), want);
+        assert_eq!(app(&mut d, 1, 3, 3), PeerRes::Refused, "the fence survived");
+        d.compact().unwrap();
+        drop(d);
+        let mut d = DiskPeers::open(&dir).unwrap();
+        assert_eq!(fence(&mut d, 2), want, "compaction keeps the same store");
+        assert_eq!(app(&mut d, 2, 1, 9), PeerRes::Have(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn frames_round_trip_and_reject_garbage() {
         for f in [
             Frame::Forward { id: 7, name: "room/1".into(), req: "do POST /incr {\"a\":1}".into() },
             Frame::Reply { id: u64::MAX, status: 503, body: String::new() },
+            Frame::Peer { id: 1, call: PeerCall::Append { obj: u128::MAX, epoch: 3, from: 9, ents: vec![vec![], vec![1, 2]], trunc: 8 } },
+            Frame::Peer { id: 2, call: PeerCall::Fence { obj: 5, epoch: 4 } },
+            Frame::PeerReply { id: 3, res: PeerRes::Have(12) },
+            Frame::PeerReply { id: 4, res: PeerRes::Refused },
+            Frame::PeerReply { id: 5, res: PeerRes::Tails(vec![Tail { epoch: 2, from: 7, ents: vec![vec![3; 5]] }]) },
         ] {
             let b = f.encode();
             assert_eq!(Frame::read(&mut &b[..]).unwrap(), f);

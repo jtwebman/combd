@@ -136,7 +136,7 @@ pub enum Call {
 }
 
 /// A call to a node's peer store.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PeerCall {
     /// Keep entries `from..` of `epoch` (the peer skips what it has), then
     /// drop entries up to `trunc`: the bucket has them. Refused once fenced
@@ -147,14 +147,14 @@ pub enum PeerCall {
 }
 
 /// What a peer holds of one epoch: entries `from + 1 ..`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Tail {
     pub epoch: u32,
     pub from: u64,
     pub ents: Vec<Vec<u8>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PeerRes {
     /// How many entries of the epoch the peer has (kept or dropped).
     Have(u64),
@@ -260,7 +260,12 @@ impl PeerStore {
                 // manifest holds everything older: those logs aren't needed.
                 po.logs.retain(|&e, _| e >= epoch);
                 let (dropped, log) = po.logs.entry(epoch).or_default();
-                if from > *dropped + log.len() as u64 + 1 {
+                let len = *dropped + log.len() as u64;
+                if from > len + 1 {
+                    if from - 1 > trunc {
+                        // A gap the bucket doesn't cover: say what we have.
+                        return PeerRes::Have(len);
+                    }
                     // The bucket has everything before `from`.
                     *dropped = from - 1;
                     log.clear();
@@ -279,6 +284,21 @@ impl PeerStore {
                 PeerRes::Tails(po.logs.iter().map(|(&e, (d, l))| Tail { epoch: e, from: *d, ents: l.clone() }).collect())
             }
         }
+    }
+
+    /// Calls that rebuild this store from nothing: each object's logs, newest
+    /// epoch first (an append drops older epochs, not newer), then its fence.
+    pub fn snapshot(&self) -> Vec<PeerCall> {
+        let mut out = vec![];
+        for (&obj, po) in &self.objs {
+            for (&epoch, (d, l)) in po.logs.iter().rev() {
+                out.push(PeerCall::Append { obj, epoch, from: d + 1, ents: l.clone(), trunc: 0 });
+            }
+            if po.fenced > 0 {
+                out.push(PeerCall::Fence { obj, epoch: po.fenced + 1 });
+            }
+        }
+        out
     }
 }
 
@@ -458,6 +478,8 @@ pub struct CoreStats {
 
 pub struct Core {
     pub node: Node,
+    /// Whether this core keeps the node's lease alive (one per node does).
+    pub renews: bool,
     bugs: Bugs,
     lease_ms: u64,
     /// Every node, and how many peers each object gets (0: D2).
@@ -489,6 +511,7 @@ impl Core {
     pub fn with_lease(node: Node, bugs: Bugs, lease_ms: u64) -> Core {
         Core {
             node,
+            renews: true,
             bugs,
             lease_ms,
             fleet: vec![],
@@ -575,7 +598,7 @@ impl Core {
     pub fn on(&mut self, now: u64, ev: Event) -> Vec<Effect> {
         match ev {
             Event::Tick => {
-                if !self.renewing {
+                if self.renews && !self.renewing {
                     self.renewing = true;
                     self.call(Wait::LeaseRead, Call::Get(lease_key(self.node)));
                 }
@@ -729,7 +752,18 @@ impl Core {
             p.retry = false;
             // A peer behind the uploads skips ahead: the bucket has those.
             let from = p.have.max(s.uploaded) + 1;
-            let ents = s.ents.iter().skip((from - s.uploaded - 1) as usize).cloned().collect();
+            // At most about 4 MB per call; the rest goes on the next one.
+            let mut size = 0;
+            let ents = s
+                .ents
+                .iter()
+                .skip((from - s.uploaded - 1) as usize)
+                .take_while(|e| {
+                    size += e.len();
+                    size <= 4 << 20 || size == e.len()
+                })
+                .cloned()
+                .collect();
             let trunc = if trunc_early { s.made } else { s.uploaded };
             p.busy = true;
             peer_calls.push((Wait::Append(o, e, i, s.round), p.node, PeerCall::Append { obj: o, epoch: e, from, ents, trunc }));
@@ -970,7 +1004,8 @@ impl Core {
                 p.busy = false;
                 match res {
                     Res::Peer(PeerRes::Have(n)) => {
-                        p.have = p.have.max(n);
+                        // One call in flight per peer: its answer is the truth.
+                        p.have = n;
                         p.round = p.round.max(round);
                         p.down = false;
                     }
@@ -1138,6 +1173,7 @@ mod tests {
         };
         assert_eq!(app(&mut p, 1, 1, vec![e(1), e(2)], 0), Some(2));
         assert_eq!(app(&mut p, 1, 2, vec![e(2), e(3)], 1), Some(3), "a resend keeps what it has");
+        assert_eq!(app(&mut p, 1, 6, vec![e(6)], 4), Some(3), "no skip past what the bucket has");
         assert_eq!(app(&mut p, 1, 6, vec![e(6)], 5), Some(6), "skips ahead to what the bucket lacks");
         let PeerRes::Tails(t) = p.handle(PeerCall::Fence { obj: 1, epoch: 2 }) else { panic!() };
         assert_eq!((t[0].epoch, t[0].from, t[0].ents.clone()), (1, 5, vec![e(6)]));
@@ -1145,6 +1181,13 @@ mod tests {
         assert_eq!(app(&mut p, 2, 1, vec![e(9)], 0), Some(1));
         let PeerRes::Tails(t) = p.handle(PeerCall::Fence { obj: 1, epoch: 3 }) else { panic!() };
         assert_eq!(t.len(), 1, "older epochs go once a newer one appends");
+        // A snapshot rebuilds the same store.
+        let mut q = PeerStore::default();
+        for c in p.snapshot() {
+            q.handle(c);
+        }
+        assert_eq!(q.handle(PeerCall::Fence { obj: 1, epoch: 3 }), p.handle(PeerCall::Fence { obj: 1, epoch: 3 }));
+        assert!(app(&mut q, 2, 2, vec![e(1)], 0).is_none(), "the fence survives");
     }
 
     #[test]

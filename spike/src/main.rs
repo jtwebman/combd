@@ -1080,6 +1080,7 @@ mod tests {
             let fc = fleet::FleetCfg {
                 node: n,
                 lease_ms: 1000,
+                replicas: 0,
                 s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
                 peers: peers.clone(),
                 wire_port: wbase + n as u16,
@@ -1116,6 +1117,65 @@ mod tests {
         ok(b, "POST", "/do/ev/incr", "");
         assert!(eventually(3000, || stat(b, "evictions") >= 1), "nothing was evicted");
         assert_eq!(ok(b, "GET", "/do/ev/count", ""), "{\"count\":2}");
+    }
+
+    /// D3 on real nodes: three nodes, two peers per object. Writes are
+    /// acknowledged by the peers; when the owner stops, another node fences
+    /// the peers, recovers, and has every write.
+    #[test]
+    fn fleet_peer_writes() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 3).unwrap();
+        let bucket = format!("combd-test-{}-{}", std::process::id(), Instant::now().elapsed().as_nanos() % 100_000);
+        let wbase = 25000 + (std::process::id() % 1000) as u16 * 3;
+        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wbase + n as u16))).collect();
+        let node = |n: own::Node| {
+            let fc = fleet::FleetCfg {
+                node: n,
+                lease_ms: 1000,
+                replicas: 2,
+                s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
+                peers: peers.clone(),
+                wire_port: wbase + n as u16,
+                wire_certs: Some(dir.0.join("certs")),
+                insecure: false,
+            };
+            let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 2) };
+            do_server(interp::Interp { max_pages: 16384 }, c)
+        };
+        let (a, stop_a, ta) = node(0);
+        let (b, _, _) = node(1);
+        let (c, _, _) = node(2);
+        // The HTTP port opens before the storage test and the wire: wait
+        // until every node really serves.
+        for p in [a, b, c] {
+            stat(p, "fences");
+        }
+        let ok = |port: u16, method: &str, path: &str| -> String {
+            for _ in 0..100 {
+                let (c, r) = http(port, method, path, "");
+                if c == 200 {
+                    return r;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("{method} {path} never answered 200");
+        };
+        for i in 1..=30 {
+            assert_eq!(ok(a, "POST", "/do/p1/incr"), format!("{{\"count\":{i}}}"));
+        }
+        assert!(stat(a, "peer_acks") >= 25, "writes should be acknowledged by peers: {}", http(a, "GET", "/_combd/stats", "").1);
+        // The owner stops (its peer store keeps running: it's the same
+        // process). Another node takes over after the lease and has it all.
+        stop_a.store(true, std::sync::atomic::Ordering::Relaxed);
+        ta.join().unwrap();
+        assert_eq!(ok(b, "GET", "/do/p1/count"), "{\"count\":30}");
+        assert!(stat(b, "fences") >= 1, "the takeover should fence: {}", http(b, "GET", "/_combd/stats", "").1);
+        assert_eq!(ok(b, "POST", "/do/p1/incr"), "{\"count\":31}");
     }
 
     /// Objects by id: `/do/new` hands one out, `/do/id/<uuid>` reaches it.

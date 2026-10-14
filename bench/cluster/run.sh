@@ -1,6 +1,8 @@
 #!/bin/sh
-# A real D2 fleet in Docker: Silo (a MinIO fork) as the bucket and three
-# combd nodes, one core each, on a private network. `fleet-load` drives
+# A real fleet in Docker: Silo (a MinIO fork) as the bucket and three combd
+# nodes, one core each, on a private network. REPLICAS=2 runs D3 (peers
+# confirm writes); the default, 0, runs D2. Each node's data is a volume, so a
+# restarted node keeps its peer store, as a real disk would. `fleet-load` drives
 # increments through random nodes and checks every object at the end:
 # acknowledged <= count <= acknowledged + failed.
 #
@@ -19,7 +21,7 @@ PEERS=0=node0:7100,1=node1:7100,2=node2:7100
 NODES=node0:8080,node1:8080,node2:8080
 
 docker network create $NET >/dev/null 2>&1 || true
-cleanup() { docker rm -f s3 node0 node1 node2 >/dev/null 2>&1 || true; docker volume rm -f combd-certs >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f s3 node0 node1 node2 >/dev/null 2>&1 || true; docker volume rm -f combd-certs combd-data0 combd-data1 combd-data2 >/dev/null 2>&1 || true; }
 cleanup
 trap cleanup EXIT
 
@@ -29,8 +31,9 @@ docker run --rm -v combd-certs:/certs $IMG ./target/release/combd-spike wire-cer
 
 node() { # n
     docker rm -f node$1 >/dev/null 2>&1 || true
-    docker run -d --name node$1 --network $NET --cpus=1 -v combd-certs:/certs:ro -e COMBD_WIRE_CERTS=/certs \
-        -e COMBD_NODE=$1 -e COMBD_PEERS=$PEERS -e COMBD_THREADS=1 -e COMBD_DATA=/tmp/data -e COMBD_LEASE_MS=${LEASE_MS:-3000} \
+    docker run -d --name node$1 --network $NET --cpus=1 -v combd-certs:/certs:ro -e COMBD_WIRE_CERTS=/certs -v combd-data$1:/data \
+        -e COMBD_NODE=$1 -e COMBD_PEERS=$PEERS -e COMBD_THREADS=1 -e COMBD_DATA=/data -e COMBD_LEASE_MS=${LEASE_MS:-3000} \
+        -e COMBD_REPLICAS=${REPLICAS:-0} \
         -e COMBD_S3=http://s3:9000 -e COMBD_S3_KEY=combd -e COMBD_S3_SECRET=combd-secret-key \
         $IMG ./target/release/combd-spike serve aot rust 8080 >/dev/null
 }
