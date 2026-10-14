@@ -542,6 +542,55 @@ mod tests {
         assert_eq!(response(&copy, &b), "75025");
     }
 
+    fn run_wat(src: &str, export: &str) -> Outcome {
+        let eng = interp::Interp { max_pages: 16 };
+        let prog = eng.load(&wat::parse_str(src).unwrap()).unwrap();
+        let mut vm = eng.spawn(&prog).unwrap();
+        vm.begin(export, &[]).unwrap();
+        vm.run(u32::MAX)
+    }
+
+    /// Regression: an `if` (or `br_if`) right after a stack op used to leave the
+    /// runtime stack pointer one slot too high, so the next stack op wrote to the
+    /// wrong slot. TinyGo hits this pattern all the time.
+    #[test]
+    fn if_after_a_stack_op_keeps_sp_right() {
+        let src = r#"(module
+            (global $g (mut i32) (i32.const 0))
+            (func (export "if") (result i32)
+                global.get $g  i32.const 1  i32.const 0  select   ;; a stack op: 1
+                if
+                    global.get $g  i32.eqz                         ;; must read 0 here
+                    if (result i32) i32.const 7 else i32.const 9 end
+                    return
+                end
+                i32.const 5)
+            (func (export "br_if") (result i32)
+                block
+                    global.get $g  i32.const 1  i32.const 0  select
+                    br_if 0
+                end
+                global.get $g  i32.eqz
+                if (result i32) i32.const 7 else i32.const 9 end))"#;
+        for export in ["if", "br_if"] {
+            assert!(matches!(run_wat(src, export), Outcome::Done(r) if r == [7]), "{export}");
+        }
+    }
+
+    /// Register forms against the plain stack meaning, for local reads that are
+    /// still pending when the same local gets overwritten.
+    #[test]
+    fn pending_local_reads_see_the_old_value() {
+        let src = r#"(module (func (export "f") (result i32)
+            (local $x i32)
+            i32.const 10  local.set $x
+            local.get $x                       ;; pending read of the old x (10)
+            i32.const 3  local.set $x          ;; overwrite x
+            local.get $x                       ;; 3
+            i32.sub))"#;
+        assert!(matches!(run_wat(src, "f"), Outcome::Done(r) if r == [7]));
+    }
+
     /// Every language cell built by `langs/Dockerfile` must pass on our engine.
     #[test]
     fn every_language_passes() {

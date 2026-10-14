@@ -227,6 +227,49 @@ What this means for the plan:
 3. The faster interpreter (register-based) matters even more now. Every
    language, and any future JS engine on our VM, rides on it.
 
+## Interpreter round 2: a register design
+
+The JS spike showed every language rides on interpreter speed, so we spent a
+few hours on it. Op counts first: about a third of all ops only moved values
+between locals and the stack. So the translator now works like V8's Ignition
+and wasmi:
+- `local.get` and constants become virtual stack entries and emit nothing.
+- Math, compares, loads, stores, globals, and `select` read their operands
+  straight from frame slots.
+- `local.set` usually redirects where the previous op writes, instead of
+  copying.
+- A compare and the `br_if` or `if` that uses it become one op.
+- The runtime stack pointer is only updated when something actually reads it.
+
+Anything not converted yet still runs as a stack op. The translator writes the
+virtual values out first, so the two paths mix safely.
+
+| | Phase 0 | Round 1 (fusion) | Round 2 (register) | Wasmtime |
+|---|---|---|---|---|
+| fib 30 (macOS) | 40 ms | 27 ms | **22 ms** | 2.5 ms |
+| sieve (macOS) | 270 ms | 165 ms | **106 ms** | 14 ms |
+| sort (macOS) | 570 ms | 335 ms | **212 ms** | 15 ms |
+| JS GET /api/users/42 (Linux) | n/a | 253 us | **201 us** | 8.4 us |
+| JS POST /api/orders (Linux) | n/a | 1,453 us | **969 us** | 46 us |
+| JS fib 25 (Linux) | n/a | 190 ms | **148 ms** | 7.8 ms |
+
+Since phase 0: **1.8x to 2.7x faster** on Rust compute, 1.3x to 1.5x on JS.
+Wasmtime is still 6x to 15x ahead on compute (Linux) and about 20x ahead on
+JS.
+
+**One bug, found and fixed.** TinyGo's `hello` crashed. Two tools found it:
+- a trace of every write to locals, globals, and memory in the old stack mode
+  and the new register mode, diffed to the first difference;
+- fixed randomness, so the two runs could be compared at all.
+
+The cause: an `if` or `br_if` right after a stack op left the runtime stack
+pointer one slot high. Two regression tests in Wasm text format now guard it.
+We confirmed they fail without the fix.
+
+**What it means:** each op is already cheap, and what's left is the cost of a
+safe-Rust `match` loop. More fusion gives a few percent at a time. The next big
+jump needs machine code: an AOT tier (see the plan).
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

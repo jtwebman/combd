@@ -692,6 +692,58 @@ engine. Wasmtime stays behind the engine interface as a fast-compute option.
 See [spike/RESULTS.md](spike/RESULTS.md). If we ever need raw speed, add a JIT tier for
 hot cells later, the way BEAM did.
 
+## AOT tier: compile once per CPU, cache it, run it everywhere
+
+Our interpreter is 6x to 15x behind Wasmtime on compute, and about 20x behind
+on JS. The interpreter alone won't close that, so cells that need speed get a
+machine-code tier, compiled ahead of time instead of while requests run.
+
+**How it works:**
+1. At `combd deploy`, the tool (or a build node) compiles each module to
+   machine code for each CPU target the fleet uses: x86-64 at a couple of
+   feature levels, and ARM64.
+2. The artifacts go into the bucket next to the deploy, keyed by
+   `hash(wasm) + target + CPU features + compiler version`.
+3. A node picks the artifact that matches its CPU. If there isn't one, the cell
+   starts on the interpreter at once (no compile needed), and the node compiles
+   in the background, then switches. That's V8's tier-up idea, but done at
+   deploy time, so there's no warm-up stutter and no compiler in the serving
+   process.
+4. The auto controller decides per cell: CPU-heavy cells and JS cells run the
+   AOT tier; idle-heavy cells stay on the interpreter (no compile, smallest
+   memory).
+
+**Security rules (it's executable code):**
+- Compile in a separate locked-down process: no network, seccomp.
+- Sign every artifact. A node verifies the signature before mapping it as
+  executable, and memory is never writable and executable at once.
+- Only artifacts from our own compiler are ever loaded, never from tenants.
+  (Wasmtime warns that loading precompiled code is unsafe for untrusted
+  input.)
+
+**Keeping our superpowers:**
+- Preemption: generated code counts reductions at loop heads and calls, the
+  same safe points as the interpreter.
+- Pausing mid-function needs one of two things:
+  - (a) a native stack per running cell, like Wasmtime's async fibers. Simple
+    and proven, but each paused cell costs a stack.
+  - (b) at a safe point, compiled code writes its live values into the
+    interpreter's frame format, and the cell continues as plain data. This
+    keeps mid-call snapshots and live migration, but needs stack maps.
+
+  Start with (a), add (b) later.
+- `snapshot_after_init` keeps working either way. It's taken when no frames are
+  on the stack.
+
+**Lazy path first:** Wasmtime already does exactly this (`precompile_module`
+plus `deserialize`), behind the engine interface we already have. Use it as
+the AOT tier now and cache its artifacts per CPU in the bucket. Build our own
+Cranelift-based tier only when we need (b).
+
+**Expected numbers:** Cranelift ran 1.2x to 1.5x of native on our workloads.
+That's the ceiling for this tier: 6x to 15x faster than our interpreter today,
+and QuickJS at 8 to 46 us per request instead of 200 to 970 us.
+
 ## Build order (when we do build)
 
 0. **DONE 2026-10-13. Spike: the engine race.** Results in

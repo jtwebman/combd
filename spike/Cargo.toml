@@ -20,3 +20,7 @@ wasmtime = { version = ">=40, <50", optional = true, default-features = false, f
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[dev-dependencies]
+# Regression tests written in the Wasm text format.
+wat = "1"
