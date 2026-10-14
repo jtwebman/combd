@@ -2,4 +2,4 @@ reference/
 .DS_Store
 target/
 langs/out/
-aot/src/gen_*.rs
+spike/aot/src/gen_*.rs
