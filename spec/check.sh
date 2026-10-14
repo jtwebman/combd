@@ -25,4 +25,4 @@ check() {
     done
 }
 check MCOwnership BugSkipProof BugLoadBeforeCas BugNoManifest BugReuseEpoch
-check MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest RepAckNoProof
+check MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest RepAckNoProof RepLateManifest

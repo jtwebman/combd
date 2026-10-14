@@ -45,7 +45,8 @@ CONSTANTS Procs, NodeOf, Peers, Writes, MaxEpoch,
           BUG_TRUNC_EARLY,       \* peers drop entries before they're uploaded
           BUG_SEAL_EARLY,        \* seal before everything is uploaded
           BUG_FENCE_IF_MANIFEST, \* fence only if an epoch has a manifest (TLC's find)
-          BUG_ACK_NO_PROOF       \* acknowledge what's uploaded without re-reading rec
+          BUG_ACK_NO_PROOF,      \* acknowledge what's uploaded without re-reading rec
+          BUG_LATE_MANIFEST      \* a stale owner writes its manifest after a newer one
 
 Epochs == 1..MaxEpoch
 NoRec == [node |-> "none", epoch |-> 0]
@@ -142,12 +143,21 @@ NoFence(x) ==
     /\ st' = [st EXCEPT ![x] = "load"]
     /\ UNCHANGED <<rec, made, manifest, sealed, up, plog, ptrunc, fenced, seen, ep, base, log, wm, upseen, issued, ackedIn, proven>>
 
-\* List the bucket. q is the last epoch with a manifest, as the listing shows
-\* it now (after the fence). The history: q's manifest, then q's entries from
-\* the bucket, then whatever q's tail has past that. Both are prefixes of q's
-\* owner's log.
+\* List the bucket. If it shows a newer epoch's manifest, we're stale: stop
+\* (the peers may have dropped what we'd need). Else q is the last epoch
+\* with a manifest, as the listing shows it now (after the fence). The
+\* history: q's manifest, then q's entries from the bucket, then whatever
+\* q's tail has past that. Both are prefixes of q's owner's log.
+Stale(x) ==
+    /\ st[x] = "load"
+    /\ ~BUG_LATE_MANIFEST
+    /\ \E e \in Epochs : e > ep[x] /\ made[e]
+    /\ Reset(x)
+    /\ UNCHANGED <<rec, made, manifest, sealed, up, plog, ptrunc, fenced, seen, ep, base, tail, upseen, issued, ackedIn, proven>>
+
 Load(x) ==
     /\ st[x] = "load"
+    /\ BUG_LATE_MANIFEST \/ ~\E e \in Epochs : e > ep[x] /\ made[e]
     /\ LET q == Last(ep[x])
            u == IF BUG_LOAD_BEFORE_FENCE THEN upseen[x] ELSE IF q = 0 THEN <<>> ELSE up[q]
            t == IF q = 0 THEN [ents |-> <<>>, from |-> 0] ELSE tail[x][q]
@@ -172,16 +182,19 @@ Exec(x, w) ==
     /\ issued' = issued \cup {w}
     /\ UNCHANGED <<rec, made, manifest, sealed, up, plog, ptrunc, fenced, st, seen, ep, base, tail, wm, upseen, ackedIn, proven>>
 
-\* Send peer p the next entry. A fenced peer refuses, and we step down.
+\* Send peer p the next entry. A fenced peer refuses, and we step down. A
+\* peer that takes an entry of epoch E drops every older epoch's log: E has
+\* its manifest, and that holds everything older.
 Send(x, p) ==
     /\ st[x] = "serving"
     /\ Len(plog[p][ep[x]]) < Len(log[x])
     /\ IF fenced[p] < ep[x]
        THEN /\ plog' = [plog EXCEPT ![p][ep[x]] = Append(@, log[x][Len(@) + 1])]
+            /\ ptrunc' = [ptrunc EXCEPT ![p] = [e \in Epochs |-> IF e < ep[x] THEN Len(plog[p][e]) ELSE @[e]]]
             /\ UNCHANGED <<st, log, wm>>
        ELSE /\ Reset(x)
-            /\ UNCHANGED plog
-    /\ UNCHANGED <<rec, made, manifest, sealed, up, ptrunc, fenced, seen, ep, base, tail, upseen, issued, ackedIn, proven>>
+            /\ UNCHANGED <<plog, ptrunc>>
+    /\ UNCHANGED <<rec, made, manifest, sealed, up, fenced, seen, ep, base, tail, upseen, issued, ackedIn, proven>>
 
 \* Acknowledge the entries every peer has (or, wrongly, any one peer).
 Ack(x) ==
@@ -233,7 +246,7 @@ Crash(x) ==
     /\ UNCHANGED <<rec, made, manifest, sealed, up, plog, ptrunc, fenced, seen, ep, base, tail, upseen, issued, ackedIn, proven>>
 
 Next ==
-    \/ \E x \in Procs : ReadRec(x) \/ Cas(x) \/ NoFence(x) \/ Load(x) \/ WriteManifest(x) \/ Ack(x) \/ AckBucket(x) \/ Upload(x) \/ Seal(x) \/ Crash(x)
+    \/ \E x \in Procs : ReadRec(x) \/ Cas(x) \/ NoFence(x) \/ Stale(x) \/ Load(x) \/ WriteManifest(x) \/ Ack(x) \/ AckBucket(x) \/ Upload(x) \/ Seal(x) \/ Crash(x)
     \/ \E x \in Procs, p \in Peers : Fence(x, p) \/ Send(x, p) \/ Trunc(x, p)
     \/ \E x \in Procs, w \in Writes : Exec(x, w)
 

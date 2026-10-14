@@ -891,6 +891,60 @@ object correct.
 Not in fleet mode yet: the D3 peer path. ponytail: every node scans the whole
 alarm index; at scale each node scans only the objects that place onto it.
 
+## D3 fast writes: spec and simulator
+
+D2 acknowledges a write only after the bucket has it, and that costs a bucket
+round trip per write. D3 acknowledges once the object's peers have it on
+disk, and uploads to the bucket in the background. Same order as D2: the
+spec first, then the core and the simulator, then real nodes.
+
+**1. The spec** (`spec/Replication.tla`). A write is acknowledged once every
+peer has it. A new owner fences one peer (it refuses older epochs from then
+on and hands back what it holds), then lists the bucket. Peers drop entries
+only after the bucket has them. A clean handoff seals the epoch. If a peer is
+down, a write the bucket has can be acknowledged the D2 way. TLC checks
+39.9 million states with no error, and eight known-bad versions each fail.
+
+TLC found two real bugs on the way, and the simulator found a third:
+- **Fence even if the old epoch has no manifest yet** (TLC). Its owner can
+  write one late and start serving, and nothing would stop it.
+- **A real node can't see which epoch has a manifest at the moment it
+  fences.** So the peer hands back its tail of every epoch, and the owner
+  picks one after listing the bucket. Not a bug in the model; a gap between
+  the model and what a node can do.
+- **A stale owner must stop if a newer manifest exists** (the simulator).
+  Peers clean out older epochs' logs once a newer epoch writes to them. That
+  cleanup wasn't in the spec. A process that claimed an epoch, froze, and
+  woke after the next epoch was serving found the old tail gone, and wrote a
+  manifest missing acknowledged writes. Nobody would load from it, but it
+  broke the invariant. The fix: stop when the listing shows a newer
+  manifest. Both the cleanup and the stop are in the spec now, and the
+  version without the stop fails there too.
+
+**2. The core** (`own.rs`). D2 and D3 are one path now. Each seal is a log
+entry. It's acknowledged when every peer confirms it (or, with peers down
+or none at all, after it's uploaded and the record is re-read). Reads wait for
+a confirmation sent after they ran, so a stale owner can't serve old data.
+Peers are picked by rendezvous hashing and kept in the ownership record. The
+set changes only across a sealed epoch, so one fence always covers every
+older epoch. A sealed record also skips the lease wait on takeover. With no
+peers (`replicas` 0) the core is D2, and the D2 simulator runs still hold.
+
+**3. The simulator** (`combd-spike sim N none 2`). Each node has a peer store
+that survives its crashes, like a disk. Peer calls take 1 to 5 ms (sometimes
+500), get lost like bucket calls, and go unanswered while the node is down or
+frozen.
+
+**50,000 seeds, every invariant held:** 7.4 million acknowledged writes,
+5.0 million reads, 734,385 ownership changes, 510,041 fences, and 832,929
+entries recovered from peer tails. 78% of acknowledgements came from peers;
+the rest went the bucket way while a peer was down. Each D3 bug (ack on one
+peer, no fence, drop before upload, seal early) is caught on the first
+2,000 seeds, most on seed 0.
+
+Next: put it into real nodes. That means peer append and fence calls on the
+mTLS wire, a peer store on disk with fsync, then racing it on the cluster.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

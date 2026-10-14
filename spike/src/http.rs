@@ -1330,6 +1330,7 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }
             Effect::Restore { obj, act, segs } => self.job(Job::Fetch { obj, act, segs, back: self.me }),
+            Effect::Peer { .. } => unreachable!("real nodes run D2 until the peer wire lands"),
             Effect::Drop { obj } => {
                 if let Some(name) = self.names.get(&obj) {
                     if self.objects.remove(name).is_some() {

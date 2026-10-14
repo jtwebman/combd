@@ -28,15 +28,18 @@ owner lists the bucket and picks the last epoch with a manifest. Peers drop
 entries only after the bucket has them. If a peer is slow or down, a write
 the bucket already has can be acknowledged the D2 way, by re-reading the
 record. A clean handoff seals the epoch: upload everything, then step down.
+A peer drops older epochs' logs once a newer epoch writes to it, so an owner
+that finds a newer manifest when it lists the bucket is stale and stops.
 
 Same three invariants. The model has two owners on different nodes, two
 peers, crashes, and a superseded owner that keeps sending and uploading until
-it notices. 46.9 million states, no errors. TLC found one real bug in the
+it notices. 39.9 million states, no errors. TLC found one real bug in the
 first design: a new owner skipped the fence because the old epoch had no
 manifest yet, and the old owner then wrote one late and served writes that
-were lost. The fix: fence unless the old epoch was sealed.
+were lost. The fix: fence unless the old epoch was sealed. The simulator found
+another (the stale owner that has to stop), and it's here now too.
 
-Seven known-bad versions must fail:
+Eight known-bad versions must fail:
 
 | Bug | Caught by |
 |---|---|
@@ -47,6 +50,7 @@ Seven known-bad versions must fail:
 | seal before everything is uploaded | NoLostAckedWrite |
 | fence only if the old epoch wrote a manifest | NoLostAckedWrite |
 | acknowledge what's uploaded without re-reading the record | NoLostAckedWrite |
+| a stale owner writes its manifest after a newer one | NoLostAckedWrite |
 
 Run `./check.sh` (needs Java; it fetches TLC 1.7.4 and checks its hash). The whole run takes about 3 minutes.
 

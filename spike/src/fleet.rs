@@ -75,15 +75,17 @@ pub fn run_call(s3: &S3, call: &Call) -> Res {
     })
 }
 
-/// Every segment of a restore, in order.
+/// Every entry of a restore, in order: each segment holds several.
 pub fn fetch(s3: &S3, segs: &[String]) -> Result<Vec<Vec<u8>>, String> {
-    segs.iter()
-        .map(|k| match s3.get(k) {
-            Ok(Some((b, _))) => Ok(b),
-            Ok(None) => Err(format!("segment {k} is missing")),
-            Err(e) => Err(format!("segment {k}: {e}")),
-        })
-        .collect()
+    let mut out = vec![];
+    for k in segs {
+        match s3.get(k) {
+            Ok(Some((b, _))) => out.extend(crate::own::unframe(&b).ok_or_else(|| format!("segment {k} is garbled"))?),
+            Ok(None) => return Err(format!("segment {k} is missing")),
+            Err(e) => return Err(format!("segment {k}: {e}")),
+        }
+    }
+    Ok(out)
 }
 
 /// A frame on the wire.

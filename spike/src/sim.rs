@@ -1,8 +1,12 @@
-//! A deterministic simulator for D2 ownership. It runs the real decision
-//! core (`own.rs`) in several processes against a fake bucket, with clients
-//! sending writes and reads, and a world that misbehaves:
-//! - bucket calls take 1 to 50 ms, sometimes 500 ms,
+//! A deterministic simulator for D2 ownership and D3 peer writes. It runs the
+//! real decision core (`own.rs`) in several processes against a fake bucket
+//! and real peer stores, with clients sending writes and reads, and a world
+//! that misbehaves:
+//! - bucket calls take 1 to 50 ms, sometimes 500 ms; peer calls 1 to 5 ms,
+//!   sometimes 500 ms,
 //! - requests and replies get lost (the caller times out and can't tell),
+//! - a peer store doesn't answer while its node is down or frozen (it keeps
+//!   its entries: it's on disk),
 //! - clocks run fast or slow, by up to 10%,
 //! - processes crash, and their supervisor starts a new one,
 //! - processes freeze; the supervisor may start a new one, and the frozen
@@ -15,7 +19,8 @@
 //! One seed gives one exact run, so any failure replays.
 //!
 //! An oracle checks every run: one writer per epoch, no lost acknowledged
-//! write, no history rewrite (the invariants in `spec/Ownership.tla`), and
+//! write, no history rewrite (the invariants in `spec/Ownership.tla` and
+//! `spec/Replication.tla`), and
 //! that a read sees every write acknowledged before the read was sent.
 
 use crate::own::*;
@@ -57,12 +62,14 @@ pub struct Settings {
     /// Chances per process per tick (every 200 ms).
     pub crash: f64,
     pub freeze: f64,
+    /// Peers per object: 0 is D2, 2 is D3.
+    pub replicas: usize,
     pub bugs: Bugs,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, bugs: Bugs::default() }
+        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, bugs: Bugs::default() }
     }
 }
 
@@ -75,6 +82,10 @@ pub struct Stats {
     pub epochs: u64,
     pub crashes: u64,
     pub freezes: u64,
+    pub peer_acks: u64,
+    pub bucket_acks: u64,
+    pub fences: u64,
+    pub tail_entries: u64,
 }
 
 /// A call's give-up time: after this, the caller hears `Lost`.
@@ -86,6 +97,8 @@ enum Msg {
     Proc(usize, Event),
     /// A bucket call arriving at the bucket.
     Bucket(usize, OpId, Call, bool),
+    /// A peer call arriving at a node's peer store.
+    Peer(usize, OpId, Node, PeerCall, bool),
     /// An answer reaching a client.
     Client(ReqId, Answer, usize),
     ClientNext(u32),
@@ -131,6 +144,8 @@ pub struct Sim {
     queue: BTreeMap<(u64, u64), Msg>,
     bucket: BTreeMap<String, (Val, u64)>,
     version: u64,
+    /// Each node's peer store: on disk, so it outlives the node's processes.
+    stores: HashMap<Node, PeerStore>,
     procs: Vec<Proc>,
     /// The process a node's traffic goes to (its supervisor's latest).
     current: HashMap<Node, usize>,
@@ -162,6 +177,11 @@ fn decode(b: &[u8]) -> Vec<W> {
     b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
 }
 
+/// The writes in a segment: its entries, in order.
+fn decode_seg(b: &[u8]) -> Option<Vec<W>> {
+    Some(unframe(b)?.iter().flat_map(|e| decode(e)).collect())
+}
+
 impl Sim {
     pub fn new(seed: u64, s: Settings) -> Sim {
         let mut sim = Sim {
@@ -172,6 +192,7 @@ impl Sim {
             queue: BTreeMap::new(),
             bucket: BTreeMap::new(),
             version: 0,
+            stores: HashMap::new(),
             procs: vec![],
             current: HashMap::new(),
             next_req: 0,
@@ -203,7 +224,7 @@ impl Sim {
         let off = self.rng.below(1_000_000);
         self.procs.push(Proc {
             node,
-            core: Core::new(node, self.s.bugs),
+            core: Core::new(node, self.s.bugs).replicate((0..self.s.nodes).collect(), self.s.replicas),
             alive: true,
             frozen: false,
             held: vec![],
@@ -226,6 +247,14 @@ impl Sim {
             500
         } else {
             1 + self.rng.below(50)
+        }
+    }
+
+    fn peer_latency(&mut self) -> u64 {
+        if self.rng.chance(0.01) {
+            500
+        } else {
+            1 + self.rng.below(5)
         }
     }
 
@@ -268,6 +297,16 @@ impl Sim {
                 let res = self.apply(&call);
                 if !lose_reply {
                     let d = self.latency();
+                    self.at(d, Msg::Proc(p, Event::Reply { op, res }));
+                }
+            }
+            Msg::Peer(p, op, node, call, lose_reply) => {
+                let up = self.current.get(&node).is_some_and(|&q| self.procs[q].alive && !self.procs[q].frozen);
+                if !up {
+                    self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
+                } else if !lose_reply {
+                    let res = Res::Peer(self.stores.entry(node).or_default().handle(call));
+                    let d = self.peer_latency();
                     self.at(d, Msg::Proc(p, Event::Reply { op, res }));
                 }
             }
@@ -343,6 +382,17 @@ impl Sim {
                     self.at(d, Msg::Bucket(p, op, call, lose_reply));
                 }
             }
+            Effect::Peer { op, node, call } => {
+                let lose_req = self.faulty() && self.rng.chance(self.s.lost);
+                let lose_reply = self.faulty() && self.rng.chance(self.s.lost);
+                if lose_req || lose_reply {
+                    self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
+                }
+                if !lose_req {
+                    let d = self.peer_latency();
+                    self.at(d, Msg::Peer(p, op, node, call, lose_reply));
+                }
+            }
             Effect::Answer { req, ans } => {
                 let d = self.latency();
                 self.at(d, Msg::Client(req, ans, p));
@@ -369,9 +419,9 @@ impl Sim {
                 let mut history = vec![];
                 let mut ok = true;
                 for k in &segs {
-                    match self.bucket.get(k) {
-                        Some((Val::Seg(b), _)) => history.extend(decode(b)),
-                        _ => ok = false,
+                    match self.bucket.get(k).and_then(|(v, _)| if let Val::Seg(b) = v { decode_seg(b) } else { None }) {
+                        Some(ws) => history.extend(ws),
+                        None => ok = false,
                     }
                 }
                 self.procs[p].data.insert(obj, Data { history, unsealed: vec![] });
@@ -494,7 +544,7 @@ impl Sim {
     /// The writes a manifest stands for.
     fn expand(&self, segs: &[String]) -> Vec<W> {
         segs.iter().flat_map(|k| match self.bucket.get(k) {
-            Some((Val::Seg(b), _)) => decode(b),
+            Some((Val::Seg(b), _)) => decode_seg(b).unwrap_or_default(),
             _ => vec![],
         }).collect()
     }
@@ -532,11 +582,17 @@ fn parse_manifest(k: &str) -> Option<(Obj, u32)> {
 }
 
 /// Run `seeds` seeds; the first failing seed and why.
-pub fn run_many(seeds: std::ops::Range<u64>, bugs: Bugs) -> (Stats, Option<(u64, String)>) {
+pub fn run_many(seeds: std::ops::Range<u64>, replicas: usize, bugs: Bugs) -> (Stats, Option<(u64, String)>) {
     let mut total = Stats::default();
     for seed in seeds {
-        let mut sim = Sim::new(seed, Settings { bugs, ..Settings::default() });
+        let mut sim = Sim::new(seed, Settings { replicas, bugs, ..Settings::default() });
         let r = sim.run();
+        for p in &sim.procs {
+            total.peer_acks += p.core.stats.peer_acks;
+            total.bucket_acks += p.core.stats.bucket_acks;
+            total.fences += p.core.stats.fences;
+            total.tail_entries += p.core.stats.tail_entries;
+        }
         let s = &sim.stats;
         total.writes_acked += s.writes_acked;
         total.reads_done += s.reads_done;
@@ -558,29 +614,45 @@ mod tests {
 
     #[test]
     fn same_seed_same_run() {
-        let a = run_many(7..8, Bugs::default()).0;
-        let b = run_many(7..8, Bugs::default()).0;
-        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        for r in [0, 2] {
+            let a = run_many(7..8, r, Bugs::default()).0;
+            let b = run_many(7..8, r, Bugs::default()).0;
+            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        }
     }
 
     #[test]
     fn the_protocol_holds_under_faults() {
-        let (s, bad) = run_many(0..200, Bugs::default());
+        let (s, bad) = run_many(0..200, 0, Bugs::default());
         assert!(bad.is_none(), "{bad:?}");
         assert!(s.writes_acked > 10_000 && s.epochs > 200 && s.crashes > 10 && s.freezes > 10, "{s:?}");
+    }
+
+    #[test]
+    fn peer_writes_hold_under_faults() {
+        let (s, bad) = run_many(0..200, 2, Bugs::default());
+        assert!(bad.is_none(), "{bad:?}");
+        assert!(s.writes_acked > 10_000 && s.epochs > 200 && s.crashes > 10 && s.freezes > 10, "{s:?}");
+        // Mostly the fast way; takeovers really fence and recover tails.
+        assert!(s.peer_acks > 2 * s.bucket_acks && s.bucket_acks > 0, "{s:?}");
+        assert!(s.fences > 50 && s.tail_entries > 50, "{s:?}");
     }
 
     /// Each known-bad version must be caught, or the oracle is blind.
     #[test]
     fn known_bugs_are_caught() {
         let cases = [
-            ("skip_proof", Bugs { skip_proof: true, ..Bugs::default() }),
-            ("load_before_cas", Bugs { load_before_cas: true, ..Bugs::default() }),
-            ("no_manifest", Bugs { no_manifest: true, ..Bugs::default() }),
-            ("reuse_epoch", Bugs { reuse_epoch: true, ..Bugs::default() }),
+            ("skip_proof", 0, Bugs { skip_proof: true, ..Bugs::default() }),
+            ("load_before_cas", 0, Bugs { load_before_cas: true, ..Bugs::default() }),
+            ("no_manifest", 0, Bugs { no_manifest: true, ..Bugs::default() }),
+            ("reuse_epoch", 0, Bugs { reuse_epoch: true, ..Bugs::default() }),
+            ("ack_one", 2, Bugs { ack_one: true, ..Bugs::default() }),
+            ("no_fence", 2, Bugs { no_fence: true, ..Bugs::default() }),
+            ("trunc_early", 2, Bugs { trunc_early: true, ..Bugs::default() }),
+            ("seal_early", 2, Bugs { seal_early: true, ..Bugs::default() }),
         ];
-        for (name, bugs) in cases {
-            let (_, bad) = run_many(0..2000, bugs);
+        for (name, replicas, bugs) in cases {
+            let (_, bad) = run_many(0..2000, replicas, bugs);
             assert!(bad.is_some(), "{name} was not caught in 2,000 seeds");
         }
     }

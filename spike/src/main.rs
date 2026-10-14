@@ -649,18 +649,29 @@ fn main_with(args: &[&str]) {
                 }
             }
         }
-        // The D2 ownership simulator: `sim [seeds] [bug]`.
+        // The ownership simulator: `sim [seeds|A..B] [bug|none] [replicas]`.
         ["sim", ..] => {
-            let n: u64 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(1000);
-            let bugs = match args.get(2).copied() {
-                Some("skip_proof") => own::Bugs { skip_proof: true, ..Default::default() },
-                Some("load_before_cas") => own::Bugs { load_before_cas: true, ..Default::default() },
-                Some("no_manifest") => own::Bugs { no_manifest: true, ..Default::default() },
-                Some("reuse_epoch") => own::Bugs { reuse_epoch: true, ..Default::default() },
-                _ => own::Bugs::default(),
+            // `N` seeds from 0, or `A..B` to replay some.
+            let seeds = match args.get(1).and_then(|v| v.split_once("..")) {
+                Some((a, b)) => a.parse().unwrap()..b.parse().unwrap(),
+                None => 0..args.get(1).and_then(|v| v.parse().ok()).unwrap_or(1000),
             };
+            let n = seeds.end - seeds.start;
+            let mut bugs = own::Bugs::default();
+            match args.get(2).copied() {
+                Some("skip_proof") => bugs.skip_proof = true,
+                Some("load_before_cas") => bugs.load_before_cas = true,
+                Some("no_manifest") => bugs.no_manifest = true,
+                Some("reuse_epoch") => bugs.reuse_epoch = true,
+                Some("ack_one") => bugs.ack_one = true,
+                Some("no_fence") => bugs.no_fence = true,
+                Some("trunc_early") => bugs.trunc_early = true,
+                Some("seal_early") => bugs.seal_early = true,
+                _ => {}
+            }
+            let replicas = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
             let t = Instant::now();
-            let (stats, bad) = sim::run_many(0..n, bugs);
+            let (stats, bad) = sim::run_many(seeds, replicas, bugs);
             println!("sim      {n} seeds in {:.1} s: {stats:?}", t.elapsed().as_secs_f64());
             if let Some((seed, why)) = bad {
                 println!("sim      seed {seed} broke an invariant: {why}");
