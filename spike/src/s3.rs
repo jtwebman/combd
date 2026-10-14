@@ -125,8 +125,23 @@ impl S3 {
         let sig = hex(&hmac(&k, &to_sign));
         let auth = format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={sig}", self.key);
 
-        let mut s = TcpStream::connect(&self.host)?;
-        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        // Timeouts well under a lease: a cut link must show up as a lost
+        // call quickly, not hold a bucket thread for long.
+        use std::net::ToSocketAddrs;
+        let mut s = None;
+        let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "the bucket's name doesn't resolve");
+        for a in self.host.to_socket_addrs()? {
+            match TcpStream::connect_timeout(&a, Duration::from_secs(2)) {
+                Ok(c) => {
+                    s = Some(c);
+                    break;
+                }
+                Err(e) => last = e,
+            }
+        }
+        let mut s = s.ok_or(last)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        s.set_write_timeout(Some(Duration::from_secs(5)))?;
         s.set_nodelay(true)?;
         let target = if qs.is_empty() { uri } else { format!("{uri}?{qs}") };
         let mut req = format!("{method} {target} HTTP/1.1\r\nauthorization: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n", body.len());

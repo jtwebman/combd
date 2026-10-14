@@ -1021,6 +1021,26 @@ What's left in the 3 s cases is the lease plus routing hints: other nodes
 keep sending clients to the cut-off owner for about a lease before they
 decide it's gone. That's tuning, not safety.
 
+**On the real cluster** (`REPLICAS=2 sh bench/cluster/split.sh`). Each kind
+of traffic gets its own Docker network (bucket, node to node, clients), so
+one kind of link can be cut. Under load, node1 is cut off for 4 s from the
+bucket, from the other nodes, or from both while its clients still reach
+it. Bucket calls now time out fast (2 s to connect, 5 s to read), so a cut
+shows up as a lost call instead of holding a thread.
+
+| node1 cut off from | D2 writes/s | D3 writes/s | D2 worst gap | D3 worst gap |
+|---|---|---|---|---|
+| nothing (steady) | 954 | 2,160 | 0 ms | 0 ms |
+| the bucket | 732 | 2,065 | 623 ms | 1,088 ms |
+| the other nodes | 583 | 1,249 | 0 ms | 0 ms |
+| both | 559 | 1,249 | 431 ms | 151 ms |
+
+Every object was correct in all 8 runs. "Worst gap" is the load driver's
+longest stretch of failed requests. One run each, on a busy machine, so the
+rates are rough. Note D3 barely slows when the owner loses the bucket: its
+peers still confirm writes. One-way splits need `iptables` in the image;
+the simulator covers those.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,
