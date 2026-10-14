@@ -8,8 +8,9 @@
 //! request behind.
 //!
 //! SQLite runs in the host, so the cell's SQL is fenced in:
-//! - an authorizer denies ATTACH (it could open other files), PRAGMA, and
-//!   the cell's own BEGIN / COMMIT / SAVEPOINT (the host owns transactions),
+//! - an authorizer denies ATTACH (it could open other files), PRAGMA, the
+//!   cell's own BEGIN / COMMIT / SAVEPOINT (the host owns transactions), and
+//!   any table named `_combd...` (the host's own, like the alarm),
 //! - limits cap the size of strings, SQL text, and expression depth,
 //! - a progress handler stops any one statement after `MAX_STEPS`, since
 //!   SQLite's CPU use isn't counted by the cell's fuel.
@@ -53,6 +54,9 @@ impl Db {
         let sync = if std::env::var_os("COMBD_EXPERIMENT_NO_FSYNC").is_some() { "NORMAL" } else { "FULL" };
         conn.pragma_update(None, "synchronous", sync)?;
         conn.pragma_update(None, "trusted_schema", "OFF")?;
+        // Many objects per node: keep each one's page cache small (256 KiB).
+        conn.pragma_update(None, "cache_size", -256)?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS _combd_alarm (id INTEGER PRIMARY KEY CHECK (id = 1), at INTEGER NOT NULL)")?;
         for (limit, v) in [
             (Limit::SQLITE_LIMIT_LENGTH, MAX_RESULT as i32),
             (Limit::SQLITE_LIMIT_SQL_LENGTH, 1 << 20),
@@ -67,6 +71,9 @@ impl Db {
         conn.authorizer(Some(move |ctx: AuthContext<'_>| {
             if h.load(Relaxed) {
                 return Authorization::Allow;
+            }
+            if table_of(&ctx.action).is_some_and(|t| t.len() >= 6 && t[..6].eq_ignore_ascii_case("_combd")) {
+                return Authorization::Deny;
             }
             match ctx.action {
                 AuthAction::Attach { .. }
@@ -104,6 +111,25 @@ impl Db {
     /// The output gate: returns once the request's writes are on disk.
     pub fn commit(&self) -> rusqlite::Result<()> {
         self.host_sql("COMMIT")
+    }
+
+    /// The object's alarm, in ms since the epoch.
+    pub fn alarm(&self) -> Option<i64> {
+        self.host.store(true, Relaxed);
+        let r = self.conn.query_row("SELECT at FROM _combd_alarm", [], |r| r.get(0)).ok();
+        self.host.store(false, Relaxed);
+        r
+    }
+
+    /// Set or clear the alarm, inside the open transaction.
+    pub fn set_alarm(&self, at: Option<i64>) -> rusqlite::Result<()> {
+        self.host.store(true, Relaxed);
+        let r = match at {
+            Some(at) => self.conn.execute("INSERT OR REPLACE INTO _combd_alarm (id, at) VALUES (1, ?)", [at]),
+            None => self.conn.execute("DELETE FROM _combd_alarm", []),
+        };
+        self.host.store(false, Relaxed);
+        r.map(|_| ())
     }
 
     pub fn rollback(&self) {
@@ -160,6 +186,63 @@ impl Db {
     }
 }
 
+/// Which objects have alarms, so a restarted node finds them without opening
+/// every object. Each object's own storage is the truth; this is a hint. It's
+/// written before the object commits, so it can hold an extra entry (checked
+/// and skipped when it fires) but never miss one.
+pub struct AlarmIndex(Connection);
+
+impl AlarmIndex {
+    pub fn open(dir: &Path) -> rusqlite::Result<AlarmIndex> {
+        let conn = Connection::open(dir.join("alarms.sqlite"))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS alarms (name TEXT PRIMARY KEY, at INTEGER NOT NULL)")?;
+        Ok(AlarmIndex(conn))
+    }
+
+    pub fn set(&self, name: &str, at: Option<i64>) -> rusqlite::Result<()> {
+        match at {
+            Some(at) => self.0.execute("INSERT OR REPLACE INTO alarms (name, at) VALUES (?, ?)", rusqlite::params![name, at]),
+            None => self.0.execute("DELETE FROM alarms WHERE name = ?", [name]),
+        }
+        .map(|_| ())
+    }
+
+    pub fn all(&self) -> rusqlite::Result<Vec<(String, i64)>> {
+        let mut st = self.0.prepare("SELECT name, at FROM alarms")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+}
+
+fn table_of<'a>(a: &AuthAction<'a>) -> Option<&'a str> {
+    use AuthAction::*;
+    Some(match *a {
+        CreateIndex { table_name, .. }
+        | CreateTable { table_name }
+        | CreateTempIndex { table_name, .. }
+        | CreateTempTable { table_name }
+        | CreateTempTrigger { table_name, .. }
+        | CreateTrigger { table_name, .. }
+        | Delete { table_name }
+        | DropIndex { table_name, .. }
+        | DropTable { table_name }
+        | DropTempIndex { table_name, .. }
+        | DropTempTable { table_name }
+        | DropTempTrigger { table_name, .. }
+        | DropTrigger { table_name, .. }
+        | Insert { table_name }
+        | Read { table_name, .. }
+        | Update { table_name, .. }
+        | AlterTable { table_name, .. }
+        | Analyze { table_name }
+        | CreateVtable { table_name, .. }
+        | DropVtable { table_name, .. } => table_name,
+        _ => return None,
+    })
+}
+
 fn to_sql(v: &Json) -> Result<Value, String> {
     Ok(match v {
         Json::Null => Value::Null,
@@ -205,11 +288,28 @@ mod tests {
             "COMMIT",
             "SAVEPOINT s",
             "SELECT fts3_tokenizer('simple')",
+            "SELECT at FROM _combd_alarm",
+            "DELETE FROM _COMBD_alarm",
+            "CREATE TRIGGER t AFTER INSERT ON _combd_alarm BEGIN SELECT 1; END",
+            "DROP TABLE _combd_alarm",
         ] {
             assert!(q(&db, bad).contains("error"), "{bad} was allowed");
         }
         assert!(q(&db, "CREATE TABLE t(a)").contains("rows"));
         assert!(q(&db, "SELECT 1 + 1").contains("[[2]]"));
+    }
+
+    #[test]
+    fn alarms_commit_with_the_request() {
+        let (_d, db) = db();
+        db.begin().unwrap();
+        db.set_alarm(Some(123)).unwrap();
+        db.rollback();
+        assert_eq!(db.alarm(), None);
+        db.begin().unwrap();
+        db.set_alarm(Some(456)).unwrap();
+        db.commit().unwrap();
+        assert_eq!(db.alarm(), Some(456));
     }
 
     #[test]

@@ -208,6 +208,35 @@ pub mod room {
         br#"{"error":"storage needs a cell"}"#.to_vec()
     }
 
+    #[cfg(target_arch = "wasm32")]
+    mod host {
+        #[link(wasm_import_module = "combd")]
+        extern "C" {
+            pub fn now_ms() -> i64;
+            pub fn alarm_set(at_ms: i64);
+            pub fn alarm_get() -> i64;
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod host {
+        pub unsafe fn now_ms() -> i64 {
+            0
+        }
+        pub unsafe fn alarm_set(_: i64) {}
+        pub unsafe fn alarm_get() -> i64 {
+            -1
+        }
+    }
+
+    fn kv(k: &str) -> i64 {
+        sql("SELECT v FROM kv WHERE k = ?", &[json!(k)]).first().and_then(|r| r[0].as_i64()).unwrap_or(0)
+    }
+
+    fn set_kv(k: &str, v: i64) {
+        sql("INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", &[json!(k), json!(v)]);
+    }
+
     /// One statement. Returns the rows, or panics on an error: let it crash.
     fn sql(q: &str, p: &[Value]) -> Vec<Value> {
         let out: Value = serde_json::from_slice(&raw_sql(json!({ "q": q, "p": p }).to_string().as_bytes())).expect("bad sql answer");
@@ -248,6 +277,25 @@ pub mod room {
                         room.msgs.pop_front();
                     }
                     format!("201 {}", json!({ "id": id }))
+                }
+                // Alarms: run `ALARM` in `body` ms. `/alarm-crash`'s handler
+                // crashes on its first try, so the host must retry it.
+                ("POST", "/alarm") | ("POST", "/alarm-crash") => {
+                    let ms: i64 = body.trim().parse().unwrap_or(0);
+                    set_kv("crash_alarm", (path == "/alarm-crash") as i64);
+                    let at = unsafe { host::now_ms() } + ms;
+                    unsafe { host::alarm_set(at) };
+                    format!("200 {}", json!({ "at": at }))
+                }
+                ("GET", "/alarms") => format!("200 {}", json!({ "fired": kv("alarms"), "pending": unsafe { host::alarm_get() } > 0 })),
+                ("ALARM", _) => {
+                    let retries: i64 = body.trim().parse().unwrap_or(0);
+                    if kv("crash_alarm") == 1 && retries == 0 {
+                        panic!("alarm crash on the first try");
+                    }
+                    set_kv("crash_alarm", 0);
+                    set_kv("alarms", kv("alarms") + 1);
+                    "200 {}".into()
                 }
                 // Write, then crash: the host must roll the write back.
                 ("POST", "/crash") => {

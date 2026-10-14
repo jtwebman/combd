@@ -641,8 +641,33 @@ What's next for writes:
    files written without fsync. The same changesets are what D2 and D3 ship
    to the bucket and to peers.
 
-Not done yet: alarms, hibernation (evicting idle objects), objects on more
-than one event loop (for now, `/do/` needs `COMBD_THREADS=1`), and the
+### Alarms, eviction, and more than one event loop
+
+- **One owner per object, on any number of event loops.** An object lives on
+  the loop picked by a hash of its name. A request that lands on another loop
+  is forwarded there over a channel, and the answer comes back the same way.
+  The 80-increment test passes on 4 loops too, with requests forwarded.
+- **Alarms.** A cell sets one with `alarm_set`; it's saved in the object's
+  own SQLite (in a `_combd` table the cell can't touch), so it commits or
+  rolls back with the request. The owner runs `ALARM` when it's due. A failed
+  alarm rolls back and is retried with backoff (0.5 s, then doubling, up to 6
+  tries, then dropped, as in Cloudflare). A node index lists objects with
+  alarms, so a restarted node finds them. It's written before the object's
+  commit and cleared after it, so it can hold an extra entry (checked and
+  skipped) but never miss one. The restart test fails if the index isn't
+  read at startup.
+- **Eviction.** Objects idle for `COMBD_IDLE_MS` (default 60 s), or past
+  `COMBD_MAX_OBJECTS` per loop (default 10,000, least recently used first),
+  leave memory and come back from storage on the next request or alarm.
+- **`GET /_combd/stats`:** live objects, objects opened, evictions, alarms
+  fired and failed, and forwarded requests.
+
+Speed didn't change. Alternating the old and new builds on hot writes, three
+runs each: new 4,850 to 4,912 req/s (p99 11.5 to 12.5 ms), old 4,117 to
+4,771 (p99 12.6 to 38 ms). Stateless HTTP was the same within noise. On 2
+cores: 4,748 hot writes, 127,890 hot reads, 1,534 writes over 1,000 objects.
+
+Still to do: write coalescing and one fsync per round (above), and the
 Cloudflare JS API for objects (jsc doesn't compile classes yet).
 
 ## Security: memory is always zero

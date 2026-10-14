@@ -21,6 +21,8 @@ pub struct HostState {
     pub db: Option<Arc<Mutex<Db>>>,
     /// The answer to the last `sql` call, until `sql_read` takes it.
     pub sql_out: Vec<u8>,
+    /// The cell changed its alarm in this request.
+    pub alarm_dirty: bool,
 }
 
 const MAX_OUT: usize = 64 * 1024;
@@ -66,12 +68,31 @@ pub fn call(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -
             }
             0
         }
+        // Wall clock in ms, as coarse as the WASI clock.
+        ("combd", "now_ms") => now_ms() as u64,
+        // Alarms: `alarm_set(at_ms)` (0 or less clears it), `alarm_get()` (-1: none).
+        // They change the object's storage, so they commit with the request.
+        ("combd", "alarm_set") => {
+            let db = st.db.as_ref().ok_or("alarm_set: this cell has no storage")?;
+            let at = args[0] as i64;
+            db.lock().unwrap().set_alarm((at > 0).then_some(at)).map_err(|e| format!("alarm_set: {e}"))?;
+            st.alarm_dirty = true;
+            0
+        }
+        ("combd", "alarm_get") => {
+            let db = st.db.as_ref().ok_or("alarm_get: this cell has no storage")?;
+            db.lock().unwrap().alarm().unwrap_or(-1) as u64
+        }
         ("env", "abort") => return Err("abort".into()),
         ("wasi_snapshot_preview1", "proc_exit") => return Err(format!("exit {}", args[0] as i32)),
         ("wasi_snapshot_preview1", name) => wasi(name, args, mem, st),
         (m, n) => return Err(format!("unknown import {m}.{n}")),
     };
     Ok(if imp.results == 0 { vec![] } else { vec![r] })
+}
+
+pub fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 fn put(mem: &mut dyn Mem, ptr: u32, bytes: &[u8]) -> u64 {

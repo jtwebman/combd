@@ -830,8 +830,10 @@ Next for this tier, biggest first:
    hibernation, egress broker, mTLS admin port.
    **Started 2026-10-14:** objects, host SQLite with an authorizer, the output
    gate, crash rollback, and the race against workerd and celld are done (see
-   [spike/RESULTS.md](spike/RESULTS.md)). Next: write coalescing, one fsync
-   per round, alarms, hibernation, objects across event loops.
+   [spike/RESULTS.md](spike/RESULTS.md)). Then alarms (with retries, and
+   found again after a restart), eviction of idle objects, one owner per
+   object across event loops, and `/_combd/stats`. Next: write coalescing,
+   one fsync per round.
 3. **Fleet (D2).** Bucket leases, CAS ownership, epochs, routing between nodes
    over mTLS. Kill tests.
 4. **WebSockets** with hibernation.

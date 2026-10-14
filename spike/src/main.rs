@@ -545,6 +545,8 @@ fn main_with(args: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     const REQS: [&str; 5] = ["hello", "fib 20", "sieve 10000", "sort 5000", "nope"];
 
@@ -788,25 +790,46 @@ mod tests {
         assert!(request(&mut vm, "sieve 5000000", &mut HostState::default()).is_err());
     }
 
-    /// Start a server for Durable Object tests; returns its port.
-    fn do_server<E: Engine + Sync + Send + 'static>(eng: E, data: &std::path::Path) -> u16
+    /// A server for Durable Object tests: (port, stop switch, thread).
+    fn do_server<E: Engine + Sync + Send + 'static>(eng: E, cfg: http::Config) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>)
     where
         E::Program: Sync + Send,
     {
         static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
         let port = 21000 + (std::process::id() % 2000) as u16 * 10 + PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let data = data.to_path_buf();
-        std::thread::spawn(move || {
+        let stop = cfg.stop.clone();
+        let t = std::thread::spawn(move || {
             let prog = eng.load(&wasm()).unwrap();
-            http::serve_with(&eng, &prog, port, 1, data);
+            http::serve_with(&eng, &prog, port, cfg);
         });
         for _ in 0..200 {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return port;
+                return (port, stop, t);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("server on {port} didn't start");
+    }
+
+    fn cfg(data: &std::path::Path, threads: usize) -> http::Config {
+        http::Config { threads, data: data.to_path_buf(), idle: Duration::from_secs(60), max_objects: 10_000, stop: Arc::default() }
+    }
+
+    fn stat(port: u16, key: &str) -> i64 {
+        let (_, body) = http(port, "GET", "/_combd/stats", "");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()[key].as_i64().unwrap()
+    }
+
+    /// Wait up to `ms` for `f` to hold.
+    fn eventually(ms: u64, f: impl Fn() -> bool) -> bool {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(ms) {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        f()
     }
 
     /// One HTTP request on its own connection: (status, body).
@@ -829,12 +852,12 @@ mod tests {
 
     /// Durable Objects: state lives across requests, every answered write is
     /// on disk (the output gate), and a crash rolls its request back.
-    fn objects_keep_state_and_roll_back_crashes<E: Engine + Sync + Send + 'static>(eng: E)
+    fn objects_keep_state_and_roll_back_crashes<E: Engine + Sync + Send + 'static>(eng: E, threads: usize)
     where
         E::Program: Sync + Send,
     {
         let dir = store::tempdir::Dir::new();
-        let port = do_server(eng, &dir.0);
+        let (port, _, _) = do_server(eng, cfg(&dir.0, threads));
         for n in 1..=3 {
             assert_eq!(http(port, "POST", "/do/room1/incr", ""), (200, format!("{{\"count\":{n}}}")));
         }
@@ -865,12 +888,73 @@ mod tests {
 
     #[test]
     fn objects_on_the_interpreter() {
-        objects_keep_state_and_roll_back_crashes(interp::Interp { max_pages: 16384 });
+        objects_keep_state_and_roll_back_crashes(interp::Interp { max_pages: 16384 }, 1);
     }
 
     #[cfg(feature = "aot-guard")]
     #[test]
     fn objects_on_aot() {
-        objects_keep_state_and_roll_back_crashes(aot::Aot);
+        objects_keep_state_and_roll_back_crashes(aot::Aot, 1);
+    }
+
+    /// Four event loops: requests for an object reach its one owner from any
+    /// loop, so it still runs them one at a time.
+    #[test]
+    fn objects_across_event_loops() {
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, cfg(&dir.0, 4));
+        let answers: Vec<String> = (0..8)
+            .map(|_| std::thread::spawn(move || (0..10).map(|_| http(port, "POST", "/do/shared/incr", "").1).collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let mut counts: Vec<i64> = answers.iter().map(|a| serde_json::from_str::<serde_json::Value>(a).unwrap()["count"].as_i64().unwrap()).collect();
+        counts.sort();
+        assert_eq!(counts, (1..=80).collect::<Vec<_>>());
+        for i in 0..20 {
+            assert_eq!(http(port, "POST", &format!("/do/o{i}/incr"), "").0, 200);
+        }
+        assert!(stat(port, "forwarded") > 0, "nothing was forwarded");
+        assert_eq!(stat(port, "objects_live"), 21);
+    }
+
+    /// Alarms fire, a crashing one is retried, and one set before a restart
+    /// still fires after it.
+    #[test]
+    fn alarms_fire_retry_and_survive_restarts() {
+        let dir = store::tempdir::Dir::new();
+        let eng = || interp::Interp { max_pages: 16384 };
+        let (port, stop, t) = do_server(eng(), cfg(&dir.0, 2));
+        let fired = |port: u16, o: &str| http(port, "GET", &format!("/do/{o}/alarms"), "").1;
+        assert_eq!(http(port, "POST", "/do/a1/alarm", "100").0, 200);
+        assert_eq!(fired(port, "a1"), r#"{"fired":0,"pending":true}"#);
+        assert!(eventually(2000, || fired(port, "a1") == r#"{"fired":1,"pending":false}"#), "{}", fired(port, "a1"));
+        // The handler crashes on its first try: rolled back, then retried.
+        assert_eq!(http(port, "POST", "/do/a2/alarm-crash", "50").0, 200);
+        assert!(eventually(3000, || fired(port, "a2") == r#"{"fired":1,"pending":false}"#), "{}", fired(port, "a2"));
+        assert!(stat(port, "alarms_failed") >= 1);
+        // Set one, stop the node, start a new one on the same data.
+        assert_eq!(http(port, "POST", "/do/a3/alarm", "700").0, 200);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        t.join().unwrap();
+        let (port, _, _) = do_server(eng(), cfg(&dir.0, 3));
+        assert!(eventually(3000, || fired(port, "a3") == r#"{"fired":1,"pending":false}"#), "{}", fired(port, "a3"));
+    }
+
+    /// Idle objects leave memory and come back from storage; the cap holds.
+    #[test]
+    fn idle_objects_are_evicted() {
+        let dir = store::tempdir::Dir::new();
+        let c = http::Config { idle: Duration::from_millis(150), max_objects: 5, ..cfg(&dir.0, 1) };
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, c);
+        assert_eq!(http(port, "POST", "/do/e1/incr", "").0, 200);
+        assert!(eventually(2000, || stat(port, "objects_live") == 0), "never evicted");
+        assert_eq!(http(port, "GET", "/do/e1/count", ""), (200, "{\"count\":1}".into()));
+        for i in 0..20 {
+            http(port, "POST", &format!("/do/m{i}/incr"), "");
+        }
+        assert!(eventually(1000, || stat(port, "objects_live") <= 5), "cap not held: {}", stat(port, "objects_live"));
+        assert!(stat(port, "evictions") >= 16);
     }
 }
