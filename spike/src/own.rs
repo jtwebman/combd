@@ -144,6 +144,9 @@ pub enum PeerCall {
     Append { obj: Obj, epoch: u32, from: u64, ents: Vec<Vec<u8>>, trunc: u64 },
     /// Refuse every epoch below `epoch` from now on, and hand back every tail.
     Fence { obj: Obj, epoch: u32 },
+    /// Only in a peer store's own log, never on the wire: a store that lost
+    /// its disk relearned `obj` from the bucket, whose record said `epoch`.
+    Learn { obj: Obj, epoch: u32 },
 }
 
 /// What a peer holds of one epoch: entries `from + 1 ..`.
@@ -159,7 +162,9 @@ pub enum PeerRes {
     /// How many entries of the epoch the peer has (kept or dropped).
     Have(u64),
     Refused,
-    Tails(Vec<Tail>),
+    /// Every tail, and `born`: 0, or for a store that lost its disk, the
+    /// epoch it relearned. It speaks only for epochs after that.
+    Tails { born: u32, tails: Vec<Tail> },
 }
 
 #[derive(Clone, Debug)]
@@ -232,25 +237,62 @@ pub struct Bugs {
     pub trunc_early: bool,
     /// D3: seal before everything is uploaded.
     pub seal_early: bool,
+    /// D3: use a wiped peer's tail for an epoch it may have lost.
+    pub trust_wiped: bool,
+    /// D3: a wiped peer doesn't relearn its fence from the bucket.
+    pub wipe_forgets_fence: bool,
 }
 
 /// A node's peer store: the entries it keeps for other nodes' objects. The
 /// real node keeps it on disk; it must survive the node's restarts.
+///
+/// If the disk is lost, the store comes back `wiped`, and it forgot two
+/// things: what it held, and whom it fenced. So before it answers anything
+/// about an object, it reads the object's ownership record (epoch R) and
+/// refuses every epoch below R: the fence it lost. Epochs after R began
+/// after it came back, so it saw all of them; of R and older it may hold a
+/// partial copy, so its answers carry `born` = R, and owners don't use its
+/// tail of those.
 #[derive(Default)]
 pub struct PeerStore {
     objs: HashMap<Obj, PeerObj>,
+    pub wiped: bool,
+    /// The bug switch `wipe_forgets_fence`, for tests only.
+    pub forgets_fence: bool,
 }
 
 #[derive(Default)]
 struct PeerObj {
     fenced: u32,
+    born: u32,
     /// Per epoch: how many entries were dropped, and the rest.
     logs: BTreeMap<u32, (u64, Vec<Vec<u8>>)>,
 }
 
 impl PeerStore {
+    /// A store that lost its disk.
+    pub fn wiped() -> PeerStore {
+        PeerStore { wiped: true, ..PeerStore::default() }
+    }
+
+    /// Does a wiped store need to relearn this object first (`Learn`, with
+    /// the epoch in the bucket's record)?
+    pub fn must_learn(&self, call: &PeerCall) -> Option<Obj> {
+        match call {
+            PeerCall::Append { obj, .. } | PeerCall::Fence { obj, .. } if self.wiped && !self.objs.contains_key(obj) => Some(*obj),
+            _ => None,
+        }
+    }
+
     pub fn handle(&mut self, call: PeerCall) -> PeerRes {
         match call {
+            PeerCall::Learn { obj, epoch } => {
+                let fenced = if self.forgets_fence { 0 } else { epoch.saturating_sub(1) };
+                let po = self.objs.entry(obj).or_default();
+                po.fenced = po.fenced.max(fenced);
+                po.born = po.born.max(epoch);
+                PeerRes::Have(0)
+            }
             PeerCall::Append { obj, epoch, from, ents, trunc } => {
                 let po = self.objs.entry(obj).or_default();
                 if epoch <= po.fenced || from == 0 {
@@ -259,13 +301,14 @@ impl PeerStore {
                 // An epoch that appends has its manifest written, and that
                 // manifest holds everything older: those logs aren't needed.
                 po.logs.retain(|&e, _| e >= epoch);
+                let len = po.logs.get(&epoch).map_or(0, |(d, l)| d + l.len() as u64);
+                if from > len + 1 && from - 1 > trunc {
+                    // A gap the bucket doesn't cover: say what we have (and
+                    // don't start a log we can't fill).
+                    return PeerRes::Have(len);
+                }
                 let (dropped, log) = po.logs.entry(epoch).or_default();
-                let len = *dropped + log.len() as u64;
                 if from > len + 1 {
-                    if from - 1 > trunc {
-                        // A gap the bucket doesn't cover: say what we have.
-                        return PeerRes::Have(len);
-                    }
                     // The bucket has everything before `from`.
                     *dropped = from - 1;
                     log.clear();
@@ -281,18 +324,23 @@ impl PeerStore {
             PeerCall::Fence { obj, epoch } => {
                 let po = self.objs.entry(obj).or_default();
                 po.fenced = po.fenced.max(epoch.saturating_sub(1));
-                PeerRes::Tails(po.logs.iter().map(|(&e, (d, l))| Tail { epoch: e, from: *d, ents: l.clone() }).collect())
+                let tails = po.logs.iter().map(|(&e, (d, l))| Tail { epoch: e, from: *d, ents: l.clone() }).collect();
+                PeerRes::Tails { born: po.born, tails }
             }
         }
     }
 
-    /// Calls that rebuild this store from nothing: each object's logs, newest
-    /// epoch first (an append drops older epochs, not newer), then its fence.
+    /// Calls that rebuild this store from nothing: what a wiped store
+    /// relearned, each object's logs, newest epoch first (an append drops
+    /// older epochs, not newer), then its fence.
     pub fn snapshot(&self) -> Vec<PeerCall> {
         let mut out = vec![];
         for (&obj, po) in &self.objs {
+            if po.born > 0 {
+                out.push(PeerCall::Learn { obj, epoch: po.born });
+            }
             for (&epoch, (d, l)) in po.logs.iter().rev() {
-                out.push(PeerCall::Append { obj, epoch, from: d + 1, ents: l.clone(), trunc: 0 });
+                out.push(PeerCall::Append { obj, epoch, from: d + 1, ents: l.clone(), trunc: *d });
             }
             if po.fenced > 0 {
                 out.push(PeerCall::Fence { obj, epoch: po.fenced + 1 });
@@ -456,6 +504,21 @@ impl Serve {
     }
 }
 
+/// A takeover's fence: calls go to every peer, and answers come back.
+struct FenceSt {
+    epoch: u32,
+    /// Calls still out.
+    out: usize,
+    /// Answers: (born, tails).
+    replies: Vec<(u32, Vec<Tail>)>,
+    /// How many answers came before the listing went out. Only those can be
+    /// used: the listing must come after the fence of the peer we use.
+    listed: usize,
+    /// None of those could speak for the epoch we need: wait for the rest,
+    /// then list again.
+    waiting: bool,
+}
+
 struct ObjSt {
     phase: Phase,
     /// Requests waiting for the object to start.
@@ -466,9 +529,8 @@ struct ObjSt {
     prev: Option<Rec>,
     peers: Vec<Node>,
     etag: String,
-    /// Fencing epoch E: calls still out. Then the tails from the first reply.
-    fencing: Option<(u32, usize)>,
-    tails: Vec<Tail>,
+    /// Fencing for epoch E, until the manifest is written.
+    fence: Option<FenceSt>,
     /// The activation being started, and its epoch.
     act: Act,
     epoch: u32,
@@ -582,8 +644,7 @@ impl Core {
             prev: None,
             peers: vec![],
             etag: String::new(),
-            fencing: None,
-            tails: vec![],
+            fence: None,
             act: 0,
             epoch: 0,
         })
@@ -862,8 +923,7 @@ impl Core {
         }
         failed.extend(st.waiting.drain(..));
         st.early = None;
-        st.fencing = None;
-        st.tails.clear();
+        st.fence = None;
         self.out.push(Effect::Drop { obj: o });
         for r in failed {
             self.answer(r, Answer::Failed);
@@ -970,28 +1030,52 @@ impl Core {
             // ---- 2. fence, then load, then write the manifest, then restore ----
             (Wait::Fence(o, e), res) => {
                 let st = self.st(o);
-                let Some((fe, out)) = st.fencing else { return };
-                if fe != e {
-                    return;
+                let Some(f) = st.fence.as_mut().filter(|f| f.epoch == e) else { return };
+                f.out -= 1;
+                if let Res::Peer(PeerRes::Tails { born, tails }) = res {
+                    f.replies.push((born, tails));
                 }
-                match res {
-                    Res::Peer(PeerRes::Tails(tails)) => {
-                        st.fencing = None;
-                        st.tails = tails;
+                let first = f.listed == 0 && !f.replies.is_empty();
+                let rest = f.waiting && f.out == 0;
+                if first || rest {
+                    f.listed = f.replies.len();
+                    f.waiting = false;
+                    if first {
                         self.stats.fences += 1;
-                        self.call(Wait::List(o, e), Call::List(obj_prefix(o)));
                     }
+                    self.call(Wait::List(o, e), Call::List(obj_prefix(o)));
+                } else if f.out == 0 && f.replies.is_empty() {
                     // Every peer lost: give up; the next request starts over.
-                    _ if out == 1 => self.drop_obj(o),
-                    _ => st.fencing = Some((e, out - 1)),
+                    self.drop_obj(o);
                 }
             }
             (Wait::List(o, e), Res::Listed(keys)) => self.history(o, e, keys, None),
             (Wait::PrevManifest(o, e, segs, uploaded, q), Res::Got(Some((Val::Manifest(m), _)))) => {
                 let mut base = m;
                 base.extend(segs);
-                // What the fenced peer had of q past its uploads.
-                let more: Vec<Vec<u8>> = std::mem::take(&mut self.st(o).tails)
+                // A fenced peer's tail of q, if any (no fence: nothing to add).
+                let trust_wiped = self.bugs.trust_wiped;
+                let st = self.st(o);
+                let tails = match st.fence.as_mut().filter(|f| f.epoch == e) {
+                    None => vec![],
+                    Some(f) => match f.replies[..f.listed].iter().position(|(born, _)| trust_wiped || q > *born) {
+                        Some(i) => std::mem::take(&mut f.replies[i].1),
+                        // None of them can speak for q: they lost their disk
+                        // since. Wait for the other peers, then list again.
+                        None if f.out > 0 => {
+                            f.waiting = true;
+                            return;
+                        }
+                        None if f.listed < f.replies.len() => {
+                            f.listed = f.replies.len();
+                            return self.call(Wait::List(o, e), Call::List(obj_prefix(o)));
+                        }
+                        None => return self.drop_obj(o),
+                    },
+                };
+                self.st(o).fence = None;
+                // What that peer had of q past its uploads.
+                let more: Vec<Vec<u8>> = tails
                     .into_iter()
                     .find(|t| t.epoch == q)
                     .filter(|t| t.from <= uploaded)
@@ -1125,11 +1209,11 @@ impl Core {
         }
         let prev = self.st(o).prev.clone();
         if !self.must_fence(&prev) {
-            self.st(o).tails.clear();
+            self.st(o).fence = None;
             return self.call(Wait::List(o, e), Call::List(obj_prefix(o)));
         }
         let peers = prev.unwrap().peers;
-        self.st(o).fencing = Some((e, peers.len()));
+        self.st(o).fence = Some(FenceSt { epoch: e, out: peers.len(), replies: vec![], listed: 0, waiting: false });
         for n in peers {
             self.peer(Wait::Fence(o, e), n, PeerCall::Fence { obj: o, epoch: e });
         }
@@ -1208,11 +1292,11 @@ mod tests {
         assert_eq!(app(&mut p, 1, 2, vec![e(2), e(3)], 1), Some(3), "a resend keeps what it has");
         assert_eq!(app(&mut p, 1, 6, vec![e(6)], 4), Some(3), "no skip past what the bucket has");
         assert_eq!(app(&mut p, 1, 6, vec![e(6)], 5), Some(6), "skips ahead to what the bucket lacks");
-        let PeerRes::Tails(t) = p.handle(PeerCall::Fence { obj: 1, epoch: 2 }) else { panic!() };
+        let PeerRes::Tails { tails: t, .. } = p.handle(PeerCall::Fence { obj: 1, epoch: 2 }) else { panic!() };
         assert_eq!((t[0].epoch, t[0].from, t[0].ents.clone()), (1, 5, vec![e(6)]));
         assert!(app(&mut p, 1, 7, vec![e(7)], 0).is_none(), "a fenced epoch is refused");
         assert_eq!(app(&mut p, 2, 1, vec![e(9)], 0), Some(1));
-        let PeerRes::Tails(t) = p.handle(PeerCall::Fence { obj: 1, epoch: 3 }) else { panic!() };
+        let PeerRes::Tails { tails: t, .. } = p.handle(PeerCall::Fence { obj: 1, epoch: 3 }) else { panic!() };
         assert_eq!(t.len(), 1, "older epochs go once a newer one appends");
         // A snapshot rebuilds the same store.
         let mut q = PeerStore::default();
@@ -1221,6 +1305,31 @@ mod tests {
         }
         assert_eq!(q.handle(PeerCall::Fence { obj: 1, epoch: 3 }), p.handle(PeerCall::Fence { obj: 1, epoch: 3 }));
         assert!(app(&mut q, 2, 2, vec![e(1)], 0).is_none(), "the fence survives");
+        // A log with dropped entries survives a snapshot too.
+        assert_eq!(app(&mut p, 4, 3, vec![e(3)], 2), Some(3));
+        let mut q = PeerStore::default();
+        for c in p.snapshot() {
+            q.handle(c);
+        }
+        assert_eq!(q.handle(PeerCall::Fence { obj: 1, epoch: 5 }), p.handle(PeerCall::Fence { obj: 1, epoch: 5 }));
+    }
+
+    #[test]
+    fn a_wiped_store_relearns_its_fence_and_says_what_it_knows() {
+        let mut p = PeerStore::wiped();
+        let call = PeerCall::Append { obj: 1, epoch: 2, from: 1, ents: vec![vec![1]], trunc: 0 };
+        assert_eq!(p.must_learn(&call), Some(1));
+        p.handle(PeerCall::Learn { obj: 1, epoch: 3 });
+        assert_eq!(p.must_learn(&call), None);
+        assert_eq!(p.handle(call), PeerRes::Refused, "epoch 2 is older than the record: fenced");
+        p.handle(PeerCall::Append { obj: 1, epoch: 3, from: 1, ents: vec![vec![1]], trunc: 0 });
+        let PeerRes::Tails { born, .. } = p.handle(PeerCall::Fence { obj: 1, epoch: 4 }) else { panic!() };
+        assert_eq!(born, 3, "it can't speak for epoch 3 or older");
+        let mut q = PeerStore::wiped();
+        for c in p.snapshot() {
+            q.handle(c);
+        }
+        assert_eq!(q.handle(PeerCall::Fence { obj: 1, epoch: 4 }), p.handle(PeerCall::Fence { obj: 1, epoch: 4 }));
     }
 
     #[test]

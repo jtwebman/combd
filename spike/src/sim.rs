@@ -70,12 +70,15 @@ pub struct Settings {
     pub replicas: usize,
     /// Lasting network splits, about one every 3 s.
     pub splits: bool,
+    /// One node's disk is lost (once per run, at a crash): its peer store
+    /// comes back wiped.
+    pub wipes: bool,
     pub bugs: Bugs,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, bugs: Bugs::default() }
+        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, bugs: Bugs::default() }
     }
 }
 
@@ -93,6 +96,7 @@ pub struct Stats {
     pub fences: u64,
     pub tail_entries: u64,
     pub splits: u64,
+    pub wipes: u64,
     /// The longest time any object went without an acknowledged write, in ms
     /// (while traffic was running).
     pub max_gap: u64,
@@ -122,6 +126,20 @@ enum Msg {
 
 /// One end of a network link: a node, or the bucket (`None`).
 type End = Option<Node>;
+
+/// A peer store answers a call; a wiped one first relearns the object from
+/// the bucket, as a real one does.
+fn store_call(stores: &mut HashMap<Node, PeerStore>, bucket: &BTreeMap<String, (Val, u64)>, node: Node, call: PeerCall) -> PeerRes {
+    let st = stores.entry(node).or_default();
+    if let Some(obj) = st.must_learn(&call) {
+        let epoch = match bucket.get(&own_key(obj)) {
+            Some((Val::Rec(r), _)) => r.epoch,
+            _ => 0,
+        };
+        st.handle(PeerCall::Learn { obj, epoch });
+    }
+    st.handle(call)
+}
 
 /// What a process holds for one object it serves: its data.
 #[derive(Default)]
@@ -339,10 +357,10 @@ impl Sim {
                 if !up || self.cut(Some(from), Some(node)) {
                     self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
                 } else if self.cut(Some(node), Some(from)) {
-                    self.stores.entry(node).or_default().handle(call);
+                    store_call(&mut self.stores, &self.bucket, node, call);
                     self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
                 } else if !lose_reply {
-                    let res = Res::Peer(self.stores.entry(node).or_default().handle(call));
+                    let res = Res::Peer(store_call(&mut self.stores, &self.bucket, node, call));
                     let d = self.peer_latency();
                     self.at(d, Msg::Proc(p, Event::Reply { op, res }));
                 }
@@ -427,6 +445,14 @@ impl Sim {
         if self.rng.chance(self.s.crash) {
             self.stats.crashes += 1;
             self.procs[p].alive = false;
+            // Now and then the disk goes with it (once per run: two lost
+            // disks at once really can lose writes).
+            if self.s.wipes && self.stats.wipes == 0 && self.rng.chance(0.3) {
+                self.stats.wipes += 1;
+                let mut st = PeerStore::wiped();
+                st.forgets_fence = self.s.bugs.wipe_forgets_fence;
+                self.stores.insert(node, st);
+            }
             let d = 50 + self.rng.below(500);
             self.at(d, Msg::Restart(node));
         } else if self.rng.chance(self.s.freeze) {
@@ -702,6 +728,7 @@ pub fn run_with(seeds: std::ops::Range<u64>, settings: &dyn Fn() -> Settings) ->
         total.crashes += s.crashes;
         total.freezes += s.freezes;
         total.splits += s.splits;
+        total.wipes += s.wipes;
         total.max_gap = total.max_gap.max(s.max_gap);
         if let Err(e) = r {
             return (total, Some((seed, e)));
@@ -746,6 +773,17 @@ mod tests {
             let (s, bad) = run_with(0..300, &|| Settings { replicas, splits: true, ..Settings::default() });
             assert!(bad.is_none(), "replicas {replicas}: {bad:?}");
             assert!(s.splits > 1000 && s.writes_acked > 10_000, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn a_lost_disk_loses_nothing() {
+        let (s, bad) = run_with(0..500, &|| Settings { replicas: 2, wipes: true, ..Settings::default() });
+        assert!(bad.is_none(), "{bad:?}");
+        assert!(s.wipes > 150 && s.fences > 500, "{s:?}");
+        for (name, bugs) in [("trust_wiped", Bugs { trust_wiped: true, ..Bugs::default() }), ("wipe_forgets_fence", Bugs { wipe_forgets_fence: true, ..Bugs::default() })] {
+            let (_, bad) = run_with(0..5000, &|| Settings { replicas: 2, wipes: true, bugs, ..Settings::default() });
+            assert!(bad.is_some(), "{name} was not caught in 5,000 seeds");
         }
     }
 

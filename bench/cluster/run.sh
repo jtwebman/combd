@@ -7,7 +7,8 @@
 # acknowledged <= count <= acknowledged + failed.
 #
 # Tests: steady load; SIGKILL a node mid-load (restarted after 3 s); freeze a
-# node with `docker pause` (it wakes up still thinking it owns things).
+# node with `docker pause` (it wakes up still thinking it owns things); and
+# SIGKILL a node and delete its disk (it comes back empty, as a new disk would).
 #
 # Build first: combd-spike-aot (spike/Dockerfile with FEATURES=aot-guard).
 set -e
@@ -63,4 +64,10 @@ wait
 (sleep 5; docker pause node2 >/dev/null; echo "   (froze node2 at 5 s)"; sleep 4; docker unpause node2 >/dev/null; echo "   (node2 woke at 9 s)") &
 load "freeze a node for 4 s"
 wait
+
+(sleep 5; docker kill -s KILL node1 >/dev/null; docker rm -f node1 >/dev/null; docker volume rm -f combd-data1 >/dev/null
+ echo "   (SIGKILL node1 and deleted its disk at 5 s)"; sleep 3; node 1; echo "   (node1 restarted empty at 8 s)") &
+load "SIGKILL a node and lose its disk"
+wait
+docker logs node1 2>&1 | grep -i 'peer store' || true
 for n in 0 1 2; do echo "node$n stats: $(docker run --rm --network $NET bench-wrk curl -s -m 3 http://node$n:8080/_combd/stats)"; done

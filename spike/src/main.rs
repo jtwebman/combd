@@ -649,7 +649,7 @@ fn main_with(args: &[&str]) {
                 }
             }
         }
-        // The ownership simulator: `sim [seeds|A..B] [bug|none] [replicas] [splits|only-splits]`.
+        // The ownership simulator: `sim [seeds|A..B] [bug|none] [replicas] [splits|only-splits] [wipes]`.
         ["sim", ..] => {
             // `N` seeds from 0, or `A..B` to replay some.
             let seeds = match args.get(1).and_then(|v| v.split_once("..")) {
@@ -667,15 +667,20 @@ fn main_with(args: &[&str]) {
                 Some("no_fence") => bugs.no_fence = true,
                 Some("trunc_early") => bugs.trunc_early = true,
                 Some("seal_early") => bugs.seal_early = true,
+                Some("trust_wiped") => bugs.trust_wiped = true,
+                Some("wipe_forgets_fence") => bugs.wipe_forgets_fence = true,
                 _ => {}
             }
             let replicas = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
             let t = Instant::now();
-            // `splits`: add network splits; `only-splits`: splits and no other faults.
-            let splits = matches!(args.get(4).copied(), Some("splits" | "only-splits"));
-            let only = args.get(4) == Some(&"only-splits");
+            // Extra faults, any of: `splits` (network splits), `only-splits`
+            // (splits and no other faults), `wipes` (a lost disk).
+            let more = args.get(4..).unwrap_or_default();
+            let only = more.contains(&"only-splits");
+            let splits = only || more.contains(&"splits");
+            let wipes = more.contains(&"wipes");
             let (stats, bad) = sim::run_with(seeds, &|| {
-                let mut s = sim::Settings { replicas, bugs, splits, ..Default::default() };
+                let mut s = sim::Settings { replicas, bugs, splits, wipes, ..Default::default() };
                 if only {
                     (s.lost, s.crash, s.freeze) = (0.0, 0.0, 0.0);
                 }

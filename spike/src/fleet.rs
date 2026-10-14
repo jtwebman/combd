@@ -160,6 +160,11 @@ pub fn encode_call(c: &PeerCall, b: &mut Vec<u8>) {
             b.extend_from_slice(&obj.to_le_bytes());
             b.extend_from_slice(&epoch.to_le_bytes());
         }
+        PeerCall::Learn { obj, epoch } => {
+            b.push(3);
+            b.extend_from_slice(&obj.to_le_bytes());
+            b.extend_from_slice(&epoch.to_le_bytes());
+        }
     }
 }
 
@@ -167,6 +172,7 @@ fn decode_call(r: &mut Rd) -> Option<PeerCall> {
     Some(match r.u8()? {
         1 => PeerCall::Append { obj: r.u128()?, epoch: r.u32()?, from: r.u64()?, trunc: r.u64()?, ents: r.ents()? },
         2 => PeerCall::Fence { obj: r.u128()?, epoch: r.u32()? },
+        3 => PeerCall::Learn { obj: r.u128()?, epoch: r.u32()? },
         _ => return None,
     })
 }
@@ -178,8 +184,9 @@ fn encode_res(res: &PeerRes, b: &mut Vec<u8>) {
             b.extend_from_slice(&n.to_le_bytes());
         }
         PeerRes::Refused => b.push(2),
-        PeerRes::Tails(ts) => {
+        PeerRes::Tails { born, tails: ts } => {
             b.push(3);
+            b.extend_from_slice(&born.to_le_bytes());
             b.extend_from_slice(&(ts.len() as u32).to_le_bytes());
             for t in ts {
                 b.extend_from_slice(&t.epoch.to_le_bytes());
@@ -195,12 +202,13 @@ fn decode_res(r: &mut Rd) -> Option<PeerRes> {
         1 => PeerRes::Have(r.u64()?),
         2 => PeerRes::Refused,
         3 => {
+            let born = r.u32()?;
             let n = r.u32()?;
             let mut ts = vec![];
             for _ in 0..n {
                 ts.push(Tail { epoch: r.u32()?, from: r.u64()?, ents: r.ents()? });
             }
-            PeerRes::Tails(ts)
+            PeerRes::Tails { born, tails: ts }
         }
         _ => return None,
     })
@@ -268,6 +276,8 @@ impl Frame {
             3 => {
                 let mut r = Rd(&b[9..]);
                 match decode_call(&mut r) {
+                    // `Learn` lives only in a store's own log.
+                    Some(PeerCall::Learn { .. }) => Err(bad("a peer can't send that")),
                     Some(call) if r.0.is_empty() => Ok(Frame::Peer { id, call }),
                     _ => Err(bad("bad peer call")),
                 }
@@ -288,6 +298,7 @@ impl Frame {
 /// `[u32 length][4 bytes of SHA-256][call]`. Startup replays the log and
 /// cuts off a torn last record. When the log grows past `COMPACT`, it's
 /// rewritten from a snapshot (usually small: peers drop what's uploaded).
+/// A store that lost its disk keeps a `wiped` marker file beside the log.
 pub struct DiskPeers {
     pub store: PeerStore,
     path: PathBuf,
@@ -309,12 +320,22 @@ fn record(c: &PeerCall) -> Vec<u8> {
 }
 
 impl DiskPeers {
-    pub fn open(dir: &Path) -> std::io::Result<DiskPeers> {
+    /// `ran_before`: this node has served before (its lease is in the
+    /// bucket). If so and the log is gone, the disk was lost: the store
+    /// comes back wiped, and stays so.
+    pub fn open(dir: &Path, ran_before: bool) -> std::io::Result<DiskPeers> {
         use sha2::{Digest, Sha256};
         std::fs::create_dir_all(dir)?;
         let path = dir.join("peers.log");
+        let marker = dir.join("wiped");
+        if !path.exists() && ran_before && !marker.exists() {
+            eprintln!("combd     the peer store was lost: it comes back wiped, and relearns each object's fence from the bucket");
+            std::fs::File::create(&marker)?.sync_all()?;
+            std::fs::File::open(dir)?.sync_all()?;
+        }
         let bytes = std::fs::read(&path).unwrap_or_default();
         let mut store = PeerStore::default();
+        store.wiped = marker.exists();
         let mut at = 0;
         while let Some(h) = bytes.get(at..at + 8) {
             let n = u32::from_le_bytes(h[..4].try_into().unwrap()) as usize;
@@ -336,8 +357,18 @@ impl DiskPeers {
         Ok(DiskPeers { store, path, file, size: at as u64, dirty: false })
     }
 
-    /// Apply a call; it's durable after the next `sync`.
-    pub fn handle(&mut self, c: PeerCall) -> std::io::Result<PeerRes> {
+    /// Apply a call; it's durable after the next `sync`. A wiped store first
+    /// relearns the object (`learn`: the epoch in its ownership record);
+    /// `None` if it can't, and then it doesn't answer.
+    pub fn handle(&mut self, c: PeerCall, learn: &mut impl FnMut(crate::own::Obj) -> Option<u32>) -> std::io::Result<Option<PeerRes>> {
+        if let Some(obj) = self.store.must_learn(&c) {
+            let Some(epoch) = learn(obj) else { return Ok(None) };
+            self.apply(PeerCall::Learn { obj, epoch })?;
+        }
+        self.apply(c).map(Some)
+    }
+
+    fn apply(&mut self, c: PeerCall) -> std::io::Result<PeerRes> {
         let rec = record(&c);
         let res = self.store.handle(c);
         if res != PeerRes::Refused {
@@ -380,15 +411,21 @@ impl DiskPeers {
 
 /// The peer store's thread: take every call waiting, apply them, one fsync,
 /// then answer them all (group commit). An answer means it's on disk.
-pub fn serve_peers<B: Send + 'static>(mut disk: DiskPeers, rx: std::sync::mpsc::Receiver<(PeerCall, B)>, answer: impl Fn(B, PeerRes) + Send + 'static) {
+/// `learn` reads an object's ownership record, for a wiped store.
+pub fn serve_peers<B: Send + 'static>(
+    mut disk: DiskPeers,
+    rx: std::sync::mpsc::Receiver<(PeerCall, B)>,
+    mut learn: impl FnMut(crate::own::Obj) -> Option<u32> + Send + 'static,
+    answer: impl Fn(B, Option<PeerRes>) + Send + 'static,
+) {
     std::thread::spawn(move || {
         while let Ok(first) = rx.recv() {
             let mut batch = vec![first];
             batch.extend(rx.try_iter());
-            let done: Vec<(B, PeerRes)> = batch
+            let done: Vec<(B, Option<PeerRes>)> = batch
                 .into_iter()
                 .map(|(c, back)| {
-                    let res = disk.handle(c).unwrap_or_else(|e| fatal(e));
+                    let res = disk.handle(c, &mut learn).unwrap_or_else(|e| fatal(e));
                     (back, res)
                 })
                 .collect();
@@ -415,9 +452,9 @@ mod tests {
     fn peer_store_survives_restarts_torn_records_and_compaction() {
         let dir = std::env::temp_dir().join(format!("combd-peers-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let app = |d: &mut DiskPeers, epoch, from, n: u8| d.handle(PeerCall::Append { obj: 7, epoch, from, ents: vec![vec![n; 100]], trunc: 0 }).unwrap();
-        let fence = |d: &mut DiskPeers, epoch| d.handle(PeerCall::Fence { obj: 7, epoch }).unwrap();
-        let mut d = DiskPeers::open(&dir).unwrap();
+        let app = |d: &mut DiskPeers, epoch, from, n: u8| d.handle(PeerCall::Append { obj: 7, epoch, from, ents: vec![vec![n; 100]], trunc: 0 }, &mut |_| None).unwrap().unwrap();
+        let fence = |d: &mut DiskPeers, epoch| d.handle(PeerCall::Fence { obj: 7, epoch }, &mut |_| None).unwrap().unwrap();
+        let mut d = DiskPeers::open(&dir, false).unwrap();
         app(&mut d, 1, 1, 1);
         app(&mut d, 1, 2, 2);
         fence(&mut d, 2);
@@ -426,14 +463,30 @@ mod tests {
         drop(d);
         // A torn record at the end (a crash mid-write) is cut off.
         std::fs::OpenOptions::new().append(true).open(dir.join("peers.log")).unwrap().write_all(&[50, 0, 0, 0, 1, 2]).unwrap();
-        let mut d = DiskPeers::open(&dir).unwrap();
+        let mut d = DiskPeers::open(&dir, true).unwrap();
         assert_eq!(fence(&mut d, 2), want);
         assert_eq!(app(&mut d, 1, 3, 3), PeerRes::Refused, "the fence survived");
         d.compact().unwrap();
         drop(d);
-        let mut d = DiskPeers::open(&dir).unwrap();
+        let mut d = DiskPeers::open(&dir, true).unwrap();
         assert_eq!(fence(&mut d, 2), want, "compaction keeps the same store");
         assert_eq!(app(&mut d, 2, 1, 9), PeerRes::Have(1));
+        assert!(!d.store.wiped, "it never lost its log");
+        drop(d);
+        // The disk is lost: the store comes back wiped, relearns from the
+        // bucket before answering, and stays wiped after a restart.
+        std::fs::remove_file(dir.join("peers.log")).unwrap();
+        let mut d = DiskPeers::open(&dir, true).unwrap();
+        assert!(d.store.wiped);
+        let call = PeerCall::Append { obj: 7, epoch: 2, from: 1, ents: vec![vec![1]], trunc: 0 };
+        assert_eq!(d.handle(call.clone(), &mut |_| None).unwrap(), None, "no answer without the bucket");
+        assert_eq!(d.handle(call, &mut |_| Some(3)).unwrap(), Some(PeerRes::Refused), "epoch 2 is fenced by the record");
+        d.sync().unwrap();
+        drop(d);
+        let mut d = DiskPeers::open(&dir, true).unwrap();
+        assert!(d.store.wiped);
+        let Some(PeerRes::Tails { born, .. }) = d.handle(PeerCall::Fence { obj: 7, epoch: 4 }, &mut |_| panic!("already learned")).unwrap() else { panic!() };
+        assert_eq!(born, 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -446,7 +499,7 @@ mod tests {
             Frame::Peer { id: 2, call: PeerCall::Fence { obj: 5, epoch: 4 } },
             Frame::PeerReply { id: 3, res: PeerRes::Have(12) },
             Frame::PeerReply { id: 4, res: PeerRes::Refused },
-            Frame::PeerReply { id: 5, res: PeerRes::Tails(vec![Tail { epoch: 2, from: 7, ents: vec![vec![3; 5]] }]) },
+            Frame::PeerReply { id: 5, res: PeerRes::Tails { born: 4, tails: vec![Tail { epoch: 2, from: 7, ents: vec![vec![3; 5]] }] } },
         ] {
             let b = f.encode();
             assert_eq!(Frame::read(&mut &b[..]).unwrap(), f);

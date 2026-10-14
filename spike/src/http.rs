@@ -629,31 +629,47 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
             std::process::exit(1);
         }
     };
-    // The peer store first: the wire hands it calls as soon as it's up. A
-    // node that has run before (its lease is in the bucket) but lost its
-    // peer store must not come back as the same node: it would answer
-    // fences knowing nothing, and acknowledged writes could be lost.
-    // ponytail: the fix is a store that knows it's new, and an owner that
-    // then uses another peer's tail. Until then, a lost disk needs a new
-    // node number.
-    let fresh = !data.join("peers/peers.log").exists();
-    if fresh && fc.replicas > 0 && matches!(fc.s3.get(&own::lease_key(fc.node)), Ok(Some(_))) {
-        eprintln!("combd     node {} has run before but its peer store ({}) is gone; start it as a new node number", fc.node, data.join("peers").display());
+    // The peer store first: the wire hands it calls as soon as it's up. If
+    // this node has run before (its lease is in the bucket; if we can't
+    // tell, assume so) but its store is gone, the disk was lost: the store
+    // comes back wiped (see `own::PeerStore`). Write the lease now, before
+    // serving anything, so a node that served always has one.
+    let lease = fc.s3.get(&own::lease_key(fc.node));
+    let ran_before = !matches!(lease, Ok(None));
+    let cur = match &lease {
+        Ok(Some((b, _))) => std::str::from_utf8(b).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+        _ => 0,
+    };
+    if let Err(e) = fc.s3.put(&own::lease_key(fc.node), (cur + 1).to_string().as_bytes(), &crate::s3::Cond::Any) {
+        eprintln!("combd     can't write this node's lease: {e}");
         std::process::exit(1);
     }
-    let disk = DiskPeers::open(&data.join("peers")).unwrap_or_else(|e| {
+    let disk = DiskPeers::open(&data.join("peers"), ran_before).unwrap_or_else(|e| {
         eprintln!("combd     can't open the peer store: {e}");
         std::process::exit(1);
     });
     let (ptx, prx) = channel();
     let sink = LoopSink { loops: loops.to_vec(), threads, peer_store: ptx.clone() };
     let wire = wire::start(fc.wire_port, fc.peers.clone(), tls, sink).expect("start the wire");
-    let (w, ls) = (wire.clone(), loops.to_vec());
-    crate::fleet::serve_peers(disk, prx, move |back, res| match back {
-        PeerBack::Wire(conn, id) => w.reply(conn, Frame::PeerReply { id, res }),
+    let (w, ls, s3) = (wire.clone(), loops.to_vec(), fc.s3.clone());
+    let learn = move |obj| match s3.get(&own::own_key(obj)) {
+        Ok(Some((b, _))) => match own::Val::decode(&own::own_key(obj), &b) {
+            Some(own::Val::Rec(r)) => Some(r.epoch),
+            _ => None,
+        },
+        Ok(None) => Some(0),
+        Err(_) => None,
+    };
+    crate::fleet::serve_peers(disk, prx, learn, move |back, res| match back {
+        // No answer (the bucket was out of reach): the caller times out.
+        PeerBack::Wire(conn, id) => {
+            if let Some(res) = res {
+                w.reply(conn, Frame::PeerReply { id, res });
+            }
+        }
         PeerBack::Loop(lp, id) => {
             let (tx, waker) = &ls[lp];
-            let _ = tx.send(Msg::PeerReply { id, res: Some(res) });
+            let _ = tx.send(Msg::PeerReply { id, res });
             let _ = waker.wake();
         }
     });
