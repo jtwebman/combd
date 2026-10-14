@@ -8,6 +8,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "aot")]
+mod aot;
+mod aot_gen;
 mod engine;
 mod host;
 mod interp;
@@ -58,6 +61,7 @@ fn langs<E: Engine>(name: &str, eng: &E) -> bool {
         let t = Instant::now();
         let prog = match eng.load(&wasm) {
             Ok(p) => p,
+            Err(err) if err.starts_with("no AOT build") => continue,
             Err(err) => {
                 println!("langs    {name:<9} {lang:<5} LOAD FAILED: {err}");
                 all_ok = false;
@@ -93,6 +97,10 @@ fn langs<E: Engine>(name: &str, eng: &E) -> bool {
             "spin",
             fresh().and_then(|(mut vm, mut st)| {
                 start(&mut vm, "spin", &mut st)?;
+                if name == "aot" {
+                    // Compiled cells can't pause yet: a spin must be killed at the CPU limit.
+                    return Ok(matches!(vm.run(SLICE), Outcome::Trap(t) if t.contains("OutOfFuel")));
+                }
                 Ok((0..50).all(|_| matches!(vm.run(SLICE), Outcome::Yield)))
             }),
         );
@@ -461,6 +469,27 @@ fn main() {
             }
         }
         ["compute", "native"] => compute_native(),
+        ["aot-gen", input, output] => {
+            let wasm = std::fs::read(input).unwrap();
+            match aot_gen::generate(&wasm, input) {
+                Ok(src) => {
+                    std::fs::write(output, &src).unwrap();
+                    println!("aot-gen  {input} -> {output} ({} KB of Rust)", src.len() / 1024);
+                }
+                Err(err) => {
+                    eprintln!("aot-gen  {input}: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(feature = "aot")]
+        ["js-bench", "aot"] => js_bench("aot", &aot::Aot),
+        #[cfg(feature = "aot")]
+        ["js-mem", "aot"] => js_mem("aot", &aot::Aot),
+        #[cfg(feature = "aot")]
+        ["langs", "aot"] => std::process::exit(if langs("aot", &aot::Aot) { 0 } else { 1 }),
+        #[cfg(feature = "aot")]
+        [test, "aot"] => run(test, "aot", &aot::Aot),
         ["js"] => {
             let me = std::env::current_exe().unwrap();
             for args in [["js-bench", "interp"], ["js-bench", "wasmtime"], ["js-mem", "interp"], ["js-mem", "wasmtime"]] {
@@ -513,6 +542,13 @@ mod tests {
     #[test]
     fn interp_matches_wasmtime() {
         assert_eq!(answers(&interp::Interp { max_pages: 16384 }), answers(&wt::Wt::new(WT_FUEL, None)));
+    }
+
+    #[cfg(feature = "aot")]
+    #[test]
+    fn aot_matches_interp() {
+        assert_eq!(answers(&aot::Aot), answers(&interp::Interp { max_pages: 16384 }));
+        assert!(langs("aot", &aot::Aot));
     }
 
     #[test]

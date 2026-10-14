@@ -735,14 +735,38 @@ machine-code tier, compiled ahead of time instead of while requests run.
 - `snapshot_after_init` keeps working either way. It's taken when no frames are
   on the stack.
 
-**Lazy path first:** Wasmtime already does exactly this (`precompile_module`
-plus `deserialize`), behind the engine interface we already have. Use it as
-the AOT tier now and cache its artifacts per CPU in the bucket. Build our own
-Cranelift-based tier only when we need (b).
+**Compiling never blocks "ready".** A cell has two states:
+- **Ready:** it serves traffic on the interpreter within microseconds of
+  deploy.
+- **Fast:** it switches to machine code once its artifact exists.
 
-**Expected numbers:** Cranelift ran 1.2x to 1.5x of native on our workloads.
-That's the ceiling for this tier: 6x to 15x faster than our interpreter today,
-and QuickJS at 8 to 46 us per request instead of 200 to 970 us.
+Nodes never compile on the request path, and a node waking a cell only loads a
+finished artifact. `combd deploy --wait-aot` can hold a rollout until
+artifacts exist for every CPU in the fleet, then shift traffic.
+
+**Compile runtimes, not apps.** The QuickJS part of a JS cell is the same for
+every JS app. So the JS engine is compiled once per version per CPU and shared,
+and the app's JS is loaded at init (made free by `snapshot_after_init`). A JS
+deploy then compiles nothing. Only Rust, C, Zig, and Go apps compile their own
+code at deploy.
+
+**Built (2026-10-13): Wasm to safe Rust.** Our own compiler (`aot-gen`)
+turns a Wasm module into plain safe Rust, and rustc + LLVM produce the machine
+code for any CPU. No Wasmtime. rustc guarantees the generated code can't
+escape its sandbox, so a generator bug can't become a security bug. It beat
+Wasmtime on fib, sieve, and every JS API route, and cold starts a JS cell from
+a snapshot in 53 us. See [spike/RESULTS.md](spike/RESULTS.md).
+
+Next for this tier:
+1. Pass linear memory as its own argument so LLVM keeps the base in a
+   register (memory-heavy code is 1.7x behind Wasmtime).
+2. Only zero locals that are read before they're written (recursive QuickJS
+   is 4x behind).
+3. Lazy memory growth, like the interpreter (a fresh JS cell is 1.6 MB).
+4. Pausing mid-call: a stack per cell first, deopt to the interpreter later.
+5. Guard pages instead of bounds checks, in the audited `unsafe` crate.
+6. Maybe a Zig or C backend if rustc compile time hurts. The safe Rust
+   backend stays the reference.
 
 ## Build order (when we do build)
 

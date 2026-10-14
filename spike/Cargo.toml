@@ -11,15 +11,22 @@ resolver = "3"
 
 [features]
 default = ["wasmtime"]
+# The AOT tier. Needs spike/aot/src/gen_*.rs, made by `aot.sh`.
+aot = ["dep:combd-aot"]
 
 [dependencies]
 combd-guest = { path = "../guest" }
+combd-aot = { path = "aot", optional = true }
 wasmparser = "0.261"
 wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Generated AOT code is large; build it in parallel.
+[profile.release.package.combd-aot]
+codegen-units = 16
 
 [dev-dependencies]
 # Regression tests written in the Wasm text format.

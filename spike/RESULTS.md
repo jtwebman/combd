@@ -270,6 +270,67 @@ We confirmed they fail without the fix.
 safe-Rust `match` loop. More fusion gives a few percent at a time. The next big
 jump needs machine code: an AOT tier (see the plan).
 
+## Our own AOT compiler: Wasm to safe Rust (macOS)
+
+`aot-gen` (`spike/src/aot_gen.rs`, about 600 lines) compiles a Wasm module into
+plain safe Rust, and rustc + LLVM turn it into machine code. No Wasmtime, and
+no compiler of our own for each CPU.
+- Every Wasm local and stack slot becomes a `let mut` variable.
+- Wasm blocks and loops become Rust labeled blocks and loops.
+- Traps are `Err` values passed up with `?`.
+- `call_indirect` goes through a generated `match` per signature.
+- Call depth is counted, so deep recursion traps cleanly instead of
+  overflowing the host's stack.
+
+The output has no `unsafe`, so rustc, not our generator, guarantees a cell
+can't touch memory outside its own. Build it with `spike/aot.sh`.
+
+The Rust cell became 13,500 lines of Rust. QuickJS became 432,000 lines. rustc
+took 3 min 40 s and 3 GB for both: fine at deploy time, never at request time.
+Both compiled cells passed every check on the first run, and the
+`aot_matches_interp` test keeps it that way.
+
+| | Our interpreter | **Our AOT** | Wasmtime | Native Rust |
+|---|---|---|---|---|
+| fib 30 | 22 ms | **2.2 ms** | 2.6 ms | 1.5 ms |
+| sieve 5,000,000 | 106 ms | **12.4 ms** | 14.1 ms | 9.6 ms |
+| sort 1,000,000 | 212 ms | **24.5 ms** | 14.4 ms | 12.3 ms |
+
+JS (QuickJS), per request:
+
+| | Our interpreter | **Our AOT** | Wasmtime | Node | Bun |
+|---|---|---|---|---|---|
+| GET /api/users/42 | 182 us | **7.7 us** | 8.1 us | 1.1 us | 0.5 us |
+| GET /api/users | 644 us | **35 us** | 42 us | 1.9 us | 1.7 us |
+| POST /api/orders | 879 us | **41 us** | 43 us | 4.8 us | 3.4 us |
+| fib 25 | 137 ms | 31 ms | **7.2 ms** | 0.46 ms | 0.30 ms |
+| Cold start | 586 us (snapshot) | **53 us (snapshot)** | 477 us | 302 us | 174 us |
+
+(Node and Bun numbers are from the Linux runs above; the rest are macOS.)
+
+What it shows:
+- **8x to 10x faster than our interpreter,** and faster than Wasmtime on fib,
+  sieve, and every JS API route.
+- **Cold start from a snapshot is 53 us,** 3x faster than Bun and 6x faster
+  than Node.
+- **Memory-heavy code is behind Wasmtime** (sort 1.7x). Every memory access
+  checks bounds and reloads the memory pointer, because LLVM can't prove the
+  buffer and the cell state don't overlap. Wasmtime keeps the base in a
+  register and uses guard pages. Fixes: pass memory as its own argument, then
+  guard pages through the audited `unsafe` crate.
+- **Recursive JS is 4x behind Wasmtime** (fib 25). Each call zeroes every local
+  in QuickJS's giant interpreter function. Fix: only zero what's read before
+  it's written.
+- **A fresh JS cell is 1.6 MB, a snapshot copy 413 KB.** The runtime grows
+  memory with `resize`, which touches every new page. The interpreter's lazy
+  growth fixes that.
+- **Still 7x to 18x behind V8 per JS request.** That's QuickJS being an
+  interpreter, now running at machine-code speed. A JS engine of our own is the
+  only way past it.
+- **A compiled cell can't pause mid-call yet.** A stuck loop is killed cleanly
+  at a CPU limit instead of being paused. Pausing needs a stack per cell or
+  deopt to the interpreter (see the plan).
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

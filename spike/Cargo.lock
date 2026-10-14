@@ -90,6 +90,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "combd-aot"
+version = "0.0.0"
+
+[[package]]
 name = "combd-guest"
 version = "0.0.0"
 
@@ -97,6 +101,7 @@ version = "0.0.0"
 name = "combd-spike"
 version = "0.0.0"
 dependencies = [
+ "combd-aot",
  "combd-guest",
  "wasmparser 0.261.0",
  "wasmtime",

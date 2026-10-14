@@ -79,8 +79,14 @@ recovered from crashes about 3 times faster, used less memory, and came in
 5.5 times smaller. It is still far slower at raw math, and closing that gap is
 next. **[See the results.](spike/RESULTS.md)**
 
-Cells already run in five languages: Rust, C, Zig, Go (TinyGo), and
-AssemblyScript (TypeScript-like). See [langs/](langs/).
+Cells already run in six languages: Rust, C, Zig, Go (TinyGo),
+AssemblyScript (TypeScript-like), and JavaScript (QuickJS compiled to Wasm).
+See [langs/](langs/).
+
+We also built our own ahead-of-time compiler. It turns Wasm into plain safe
+Rust, so the Rust compiler proves the sandbox holds. Then it becomes machine
+code for any CPU. It beat Wasmtime on most of our tests, and starts a
+JavaScript cell from a snapshot in 53 microseconds, faster than Node or Bun.
 
 ## Standing on shoulders
 
