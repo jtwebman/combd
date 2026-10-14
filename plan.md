@@ -664,8 +664,8 @@ Fuzzers find those on purpose.
 
 **Status, 2026-10-14:** item 1 runs (`combd-spike fuzz`, `aot-fuzz.sh`), along
 with the official spec testsuite (`spectest.sh`), and both found real bugs
-(see "What building taught us"). Still to do: Wasmtime against the AOT tier
-directly, multi-value in the AOT tier, and items 2 to 5.
+(see "What building taught us"). The AOT tier handles multi-value now too.
+Still to do: Wasmtime against the AOT tier directly, and items 2 to 5.
 
 The list:
 

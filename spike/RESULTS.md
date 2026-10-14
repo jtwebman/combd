@@ -1106,6 +1106,7 @@ and every byte of memory must match. Running out of stack is inconclusive
 | Interpreter vs Wasmtime, after fixes | 50,000 | 189,219 | 0 |
 | AOT (guard pages) vs interpreter, first | 138 | 469 | 1 real bug |
 | AOT, both builds, after the fix | 979 | 3,186 each | 0 |
+| AOT, both builds, with multi-value | 1,270 | 5,949 each | 0 |
 
 **Bug 1, the interpreter: a wrong answer.** `big == extend(0)` said "equal".
 To use an immediate, a commuted compare swapped its operands. But `big`
@@ -1131,10 +1132,19 @@ not a bug; both get the same cap now.
 
 Still open: stores. LLVM may also move a store across one that faults, so
 memory at a trap could differ from Wasm's. The fuzzer compares memory after
-every trap and hasn't seen it in 979 modules, but that's not proof. Also not
-done yet: multi-value in the AOT tier (142 modules refused), Wasmtime
-against the AOT tier directly, and fuzzing the host API, the HTTP parser,
-and the peer protocol.
+every trap and hasn't seen it in 1,270 modules, but that's not proof. Also
+not done yet: Wasmtime against the AOT tier directly, and fuzzing the host
+API, the HTTP parser, and the peer protocol.
+
+**Multi-value in the AOT tier.** A compiled function with two or more
+results now returns `Result<[u64; N], Trap>`; one with 0 or 1 still returns
+`Result<u64, Trap>`, which comes back in two registers, so the fast path
+didn't change (the Rust cell's generated functions are byte for byte the
+same). Calls, direct and through the table, unpack the results into stack
+slots; blocks with several results already worked. Only imports with more
+than one result are still refused: the host interface returns one value.
+The same 1,700 fuzz seeds that had 153 modules refused now compile all
+1,270, and both AOT builds agree with the interpreter on every call.
 
 ## Security: memory is always zero
 

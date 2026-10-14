@@ -7,8 +7,11 @@
 //! up with `?`. The output never needs `unsafe`, so rustc, not this generator,
 //! guarantees the cell can't touch memory outside its own.
 //!
-//! ponytail: no multi-value results, one memory, one table. Error out on
-//! anything else so a module either compiles fully or not at all.
+//! A function with 0 or 1 results returns `Result<u64, Trap>` (two
+//! registers); one with more returns `Result<[u64; N], Trap>`.
+//!
+//! ponytail: one memory, one table, imports with at most one result. Error out
+//! on anything else so a module either compiles fully or not at all.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -84,6 +87,9 @@ pub fn generate(wasm: &[u8], source: &str) -> Result<String, String> {
                     let i = i.map_err(e)?;
                     let TypeRef::Func(t) = i.ty else { return Err("only function imports are supported".into()) };
                     let results = m.types[t as usize].results().len() as u32;
+                    if results > 1 {
+                        return Err("imports with more than one result are not supported".into());
+                    }
                     m.imports.push((i.module.into(), i.name.into(), results));
                     m.func_types.push(t);
                 }
@@ -176,6 +182,23 @@ fn crate_hash(wasm: &[u8]) -> u64 {
     wasm.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
 }
 
+/// What a function with `nr` results returns.
+fn ret_ty(nr: usize) -> String {
+    if nr <= 1 { "u64".into() } else { format!("[u64; {nr}]") }
+}
+
+/// A call `x` (with fuel saved around it) whose `nr` results go to `s{at}..`.
+fn call_into(mark: &str, x: &str, nr: usize, at: usize) -> String {
+    match nr {
+        0 => format!("{mark}c.fuel = fuel; {x}; fuel = c.fuel;"),
+        1 => format!("{mark}c.fuel = fuel; s{at} = {x}; fuel = c.fuel;"),
+        _ => {
+            let unpack: String = (0..nr).map(|i| format!(" s{} = r[{i}];", at + i)).collect();
+            format!("{{ {mark}c.fuel = fuel; let r = {x}; fuel = c.fuel;{unpack} }}")
+        }
+    }
+}
+
 fn args(n: usize, prefix: &str) -> String {
     (0..n).map(|i| format!(", {prefix}{i}")).collect()
 }
@@ -236,17 +259,19 @@ fn module_text(m: &Info, funcs: &str, source: &str, hash: u64) -> String {
         } else {
             format!("f{i}(c, m, rt::STACK_BUDGET as u32{argv})?")
         };
-        let _ = writeln!(
-            o,
-            "        {i} if a.len() == {np} => {{ let r = {callx}; Ok(if {nr} == 1 {{ vec![r] }} else {{ vec![] }}) }}"
-        );
+        let results = match nr {
+            0 => "vec![]",
+            1 => "vec![r]",
+            _ => "r.to_vec()",
+        };
+        let _ = writeln!(o, "        {i} if a.len() == {np} => {{ let r = {callx}; Ok({results}) }}");
     }
     o.push_str("        _ => Err(Trap::Unreachable),\n    }\n}\n\n");
     // One `call_indirect` dispatcher per signature: only matching functions can be reached.
     for &t in &m.indirect {
         let ty = &m.types[t as usize];
-        let np = ty.params().len();
-        let _ = writeln!(o, "fn ci{t}(c: &mut Ctx, m: &mut rt::Mem, sb: u32, i: u64{}) -> Result<u64, Trap> {{", (0..np).map(|k| format!(", a{k}: u64")).collect::<String>());
+        let (np, nr) = (ty.params().len(), ty.results().len());
+        let _ = writeln!(o, "fn ci{t}(c: &mut Ctx, m: &mut rt::Mem, sb: u32, i: u64{}) -> Result<{}, Trap> {{", (0..np).map(|k| format!(", a{k}: u64")).collect::<String>(), ret_ty(nr));
         o.push_str("    match c.table_get(i)? {\n");
         for (f, ft) in m.func_types.iter().enumerate() {
             if m.types[*ft as usize] != *ty {
@@ -289,9 +314,6 @@ fn gen_func(
 ) -> Result<(), String> {
     let ty = m.types[m.func_types[idx as usize] as usize].clone();
     let (np, nr) = (ty.params().len(), ty.results().len());
-    if nr > 1 {
-        return Err("multi-value results are not supported".into());
-    }
     let mut nl = np;
     let mut locals = body.get_locals_reader().map_err(e)?;
     for _ in 0..locals.get_count() {
@@ -303,8 +325,13 @@ fn gen_func(
             return Err("too many locals".into());
         }
     }
+    // Return the top `nr` values.
     let ret = |top: usize| -> String {
-        if nr == 1 { format!("c.fuel = fuel; return Ok(s{});", top - 1) } else { "c.fuel = fuel; return Ok(0);".into() }
+        match nr {
+            0 => "c.fuel = fuel; return Ok(0);".into(),
+            1 => format!("c.fuel = fuel; return Ok(s{});", top - 1),
+            _ => format!("c.fuel = fuel; return Ok([{}]);", (top - nr..top).map(|i| format!("s{i}")).collect::<Vec<_>>().join(", ")),
+        }
     };
     let mut b = String::new();
     let mut ctl: Vec<(Lk, u32)> = vec![(Lk::Root, 0)];
@@ -386,9 +413,6 @@ fn gen_func(
                 let f = *function_index as usize;
                 let cty = &m.types[m.func_types[f] as usize];
                 let (n, cr) = (cty.params().len(), cty.results().len());
-                if cr > 1 {
-                    return Err("multi-value calls are not supported".into());
-                }
                 let a: Vec<String> = (h - n..h).map(|i| format!("s{i}")).collect();
                 let (x, mark) = if f < m.imports.len() {
                     (format!("c.import(m, {f}, &[{}])?", a.join(", ")), String::new())
@@ -396,7 +420,7 @@ fn gen_func(
                     callees.push(f as u32);
                     (format!("f{f}(c, m, sb{})?", a.iter().map(|x| format!(", {x}")).collect::<String>()), format!("/*T{idx}:{f}*/"))
                 };
-                if cr == 1 { format!("{mark}c.fuel = fuel; s{} = {x}; fuel = c.fuel;", h - n) } else { format!("{mark}c.fuel = fuel; {x}; fuel = c.fuel;") }
+                call_into(&mark, &x, cr, h - n)
             }
             Operator::CallIndirect { type_index, table_index } => {
                 if *table_index != 0 {
@@ -404,14 +428,11 @@ fn gen_func(
                 }
                 let cty = &m.types[*type_index as usize];
                 let (n, cr) = (cty.params().len(), cty.results().len());
-                if cr > 1 {
-                    return Err("multi-value calls are not supported".into());
-                }
                 m.indirect.insert(*type_index);
                 let a: String = (h - 1 - n..h - 1).map(|i| format!(", s{i}")).collect();
                 // An indirect call can go anywhere, recursion included: always tick.
                 let x = format!("ci{type_index}(c, m, sb, s{}{a})?", h - 1);
-                if cr == 1 { format!("/*TI{idx}*/c.fuel = fuel; s{} = {x}; fuel = c.fuel;", h - 1 - n) } else { format!("/*TI{idx}*/c.fuel = fuel; {x}; fuel = c.fuel;") }
+                call_into(&format!("/*TI{idx}*/"), &x, cr, h - 1 - n)
             }
             Operator::LocalGet { local_index } => format!("s{h} = l{local_index};"),
             Operator::LocalSet { local_index } | Operator::LocalTee { local_index } => {
@@ -462,7 +483,7 @@ fn gen_func(
         max_h = max_h.max(fv.operand_stack_height() as usize);
     }
     r.finish().map_err(e)?;
-    let _ = writeln!(out, "fn f{idx}(c: &mut Ctx, m: &mut rt::Mem, sb: u32{}) -> Result<u64, Trap> {{", (0..np).map(|i| format!(", p{i}: u64")).collect::<String>());
+    let _ = writeln!(out, "fn f{idx}(c: &mut Ctx, m: &mut rt::Mem, sb: u32{}) -> Result<{}, Trap> {{", (0..np).map(|i| format!(", p{i}: u64")).collect::<String>(), ret_ty(nr));
     if !experiment("nostack") {
         // `sb` is the stack budget left, in bytes, carried in a register. Each
         // function charges a conservative estimate of its frame: every value
