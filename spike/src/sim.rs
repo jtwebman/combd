@@ -8,6 +8,10 @@
 //! - processes freeze; the supervisor may start a new one, and the frozen
 //!   one later wakes up still thinking it owns things.
 //!
+//! Each process also plays the executor: it keeps an object's data (a list
+//! of writes), seals segments, and restores from them, through the bucket,
+//! the way a real node does with SQLite.
+//!
 //! One seed gives one exact run, so any failure replays.
 //!
 //! An oracle checks every run: one writer per epoch, no lost acknowledged
@@ -16,6 +20,9 @@
 
 use crate::own::*;
 use std::collections::{BTreeMap, HashMap};
+
+/// A write, as the simulator's clients make them.
+pub type W = u64;
 
 /// splitmix64: small, fast, and the same everywhere.
 pub struct Rng(u64);
@@ -88,6 +95,13 @@ enum Msg {
     Thaw(usize),
 }
 
+/// What a process holds for one object it serves: its data.
+#[derive(Default)]
+struct Data {
+    history: Vec<W>,
+    unsealed: Vec<W>,
+}
+
 struct Proc {
     node: Node,
     core: Core,
@@ -97,12 +111,15 @@ struct Proc {
     held: Vec<Event>,
     rate: f64,
     off: u64,
+    data: HashMap<Obj, Data>,
+    /// The history each request saw, for its answer.
+    saw: HashMap<ReqId, Vec<W>>,
 }
 
 struct Pending {
     client: u32,
     obj: Obj,
-    op: Op,
+    write: Option<W>,
     sent: u64,
 }
 
@@ -120,6 +137,9 @@ pub struct Sim {
     next_req: ReqId,
     next_w: W,
     pending: HashMap<ReqId, Pending>,
+    /// Every request ever sent: what it does (a process may run it after
+    /// its client gave up).
+    ops: HashMap<ReqId, (Obj, Option<W>)>,
     pub stats: Stats,
     // The oracle's notes.
     /// Write -> (object, epoch, when the client heard).
@@ -132,6 +152,14 @@ pub struct Sim {
 
 fn is_prefix(a: &[W], b: &[W]) -> bool {
     a.len() <= b.len() && b[..a.len()] == *a
+}
+
+fn encode(ws: &[W]) -> Vec<u8> {
+    ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+fn decode(b: &[u8]) -> Vec<W> {
+    b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
 }
 
 impl Sim {
@@ -149,6 +177,7 @@ impl Sim {
             next_req: 0,
             next_w: 0,
             pending: HashMap::new(),
+            ops: HashMap::new(),
             stats: Stats::default(),
             acked: HashMap::new(),
             answered_by: HashMap::new(),
@@ -172,7 +201,17 @@ impl Sim {
     fn spawn(&mut self, node: Node) {
         let rate = 0.9 + self.rng.below(200) as f64 / 1000.0;
         let off = self.rng.below(1_000_000);
-        self.procs.push(Proc { node, core: Core::new(node, self.s.bugs), alive: true, frozen: false, held: vec![], rate, off });
+        self.procs.push(Proc {
+            node,
+            core: Core::new(node, self.s.bugs),
+            alive: true,
+            frozen: false,
+            held: vec![],
+            rate,
+            off,
+            data: HashMap::new(),
+            saw: HashMap::new(),
+        });
         let p = self.procs.len() - 1;
         self.current.insert(node, p);
         self.at(0, Msg::Tick(p));
@@ -208,7 +247,7 @@ impl Sim {
 
     fn step(&mut self, m: Msg) -> Result<(), String> {
         match m {
-            Msg::Proc(p, ev) => self.deliver(p, ev)?,
+            Msg::Proc(p, ev) => self.deliver(p, ev),
             Msg::Tick(p) => {
                 if !self.procs[p].alive {
                     return Ok(());
@@ -217,7 +256,7 @@ impl Sim {
                     let next = (RENEW_MS as f64 / self.procs[p].rate) as u64;
                     self.at(next, Msg::Tick(p));
                 }
-                self.deliver(p, Event::Tick)?;
+                self.deliver(p, Event::Tick);
                 self.maybe_fault(p);
             }
             Msg::Bucket(p, op, call, lose_reply) => {
@@ -239,7 +278,7 @@ impl Sim {
             Msg::Thaw(p) => {
                 self.procs[p].frozen = false;
                 for ev in std::mem::take(&mut self.procs[p].held) {
-                    self.deliver(p, ev)?;
+                    self.deliver(p, ev);
                 }
             }
         }
@@ -269,47 +308,86 @@ impl Sim {
         }
     }
 
-    fn deliver(&mut self, p: usize, ev: Event) -> Result<(), String> {
+    fn deliver(&mut self, p: usize, ev: Event) {
         if !self.procs[p].alive {
-            return Ok(());
+            return;
         }
         if self.procs[p].frozen {
             self.procs[p].held.push(ev);
-            return Ok(());
+            return;
         }
         let now = self.clock(p);
         let effects = self.procs[p].core.on(now, ev);
         for e in effects {
-            match e {
-                Effect::Call { op, call } => {
-                    let lose_req = self.faulty() && self.rng.chance(self.s.lost);
-                    let lose_reply = self.faulty() && self.rng.chance(self.s.lost);
-                    if lose_req || lose_reply {
-                        self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
-                    }
-                    if !lose_req {
-                        let d = self.latency();
-                        self.at(d, Msg::Bucket(p, op, call, lose_reply));
-                    }
+            self.effect(p, e);
+        }
+    }
+
+    /// One effect: a bucket call goes out; the rest is this process's
+    /// executor, which answers by queuing an event back to its core.
+    fn effect(&mut self, p: usize, e: Effect) {
+        match e {
+            Effect::Call { op, call } => {
+                let lose_req = self.faulty() && self.rng.chance(self.s.lost);
+                let lose_reply = self.faulty() && self.rng.chance(self.s.lost);
+                if lose_req || lose_reply {
+                    self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
                 }
-                Effect::Answer { req, ans } => {
+                if !lose_req {
                     let d = self.latency();
-                    self.at(d, Msg::Client(req, ans, p));
+                    self.at(d, Msg::Bucket(p, op, call, lose_reply));
                 }
             }
+            Effect::Answer { req, ans } => {
+                let d = self.latency();
+                self.at(d, Msg::Client(req, ans, p));
+            }
+            Effect::Run { obj, act, req } => {
+                let write = self.ops.get(&req).and_then(|(_, w)| *w);
+                let d = self.procs[p].data.entry(obj).or_default();
+                if let Some(w) = write {
+                    d.history.push(w);
+                    d.unsealed.push(w);
+                }
+                let h = d.history.clone();
+                self.procs[p].saw.insert(req, h);
+                self.at(0, Msg::Proc(p, Event::Ran { obj, act, req, changed: write.is_some() }));
+            }
+            Effect::Seal { obj, act } => {
+                let d = self.procs[p].data.entry(obj).or_default();
+                let changes = encode(&std::mem::take(&mut d.unsealed));
+                self.at(0, Msg::Proc(p, Event::Sealed { obj, act, changes }));
+            }
+            Effect::Restore { obj, act, segs } => {
+                // Segments are write-once, so reading them all now is the same
+                // as reading them one by one later.
+                let mut history = vec![];
+                let mut ok = true;
+                for k in &segs {
+                    match self.bucket.get(k) {
+                        Some((Val::Seg(b), _)) => history.extend(decode(b)),
+                        _ => ok = false,
+                    }
+                }
+                self.procs[p].data.insert(obj, Data { history, unsealed: vec![] });
+                let d = self.latency();
+                self.at(d, Msg::Proc(p, Event::Restored { obj, act, ok }));
+            }
+            Effect::Drop { obj } => {
+                self.procs[p].data.remove(&obj);
+            }
         }
-        Ok(())
     }
 
     /// The bucket: linearizable, with conditional writes.
     fn apply(&mut self, c: &Call) -> Res {
         match c {
-            Call::Get(k) => Res::Got(self.bucket.get(k).cloned()),
+            Call::Get(k) => Res::Got(self.bucket.get(k).map(|(v, ver)| (v.clone(), ver.to_string()))),
             Call::Put(k, v, cond) => {
                 let ok = match (cond, self.bucket.get(k)) {
                     (Cond::Any, _) => true,
                     (Cond::IfAbsent, cur) => cur.is_none(),
-                    (Cond::IfMatch(ver), Some((_, cur))) => cur == ver,
+                    (Cond::IfMatch(etag), Some((_, cur))) => cur.to_string() == *etag,
                     (Cond::IfMatch(_), None) => false,
                 };
                 if !ok {
@@ -320,41 +398,44 @@ impl Sim {
                     self.stats.epochs += 1;
                 }
                 self.bucket.insert(k.clone(), (v.clone(), self.version));
-                Res::Put(Ok(self.version))
+                Res::Put(Ok(self.version.to_string()))
             }
-            Call::Scan(prefix) => {
-                Res::Scanned(self.bucket.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(prefix.as_str())).map(|(k, (v, _))| (k.clone(), v.clone())).collect())
+            Call::List(prefix) => {
+                Res::Listed(self.bucket.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(prefix.as_str())).map(|(k, _)| k.clone()).collect())
             }
         }
     }
 
-    fn client_send(&mut self, client: u32, to: Option<(Obj, Op, Node)>) {
+    fn client_send(&mut self, client: u32, to: Option<(Obj, Option<W>, Node)>) {
         if self.now >= self.s.duration && to.is_none() {
             return; // traffic is over
         }
-        let (obj, op, node) = to.unwrap_or_else(|| {
+        let (obj, write, node) = to.unwrap_or_else(|| {
             let obj = self.rng.below(self.s.objects as u64) as Obj;
-            let op = if self.rng.chance(0.6) {
+            let write = if self.rng.chance(0.6) {
                 self.next_w += 1;
-                Op::Write(self.next_w)
+                Some(self.next_w)
             } else {
-                Op::Read
+                None
             };
-            (obj, op, self.rng.below(self.s.nodes as u64) as Node)
+            (obj, write, self.rng.below(self.s.nodes as u64) as Node)
         });
         self.next_req += 1;
         let req = self.next_req;
-        self.pending.insert(req, Pending { client, obj, op, sent: self.now });
+        self.pending.insert(req, Pending { client, obj, write, sent: self.now });
+        self.ops.insert(req, (obj, write));
         self.at(CLIENT_TIMEOUT, Msg::ClientTimeout(req));
         let p = self.current[&node];
         let d = self.latency();
-        self.at(d, Msg::Proc(p, Event::Request { obj, req, op }));
+        self.at(d, Msg::Proc(p, Event::Request { obj, req }));
     }
 
     fn client_answer(&mut self, req: ReqId, ans: Answer, p: usize) -> Result<(), String> {
+        let saw = self.procs[p].saw.remove(&req);
         let Some(pd) = self.pending.remove(&req) else { return Ok(()) }; // timed out already
         match ans {
-            Answer::Done { epoch, history } => {
+            Answer::Done { epoch } => {
+                let history = saw.ok_or_else(|| format!("request {req} answered without being run"))?;
                 let key = (pd.obj, epoch);
                 // One writer per epoch: only one process answers in it.
                 let by = self.answered_by.entry(key).or_default();
@@ -371,15 +452,15 @@ impl Sim {
                 } else if !is_prefix(&history, best) {
                     return Err(format!("object {} epoch {epoch}: answers disagree: {history:?} vs {best:?}", pd.obj));
                 }
-                match pd.op {
-                    Op::Write(w) => {
+                match pd.write {
+                    Some(w) => {
                         if !history.contains(&w) {
                             return Err(format!("write {w} acknowledged but not in its own history"));
                         }
                         self.acked.insert(w, (pd.obj, epoch, self.now));
                         self.stats.writes_acked += 1;
                     }
-                    Op::Read => {
+                    None => {
                         // A read sees every write acknowledged before it was sent.
                         for (&w, &(o, _, t)) in &self.acked {
                             if o == pd.obj && t < pd.sent && !history.contains(&w) {
@@ -394,7 +475,7 @@ impl Sim {
             }
             Answer::Redirect(n) => {
                 self.stats.redirects += 1;
-                self.client_send(pd.client, Some((pd.obj, pd.op, n)));
+                self.client_send(pd.client, Some((pd.obj, pd.write, n)));
             }
             Answer::Failed => {
                 self.stats.failed += 1;
@@ -405,19 +486,28 @@ impl Sim {
         Ok(())
     }
 
+    /// The writes a manifest stands for.
+    fn expand(&self, segs: &[String]) -> Vec<W> {
+        segs.iter().flat_map(|k| match self.bucket.get(k) {
+            Some((Val::Seg(b), _)) => decode(b),
+            _ => vec![],
+        }).collect()
+    }
+
     /// The bucket's invariants: every manifest holds every write acknowledged
     /// in an earlier epoch, and starts with what that epoch proved.
     fn check_bucket(&self) -> Result<(), String> {
         for (k, (v, _)) in &self.bucket {
-            let Val::Manifest(m) = v else { continue };
+            let Val::Manifest(segs) = v else { continue };
             let Some((o, e)) = parse_manifest(k) else { continue };
+            let m = self.expand(segs);
             for (&w, &(wo, we, _)) in &self.acked {
                 if wo == o && we < e && !m.contains(&w) {
                     return Err(format!("lost write {w}: acknowledged in object {o} epoch {we}, missing from epoch {e}"));
                 }
             }
             for (&(po, pe), h) in &self.proven {
-                if po == o && pe < e && !is_prefix(h, m) {
+                if po == o && pe < e && !is_prefix(h, &m) {
                     return Err(format!("history rewrite in object {o}: epoch {pe} proved {h:?}, epoch {e} starts from {m:?}"));
                 }
             }
@@ -428,9 +518,12 @@ impl Sim {
 
 fn parse_manifest(k: &str) -> Option<(Obj, u32)> {
     let rest = k.strip_prefix("obj/")?;
-    let (o, rest) = rest.split_once("/e")?;
-    let e = rest.strip_suffix("/m")?;
-    Some((o.parse().ok()?, e.parse().ok()?))
+    let (o, _) = rest.split_once('/')?;
+    let o: Obj = o.parse().ok()?;
+    match parse_key(o, k)? {
+        (e, "m") => Some((o, e)),
+        _ => None,
+    }
 }
 
 /// Run `seeds` seeds; the first failing seed and why.
