@@ -5,16 +5,22 @@
 //! is coarse on purpose (timing attacks). Anything else answers "not supported".
 
 use crate::engine::Import;
+use crate::store::{Db, MAX_RESULT};
+use std::sync::{Arc, Mutex};
 use std::io::Read;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// What the host keeps for one cell.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct HostState {
     pub counter: i64,
     /// stdout and stderr, capped at `MAX_OUT`.
     pub out: Vec<u8>,
+    /// A Durable Object's storage. Cells without it get an error from `sql`.
+    pub db: Option<Arc<Mutex<Db>>>,
+    /// The answer to the last `sql` call, until `sql_read` takes it.
+    pub sql_out: Vec<u8>,
 }
 
 const MAX_OUT: usize = 64 * 1024;
@@ -41,6 +47,24 @@ pub fn call(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -
         ("combd", "counter_incr") => {
             st.counter += 1;
             st.counter as u64
+        }
+        // Storage: `sql(ptr, len)` runs one statement and returns the answer's
+        // length; `sql_read(ptr)` copies the answer into the cell.
+        ("combd", "sql") => {
+            let len = (args[1] as u32).min(MAX_RESULT as u32 + 1);
+            let req = mem.read(args[0] as u32, len).ok_or("sql: bad pointer")?;
+            st.sql_out = match &st.db {
+                Some(db) => db.lock().unwrap().exec_json(&req),
+                None => br#"{"error":"this cell has no storage"}"#.to_vec(),
+            };
+            st.sql_out.len() as u64
+        }
+        ("combd", "sql_read") => {
+            let out = std::mem::take(&mut st.sql_out);
+            if !mem.write(args[0] as u32, &out) {
+                return Err("sql_read: bad pointer".into());
+            }
+            0
         }
         ("env", "abort") => return Err("abort".into()),
         ("wasi_snapshot_preview1", "proc_exit") => return Err(format!("exit {}", args[0] as i32)),

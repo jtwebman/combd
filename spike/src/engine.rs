@@ -45,6 +45,11 @@ pub trait CellVm {
     fn host_out(&self) -> Vec<u8> {
         Vec::new()
     }
+    /// The host state of an engine that runs host calls inline. Others use
+    /// the `HostState` the caller passes in.
+    fn host_state(&mut self) -> Option<&mut crate::host::HostState> {
+        None
+    }
     /// A full copy of the cell, even mid-call. `None` if the engine can't.
     fn snapshot(&self) -> Option<Self>
     where

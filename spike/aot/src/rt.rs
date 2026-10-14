@@ -39,6 +39,8 @@ pub trait Host {
     fn call(&mut self, import: u32, args: &[u64], mem: &mut [u8]) -> Result<u64, String>;
     fn boxed_clone(&self) -> Box<dyn Host>;
     fn out(&self) -> Vec<u8>;
+    /// So the embedder can reach its own host state.
+    fn as_any(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Everything a compiled cell owns, except its linear memory. Memory is passed

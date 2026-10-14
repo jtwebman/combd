@@ -41,30 +41,23 @@ impl Mem for SliceMem<'_> {
 #[derive(Clone)]
 struct AotHost {
     imports: Vec<Import>,
-    st: HostStateBox,
-}
-
-/// HostState isn't Clone; snapshots copy the parts that matter.
-#[derive(Default)]
-struct HostStateBox(HostState);
-
-impl Clone for HostStateBox {
-    fn clone(&self) -> Self {
-        HostStateBox(HostState { counter: self.0.counter, out: self.0.out.clone() })
-    }
+    st: HostState,
 }
 
 impl Host for AotHost {
     fn call(&mut self, import: u32, args: &[u64], mem: &mut [u8]) -> Result<u64, String> {
         let imp = self.imports.get(import as usize).ok_or("unknown import")?;
-        let r = host::call(imp, args, &mut SliceMem(mem), &mut self.st.0)?;
+        let r = host::call(imp, args, &mut SliceMem(mem), &mut self.st)?;
         Ok(r.first().copied().unwrap_or(0))
     }
     fn boxed_clone(&self) -> Box<dyn Host> {
         Box::new(self.clone())
     }
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn out(&self) -> Vec<u8> {
-        self.st.0.out.clone()
+        self.st.out.clone()
     }
 }
 
@@ -108,7 +101,7 @@ impl Engine for Aot {
 
     fn spawn(&self, m: &&'static Compiled) -> Result<AotVm, String> {
         let imports = m.imports.iter().map(|(md, n, r)| Import { module: md.to_string(), name: n.to_string(), results: *r }).collect();
-        let host = Box::new(AotHost { imports, st: HostStateBox::default() });
+        let host = Box::new(AotHost { imports, st: HostState::default() });
         let (c, mem) = (m.new)(host).map_err(|t| t.to_string())?;
         Ok(AotVm {
             state: Some((c, mem)),
@@ -220,6 +213,11 @@ impl CellVm for AotVm {
 
     fn host_out(&self) -> Vec<u8> {
         self.state.as_ref().map_or_else(Vec::new, |(c, _)| c.host.out())
+    }
+
+    fn host_state(&mut self) -> Option<&mut HostState> {
+        let (c, _) = self.state.as_mut()?;
+        c.host.as_any().downcast_mut::<AotHost>().map(|h| &mut h.st)
     }
 
     /// Between calls a compiled cell is plain data, so it can be copied.

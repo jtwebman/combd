@@ -168,8 +168,100 @@ pub mod api {
     }
 }
 
+/// A Durable Object: a counter and a chat room, with state kept in memory
+/// between requests and saved in the object's SQLite storage.
+///
+/// The host wraps each request in a transaction and commits it before the
+/// answer leaves. If this cell crashes, the host rolls the request back and
+/// starts a fresh cell, and the state is loaded again from storage.
+pub mod room {
+    use serde_json::{json, Value};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    const KEEP: usize = 20;
+
+    struct Room {
+        count: i64,
+        msgs: VecDeque<String>,
+    }
+
+    thread_local! {
+        static ROOM: RefCell<Option<Room>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn raw_sql(req: &[u8]) -> Vec<u8> {
+        #[link(wasm_import_module = "combd")]
+        extern "C" {
+            fn sql(ptr: *const u8, len: u32) -> u32;
+            fn sql_read(ptr: *mut u8);
+        }
+        let n = unsafe { sql(req.as_ptr(), req.len() as u32) } as usize;
+        let mut out = vec![0u8; n];
+        unsafe { sql_read(out.as_mut_ptr()) };
+        out
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn raw_sql(_: &[u8]) -> Vec<u8> {
+        br#"{"error":"storage needs a cell"}"#.to_vec()
+    }
+
+    /// One statement. Returns the rows, or panics on an error: let it crash.
+    fn sql(q: &str, p: &[Value]) -> Vec<Value> {
+        let out: Value = serde_json::from_slice(&raw_sql(json!({ "q": q, "p": p }).to_string().as_bytes())).expect("bad sql answer");
+        if let Some(e) = out.get("error") {
+            panic!("sql: {e}");
+        }
+        out["rows"].as_array().cloned().unwrap_or_default()
+    }
+
+    fn load() -> Room {
+        sql("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v INTEGER)", &[]);
+        sql("CREATE TABLE IF NOT EXISTS msgs (id INTEGER PRIMARY KEY, body TEXT)", &[]);
+        let count = sql("SELECT v FROM kv WHERE k = 'count'", &[]).first().and_then(|r| r[0].as_i64()).unwrap_or(0);
+        let mut msgs: VecDeque<String> = sql("SELECT body FROM msgs ORDER BY id DESC LIMIT ?", &[json!(KEEP)])
+            .iter()
+            .filter_map(|r| r[0].as_str().map(String::from))
+            .collect();
+        msgs.make_contiguous().reverse();
+        Room { count, msgs }
+    }
+
+    pub fn handle(method: &str, path: &str, body: &str) -> String {
+        ROOM.with(|r| {
+            let mut r = r.borrow_mut();
+            let room = r.get_or_insert_with(load);
+            match (method, path) {
+                ("GET", "/count") => format!("200 {}", json!({ "count": room.count })),
+                ("POST", "/incr") => {
+                    room.count += 1;
+                    sql("INSERT INTO kv (k, v) VALUES ('count', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", &[json!(room.count)]);
+                    format!("200 {}", json!({ "count": room.count }))
+                }
+                ("GET", "/msgs") => format!("200 {}", json!({ "msgs": room.msgs })),
+                ("POST", "/msg") => {
+                    let id = sql("INSERT INTO msgs (body) VALUES (?) RETURNING id", &[json!(body)])[0][0].clone();
+                    room.msgs.push_back(body.to_string());
+                    if room.msgs.len() > KEEP {
+                        room.msgs.pop_front();
+                    }
+                    format!("201 {}", json!({ "id": id }))
+                }
+                // Write, then crash: the host must roll the write back.
+                ("POST", "/crash") => {
+                    sql("INSERT INTO msgs (body) VALUES ('never saved')", &[]);
+                    panic!("crash after a write");
+                }
+                _ => "404 {\"error\":\"not found\"}".into(),
+            }
+        })
+    }
+}
+
 /// One request: "hello", "print", "spin", "panic", "fib N", "sieve N", "sort N",
-/// or "api METHOD PATH BODY".
+/// "api METHOD PATH BODY", or "do METHOD PATH BODY" (a Durable Object).
 pub fn run(req: &str, counter: impl FnOnce() -> i64) -> String {
     let (cmd, arg) = req.split_once(' ').unwrap_or((req, "0"));
     let n: u64 = arg.trim().parse().unwrap_or(0);
@@ -194,6 +286,11 @@ pub fn run(req: &str, counter: impl FnOnce() -> i64) -> String {
             let mut parts = arg.splitn(3, ' ');
             let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
             api::handle(method, path, parts.next().unwrap_or(""))
+        }
+        "do" => {
+            let mut parts = arg.splitn(3, ' ');
+            let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            room::handle(method, path, parts.next().unwrap_or(""))
         }
         _ => "unknown".into(),
     }
@@ -313,7 +410,11 @@ mod cell {
         super::api::warm(); // statics live outside the request arena
         // Everything the request allocates dies with it, except the answer,
         // which is copied out before the arena resets.
-        let answer = super::arena::scope(|| super::run(core::str::from_utf8(&req).unwrap_or(""), || unsafe { counter_incr() }));
+        let req = core::str::from_utf8(&req).unwrap_or("");
+        let run = || super::run(req, || unsafe { counter_incr() });
+        // A Durable Object keeps state between requests, so its requests
+        // can't use the request arena: that state would be freed with it.
+        let answer = if req.starts_with("do ") { run() } else { super::arena::scope(run) };
         // The arena is off now and nothing has reused it yet: copy the answer out.
         let out: Box<[u8]> = answer.as_bytes().into();
         drop(answer);

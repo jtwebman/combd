@@ -12,6 +12,7 @@ mod aot;
 mod aot_gen;
 mod engine;
 mod host;
+mod store;
 mod http;
 mod interp;
 #[cfg(feature = "wasmtime")]
@@ -785,5 +786,91 @@ mod tests {
         let prog = eng.load(&wasm()).unwrap();
         let mut vm = eng.spawn(&prog).unwrap();
         assert!(request(&mut vm, "sieve 5000000", &mut HostState::default()).is_err());
+    }
+
+    /// Start a server for Durable Object tests; returns its port.
+    fn do_server<E: Engine + Sync + Send + 'static>(eng: E, data: &std::path::Path) -> u16
+    where
+        E::Program: Sync + Send,
+    {
+        static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        let port = 21000 + (std::process::id() % 2000) as u16 * 10 + PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let data = data.to_path_buf();
+        std::thread::spawn(move || {
+            let prog = eng.load(&wasm()).unwrap();
+            http::serve_with(&eng, &prog, port, 1, data);
+        });
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("server on {port} didn't start");
+    }
+
+    /// One HTTP request on its own connection: (status, body).
+    fn http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "{method} {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut out = String::new();
+        let r = s.read_to_string(&mut out);
+        assert!(r.is_ok() && out.len() >= 12, "{method} {path}: no answer ({r:?}, {out:?})");
+        let status = out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
+        (status, out.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_string())
+    }
+
+    /// What's on disk for an object, read with a separate connection.
+    fn on_disk(data: &std::path::Path, name: &str, sql: &str) -> String {
+        let db = store::Db::open(&store::path_for(data, name)).unwrap();
+        String::from_utf8(db.exec_json(format!("{{\"q\":{sql:?}}}").as_bytes())).unwrap()
+    }
+
+    /// Durable Objects: state lives across requests, every answered write is
+    /// on disk (the output gate), and a crash rolls its request back.
+    fn objects_keep_state_and_roll_back_crashes<E: Engine + Sync + Send + 'static>(eng: E)
+    where
+        E::Program: Sync + Send,
+    {
+        let dir = store::tempdir::Dir::new();
+        let port = do_server(eng, &dir.0);
+        for n in 1..=3 {
+            assert_eq!(http(port, "POST", "/do/room1/incr", ""), (200, format!("{{\"count\":{n}}}")));
+        }
+        // The output gate: once we have the answer, the write is on disk.
+        assert!(on_disk(&dir.0, "room1", "SELECT v FROM kv").contains("[[3]]"));
+        assert_eq!(http(port, "POST", "/do/room1/msg", "hi").0, 201);
+        // A crash after a write: 500, and the write is gone.
+        assert_eq!(http(port, "POST", "/do/room1/crash", "").0, 500);
+        assert!(!on_disk(&dir.0, "room1", "SELECT body FROM msgs").contains("never saved"));
+        // A fresh cell loads its state back from storage.
+        assert_eq!(http(port, "GET", "/do/room1/count", ""), (200, "{\"count\":3}".into()));
+        assert_eq!(http(port, "GET", "/do/room1/msgs", ""), (200, "{\"msgs\":[\"hi\"]}".into()));
+        // Objects are separate.
+        assert_eq!(http(port, "GET", "/do/room2/count", ""), (200, "{\"count\":0}".into()));
+        // Many clients at once on one object: it runs them one at a time, and
+        // none are lost or doubled.
+        let answers: Vec<String> = (0..8)
+            .map(|_| std::thread::spawn(move || (0..10).map(|_| http(port, "POST", "/do/busy/incr", "").1).collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let mut counts: Vec<i64> = answers.iter().map(|a| serde_json::from_str::<serde_json::Value>(a).unwrap()["count"].as_i64().unwrap()).collect();
+        counts.sort();
+        assert_eq!(counts, (1..=80).collect::<Vec<_>>());
+        assert!(on_disk(&dir.0, "busy", "SELECT v FROM kv").contains("[[80]]"));
+    }
+
+    #[test]
+    fn objects_on_the_interpreter() {
+        objects_keep_state_and_roll_back_crashes(interp::Interp { max_pages: 16384 });
+    }
+
+    #[cfg(feature = "aot-guard")]
+    #[test]
+    fn objects_on_aot() {
+        objects_keep_state_and_roll_back_crashes(aot::Aot);
     }
 }
