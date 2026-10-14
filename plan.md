@@ -84,10 +84,13 @@ right after, the same careful way: spec, then simulator, then real nodes.
 - **The result:** on the cluster, about 1.6x the writes and half the p50
   (14 ms vs 28 ms), every object correct.
 
-**A peer that loses its disk is a real risk.** If it came back as the same
-node, its empty store would answer a fence knowing nothing. For now a node
-whose peer store is gone, but whose lease shows it ran before, refuses to
-start. The real fix needs its own spec work.
+**A peer that loses its disk forgets two things, not one.** It forgets what
+it held, and, worse, whom it fenced, which could let an old owner get writes
+confirmed again. Now a wiped peer relearns its fence from the bucket before it
+answers anything, and speaks only for epochs that began after it came back.
+TLC found that our first rule ("it has a log of that epoch since the wipe")
+was wrong, because a log being re-sent can be partial. Checked in the spec,
+the simulator, and the cluster (kill a node and delete its disk).
 
 **Network splits found three ways we held clients too long.** Safety held
 through every split, in the simulator and on the cluster. But an owner cut
@@ -97,6 +100,25 @@ off from everything but its clients held them until they timed out. Fixed
 all three: D3 keeps serving on its peers, cut-off nodes say "retry" fast,
 and nothing waits longer than a lease. With the owner cut off from the
 bucket, D3's typical stall went from 4.7 s to 1.3 s.
+
+**The official Wasm testsuite: 30,497 checks pass, 0 fail.** It found that we
+loaded modules using instructions we don't run and only trapped when one ran,
+and that a module with two memories silently got memory 0's answers. Both
+are refused at load now, by name. What we don't support is counted, not
+hidden (SIMD, imported memories and tables, memory64, GC, table copy).
+
+**Differential fuzzing found real bugs in both engine tiers.** Random valid
+modules run on our interpreter and Wasmtime (and on the AOT tier against the
+interpreter); results, traps, and every byte of memory must match.
+- **The interpreter gave a wrong answer:** `big == extend(0)` said "equal".
+  A compare swapped its operands for an immediate, and a constant too big for
+  one landed in the slot holding the other operand. Wrong, but it only
+  touched the cell's own frame.
+- **The guard-page AOT build missed traps.** LLVM deletes loads whose value
+  is never used, so an out-of-bounds load that should trap never happened.
+  No memory outside the cell was touched (the load was removed, not done),
+  but Wasm says it must trap. Fixed the way wasm2c does: an empty asm keeps
+  every load. It costs 2% to 5%.
 
 **Benchmarks on a busy laptop lie.** Runs of the same build swung 2x to 5x
 while other work ran on the machine. Only runs that alternate A and B can
@@ -638,7 +660,14 @@ style. A custom VFS turned out not to be needed.
 
 The TinyGo bug (an `if` right after a stack op left the stack pointer one
 slot high) was found by luck: one compiler happened to emit that pattern.
-Fuzzers find those on purpose. Next up, after the HTTP race:
+Fuzzers find those on purpose.
+
+**Status, 2026-10-14:** item 1 runs (`combd-spike fuzz`, `aot-fuzz.sh`), along
+with the official spec testsuite (`spectest.sh`), and both found real bugs
+(see "What building taught us"). Still to do: Wasmtime against the AOT tier
+directly, multi-value in the AOT tier, and items 2 to 5.
+
+The list:
 
 1. **Differential fuzzing of every engine.** `wasm-smith` makes random valid
    Wasm modules. Each one runs on our interpreter, our AOT tier, and

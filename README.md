@@ -120,6 +120,10 @@ the full story; the short version:
 - **The checkers earned their keep.** The TLA+ spec found a real bug in our
   fast-write design, and the simulator found another the spec couldn't see.
   Both were fixed before any real node ran that code.
+- **Outside judges found bugs our tests missed.** The official Wasm
+  testsuite and random modules raced against Wasmtime found a wrong answer
+  in our interpreter, and loads our fast compiled tier skipped instead of
+  trapping. None let a cell reach outside its sandbox; all are fixed.
 - **Network splits never broke a write,** but they showed three ways a
   cut-off node held its clients too long. All three are fixed.
 - **Benchmarks on a busy laptop swing 2x to 5x.** We only trust runs that

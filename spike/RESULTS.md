@@ -969,12 +969,10 @@ An A/B against the code from before the D3 core showed no D2 regression
 (steady averages 828 vs 827), but only alternating runs can be trusted
 here. Honest numbers need quiet Linux machines.
 
-**A gap, made safe for now:** if a peer loses its disk and comes back as the
-same node, its empty store would answer a fence knowing nothing, and writes
-it confirmed could be lost. So a node whose lease is in the bucket but whose
-peer store is gone refuses to start. The real fix (a store that knows it's
-new, and an owner that then uses another peer's tail) needs its own spec
-work first. Also, a peer no longer skips ahead past what the bucket has.
+**A gap, closed later:** a peer that lost its disk and came back as the same
+node would answer a fence knowing nothing. At first such a node refused to
+start; see "A peer that loses its disk" below for the real fix. Also, a peer
+no longer skips ahead past what the bucket has.
 
 ## Network splits
 
@@ -1040,6 +1038,103 @@ longest stretch of failed requests. One run each, on a busy machine, so the
 rates are rough. Note D3 barely slows when the owner loses the bucket: its
 peers still confirm writes. One-way splits need `iptables` in the image;
 the simulator covers those.
+
+## A peer that loses its disk
+
+If a peer's disk is lost and the node comes back empty, it has forgotten two
+things: the entries it held, and whom it fenced. The second is the worse one.
+If a new owner fenced only that peer, the old owner could write to it again
+and get writes confirmed.
+
+**The fix.** A node that has run before (its lease is in the bucket) but
+whose peer store is gone comes back *wiped*, with a marker file so it stays
+that way. Before it answers anything about an object, it reads the object's
+ownership record (epoch R). It refuses every epoch below R, which is the fence
+it lost. And it speaks only for epochs after R, because those began after it
+came back, so it saw all of their entries. Its fence answers carry R. A new
+owner uses a peer's tail only if that peer can speak for the epoch it needs.
+If none of the answers it has can, it waits for the other peers and lists the
+bucket again, so the listing still comes after the fence of the peer it uses.
+
+**Checked four ways:**
+- **Spec:** a Wipe step (at most once: two lost disks at once really can lose
+  writes). TLC found a hole in the first try. "The peer has a log of that
+  epoch since the wipe" isn't enough, because the owner may still be
+  re-sending it, so the copy can be partial. With the fix: 143.9 million
+  states, no errors. The two bad versions (trust a wiped tail, forget the
+  fence) both fail.
+- **Simulator:** one lost disk per run, at a crash. 2,000 seeds hold every
+  invariant, and both bad versions are caught.
+- **Real nodes:** the test `peer_store_survives_restarts_torn_records_and_compaction`
+  deletes the log, reopens, and checks that the store relearns from the bucket
+  (and gives no answer when the bucket is out of reach).
+- **Cluster:** SIGKILL a node and delete its disk under load. It comes back
+  wiped, relearns, and every object is correct (1,425 writes/s through it).
+
+Found on the way: a store snapshot wrote logs with dropped entries in a way
+the stricter skip rule refused to replay. Compaction would have lost them. A
+test covers it now. The node also writes its lease before serving, so a node
+that served always has one.
+
+## Engine safety: the spec testsuite and differential fuzzing
+
+The fleet was checked four ways; the sandbox only had our own tests. Now it
+has two outside judges.
+
+**The official WebAssembly testsuite** (`spike/spectest.sh`, pinned commit,
+every `.wast` file) against the interpreter: **30,497 checks pass, 0 fail**,
+34,346 skipped. A skip is a module we refuse at load because it uses
+something we don't support, counted by reason: SIMD (most of them), imported
+memories, tables, or globals, memory64, GC, `table.copy` and `table.init`,
+start functions. It found two problems:
+1. **Lazy refusal.** A module using an instruction we don't run loaded fine
+   and trapped only when it reached one. Now it's refused at load, by name.
+2. **Two memories, one answer.** A module with a second memory got memory 0's
+   answers for it. Wrong, though every access was still bounds-checked.
+   Refused at load now.
+
+**Differential fuzzing** (`combd-spike fuzz N`). wasm-smith makes random
+valid modules that use only what we run. Every loop ends (a fuel global), and
+NaN results are canonical. Every export is called with random arguments on
+our interpreter and Wasmtime, each call on a fresh instance. Results, traps,
+and every byte of memory must match. Running out of stack is inconclusive
+(the engines have different limits). Both engines get the same memory cap.
+
+| Run | Modules | Calls compared | Mismatches |
+|---|---|---|---|
+| Interpreter vs Wasmtime, first | 50,000 | 189,782 | 1 real bug (and 31 from a harness gap) |
+| Interpreter vs Wasmtime, after fixes | 50,000 | 189,219 | 0 |
+| AOT (guard pages) vs interpreter, first | 138 | 469 | 1 real bug |
+| AOT, both builds, after the fix | 979 | 3,186 each | 0 |
+
+**Bug 1, the interpreter: a wrong answer.** `big == extend(0)` said "equal".
+To use an immediate, a commuted compare swapped its operands. But `big`
+doesn't fit an immediate, so it went to the scratch slot, and that slot held
+the other operand: it compared `big` with itself. It only touched the cell's
+own frame. The shrinker (wasm-shrink) and a hand-made test pinned it down;
+the regression test `a_commuted_compare_keeps_both_operands` fails without
+the fix.
+
+**Bug 2, the guard-page AOT build: missing traps.** A load from a 0-page
+memory returned instead of trapping. Its value was never used, and to LLVM a
+plain read has no side effects, so it deleted the load, and the guard page
+never saw it. No memory outside the cell was touched, since the access was
+removed, not done. But Wasm says it must trap. The fix is the one wasm2c uses
+(`FORCE_READ`): an empty asm takes each loaded value, so the load stays, and
+every other optimization still applies. Cost, alternating builds in-process:
+0.54 to 0.57 us, 1.32 to 1.38 us, and 3.53 to 3.59 us per request (2% to 5%).
+The bounds-checked build never had this bug: its check has a side effect.
+
+**The harness gap:** the first run let Wasmtime grow memory to 4 GiB while
+our test engine stops at 64 MiB, so `memory.grow` disagreed. That's a limit,
+not a bug; both get the same cap now.
+
+Still open: stores. LLVM may also move a store across one that faults, so
+memory at a trap could differ from Wasm's. The fuzzer compares memory after
+every trap and hasn't seen it in 979 modules, but that's not proof. Also not
+done yet: multi-value in the AOT tier (142 modules refused), Wasmtime
+against the AOT tier directly, and fuzzing the host API, the HTTP parser,
+and the peer protocol.
 
 ## Security: memory is always zero
 

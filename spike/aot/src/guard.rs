@@ -98,7 +98,9 @@ impl Mem {
     #[inline(always)]
     pub(crate) fn load<const N: usize>(&self, a: usize) -> [u8; N] {
         debug_assert!(a + N <= RESERVE);
-        unsafe { std::ptr::read_unaligned(self.base.add(a) as *const [u8; N]) }
+        let v = unsafe { std::ptr::read_unaligned(self.base.add(a) as *const [u8; N]) };
+        keep(&v);
+        v
     }
 
     #[inline(always)]
@@ -111,6 +113,20 @@ impl Mem {
     pub fn range(&self) -> (usize, usize) {
         (self.base as usize, RESERVE)
     }
+}
+
+/// A Wasm load must trap even if nothing uses its value. To LLVM a plain read
+/// has no side effects, so it deletes unused ones, and then the guard page
+/// never sees them (found by differential fuzzing: a load from a 0-page memory
+/// returned instead of trapping). An empty asm that takes the value keeps the
+/// load. It costs a register, and every other optimization still applies
+/// (`nomem`: it touches no memory). wasm2c does the same (`FORCE_READ`).
+#[inline(always)]
+fn keep<const N: usize>(v: &[u8; N]) {
+    let mut w = [0u8; 8];
+    w[..N.min(8)].copy_from_slice(&v[..N.min(8)]);
+    let w = u64::from_ne_bytes(w);
+    unsafe { std::arch::asm!("/* {0} */", in(reg) w, options(nomem, nostack, preserves_flags)) };
 }
 
 impl Clone for Mem {

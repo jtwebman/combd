@@ -722,6 +722,8 @@ fn main_with(args: &[&str]) {
         }
         // The AOT tier's fuzz batch: `fuzz-gen N [start]`, build, `fuzz-aot N [start]`.
         #[cfg(feature = "fuzz")]
+        ["fuzz-dump", seed, out] => std::fs::write(out, fuzz::module(seed.parse().unwrap()).unwrap().0).unwrap(),
+        #[cfg(feature = "fuzz")]
         ["fuzz-replay", path] => match fuzz::replay(std::path::Path::new(path)) {
             Ok(()) => println!("fuzz     {path}: the engines agree"),
             Err(e) => {
