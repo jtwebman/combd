@@ -10,7 +10,7 @@ rust-version = "1.94"
 resolver = "3"
 
 [features]
-default = ["wasmtime"]
+default = ["wasmtime", "fuzz"]
 # The AOT tier. Needs spike/aot/src/gen_*.rs, made by `aot.sh`.
 aot = ["aot-lite"]
 aot-lite = ["dep:combd-aot"]
@@ -18,6 +18,8 @@ aot-lite = ["dep:combd-aot"]
 aot-guard = ["aot", "combd-aot/guard", "dep:corosensei"]
 # EXPERIMENT ONLY: see combd-aot's `experiment-unchecked`.
 aot-unchecked-experiment = ["aot-lite", "combd-aot/experiment-unchecked"]
+# Differential fuzzing: random valid modules on every engine (`combd-spike fuzz`).
+fuzz = ["wasmtime", "dep:wasm-smith", "dep:arbitrary"]
 
 [dependencies]
 combd-guest = { path = "../guest" }
@@ -39,6 +41,10 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 sha2 = "0.10"
 hmac = "0.12"
 wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
+# Random valid Wasm modules for differential fuzzing, the same wasm-tools
+# release as wasmparser.
+wasm-smith = { version = "0.261", optional = true }
+arbitrary = { version = "1", optional = true }
 
 [profile.release]
 lto = "thin"

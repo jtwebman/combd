@@ -1,1 +1,4 @@
 .testsuite/
+aot/src/fuzz/
+aot/src/gen_fuzz.rs
+fuzz-*.wasm

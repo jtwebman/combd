@@ -17,6 +17,8 @@ pub mod rt;
 #[cfg(has_js)]
 mod gen_js;
 mod gen_rust;
+#[cfg(has_fuzz)]
+mod gen_fuzz;
 
 /// One precompiled module, found by the hash of its Wasm bytes.
 pub struct Compiled {
@@ -39,5 +41,9 @@ pub fn hash(wasm: &[u8]) -> u64 {
 
 pub fn find(wasm: &[u8]) -> Option<&'static Compiled> {
     let h = hash(wasm);
+    #[cfg(has_fuzz)]
+    if let Some(m) = gen_fuzz::ALL.iter().find(|m| m.hash == h) {
+        return Some(m);
+    }
     MODULES.iter().find(|m| m.hash == h)
 }

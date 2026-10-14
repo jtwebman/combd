@@ -20,6 +20,8 @@ mod store;
 mod wire;
 #[cfg(test)]
 mod spectest;
+#[cfg(feature = "fuzz")]
+mod fuzz;
 mod http;
 mod interp;
 #[cfg(feature = "wasmtime")]
@@ -695,6 +697,62 @@ fn main_with(args: &[&str]) {
             }
             println!("sim      every invariant held");
         }
+        // Differential fuzzing against Wasmtime: `fuzz N [start]`.
+        #[cfg(feature = "fuzz")]
+        ["fuzz", n, ref rest @ ..] => {
+            let start: u64 = rest.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let n: u64 = n.parse().unwrap();
+            let t = Instant::now();
+            let st = fuzz::run(start..start + n, true);
+            println!("fuzz     {n} seeds in {:.1} s: {} modules, {} calls ({} trapped), {} inconclusive", t.elapsed().as_secs_f64(), st.modules, st.calls, st.traps, st.inconclusive);
+            for (why, count) in &st.refused {
+                println!("fuzz     refused {count:5}  {why}");
+            }
+            for (kind, count) in &st.trap_kinds {
+                println!("fuzz     trap    {count:5}  {kind}");
+            }
+            for (seed, why) in st.mismatches.iter().take(20) {
+                println!("fuzz     MISMATCH seed {seed}: {why}");
+            }
+            if !st.mismatches.is_empty() {
+                println!("fuzz     {} mismatches (modules saved as fuzz-<seed>.wasm)", st.mismatches.len());
+                std::process::exit(1);
+            }
+            println!("fuzz     no mismatches");
+        }
+        // The AOT tier's fuzz batch: `fuzz-gen N [start]`, build, `fuzz-aot N [start]`.
+        #[cfg(feature = "fuzz")]
+        ["fuzz-replay", path] => match fuzz::replay(std::path::Path::new(path)) {
+            Ok(()) => println!("fuzz     {path}: the engines agree"),
+            Err(e) => {
+                println!("fuzz     {path}: MISMATCH {e}");
+                std::process::exit(1);
+            }
+        },
+        #[cfg(feature = "fuzz")]
+        ["fuzz-gen", n, ref rest @ ..] => {
+            let start: u64 = rest.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let st = fuzz::gen_aot(start..start + n.parse::<u64>().unwrap(), std::path::Path::new("aot/src"));
+            println!("fuzz-gen {} modules written to aot/src/fuzz", st.modules);
+            for (why, count) in &st.refused {
+                println!("fuzz-gen aot-gen refused {count:5}  {why}");
+            }
+        }
+        #[cfg(all(feature = "fuzz", feature = "aot-lite"))]
+        ["fuzz-aot", n, ref rest @ ..] => {
+            let start: u64 = rest.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let n: u64 = n.parse().unwrap();
+            let t = Instant::now();
+            let st = fuzz::run_aot(start..start + n);
+            println!("fuzz-aot {n} seeds in {:.1} s: {} modules, {} calls ({} trapped), {} inconclusive", t.elapsed().as_secs_f64(), st.modules, st.calls, st.traps, st.inconclusive);
+            for (seed, why) in st.mismatches.iter().take(20) {
+                println!("fuzz-aot MISMATCH seed {seed}: {why}");
+            }
+            if !st.mismatches.is_empty() {
+                std::process::exit(1);
+            }
+            println!("fuzz-aot no mismatches");
+        }
         ["aot-gen", input, output] => {
             let wasm = std::fs::read(input).unwrap();
             match aot_gen::generate(&wasm, input) {
@@ -813,6 +871,21 @@ mod tests {
         let mut vm = eng.spawn(&prog).unwrap();
         vm.begin(export, &[]).unwrap();
         vm.run(u32::MAX)
+    }
+
+    /// Regression, found by differential fuzzing (seed 6831): `big == extend(0)`
+    /// swapped its operands so the constant could be an immediate, but `big`
+    /// doesn't fit one, so it went to the scratch slot, which held the other
+    /// operand. It compared `big` with itself and said "equal".
+    #[test]
+    fn a_commuted_compare_keeps_both_operands() {
+        let src = r#"(module
+            (func (export "eq") (result i32)
+                i64.const 910823536302486501  i32.const 0  i64.extend_i32_s  i64.eq)
+            (func (export "add") (result i64)
+                i64.const 0x100000000  i32.const 5  i64.extend_i32_s  i64.add))"#;
+        assert!(matches!(run_wat(src, "eq"), Outcome::Done(r) if r == [0]));
+        assert!(matches!(run_wat(src, "add"), Outcome::Done(r) if r == [0x100000005]));
     }
 
     /// Regression: an `if` (or `br_if`) right after a stack op used to leave the

@@ -711,16 +711,21 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
                 let mut b = rg.vs.pop().ok_or("stack underflow")?;
                 let mut a = rg.vs.pop().ok_or("stack underflow")?;
                 let ha = rg.vs.len();
-                if comm && matches!(a, V::Const(_)) && matches!(b, V::Slot(_)) {
-                    std::mem::swap(&mut a, &mut b);
-                }
-                let ra = rg.slot(&mut f, a, ha);
-                let d = rg.own(ha);
-                let imm = match b {
+                let imm_of = |v: V| match v {
                     V::Const(c) if !wide => Some(c as u32 as i32),
                     V::Const(c) if c as i64 == c as i64 as i32 as i64 => Some(c as i64 as i32),
                     _ => None,
                 };
+                // Swap only when the constant becomes an immediate. Otherwise
+                // it would be written to the scratch slot at height ha + 1,
+                // which may be the very slot the other operand is in (found
+                // by differential fuzzing: `x == extend(0)` with a big x).
+                if comm && imm_of(a).is_some() && matches!(b, V::Slot(_)) {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                let ra = rg.slot(&mut f, a, ha);
+                let d = rg.own(ha);
+                let imm = imm_of(b);
                 let op = match imm {
                     Some(imm) => ri(d, ra, imm),
                     None => {
