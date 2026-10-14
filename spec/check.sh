@@ -13,7 +13,7 @@ echo "$SHA  $JAR" | shasum -a 256 -c - >/dev/null
 tlc() { java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -deadlock -metadir ".tools/states/$2" -config "$2.cfg" "$1.tla" 2>&1; }
 check() {
     model=$1; shift
-    out=$(tlc "$model" "$model")
+    out=$(tlc "$model" "$model" || true)
     if echo "$out" | grep -q "No error has been found"; then
         echo "ok    $model: $(echo "$out" | grep -o '[0-9]* distinct states found, 0 states left' | cut -d' ' -f1) states, no errors"
     else
@@ -25,4 +25,4 @@ check() {
     done
 }
 check MCOwnership BugSkipProof BugLoadBeforeCas BugNoManifest BugReuseEpoch
-check MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest
+check MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest RepAckNoProof

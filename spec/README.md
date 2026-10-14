@@ -23,18 +23,20 @@ Four known-bad versions must fail, each on a different invariant:
 
 `Replication.tla` is D3, fast writes: peers confirm each write, and the
 bucket gets batches later. A write is acknowledged once every peer has it. A
-new owner fences one peer of the epoch it took over from, then reads the
-peer's tail along with the bucket. Peers drop entries only after the bucket
-has them. A clean handoff seals the epoch: upload everything, then step down.
+new owner fences one peer, which hands back its tail of every epoch. Then the
+owner lists the bucket and picks the last epoch with a manifest. Peers drop
+entries only after the bucket has them. If a peer is slow or down, a write
+the bucket already has can be acknowledged the D2 way, by re-reading the
+record. A clean handoff seals the epoch: upload everything, then step down.
 
 Same three invariants. The model has two owners on different nodes, two
 peers, crashes, and a superseded owner that keeps sending and uploading until
-it notices. 35.7 million states, no errors. TLC found one real bug in the
+it notices. 46.9 million states, no errors. TLC found one real bug in the
 first design: a new owner skipped the fence because the old epoch had no
 manifest yet, and the old owner then wrote one late and served writes that
 were lost. The fix: fence unless the old epoch was sealed.
 
-Six known-bad versions must fail:
+Seven known-bad versions must fail:
 
 | Bug | Caught by |
 |---|---|
@@ -44,8 +46,9 @@ Six known-bad versions must fail:
 | peers drop entries before upload | NoLostAckedWrite |
 | seal before everything is uploaded | NoLostAckedWrite |
 | fence only if the old epoch wrote a manifest | NoLostAckedWrite |
+| acknowledge what's uploaded without re-reading the record | NoLostAckedWrite |
 
-Run `./check.sh` (needs Java; it fetches TLC 1.7.4 and checks its hash). The whole run takes about 2.5 minutes.
+Run `./check.sh` (needs Java; it fetches TLC 1.7.4 and checks its hash). The whole run takes about 3 minutes.
 
 Not modeled yet: reads (they pass the same gate as writes), leases and
 clocks (liveness only), many objects, and checkpoints of old epochs.
