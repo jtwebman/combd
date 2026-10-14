@@ -32,6 +32,7 @@ use rusqlite::limits::Limit;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::Connection;
 use serde_json::{json, Value as Json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::Arc;
@@ -56,6 +57,8 @@ pub struct Db {
     wrote: std::cell::Cell<bool>,
     /// Pages in the WAL after the last commit.
     wal_pages: std::cell::Cell<i32>,
+    /// D2: where the next unsealed WAL frame starts, and the WAL's salt.
+    tail: std::cell::Cell<(u64, u64)>,
     /// True while the host itself runs SQL (BEGIN, COMMIT).
     host: Arc<AtomicBool>,
     steps: Arc<AtomicU32>,
@@ -132,7 +135,7 @@ impl Db {
         conn.progress_handler(1000, Some(move || s.fetch_add(1, Relaxed) >= MAX_STEPS));
         let mut wal_path = path.as_os_str().to_owned();
         wal_path.push("-wal");
-        Ok(Db { conn, path: path.to_path_buf(), wal_path: wal_path.into(), wal: Default::default(), wrote: Default::default(), wal_pages: Default::default(), host, steps })
+        Ok(Db { conn, path: path.to_path_buf(), wal_path: wal_path.into(), wal: Default::default(), wrote: Default::default(), wal_pages: Default::default(), tail: std::cell::Cell::new((WAL_HEADER, 0)), host, steps })
     }
 
     fn host_sql(&self, sql: &str) -> rusqlite::Result<()> {
@@ -264,6 +267,124 @@ fn note_wal_pages(_: &rusqlite::hooks::Wal, pages: std::ffi::c_int) -> rusqlite:
 /// Copy an object's WAL back into its database file. Runs on an fsync thread
 /// with its own connection. Passive: it copies what it can without blocking
 /// the object's writer, which then restarts the WAL from the top.
+const WAL_HEADER: u64 = 32;
+const FRAME_HEADER: u64 = 24;
+
+impl Db {
+    /// D2: every page changed since the last seal, from the WAL's committed
+    /// frames, newest copy of each. Format: page size, database size in
+    /// pages, count, then (page number, page) pairs, all u32 little-endian.
+    ///
+    /// Only call between requests, and checkpoint (with `checkpoint_local`)
+    /// only right after a seal, so no change is ever skipped.
+    pub fn seal(&self) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = match std::fs::File::open(&self.wal_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(encode_pages(4096, 0, &BTreeMap::new())),
+            Err(e) => return Err(e),
+        };
+        let mut hdr = [0u8; WAL_HEADER as usize];
+        if f.read_exact(&mut hdr).is_err() {
+            return Ok(encode_pages(4096, 0, &BTreeMap::new())); // empty: truncated by a checkpoint
+        }
+        let be = |b: &[u8]| u32::from_be_bytes(b.try_into().unwrap());
+        let page = be(&hdr[8..12]) as u64;
+        let salt = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+        let (mut pos, old_salt) = self.tail.get();
+        if salt != old_salt {
+            pos = WAL_HEADER; // a new WAL, after a checkpoint: start from the top
+        }
+        f.seek(SeekFrom::Start(pos))?;
+        let mut pages = BTreeMap::new();
+        let mut pending: Vec<(u32, Vec<u8>)> = vec![];
+        let mut size = 0u32;
+        let mut frame = vec![0u8; (FRAME_HEADER + page) as usize];
+        let mut at = pos;
+        loop {
+            if f.read_exact(&mut frame).is_err() {
+                break;
+            }
+            // Frames left over from before the WAL restarted have the old salt.
+            if u64::from_be_bytes(frame[8..16].try_into().unwrap()) != salt {
+                break;
+            }
+            let pgno = be(&frame[0..4]);
+            let commit = be(&frame[4..8]);
+            pending.push((pgno, frame[FRAME_HEADER as usize..].to_vec()));
+            at += FRAME_HEADER + page;
+            if commit > 0 {
+                // A commit frame: everything up to here is a whole transaction.
+                for (n, p) in pending.drain(..) {
+                    pages.insert(n, p);
+                }
+                size = commit;
+                pos = at;
+            }
+        }
+        self.tail.set((pos, salt));
+        Ok(encode_pages(page as u32, size, &pages))
+    }
+
+    /// D2: copy the WAL into the database file and empty it. No fsync: in D2
+    /// the local file is a cache, rebuilt from the bucket after a restart.
+    /// Only right after a `seal`.
+    pub fn checkpoint_local(&self) -> rusqlite::Result<()> {
+        self.host.store(true, Relaxed);
+        let r = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        self.host.store(false, Relaxed);
+        self.tail.set((WAL_HEADER, 0));
+        r
+    }
+}
+
+fn encode_pages(page: u32, size: u32, pages: &BTreeMap<u32, Vec<u8>>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + pages.len() * (4 + page as usize));
+    for v in [page, size, pages.len() as u32] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for (n, p) in pages {
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// D2: build a database file from sealed segments, in order, from nothing.
+pub fn restore(path: &Path, segs: &[Vec<u8>]) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let bad = || std::io::Error::other("bad segment");
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_owned();
+    shm.push("-shm");
+    for p in [path.as_os_str(), &wal, &shm] {
+        let _ = std::fs::remove_file(p);
+    }
+    let mut f = std::fs::File::create(path)?;
+    let mut size = 0u64;
+    let mut page_size = 4096u64;
+    for seg in segs {
+        let u = |i: usize| -> std::io::Result<u32> { Ok(u32::from_le_bytes(seg.get(i..i + 4).ok_or_else(bad)?.try_into().unwrap())) };
+        let (page, db, n) = (u(0)? as u64, u(4)? as u64, u(8)? as usize);
+        if n == 0 {
+            continue;
+        }
+        page_size = page;
+        let mut at = 12;
+        for _ in 0..n {
+            let pgno = u(at)? as u64;
+            let body = seg.get(at + 4..at + 4 + page as usize).ok_or_else(bad)?;
+            f.seek(SeekFrom::Start((pgno - 1) * page))?;
+            f.write_all(body)?;
+            at += 4 + page as usize;
+        }
+        size = db;
+    }
+    f.set_len(size * page_size)?;
+    Ok(())
+}
+
 pub fn checkpoint(path: &Path) -> rusqlite::Result<()> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -424,6 +545,57 @@ mod tests {
         assert!(max < 2 * CHECKPOINT_PAGES as u64 * page, "WAL grew to {max} bytes");
         eprintln!("largest WAL: {max} bytes");
         assert!(q(&db, "SELECT count(*) FROM t").contains("[[400]]"));
+    }
+
+    /// D2: pages sealed from the WAL rebuild the same database, through
+    /// schema changes, many seals, and checkpoints in between.
+    #[test]
+    fn sealed_pages_restore_the_database() {
+        let (d, db) = db();
+        let mut segs = vec![db.seal().unwrap()]; // what opening wrote
+        q(&db, "CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)");
+        for round in 0..30 {
+            db.begin().unwrap();
+            for i in 0..20 {
+                let sql = format!("{{\"q\":\"INSERT OR REPLACE INTO t VALUES (?, ?)\",\"p\":[{}, \"v{round}-{}\"]}}", (round * 7 + i) % 97, "x".repeat(round * 50));
+                db.exec_json(sql.as_bytes());
+            }
+            db.commit().unwrap();
+            if round % 3 == 0 {
+                segs.push(db.seal().unwrap());
+            }
+            if round % 10 == 9 {
+                segs.push(db.seal().unwrap());
+                db.checkpoint_local().unwrap();
+            }
+            if round == 15 {
+                q(&db, "CREATE INDEX tv ON t(v)");
+            }
+        }
+        segs.push(db.seal().unwrap());
+        let want = q(&db, "SELECT k, v FROM t ORDER BY k");
+        // A transaction in progress isn't sealed.
+        db.begin().unwrap();
+        q(&db, "INSERT INTO t VALUES (1000, 'not committed')");
+        let unsealed = db.seal().unwrap();
+        assert_eq!(&unsealed[8..12], &0u32.to_le_bytes(), "uncommitted pages were sealed");
+        db.rollback();
+
+        let copy = d.0.join("restored.sqlite");
+        restore(&copy, &segs).unwrap();
+        let back = Db::open(&copy).unwrap();
+        let got = q(&back, "SELECT k, v FROM t ORDER BY k");
+        let rows = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap()["rows"].as_array().unwrap().clone();
+        let (g, w) = (rows(&got), rows(&want));
+        assert_eq!(w.len(), 97);
+        if g != w {
+            let first = g.iter().zip(&w).position(|(a, b)| a != b);
+            let short = |v: Option<&serde_json::Value>| v.map(|v| v.to_string().chars().take(40).collect::<String>());
+            panic!("restored {} rows, want {}; first difference at {first:?}: {:?} vs {:?}", g.len(), w.len(), short(first.and_then(|i| g.get(i))), short(first.and_then(|i| w.get(i))));
+        }
+        let conn = Connection::open(&copy).unwrap();
+        let ok: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(ok, "ok");
     }
 
     #[test]
