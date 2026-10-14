@@ -22,6 +22,8 @@ use host::HostState;
 use std::time::{Duration, Instant};
 
 const GUEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../guest/target/wasm32-unknown-unknown/release/combd_guest.wasm");
+/// `langs/js/app.js`, compiled by jsc (`jsc/build.sh`).
+const JS_CELL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../jsc/out/app/target/wasm32-unknown-unknown/release/combd_js_app.wasm");
 /// Reductions (loop iterations and calls) per slice for our interpreter.
 const SLICE: u32 = 2_500;
 /// Fuel (about one per wasm op) per slice for Wasmtime. Both are tuned so a
@@ -37,6 +39,9 @@ const LANGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../langs/out");
 /// The Rust cell, plus every cell built by `langs/Dockerfile`.
 fn lang_cells() -> Vec<(String, Vec<u8>)> {
     let mut out = vec![("rust".to_string(), wasm())];
+    if let Ok(js) = std::fs::read(JS_CELL) {
+        out.push(("js".to_string(), js));
+    }
     let mut files: Vec<_> = std::fs::read_dir(LANGS).into_iter().flatten().flatten().map(|e| e.path()).collect();
     files.sort();
     for f in files.into_iter().filter(|f| f.extension().is_some_and(|x| x == "wasm")) {
@@ -135,24 +140,34 @@ fn expected() -> Vec<String> {
     std::fs::read_to_string(format!("{JS_DIR}/expected.txt")).unwrap().lines().map(String::from).collect()
 }
 
-/// The API requests, on the Rust cell.
-fn api_bench<E: Engine>(name: &str, eng: &E) {
+/// The Rust cell or the JS one.
+fn cell(name: &str) -> Vec<u8> {
+    match name {
+        "rust" => wasm(),
+        "js" => std::fs::read(JS_CELL).expect("build the JS cell first: jsc/build.sh"),
+        _ => panic!("cell must be rust or js"),
+    }
+}
+
+/// The API requests, on one cell.
+fn api_bench<E: Engine>(name: &str, eng: &E, lang: &str) {
     let reqs = requests();
-    let prog = eng.load(&wasm()).unwrap();
+    let prog = eng.load(&cell(lang)).unwrap();
     let mut vm = eng.spawn(&prog).unwrap();
     let mut st = HostState::default();
+    init(&mut vm, &mut st).unwrap();
     for r in reqs.iter().filter(|r| r.starts_with("api")) {
         let label: String = r.chars().take(22).collect();
         for _ in 0..200 {
             request(&mut vm, r, &mut st).unwrap();
         }
-        let n = 5000;
+        let n: u32 = std::env::var("COMBD_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
         let t = Instant::now();
         for _ in 0..n {
             request(&mut vm, r, &mut st).unwrap();
         }
         let out = request(&mut vm, r, &mut st).unwrap();
-        println!("rust-api {name:<9} {label:<22} {:>9.2} us   -> {} bytes", us(t.elapsed() / n), out.len());
+        println!("{lang:>4}-api {name:<9} {label:<22} {:>9.2} us   -> {} bytes", us(t.elapsed() / n), out.len());
     }
 }
 
@@ -440,7 +455,11 @@ where
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+    main_with(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+fn main_with(args: &[&str]) {
+    match args[..] {
         ["all"] => {
             for test in ["compute", "startup", "crash", "density", "fairness"] {
                 let engines: &[&str] =
@@ -454,11 +473,12 @@ fn main() {
         }
         ["compute", "native"] => compute_native(),
         ["api-bench", "native"] => api_bench_native(),
-        ["api-bench", "interp"] => api_bench("interp", &interp::Interp { max_pages: 16384 }),
+        ["api-bench", e] => main_with(&["api-bench", e, "rust"]),
+        ["api-bench", "interp", lang] => api_bench("interp", &interp::Interp { max_pages: 16384 }, lang),
         #[cfg(feature = "wasmtime")]
-        ["api-bench", "wasmtime"] => api_bench("wasmtime", &wt::Wt::new(WT_FUEL, None)),
+        ["api-bench", "wasmtime", lang] => api_bench("wasmtime", &wt::Wt::new(WT_FUEL, None), lang),
         #[cfg(feature = "aot-lite")]
-        ["api-bench", "aot"] => api_bench("aot", &aot::Aot),
+        ["api-bench", "aot", lang] => api_bench("aot", &aot::Aot, lang),
         ["aot-gen", input, output] => {
             let wasm = std::fs::read(input).unwrap();
             match aot_gen::generate(&wasm, input) {
@@ -477,10 +497,7 @@ fn main() {
         #[cfg(feature = "aot-lite")]
         [test, "aot"] => run(test, "aot", &aot::Aot),
         ["serve", engine, cell, port] => {
-            let wasm = match cell {
-                "rust" => wasm(),
-                _ => panic!("cell must be rust"),
-            };
+            let wasm = self::cell(cell);
             let port: u16 = port.parse().unwrap();
             match engine {
                 "interp" => {
@@ -620,6 +637,22 @@ mod tests {
         assert!(matches!(run_wat(src, "f"), Outcome::Done(r) if r == [7]));
     }
 
+    /// jsc's build of app.js must answer every request byte-for-byte like Node.
+    #[test]
+    fn js_matches_node() {
+        let Ok(js) = std::fs::read(JS_CELL) else {
+            eprintln!("skipping: build the JS cell first (jsc/build.sh)");
+            return;
+        };
+        let eng = interp::Interp { max_pages: 16384 };
+        let prog = eng.load(&js).unwrap();
+        for (r, want) in requests().iter().zip(expected()) {
+            let (mut vm, mut st) = (eng.spawn(&prog).unwrap(), HostState::default());
+            init(&mut vm, &mut st).unwrap();
+            assert_eq!(request(&mut vm, r, &mut st).unwrap(), want, "{r}");
+        }
+    }
+
     /// The Rust API routes must answer byte-for-byte like Node running app.js.
     #[test]
     fn rust_api_matches_node() {
@@ -634,21 +667,27 @@ mod tests {
     /// A compiled cell yields mid-call (on a fiber) and resumes to the right answer.
     #[cfg(feature = "aot-guard")]
     #[test]
+    /// The JS cell's fib is plain recursion with no loop: it must yield too.
     fn aot_yields_mid_call_and_resumes() {
-        let prog = aot::Aot.load(&wasm()).unwrap();
-        let mut vm = aot::Aot.spawn(&prog).unwrap();
-        let mut st = HostState::default();
-        start(&mut vm, "fib 27", &mut st).unwrap();
-        let mut yields = 0;
-        let r = loop {
-            match vm.run(100) {
-                Outcome::Yield => yields += 1,
-                Outcome::Done(r) => break r,
-                other => panic!("unexpected {:?}", matches!(other, Outcome::Trap(_))),
-            }
-        };
-        assert!(yields > 10, "only {yields} yields");
-        assert_eq!(response(&vm, &r), "196418");
+        let mut cells = vec![("rust", wasm())];
+        cells.extend(std::fs::read(JS_CELL).ok().map(|js| ("js", js)));
+        for (lang, wasm) in cells {
+            let Ok(prog) = aot::Aot.load(&wasm) else { continue };
+            let mut vm = aot::Aot.spawn(&prog).unwrap();
+            let mut st = HostState::default();
+            init(&mut vm, &mut st).unwrap();
+            start(&mut vm, "fib 27", &mut st).unwrap();
+            let mut yields = 0;
+            let r = loop {
+                match vm.run(100) {
+                    Outcome::Yield => yields += 1,
+                    Outcome::Done(r) => break r,
+                    other => panic!("{lang}: unexpected {:?}", matches!(other, Outcome::Trap(_))),
+                }
+            };
+            assert!(yields > 10, "{lang}: only {yields} yields");
+            assert_eq!(response(&vm, &r), "196418", "{lang}");
+        }
     }
 
     /// A stuck compiled cell is still killed fast: the CPU limit is the backstop.

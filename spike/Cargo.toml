@@ -27,11 +27,6 @@ wasmparser = "0.261"
 # The HTTP front: epoll/kqueue event loop and hyper's request parser.
 mio = { version = "1", features = ["net", "os-poll"] }
 httparse = "1"
-# jsc: the JS-to-Rust compiler's parser.
-oxc_allocator = "=0.139.0"
-oxc_ast = "=0.139.0"
-oxc_parser = "=0.139.0"
-oxc_span = "=0.139.0"
 wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
 
 [profile.release]

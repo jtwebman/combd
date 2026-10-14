@@ -1,0 +1,11 @@
+[package]
+name = "combd-jsrt"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "The runtime that JS compiled by jsc links against: values, operators, built-ins, JSON, regex."
+
+[workspace]
+
+[dependencies]
+regress = "0.12"

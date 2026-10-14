@@ -3,3 +3,4 @@ reference/
 target/
 langs/out/
 spike/aot/src/gen_*.rs
+jsc/out/

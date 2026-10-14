@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 use wasmparser::{
     BlockType, ConstExpr, DataKind, ElementItems, ElementKind, ExternalKind, FrameKind, FuncType, FuncValidator,
-    FunctionBody, Operator, Parser, Payload, TypeRef, ValidPayload, Validator, ValidatorResources,
+    FunctionBody, KnownCustom, Name, Operator, Parser, Payload, TypeRef, ValidPayload, Validator, ValidatorResources,
 };
 
 /// EXPERIMENT ONLY: `COMBD_AOT_EXPERIMENT=notick,nostack,unchecked` drops a
@@ -62,6 +62,7 @@ pub fn generate(wasm: &[u8], source: &str) -> Result<String, String> {
     let mut m = Info { mem: (0, 0), ..Default::default() };
     let mut funcs = String::new();
     let mut defined = 0u32;
+    let mut names = String::new();
     for payload in Parser::new(0).parse_all(wasm) {
         let payload = payload.map_err(e)?;
         if let ValidPayload::Func(f, body) = v.payload(&payload).map_err(e)? {
@@ -146,10 +147,22 @@ pub fn generate(wasm: &[u8], source: &str) -> Result<String, String> {
                     }
                 }
             }
+            // Function names, so a profile of `fN` can be read.
+            Payload::CustomSection(c) => {
+                if let KnownCustom::Name(r) = c.as_known() {
+                    for n in r.into_iter().flatten() {
+                        if let Name::Function(map) = n {
+                            for f in map.into_iter().flatten() {
+                                let _ = writeln!(names, "// f{} = {}", f.index, f.name);
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
-    Ok(module_text(&m, &funcs, source, crate_hash(wasm)))
+    Ok(module_text(&m, &funcs, source, crate_hash(wasm)) + &names)
 }
 
 fn crate_hash(wasm: &[u8]) -> u64 {
@@ -448,12 +461,22 @@ fn gen_func(
         }
     }
     // Fuel lives in a register; it is saved to the cell only around calls and
-    // returns. A function with no loops never spends fuel, so it needs none of that.
+    // returns. Loops spend it at their heads. A function that calls others
+    // also spends it on entry: recursion with no loop (fib) can still run for
+    // ages, and it must yield and hit the CPU limit like anything else. A leaf
+    // with no loops does bounded work, so it needs none of this.
     let has_loop = b.contains(": loop {");
+    let has_call = b.contains("(c, m, sb");
     if has_loop {
         out.push_str("let mut fuel = c.fuel;\n");
+        if has_call && !experiment("notick") {
+            out.push_str("fuel -= 1; if fuel < 0 { c.fuel = fuel; c.out_of_fuel()?; fuel = c.fuel; }\n");
+        }
     } else {
         b = b.replace("c.fuel = fuel; ", "").replace(" fuel = c.fuel;", "");
+        if has_call && !experiment("notick") {
+            out.push_str("c.fuel -= 1; if c.fuel < 0 { c.out_of_fuel()?; }\n");
+        }
     }
     for i in 0..nl {
         if i < np {

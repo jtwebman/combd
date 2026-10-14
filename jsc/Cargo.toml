@@ -1,0 +1,17 @@
+[package]
+name = "jsc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+rust-version = "1.94"
+description = "combd's JS-to-Rust compiler: app.js in, a Rust Wasm cell out."
+
+# Its own workspace: the runtime in rt/ builds for wasm32 on its own.
+[workspace]
+resolver = "3"
+
+[dependencies]
+oxc_allocator = "=0.139.0"
+oxc_ast = "=0.139.0"
+oxc_parser = "=0.139.0"
+oxc_span = "=0.139.0"
