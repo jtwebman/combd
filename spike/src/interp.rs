@@ -41,7 +41,7 @@ macro_rules! ops {
     (plain: $($p:ident)*; mem: $($m:ident)*;) => {
         #[derive(Clone, Copy, Debug)]
         enum Op {
-            Unreachable, Unsupported, Tick,
+            Unreachable, Tick,
             Br(Target), Jump(u32), BrTable { start: u32, len: u32 },
             MemorySize, MemoryGrow, MemoryCopy, MemoryFill, MemoryInit(u32), DataDrop(u32),
             // Register forms: operands are frame slots (locals and stack slots alike).
@@ -212,6 +212,10 @@ pub fn load(wasm: &[u8]) -> Result<Module, String> {
                 }
             }
             Payload::MemorySection(r) => {
+                // One memory: every memory instruction works on memory 0.
+                if r.count() > 1 {
+                    return Err("only one memory is supported".into());
+                }
                 for mt in r {
                     let mt = mt.map_err(e)?;
                     if mt.memory64 || mt.shared {
@@ -902,7 +906,9 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
             Operator::MemoryFill { mem: 0 } => f.ops.push(Op::MemoryFill),
             Operator::MemoryInit { data_index, mem: 0 } => f.ops.push(Op::MemoryInit(*data_index)),
             Operator::DataDrop { data_index } => f.ops.push(Op::DataDrop(*data_index)),
-            other => f.ops.push(simple(other).unwrap_or(Op::Unsupported)),
+            // Refuse it at load, by name: never a module that traps later on
+            // an instruction we skipped.
+            other => f.ops.push(simple(&other).ok_or_else(|| format!("unsupported instruction: {other:?}"))?),
         }
         }
         fv.op(offset, &op).map_err(e)?;
@@ -1348,7 +1354,6 @@ impl Vm {
                     fuel -= 1;
                 }
                 Op::Unreachable => return Err("unreachable"),
-                Op::Unsupported => return Err("unsupported instruction"),
                 Op::Br(t) => {
                     sp = branch(s, base, sp, t);
                     pc = t.pc as usize;

@@ -18,6 +18,8 @@ mod s3;
 mod sim;
 mod store;
 mod wire;
+#[cfg(test)]
+mod spectest;
 mod http;
 mod interp;
 #[cfg(feature = "wasmtime")]

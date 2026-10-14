@@ -51,3 +51,5 @@ codegen-units = 16
 [dev-dependencies]
 # Regression tests written in the Wasm text format.
 wat = "1"
+# The official spec testsuite's scripts (`.wast`), same version `wat` uses.
+wast = "262"

@@ -137,6 +137,7 @@ dependencies = [
  "sha2",
  "wasmparser 0.261.0",
  "wasmtime",
+ "wast",
  "wat",
 ]
 
