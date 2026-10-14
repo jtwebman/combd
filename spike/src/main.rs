@@ -720,6 +720,27 @@ mod tests {
         }
     }
 
+    fn oob_traps_then_recovers<E: Engine>(eng: &E) {
+        let prog = eng.load(&wasm()).unwrap();
+        let mut vm = eng.spawn(&prog).unwrap();
+        assert!(request(&mut vm, "oob", &mut HostState::default()).is_err(), "out-of-bounds read must trap");
+        let mut fresh = eng.spawn(&prog).unwrap();
+        assert_eq!(request(&mut fresh, "hello", &mut HostState::default()).unwrap(), "hello #1");
+    }
+
+    /// Security: a read past a cell's memory traps on every engine, and the
+    /// host carries on. With guard pages this goes through the fault handler.
+    #[test]
+    fn out_of_bounds_traps_on_every_engine() {
+        oob_traps_then_recovers(&interp::Interp { max_pages: 16384 });
+        #[cfg(feature = "wasmtime")]
+        oob_traps_then_recovers(&wt::Wt::new(WT_FUEL, None));
+        #[cfg(feature = "aot-lite")]
+        for _ in 0..100 {
+            oob_traps_then_recovers(&aot::Aot); // many faults in a row, same thread
+        }
+    }
+
     /// Regression: answers used to leak, so a busy cell hit its memory limit
     /// after about a million list requests and crashed.
     #[test]

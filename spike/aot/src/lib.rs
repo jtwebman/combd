@@ -3,8 +3,12 @@
 //! Memory safety comes from rustc: no `unsafe` anywhere, every memory access is
 //! bounds-checked, and every trap is an `Err` passed back up the call chain.
 
-#![cfg_attr(not(feature = "experiment-unchecked"), forbid(unsafe_code))]
+#![cfg_attr(not(any(feature = "experiment-unchecked", feature = "guard")), forbid(unsafe_code))]
+#![cfg_attr(feature = "guard", deny(unsafe_code))]
 
+#[cfg(feature = "guard")]
+#[allow(unsafe_code)]
+pub mod guard;
 pub mod rt;
 
 #[cfg(feature = "js")]

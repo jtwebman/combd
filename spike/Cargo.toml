@@ -15,6 +15,8 @@ default = ["wasmtime"]
 aot = ["aot-lite", "combd-aot/js"]
 # The AOT tier with only the Rust cell: builds in seconds, for experiments.
 aot-lite = ["dep:combd-aot"]
+# The AOT tier with guard pages instead of bounds checks.
+aot-guard = ["aot", "combd-aot/guard"]
 # EXPERIMENT ONLY: see combd-aot's `experiment-unchecked`.
 aot-unchecked-experiment = ["aot-lite", "combd-aot/experiment-unchecked"]
 

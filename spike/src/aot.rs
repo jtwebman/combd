@@ -95,7 +95,18 @@ impl CellVm for AotVm {
     fn run(&mut self, _reductions: u32) -> Outcome {
         let Some((f, args)) = self.pending.take() else { return Outcome::Trap("cell is not running".into()) };
         self.c.fuel = CPU_LIMIT;
-        match (self.m.call)(&mut self.c, &mut self.mem, f, &args) {
+        #[cfg(feature = "aot-guard")]
+        let result = {
+            let range = self.mem.range();
+            let (c, mem, call) = (&mut self.c, &mut self.mem, self.m.call);
+            match combd_aot::guard::catch(range, || call(c, mem, f, &args)) {
+                Some(r) => r,
+                None => return Outcome::Trap("out of bounds memory access (guard page)".into()),
+            }
+        };
+        #[cfg(not(feature = "aot-guard"))]
+        let result = (self.m.call)(&mut self.c, &mut self.mem, f, &args);
+        match result {
             Ok(r) => Outcome::Done(r),
             Err(combd_aot::rt::Trap::Host) => Outcome::Trap(self.c.host_err.take().unwrap_or_default()),
             Err(t) => Outcome::Trap(t.to_string()),

@@ -163,16 +163,22 @@ impl Ctx {
     }
 }
 
+#[cfg(feature = "guard")]
+pub use crate::guard::Mem;
+
 /// A cell's linear memory, exactly the Wasm memory's size, so every access is
 /// one bounds check. Growing writes zeros only into the new part.
+#[cfg(not(feature = "guard"))]
 pub struct Mem {
     pub(crate) buf: Vec<u8>,
 }
 
+#[cfg(not(feature = "guard"))]
 const CHUNK: usize = 16 * 1024;
 
 /// A fresh zeroed buffer holding `from`. All-zero chunks are skipped, so a
 /// snapshot copy never touches pages the cell left empty.
+#[cfg(not(feature = "guard"))]
 fn copy_nonzero(from: &[u8]) -> Vec<u8> {
     let mut nb = vec![0u8; from.len()];
     for (i, c) in from.chunks(CHUNK).enumerate() {
@@ -184,6 +190,7 @@ fn copy_nonzero(from: &[u8]) -> Vec<u8> {
     nb
 }
 
+#[cfg(not(feature = "guard"))]
 impl Mem {
     pub fn new(len: usize) -> Mem {
         Mem { buf: vec![0; len] }
@@ -220,6 +227,7 @@ impl Mem {
     }
 }
 
+#[cfg(not(feature = "guard"))]
 impl Clone for Mem {
     fn clone(&self) -> Self {
         Mem { buf: copy_nonzero(&self.buf) }
@@ -259,6 +267,12 @@ macro_rules! loads {
         #[inline(always)]
         pub fn $name(m: &Mem, addr: u64, off: u32) -> Result<$t, Trap> {
             let a = ea(addr, off);
+            // With guard pages, a u32 address plus a small offset always lands
+            // inside the cell's reservation; past live memory it faults into a trap.
+            #[cfg(feature = "guard")]
+            if off <= crate::guard::MAX_FAST_OFFSET {
+                return Ok(<$t>::from_le_bytes(m.load::<$n>(a)));
+            }
             match m.get(a, $n) {
                 Some(b) => Ok(<$t>::from_le_bytes(b.try_into().unwrap())),
                 None => Err(Trap::OutOfBounds),
@@ -273,6 +287,11 @@ macro_rules! stores {
         #[inline(always)]
         pub fn $name(m: &mut Mem, addr: u64, off: u32, v: $t) -> Result<(), Trap> {
             let a = ea(addr, off);
+            #[cfg(feature = "guard")]
+            if off <= crate::guard::MAX_FAST_OFFSET {
+                m.store::<$n>(a, v.to_le_bytes());
+                return Ok(());
+            }
             match m.get_mut(a, $n) {
                 Some(b) => {
                     b.copy_from_slice(&v.to_le_bytes());

@@ -92,6 +92,10 @@ dependencies = [
 [[package]]
 name = "combd-aot"
 version = "0.0.0"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "combd-guest"

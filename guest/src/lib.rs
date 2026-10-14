@@ -177,6 +177,9 @@ pub fn run(req: &str, counter: impl FnOnce() -> i64) -> String {
             }
         }
         "panic" => panic!("boom"),
+        // A read far past the cell's memory. Every engine must trap.
+        #[cfg(target_arch = "wasm32")]
+        "oob" => unsafe { core::ptr::read_volatile(0xFFFF_FFF0usize as *const u8) }.to_string(),
         // wasm32-unknown-unknown has no stdout, so "print" just answers.
         "print" => "printed".into(),
         "fib" => fib(n as u32).to_string(),

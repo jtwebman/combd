@@ -1,6 +1,6 @@
 # Phase 0 race on Linux. Build from the repo root:
 #   docker build -f spike/Dockerfile -t combd-spike .
-#   docker build -f spike/Dockerfile --build-arg FEATURES=aot -t combd-spike-aot .
+#   docker build -f spike/Dockerfile --build-arg FEATURES=aot-guard -t combd-spike-aot .
 #   docker run --rm combd-spike
 FROM rust:1.94.1-slim-bookworm
 # FEATURES=aot builds the AOT tier too (needs langs/out built first).
@@ -13,10 +13,10 @@ COPY langs langs
 RUN cd guest && cargo build --locked --release --target wasm32-unknown-unknown
 # AOT builds are keyed by the Wasm's hash, so generate them from the Wasm built here.
 RUN cd spike && cargo build --locked --release \
-    && if [ "$FEATURES" = "aot" ]; then \
+    && case "$FEATURES" in aot*) \
          ./target/release/combd-spike aot-gen ../guest/target/wasm32-unknown-unknown/release/combd_guest.wasm aot/src/gen_rust.rs \
          && ./target/release/combd-spike aot-gen ../langs/out/js.wasm aot/src/gen_js.rs \
-         && cargo build --locked --release --features aot; fi \
+         && cargo build --locked --release --features "$FEATURES";; esac \
     && cargo test --locked --release --features "$FEATURES"
 WORKDIR /combd/spike
 # glibc normally raises its mmap threshold after big frees, then hands out

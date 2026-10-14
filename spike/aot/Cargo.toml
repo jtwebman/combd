@@ -8,6 +8,12 @@ description = "combd's AOT tier: Wasm modules compiled to plain safe Rust by `co
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+libc = { version = "0.2", optional = true }
+
+[build-dependencies]
+cc = "1"
+
 [features]
 default = ["js"]
 # The QuickJS cell. Off for quick experiments, since it takes minutes to build.
@@ -15,3 +21,6 @@ js = []
 # EXPERIMENT ONLY, NEVER SHIP: skips bounds checks with `unsafe`, to measure
 # what they cost. Generated code needs COMBD_AOT_EXPERIMENT=unchecked.
 experiment-unchecked = []
+# Guard pages instead of bounds checks: `guard.rs` and `trap.c` hold the only
+# unsafe code. Generated code stays `forbid(unsafe_code)`.
+guard = ["dep:libc"]
