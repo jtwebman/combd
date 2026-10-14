@@ -3,7 +3,7 @@
 #   docker build -f spike/Dockerfile --build-arg FEATURES=aot-guard -t combd-spike-aot .
 #   docker run --rm combd-spike
 FROM rust:1.94.1-slim-bookworm
-# FEATURES=aot builds the AOT tier too (needs langs/out built first).
+# FEATURES=aot-guard builds the AOT tier with guard pages.
 ARG FEATURES=""
 RUN rustup target add wasm32-unknown-unknown
 WORKDIR /combd
@@ -15,7 +15,6 @@ RUN cd guest && cargo build --locked --release --target wasm32-unknown-unknown
 RUN cd spike && cargo build --locked --release \
     && case "$FEATURES" in aot*) \
          ./target/release/combd-spike aot-gen ../guest/target/wasm32-unknown-unknown/release/combd_guest.wasm aot/src/gen_rust.rs \
-         && ./target/release/combd-spike aot-gen ../langs/out/js.wasm aot/src/gen_js.rs \
          && cargo build --locked --release --features "$FEATURES";; esac \
     && cargo test --locked --release --features "$FEATURES"
 WORKDIR /combd/spike

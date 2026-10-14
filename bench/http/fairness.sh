@@ -29,18 +29,18 @@ race() { # name image command...
     docker run --rm --network combd-bench bench-wrk wrk -t2 -c16 -d3s http://srv:8080/api/users/42 >/dev/null
     fast "$name alone"
     echo
-    docker run -d --rm --name neighbor --network combd-bench bench-wrk wrk -t1 -c4 -d"$((SECS + 4))s" http://srv:8080/api/fib/32 >/dev/null
+    docker rm -f neighbor >/dev/null 2>&1 || true
+    docker run -d --name neighbor --network combd-bench bench-wrk wrk -t1 -c4 -d"$((SECS + 4))s" http://srv:8080/api/fib/32 >/dev/null
     sleep 2
     fast "$name + heavy neighbor"
-    n=$(docker logs neighbor 2>/dev/null | awk '/Requests\/sec/ {print $2}')
     docker wait neighbor >/dev/null 2>&1 || true
+    n=$(docker logs neighbor 2>/dev/null | awk '/Requests\/sec/ {print $2}')
+    docker rm -f neighbor srv >/dev/null 2>&1 || true
     echo "   (neighbor: ${n:-?} fib/s)"
-    docker rm -f srv >/dev/null 2>&1 || true
 }
 
 race combd-rust combd-spike-aot env COMBD_THREADS=1 ./target/release/combd-spike serve aot rust 8080
 race combd-rust-no-yield combd-spike-aot env COMBD_THREADS=1 COMBD_NO_YIELD=1 ./target/release/combd-spike serve aot rust 8080
-race combd-js combd-spike-aot env COMBD_THREADS=1 ./target/release/combd-spike serve aot js 8080
 race bun bench-bun
 race node bench-node
 race celld bench-celld

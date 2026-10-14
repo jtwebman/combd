@@ -33,7 +33,6 @@ run() { # name image command...
 
 echo "cores per server: $CPUS, connections: $CONNS, ${SECS}s per route"
 run combd-rust combd-spike-aot env COMBD_THREADS="$CPUS" ./target/release/combd-spike serve aot rust 8080
-run combd-js combd-spike-aot env COMBD_THREADS="$CPUS" ./target/release/combd-spike serve aot js 8080
 run workerd bench-workerd
 run celld bench-celld
 run bun bench-bun

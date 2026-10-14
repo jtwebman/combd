@@ -14,8 +14,6 @@ pub mod fiber;
 pub mod guard;
 pub mod rt;
 
-#[cfg(feature = "js")]
-mod gen_js;
 mod gen_rust;
 
 /// One precompiled module, found by the hash of its Wasm bytes.
@@ -27,9 +25,6 @@ pub struct Compiled {
     pub call: fn(&mut rt::Ctx, &mut rt::Mem, u32, &[u64]) -> Result<Vec<u64>, rt::Trap>,
 }
 
-#[cfg(feature = "js")]
-pub static MODULES: &[Compiled] = &[gen_rust::MODULE, gen_js::MODULE];
-#[cfg(not(feature = "js"))]
 pub static MODULES: &[Compiled] = &[gen_rust::MODULE];
 
 /// FNV-1a, the cache key for "is there an AOT build of these bytes?".

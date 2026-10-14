@@ -16,9 +16,6 @@ corosensei = { version = "0.3.4", optional = true }
 cc = "1"
 
 [features]
-default = ["js"]
-# The QuickJS cell. Off for quick experiments, since it takes minutes to build.
-js = []
 # EXPERIMENT ONLY, NEVER SHIP: skips bounds checks with `unsafe`, to measure
 # what they cost. Generated code needs COMBD_AOT_EXPERIMENT=unchecked.
 experiment-unchecked = []

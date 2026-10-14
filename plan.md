@@ -358,60 +358,35 @@ per-cell state. A shared database is for data many cells need.
 ## JavaScript
 
 Most Workers code is JS and TypeScript, so combd needs it to grow past Rust
-developers. No V8, and no JS engine in the host.
+developers. No V8, no JS engine in the host, and (decided 2026-10-13) **no
+QuickJS either**: the JS spike showed an interpreted JS can't beat Bun, so
+combd compiles JS instead.
 
-**How: a JS engine compiled to Wasm, running as a normal cell.** Start with
-QuickJS (through `rquickjs`, like Shopify's Javy, about 870 KB of Wasm). Maybe
-move to SpiderMonkey (StarlingMonkey) later for speed and conformance, as
-Fermyon did. Every combd property still holds: sandbox, preemption, let it
-crash, snapshots, the same host API.
+**How: our own JS-to-Rust compiler (`jsc`).** JS → Rust → Wasm → our AOT
+tier. The compiled app is an ordinary Rust cell, so it gets the sandbox,
+yielding, let it crash, guard pages, and snapshots for free.
+- Parse with `oxc`, an existing Rust JS parser.
+- A small runtime in Rust: a dynamic `Value`, insertion-ordered objects (so
+  `JSON.stringify` key order matches), and a JS-compatible regex engine
+  (`regress`).
+- Built by need: start with the subset `app.js` uses, and grow with real apps.
+  Node is the byte-for-byte oracle (`langs/js/expected.txt`). Bun and Node are
+  the speed bar.
 
-Rejected: a native engine in the host (C in our process, no snapshots, and
-only V8 is fast), and compiling JS to Wasm ahead of time (Porffor is too young;
-JS is too dynamic).
+**Scope: the JS language plus a web platform layer, not Node.js.** Workers
+apps use web-standard APIs (`fetch`, `Request`, `Response`, `URL`, `Headers`,
+`crypto.subtle`, `TextEncoder`), a much smaller surface than Node's. Node
+compatibility, if ever, is a library of shims on top, as Cloudflare and Deno
+did it.
 
-**Making it fast enough:**
-1. `snapshot_after_init`: boot QuickJS, load the bundle, run its setup, then
-   snapshot. Every new JS cell starts warm, with no parse time.
-2. Hot built-ins as native Rust host functions: `JSON.parse` /
-   `JSON.stringify`, crypto, URL, text encoding.
-3. CPU-heavy JS cells can use the Wasmtime tier behind the engine interface.
-4. Later: share the snapshot's pages copy-on-write between cells (needs the
-   audited memory crate), so a JS cell only pays for pages it changes.
-
-**What we support, in steps (the same target as Cloudflare):**
-1. Workers APIs: `fetch` handlers, `Request` / `Response` / `Headers` / `URL`,
+**What we support, in steps:**
+1. The `app.js` subset, behind our cell interface (`handle(request)`).
+2. Workers APIs: `fetch` handlers, `Request` / `Response` / `Headers` / `URL`,
    streams, WebCrypto, and the Durable Object class with `storage.sql`,
    alarms, and WebSockets. Hono, itty-router, and web-standard npm packages
-   work.
-2. A Node subset, driven by the most-used npm packages: `buffer`, `events`,
-   `util`, `crypto`, `stream`, `process.env`.
-3. A `node:http` shim so Express and Koa run. Cloudflare has done this since
-   August 2025 (`httpServerHandler`), though not every middleware works.
-
-**Measured in the JS spike (step 0b):** QuickJS on our interpreter is 230x
-to 525x slower than V8 per request, so JS cells run on the **Wasmtime tier by
-default** (8 to 46 us per request, 0.48 ms cold start). A JS cell is about
-410 KB. Snapshot copies don't save memory until pages are shared
-copy-on-write.
-
-## Languages right away (no JS needed)
-
-Any language that compiles to a plain Wasm module can run on our engine today.
-Most need a small set of WASI preview 1 calls (write to stdout and stderr,
-clock, random, args, env). combd provides those as safe host functions, with
-no real file or network access. Days of work, not months.
-
-| Language | Toolchain | Notes |
-|---|---|---|
-| Rust | `wasm32-unknown-unknown` / `wasm32-wasip1` | works today |
-| AssemblyScript | `asc` | TypeScript-like syntax, small fast Wasm. The bridge for JS developers moving off JS |
-| Go | TinyGo `-target=wasip1` | |
-| C / C++ | wasi-sdk | |
-| Zig | `zig build -target wasm32-wasi` | |
-
-Each gets a tiny SDK for the cell API (`fetch`, `storage.sql`, alarms, `db`)
-and an example cell. The JS path below does not block any of this.
+   should work then.
+3. Type-directed speed: TypeScript types and inferred shapes compile to plain
+   Rust structs where possible.
 
 ## Our own JS engine
 
@@ -449,17 +424,17 @@ code. The bar: the Rust version of the same routes already runs at 0.46 to
 - Performance suite: startup, short Hono-style requests, JSON, templating,
   memory per instance, p99 under load, plus long compute benchmarks.
 - Fuzzer: random JS programs, run everywhere, outputs compared. Runs nonstop.
-- Nightly scoreboard against V8, JSC, and QuickJS.
+- Nightly scoreboard against Node (V8) and Bun (JSC).
 
 **Then build, and let the AI loop grind against the harness:**
-1. Month 1: parser, bytecode, shapes and inline caches, a safe-Rust GC (arena
-   objects addressed by index, no `unsafe`). Goal: Hono "hello" on our VM, with
-   snapshots and preemption, and a test262 pass rate on the board.
-2. Months 2 to 3: conformance and interpreter speed, nonstop.
-3. Gate: it must beat QuickJS on Wasmtime (8 to 46 us per request in the JS
-   spike), and it is measured against V8 and Bun (0.5 to 5 us). If it can't
-   clearly beat QuickJS on Wasmtime, stop and keep QuickJS.
-4. Replace QuickJS once ours passes enough of test262 and wins the race.
+1. First: `jsc` compiles the `app.js` subset to Rust, matching Node byte for
+   byte on every route.
+2. Then grow by real apps: Hono, itty-router, real Workers code. Track the
+   test262 pass rate as we go.
+3. Type-directed speed: TypeScript types and inferred shapes become plain
+   Rust structs where possible.
+4. The bar at every step: the same routes on Node and Bun, in-process, over
+   HTTP, and in the fairness race. Measured, never assumed.
 
 **Security rules for any JIT:** tests prove an engine gives right answers.
 They can't prove a speculative optimizing JIT is safe against a hostile
@@ -782,11 +757,10 @@ Nodes never compile on the request path, and a node waking a cell only loads a
 finished artifact. `combd deploy --wait-aot` can hold a rollout until
 artifacts exist for every CPU in the fleet, then shift traffic.
 
-**Compile runtimes, not apps.** The QuickJS part of a JS cell is the same for
-every JS app. So the JS engine is compiled once per version per CPU and shared,
-and the app's JS is loaded at init (made free by `snapshot_after_init`). A JS
-deploy then compiles nothing. Only Rust, C, Zig, and Go apps compile their own
-code at deploy.
+**Compile runtimes once, apps at deploy.** The `jsc` runtime (values, JSON,
+regex, Workers APIs) is the same for every JS app, so it is compiled once per
+version per CPU and shared. Only the app's own code compiles at deploy,
+whatever language it was written in.
 
 **Built (2026-10-13): Wasm to safe Rust.** Our own compiler (`aot-gen`)
 turns a Wasm module into plain safe Rust, and rustc + LLVM produce the machine
@@ -836,9 +810,8 @@ Next for this tier, biggest first:
    (`langs/`). All five languages, including Rust, pass all checks on both
    engines. See [spike/RESULTS.md](spike/RESULTS.md).
 0b. **DONE 2026-10-13. JS spike.** QuickJS in Wasm, a Hono-style app, on our
-   engine, Wasmtime, Node, and Bun. QuickJS on our interpreter is 230x to 525x
-   slower than V8: not viable. QuickJS on Wasmtime is 8 to 46 us per request:
-   viable. **JS cells default to the Wasmtime tier.** See
+   engine, Wasmtime, Node, and Bun. Interpreted JS can't beat Bun, even native
+   QuickJS. **Decision: compile JS instead, and drop QuickJS.** See
    [spike/RESULTS.md](spike/RESULTS.md).
 0c. **DONE 2026-10-13. HTTP race against workerd, celld, Bun, and Node.** Per
    core, a Rust cell on combd beat Bun on every route (1.3x to 1.6x), celld by
@@ -854,9 +827,9 @@ Next for this tier, biggest first:
 4. **WebSockets** with hibernation.
 5. **Bring your own database.** Host-owned pools, Postgres first.
 6. **Fast fleet writes (D3).** Peer proofs, only after D2 is solid.
-7. **JavaScript** (QuickJS in Wasm, Workers APIs first), then **more
-   languages** (Python via componentize-py, Go via TinyGo) using the same WIT
-   file. Not before the core is proven.
+7. **JavaScript** (our JS-to-Rust compiler, Workers APIs next), then **more
+   languages** (Python, Go) using the same cell interface. Not before the core
+   is proven.
 
 Not planned: Node.js, V8, KV, R2, Queues, D1 (the Cloudflare product), Workflows,
 containers. Most can be built later as cells on top of the core.
