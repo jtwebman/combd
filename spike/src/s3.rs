@@ -244,7 +244,12 @@ impl S3 {
     pub fn check(&self) -> Result<(), String> {
         let e = |x: std::io::Error| x.to_string();
         self.make_bucket().map_err(e)?;
-        let k = format!("_combd/check/{}-{}", std::process::id(), amz_date());
+        // Unique per run: several nodes check at once (and in containers
+        // their process ids are all 1).
+        let mut nonce = [0u8; 16];
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut nonce)).map_err(e)?;
+        let nonce = hex(&nonce);
+        let k = format!("_combd/check/{nonce}");
         let first = self.put(&k, b"one", &Cond::IfAbsent).map_err(e)?.map_err(|_| "a create-if-absent of a new key failed")?;
         if self.put(&k, b"two", &Cond::IfAbsent).map_err(e)?.is_ok() {
             return Err("If-None-Match: * overwrote an existing object".into());

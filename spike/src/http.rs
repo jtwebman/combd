@@ -529,7 +529,12 @@ impl<E: Engine> Loop<'_, E> {
             } else {
                 Duration::ZERO
             };
-            self.poll.poll(&mut events, Some(timeout))?;
+            // A signal (SIGCONT after a freeze, say) interrupts the wait: just
+            // wait again. Treating it as an error stopped the loop for good.
+            match self.poll.poll(&mut events, Some(timeout)) {
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                r => r?,
+            }
             touched.clear();
             for ev in events.iter() {
                 match ev.token() {

@@ -145,6 +145,136 @@ fn expected() -> Vec<String> {
     std::fs::read_to_string(format!("{JS_DIR}/expected.txt")).unwrap().lines().map(String::from).collect()
 }
 
+/// One keep-alive HTTP connection, for `fleet-load`.
+struct Client {
+    addr: String,
+    s: Option<std::io::BufReader<std::net::TcpStream>>,
+}
+
+impl Client {
+    /// (status, body), or `None` if the connection failed (it reconnects next time).
+    fn call(&mut self, method: &str, path: &str) -> Option<(u16, String)> {
+        use std::io::{BufRead, Read, Write};
+        if self.s.is_none() {
+            let s = std::net::TcpStream::connect(&self.addr).ok()?;
+            s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+            s.set_nodelay(true).ok()?;
+            self.s = Some(std::io::BufReader::new(s));
+        }
+        let r = (|| -> std::io::Result<(u16, String)> {
+            let s = self.s.as_mut().unwrap();
+            write!(s.get_mut(), "{method} {path} HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\n\r\n")?;
+            let mut line = String::new();
+            s.read_line(&mut line)?;
+            let status = line.get(9..12).and_then(|c| c.parse().ok()).ok_or_else(|| std::io::Error::other("bad status"))?;
+            let mut len = 0;
+            loop {
+                line.clear();
+                s.read_line(&mut line)?;
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; len];
+            s.read_exact(&mut body)?;
+            Ok((status, String::from_utf8_lossy(&body).into_owned()))
+        })();
+        if r.is_err() {
+            self.s = None;
+        }
+        r.ok()
+    }
+}
+
+/// Load a fleet with increments through random nodes, then check every
+/// object: acknowledged <= count <= acknowledged + failed. The low side means
+/// no acknowledged write was lost; the high side means none was applied
+/// twice. (A failed answer may still have been applied, like a timeout.)
+fn fleet_load(secs: u64, threads: usize, objects: usize, nodes: &str) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let nodes: Vec<String> = nodes.split(',').map(String::from).collect();
+    // Fresh objects for every run, so runs don't add up.
+    let run = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let acked: Vec<AtomicU64> = (0..objects).map(|_| AtomicU64::new(0)).collect();
+    let failed: Vec<AtomicU64> = (0..objects).map(|_| AtomicU64::new(0)).collect();
+    let start = Instant::now();
+    let until = start + Duration::from_secs(secs);
+    let results: Vec<(Vec<u32>, Vec<(u64, u64)>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads)
+            .map(|t| {
+                let (nodes, acked, failed) = (&nodes, &acked, &failed);
+                sc.spawn(move || {
+                    let mut rng = sim::Rng::new(t as u64 + 1);
+                    let mut clients: Vec<Client> = nodes.iter().map(|a| Client { addr: a.clone(), s: None }).collect();
+                    let mut lat = vec![];
+                    // Stretches of failures: (from, to) in ms since start.
+                    let mut bad: Vec<(u64, u64)> = vec![];
+                    while Instant::now() < until {
+                        let o = rng.below(objects as u64) as usize;
+                        let n = rng.below(nodes.len() as u64) as usize;
+                        let t0 = Instant::now();
+                        let r = clients[n].call("POST", &format!("/do/load-{run}-{o}/incr"));
+                        let ms = start.elapsed().as_millis() as u64;
+                        if matches!(r, Some((200, _))) {
+                            acked[o].fetch_add(1, Relaxed);
+                            lat.push(t0.elapsed().as_micros() as u32);
+                        } else {
+                            failed[o].fetch_add(1, Relaxed);
+                            match bad.last_mut() {
+                                Some(b) if ms - b.1 < 100 => b.1 = ms,
+                                _ => bad.push((ms, ms)),
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                    (lat, bad)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let elapsed = start.elapsed().as_secs_f64();
+    let mut lat: Vec<u32> = results.iter().flat_map(|(l, _)| l.iter().copied()).collect();
+    lat.sort_unstable();
+    let pct = |p: f64| lat.get(((lat.len() as f64 * p) as usize).min(lat.len().saturating_sub(1))).copied().unwrap_or(0) as f64 / 1000.0;
+    let worst_gap = results.iter().flat_map(|(_, b)| b.iter()).map(|(a, b)| b - a).max().unwrap_or(0);
+    let (ok, bad): (u64, u64) = (acked.iter().map(|a| a.load(Relaxed)).sum(), failed.iter().map(|f| f.load(Relaxed)).sum());
+    println!(
+        "load     {:.0} acknowledged writes/s ({ok} ok, {bad} failed) in {elapsed:.1} s; p50 {:.2} ms, p99 {:.2} ms; longest failure stretch {worst_gap} ms",
+        ok as f64 / elapsed,
+        pct(0.5),
+        pct(0.99)
+    );
+    // Check every object, through any node that answers.
+    let mut c: Vec<Client> = nodes.iter().map(|a| Client { addr: a.clone(), s: None }).collect();
+    let mut good = true;
+    for o in 0..objects {
+        let (a, f) = (acked[o].load(Relaxed), failed[o].load(Relaxed));
+        let count = (0..100).find_map(|i| {
+            let k = i % c.len();
+            match c[k].call("GET", &format!("/do/load-{run}-{o}/count")) {
+                Some((200, b)) => serde_json::from_str::<serde_json::Value>(&b).ok()?["count"].as_u64(),
+                _ => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    None
+                }
+            }
+        });
+        match count {
+            Some(n) if a <= n && n <= a + f => {}
+            other => {
+                good = false;
+                println!("load     object load-{o}: count {other:?}, but {a} acknowledged and {f} failed");
+            }
+        }
+    }
+    println!("load     {} objects checked: {}", objects, if good { "acknowledged <= count <= acknowledged + failed, for every one" } else { "BROKEN" });
+    good
+}
+
 /// The Rust cell or the JS one.
 fn cell(name: &str) -> Vec<u8> {
     match name {
@@ -494,6 +624,11 @@ fn main_with(args: &[&str]) {
         ["api-bench", "wasmtime", lang] => api_bench("wasmtime", &wt::Wt::new(WT_FUEL, None), lang),
         #[cfg(feature = "aot-lite")]
         ["api-bench", "aot", lang] => api_bench("aot", &aot::Aot, lang),
+        // Load a fleet and check it: `fleet-load secs threads objects host:port,host:port,...`.
+        ["fleet-load", secs, threads, objects, nodes] => {
+            let ok = fleet_load(secs.parse().unwrap(), threads.parse().unwrap(), objects.parse().unwrap(), nodes);
+            std::process::exit(if ok { 0 } else { 1 });
+        }
         // The startup storage test, on its own: COMBD_S3=http://host:port ...
         ["s3-check"] => {
             let s3 = s3::S3::from_env().expect("set COMBD_S3 (and COMBD_S3_KEY, COMBD_S3_SECRET)");
