@@ -31,6 +31,10 @@ httparse = "1"
 rusqlite = { version = "0.37", features = ["bundled", "hooks", "limits"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+# The wire between nodes: mTLS, and certificates for a fleet.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 # The bucket client: SigV4 signing.
 sha2 = "0.10"
 hmac = "0.12"

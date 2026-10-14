@@ -34,7 +34,10 @@ pub type OpId = u64;
 /// are ignored.
 pub type Act = u64;
 
-/// How long a node may go without a heartbeat before others take over.
+/// How long a node may go without a heartbeat before others take over, in
+/// the simulator. Real nodes set it (`COMBD_LEASE_MS`): it must be several
+/// times the worst round trip to the bucket, and shorter means more bucket
+/// writes (one per node per third of a lease).
 pub const LEASE_MS: u64 = 1000;
 pub const RENEW_MS: u64 = 200;
 
@@ -249,6 +252,7 @@ struct ObjSt {
 pub struct Core {
     pub node: Node,
     bugs: Bugs,
+    lease_ms: u64,
     next_op: OpId,
     next_act: Act,
     ops: HashMap<OpId, Wait>,
@@ -268,9 +272,14 @@ pub struct Core {
 
 impl Core {
     pub fn new(node: Node, bugs: Bugs) -> Core {
+        Core::with_lease(node, bugs, LEASE_MS)
+    }
+
+    pub fn with_lease(node: Node, bugs: Bugs, lease_ms: u64) -> Core {
         Core {
             node,
             bugs,
+            lease_ms,
             next_op: 0,
             next_act: 0,
             ops: HashMap::new(),
@@ -372,7 +381,7 @@ impl Core {
     fn request(&mut self, now: u64, o: Obj, req: ReqId) {
         if matches!(self.st(o).phase, Phase::Idle) {
             if let Some(&(n, t)) = self.hints.get(&o) {
-                if now.saturating_sub(t) < LEASE_MS {
+                if now.saturating_sub(t) < self.lease_ms {
                     return self.answer(req, Answer::Redirect(n));
                 }
                 self.hints.remove(&o);
@@ -478,7 +487,7 @@ impl Core {
                 if e.0 != beat {
                     *e = (beat, now);
                 }
-                if now.saturating_sub(e.1) >= LEASE_MS {
+                if now.saturating_sub(e.1) >= self.lease_ms {
                     self.cas(o, Some(etag), r.epoch + 1);
                 } else {
                     self.hints.insert(o, (r.node, now));

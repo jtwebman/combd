@@ -19,14 +19,18 @@ PEERS=0=node0:7100,1=node1:7100,2=node2:7100
 NODES=node0:8080,node1:8080,node2:8080
 
 docker network create $NET >/dev/null 2>&1 || true
-cleanup() { docker rm -f s3 node0 node1 node2 >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f s3 node0 node1 node2 >/dev/null 2>&1 || true; docker volume rm -f combd-certs >/dev/null 2>&1 || true; }
 cleanup
 trap cleanup EXIT
 
+# The wire's certificates: a fleet CA and one per node, in a volume.
+docker volume create combd-certs >/dev/null
+docker run --rm -v combd-certs:/certs $IMG ./target/release/combd-spike wire-certs /certs 3 >/dev/null
+
 node() { # n
     docker rm -f node$1 >/dev/null 2>&1 || true
-    docker run -d --name node$1 --network $NET --cpus=1 \
-        -e COMBD_NODE=$1 -e COMBD_PEERS=$PEERS -e COMBD_THREADS=1 -e COMBD_DATA=/tmp/data \
+    docker run -d --name node$1 --network $NET --cpus=1 -v combd-certs:/certs:ro -e COMBD_WIRE_CERTS=/certs \
+        -e COMBD_NODE=$1 -e COMBD_PEERS=$PEERS -e COMBD_THREADS=1 -e COMBD_DATA=/tmp/data -e COMBD_LEASE_MS=${LEASE_MS:-3000} \
         -e COMBD_S3=http://s3:9000 -e COMBD_S3_KEY=combd -e COMBD_S3_SECRET=combd-secret-key \
         $IMG ./target/release/combd-spike serve aot rust 8080 >/dev/null
 }

@@ -17,6 +17,7 @@ mod own;
 mod s3;
 mod sim;
 mod store;
+mod wire;
 mod http;
 mod interp;
 #[cfg(feature = "wasmtime")]
@@ -629,6 +630,14 @@ fn main_with(args: &[&str]) {
             let ok = fleet_load(secs.parse().unwrap(), threads.parse().unwrap(), objects.parse().unwrap(), nodes);
             std::process::exit(if ok { 0 } else { 1 });
         }
+        // Certificates for a fleet's wire: a CA and one per node.
+        ["wire-certs", dir, nodes] => match wire::make_certs(std::path::Path::new(dir), nodes.parse().unwrap()) {
+            Ok(()) => println!("wire     a CA and {nodes} node certificates in {dir}"),
+            Err(e) => {
+                eprintln!("wire     {e}");
+                std::process::exit(1);
+            }
+        },
         // The startup storage test, on its own: COMBD_S3=http://host:port ...
         ["s3-check"] => {
             let s3 = s3::S3::from_env().expect("set COMBD_S3 (and COMBD_S3_KEY, COMBD_S3_SECRET)");

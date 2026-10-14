@@ -801,6 +801,43 @@ Next for this tier, biggest first:
 5. Maybe a Zig or C backend if rustc compile time hurts. The safe Rust
    backend stays the reference.
 
+## Scaling the fleet: rules that keep it quiet
+
+The fleet must not hit the walls Erlang distribution hits:
+
+| Erlang's wall | Why | combd's rule |
+|---|---|---|
+| The full mesh forms by itself | connecting to one node connects to all, transitively | Connect only to the node you forward to. Close idle links. |
+| Heartbeats grow as N² | every link ticks | Nothing chats on the wire. Liveness is a bucket lease now, SWIM gossip at scale (constant work per node). |
+| `global` names need cluster-wide locks | one registry for everything | No registry. Each object's owner is one record, claimed by CAS on that key alone. |
+| Head-of-line blocking | one TCP link carries everything | Small frames. Bulk data (D3 replication) is chunked or gets its own stream, or QUIC. |
+| All-or-nothing trust | any node can run code anywhere | mTLS with node identities, and a fixed set of message types. |
+
+What changes as the fleet grows:
+- **About 100 nodes:** lease timing becomes a cost. A node writes its lease
+  every third of `COMBD_LEASE_MS`; 1 s leases at 100 nodes would be 500 S3
+  PUTs a second.
+- **1,000 to 10,000 nodes:**
+  - **Liveness moves to SWIM gossip.** The bucket is touched only when
+    ownership changes.
+  - **Placement uses rendezvous hashing** over live members, and the edge
+    routes straight to an object's home, so forwarding is rare.
+  - **Membership is dynamic**, by gossip, bootstrapped from a bucket record.
+  - **Writes take the D3 path:** peers confirm, the bucket gets batches.
+    A bucket proof per write doesn't scale in cost or in S3's per-prefix
+    limits.
+  - **The fleet splits into cells** of a few hundred nodes, each with its own
+    bucket prefix, to bound blast radius.
+- **Worldwide:**
+  - **Regional cells with regional buckets.** A node in Sydney can't pay
+    a round trip to a bucket in Virginia on every write.
+  - **Objects live near their traffic,** like Cloudflare's location hints,
+    and can move.
+  - **One cross-region hop at most.**
+  - **Timeouts are measured per peer**, in TCP's way (smoothed round trip
+    plus 4x its variation), never fixed. Safety never depends on a timeout;
+    only availability does.
+
 ## Build order (when we do build)
 
 0. **DONE 2026-10-13. Spike: the engine race.** Results in

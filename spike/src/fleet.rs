@@ -12,15 +12,20 @@
 //! - `COMBD_NODE`: this node's number.
 //! - `COMBD_PEERS`: `0=host:7100,1=host:7100,...`, every node's wire address.
 //! - `COMBD_WIRE_PORT`: where this node listens for peers (default 7100).
+//! - `COMBD_LEASE_MS`: how long a silent node keeps its objects (default 10 s).
+//! - `COMBD_WIRE_CERTS`: the wire's certificates (`combd-spike wire-certs`),
+//!   or `COMBD_WIRE_INSECURE=1` for plain TCP.
 //! - `COMBD_S3`, `COMBD_S3_KEY`, `COMBD_S3_SECRET`, `COMBD_S3_BUCKET`: the bucket.
 
 use crate::own::{Call, Cond, Node, Res, Val};
 use crate::s3::{self, S3};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 
 pub struct FleetCfg {
     pub node: Node,
+    /// `COMBD_LEASE_MS` (default 10 s), renewed every third of it.
+    pub lease_ms: u64,
     pub s3: S3,
     pub peers: HashMap<Node, String>,
     pub wire_port: u16,
@@ -39,7 +44,8 @@ impl FleetCfg {
             })
             .collect();
         let wire_port = std::env::var("COMBD_WIRE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7100);
-        Some(FleetCfg { node, s3, peers, wire_port })
+        let lease_ms = std::env::var("COMBD_LEASE_MS").ok().and_then(|p| p.parse().ok()).unwrap_or(10_000);
+        Some(FleetCfg { node, lease_ms, s3, peers, wire_port })
     }
 }
 
@@ -134,10 +140,6 @@ impl Frame {
             }
             _ => Err(bad("unknown frame kind")),
         }
-    }
-
-    pub fn write(&self, w: &mut impl Write) -> std::io::Result<()> {
-        w.write_all(&self.encode())
     }
 }
 

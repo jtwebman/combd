@@ -844,6 +844,22 @@ Bugs the cluster found, fixed:
 4. **`localhost` resolved to IPv6 first,** but the wire listened on IPv4, so
    peers couldn't connect. Every resolved address is tried now.
 
+**mTLS on the wire.** One hub thread runs every peer connection on a `mio`
+poll with rustls. Each node has a certificate for `node<N>.combd` from the
+fleet's CA (`combd-spike wire-certs`). A node accepts only clients with a
+certificate from that CA, and checks a server against the exact name it
+dialed, so no node can pass itself off as another. Without certificates, a
+node won't join a fleet unless `COMBD_WIRE_INSECURE=1` asks for plain TCP.
+The test `mtls_carries_frames_and_refuses_strangers` checks that a node from
+another fleet's CA and a plain-TCP node both get nothing through.
+
+Forward timeouts are measured per peer (smoothed round trip plus 4x its
+variation, 1 to 30 s), and the lease is a setting (`COMBD_LEASE_MS`,
+default 10 s). The cluster, rerun over mTLS with 3 s leases: 1,192
+acknowledged writes/s steady (1,288 on plain TCP, so TLS costs about 7%),
+904/s through a SIGKILL (longest failure stretch 3.3 s, about one lease),
+730/s through a 4 s freeze, every object correct.
+
 Not in fleet mode yet: alarms, eviction, and the D3 peer path.
 
 ## Security: memory is always zero

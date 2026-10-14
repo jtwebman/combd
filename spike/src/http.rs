@@ -42,6 +42,7 @@
 
 use crate::engine::{CellVm, Engine, Outcome};
 use crate::fleet::{FleetCfg, Frame};
+use crate::wire::{self, Wire};
 use crate::own::{self, Act, Core, Effect};
 use crate::host::{now_ms, HostState};
 use crate::store::{self, AlarmIndex, Db};
@@ -142,8 +143,8 @@ struct FleetShared {
     cfg: FleetCfg,
     /// Bucket work, done by a pool of threads.
     jobs: Mutex<Sender<Job>>,
-    /// Connections to other nodes, by node.
-    links: Mutex<HashMap<own::Node, Link>>,
+    /// The wire to other nodes (mTLS).
+    wire: Wire,
     next_id: AtomicU64,
     start: Instant,
 }
@@ -153,19 +154,13 @@ enum Job {
     Fetch { obj: own::Obj, act: Act, segs: Vec<String>, back: usize },
 }
 
-/// A connection to another node.
-#[derive(Clone)]
-struct Link {
-    tx: Sender<Frame>,
-    /// Forwarded requests waiting for a reply on it: frame id -> the loop waiting.
-    waiting: Arc<Mutex<HashMap<u64, usize>>>,
-    /// The connection broke: everything waiting on it got a 503.
-    dead: Arc<AtomicBool>,
-}
-
-/// A forwarded request with no reply by then gets a 503 (the peer may be
-/// frozen), so the client can retry.
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+/// A forwarded request with no reply in time gets a 503 (the peer may be
+/// frozen), so the client can retry. "In time" is measured per peer, as TCP
+/// does it: smoothed round trip + 4x its variation, within these bounds, so a
+/// peer across the world gets more time than one in the same rack.
+const FORWARD_MIN: Duration = Duration::from_secs(1);
+const FORWARD_MAX: Duration = Duration::from_secs(30);
+const FORWARD_FIRST: Duration = Duration::from_secs(5);
 
 /// Bucket I/O is slow and parallel; these threads do it.
 const BUCKET_THREADS: usize = 32;
@@ -187,7 +182,7 @@ enum Origin {
     /// Fleet mode: a request the decision core started.
     Fleet(own::ReqId),
     /// Fleet mode: a request another node forwarded (connection, frame id).
-    Wire(u64, u64),
+    Wire(usize, u64),
 }
 
 /// Between loops.
@@ -205,7 +200,7 @@ enum Msg {
     /// Fleet mode: an object's segments, for a restore.
     Fetched { obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String> },
     /// Fleet mode: another node forwarded us a request.
-    WireIn { conn: u64, tx: Sender<Frame>, id: u64, name: String, req: String },
+    WireIn { conn: usize, id: u64, name: String, req: String },
     /// Fleet mode: the answer to a request we forwarded.
     WireReply { id: u64, reply: (u16, String) },
 }
@@ -425,12 +420,12 @@ where
                     free: vec![],
                     next_gen: 0,
                     last_sweep: Instant::now(),
-                    core: sh.fleet.as_ref().map(|f| Core::new(f.cfg.node, own::Bugs::default())),
+                    core: sh.fleet.as_ref().map(|f| Core::with_lease(f.cfg.node, own::Bugs::default(), f.cfg.lease_ms)),
                     freqs: HashMap::new(),
                     next_req: 0,
                     names: HashMap::new(),
-                    wire_conns: HashMap::new(),
                     wire_out: HashMap::new(),
+                    rtt: HashMap::new(),
                     last_tick: Instant::now(),
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l)) {
@@ -467,10 +462,11 @@ struct Loop<'a, E: Engine> {
     next_req: own::ReqId,
     /// Object ids back to names.
     names: HashMap<own::Obj, String>,
-    /// Peers' connections to us, to answer their forwarded requests.
-    wire_conns: HashMap<u64, Sender<Frame>>,
-    /// Requests we forwarded: frame id -> where the answer goes, and when it gives up.
-    wire_out: HashMap<u64, (Origin, Instant)>,
+    /// Requests we forwarded: frame id -> where the answer goes, the node, when
+    /// it was sent, and when it gives up.
+    wire_out: HashMap<u64, (Origin, own::Node, Instant, Duration)>,
+    /// Each peer's round trip: (smoothed, variation), in seconds.
+    rtt: HashMap<own::Node, (f64, f64)>,
     last_tick: Instant,
 }
 
@@ -497,39 +493,30 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
             let _ = waker.wake();
         });
     }
-    // The wire: peers connect and forward requests; each frame goes to the
-    // loop that owns its object.
-    let wl = std::net::TcpListener::bind(("0.0.0.0", fc.wire_port)).expect("bind the wire port");
-    let loops = loops.to_vec();
-    std::thread::spawn(move || {
-        for (n, s) in wl.incoming().flatten().enumerate() {
-            let _ = s.set_nodelay(true);
-            let (wtx, wrx) = channel::<Frame>();
-            let mut w = s.try_clone().expect("clone a wire connection");
-            std::thread::spawn(move || {
-                while let Ok(f) = wrx.recv() {
-                    if f.write(&mut w).is_err() {
-                        return;
-                    }
-                }
-            });
-            let loops = loops.clone();
-            let mut r = std::io::BufReader::new(s);
-            std::thread::spawn(move || {
-                while let Ok(f) = Frame::read(&mut r) {
-                    if let Frame::Forward { id, name, req } = f {
-                        let (tx, waker) = &loops[owner(&name, threads)];
-                        let _ = tx.send(Msg::WireIn { conn: n as u64, tx: wtx.clone(), id, name, req });
-                        let _ = waker.wake();
-                    }
-                }
-            });
+    // The wire: mTLS between nodes, unless plain TCP is asked for.
+    let tls = match std::env::var("COMBD_WIRE_CERTS") {
+        Ok(dir) => match wire::load_tls(std::path::Path::new(&dir), fc.node) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("combd     can't load the wire certificates from {dir}: {e}");
+                std::process::exit(1);
+            }
+        },
+        Err(_) if std::env::var("COMBD_WIRE_INSECURE").as_deref() == Ok("1") => {
+            eprintln!("combd     WARNING: the wire is plain TCP (COMBD_WIRE_INSECURE=1)");
+            None
         }
-    });
+        Err(_) => {
+            eprintln!("combd     set COMBD_WIRE_CERTS (see `combd-spike wire-certs`), or COMBD_WIRE_INSECURE=1 for plain TCP");
+            std::process::exit(1);
+        }
+    };
+    let sink = LoopSink { loops: loops.to_vec(), threads };
+    let wire = wire::start(fc.wire_port, fc.peers.clone(), tls, sink).expect("start the wire");
     FleetShared {
         cfg: fc,
         jobs: Mutex::new(tx),
-        links: Mutex::new(HashMap::new()),
+        wire,
         next_id: AtomicU64::new(1),
         start: Instant::now(),
     }
@@ -583,13 +570,14 @@ impl<E: Engine> Loop<'_, E> {
                 self.settle(id)?;
             }
             if self.core.is_some() {
-                let late: Vec<u64> = self.wire_out.iter().filter(|(_, (_, t))| t.elapsed() >= FORWARD_TIMEOUT).map(|(id, _)| *id).collect();
+                let late: Vec<u64> = self.wire_out.iter().filter(|(_, (_, _, t, limit))| t.elapsed() >= *limit).map(|(id, _)| *id).collect();
                 for id in late {
-                    let (origin, _) = self.wire_out.remove(&id).unwrap();
+                    let (origin, ..) = self.wire_out.remove(&id).unwrap();
                     self.deliver(origin, (503, "{\"error\":\"owner didn't answer\"}".into()))?;
                 }
                 // Loop 0 keeps the node's lease alive.
-                if self.me == 0 && self.last_tick.elapsed() >= Duration::from_millis(own::RENEW_MS) {
+                let renew = self.sh.fleet.as_ref().map_or(own::RENEW_MS, |f| f.cfg.lease_ms / 3);
+                if self.me == 0 && self.last_tick.elapsed() >= Duration::from_millis(renew) {
                     self.last_tick = Instant::now();
                     self.core_on(own::Event::Tick);
                 }
@@ -676,12 +664,10 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Msg::Bucket { op, res } => self.core_on(own::Event::Reply { op, res }),
                 Msg::Fetched { obj, act, data } => self.fetched(obj, act, data),
-                Msg::WireIn { conn, tx, id, name, req } => {
-                    self.wire_conns.entry(conn).or_insert(tx);
-                    self.submit(Origin::Wire(conn, id), name, req);
-                }
+                Msg::WireIn { conn, id, name, req } => self.submit(Origin::Wire(conn, id), name, req),
                 Msg::WireReply { id, reply } => {
-                    if let Some((origin, _)) = self.wire_out.remove(&id) {
+                    if let Some((origin, node, sent, _)) = self.wire_out.remove(&id) {
+                        self.measured(node, sent.elapsed());
                         self.deliver(origin, reply)?;
                     }
                 }
@@ -708,8 +694,8 @@ impl<E: Engine> Loop<'_, E> {
             }
             Origin::Alarm { .. } | Origin::Fleet(_) => Ok(()), // `finish_task` already handled it
             Origin::Wire(conn, id) => {
-                if let Some(tx) = self.wire_conns.get(&conn) {
-                    let _ = tx.send(Frame::Reply { id, status: reply.0, body: reply.1 });
+                if let Some(f) = &self.sh.fleet {
+                    f.wire.reply(conn, Frame::Reply { id, status: reply.0, body: reply.1 });
                 }
                 Ok(())
             }
@@ -1307,75 +1293,48 @@ impl<E: Engine> Loop<'_, E> {
     fn forward(&mut self, node: own::Node, fr: FReq) {
         let f = self.sh.fleet.as_ref().unwrap();
         let id = f.next_id.fetch_add(1, Relaxed);
-        let link = {
-            let mut links = f.links.lock().unwrap();
-            match links.get(&node).filter(|l| !l.dead.load(Relaxed)) {
-                Some(l) => Some(l.clone()),
-                None => f.cfg.peers.get(&node).and_then(|addr| connect(addr, self.sh.peers.clone())).inspect(|l| {
-                    links.insert(node, l.clone());
-                }),
-            }
-        };
-        let Some(link) = link else {
-            let _ = self.deliver(fr.origin, (503, "{\"error\":\"owner unreachable\"}".into()));
-            return;
-        };
         self.sh.stats.forwarded.fetch_add(1, Relaxed);
-        link.waiting.lock().unwrap().insert(id, self.me);
-        self.wire_out.insert(id, (fr.origin, Instant::now()));
-        if link.tx.send(Frame::Forward { id, name: fr.name, req: fr.cell_req }).is_err() {
-            link.dead.store(true, Relaxed);
-            link.waiting.lock().unwrap().remove(&id);
-            if let Some((origin, _)) = self.wire_out.remove(&id) {
-                let _ = self.deliver(origin, (503, "{\"error\":\"owner unreachable\"}".into()));
-            }
+        let limit = self.forward_limit(node);
+        self.wire_out.insert(id, (fr.origin, node, Instant::now(), limit));
+        f.wire.send(node, Frame::Forward { id, name: fr.name, req: fr.cell_req }, self.me);
+    }
+}
+
+impl<E: Engine> Loop<'_, E> {
+    /// A round trip to `node`, in TCP's way (RFC 6298).
+    fn measured(&mut self, node: own::Node, d: Duration) {
+        let r = d.as_secs_f64();
+        let e = self.rtt.entry(node).or_insert((r, r / 2.0));
+        e.1 = 0.75 * e.1 + 0.25 * (e.0 - r).abs();
+        e.0 = 0.875 * e.0 + 0.125 * r;
+    }
+
+    fn forward_limit(&self, node: own::Node) -> Duration {
+        match self.rtt.get(&node) {
+            Some(&(srtt, var)) => Duration::from_secs_f64(srtt + 4.0 * var).clamp(FORWARD_MIN, FORWARD_MAX),
+            None => FORWARD_FIRST,
         }
     }
 }
 
-/// Open a wire connection to a peer: a writer thread fed by the link's
-/// sender, and a reader thread that routes replies to the waiting loops. If
-/// the connection breaks, everything waiting on it gets a 503 at once.
-fn connect(addr: &str, loops: Vec<(Sender<Msg>, Arc<Waker>)>) -> Option<Link> {
-    use std::net::ToSocketAddrs;
-    // Try every address the name gives (localhost may be IPv6 first).
-    let tos = addr.to_socket_addrs().map_err(|e| eprintln!("wire: can't resolve {addr}: {e}")).ok()?;
-    let Some(s) = tos.into_iter().find_map(|to| std::net::TcpStream::connect_timeout(&to, Duration::from_millis(500)).ok()) else {
-        eprintln!("wire: can't reach {addr}");
-        return None;
-    };
-    let _ = s.set_nodelay(true);
-    let mut w = s.try_clone().ok()?;
-    let (tx, rx) = channel::<Frame>();
-    std::thread::spawn(move || {
-        while let Ok(f) = rx.recv() {
-            if f.write(&mut w).is_err() {
-                return;
-            }
-        }
-    });
-    let link = Link { tx, waiting: Arc::default(), dead: Arc::default() };
-    let (waiting, dead) = (link.waiting.clone(), link.dead.clone());
-    let mut r = std::io::BufReader::new(s);
-    std::thread::spawn(move || {
-        let send = |back: usize, id: u64, reply: (u16, String)| {
-            let (tx, waker) = &loops[back];
-            let _ = tx.send(Msg::WireReply { id, reply });
-            let _ = waker.wake();
-        };
-        while let Ok(f) = Frame::read(&mut r) {
-            if let Frame::Reply { id, status, body } = f {
-                if let Some(back) = waiting.lock().unwrap().remove(&id) {
-                    send(back, id, (status, body));
-                }
-            }
-        }
-        dead.store(true, Relaxed);
-        for (id, back) in waiting.lock().unwrap().drain() {
-            send(back, id, (503, "{\"error\":\"owner went away\"}".into()));
-        }
-    });
-    Some(link)
+/// Where the wire hands what arrives: forwards to the loop that owns the
+/// object, replies to the loop that's waiting.
+struct LoopSink {
+    loops: Vec<(Sender<Msg>, Arc<Waker>)>,
+    threads: usize,
+}
+
+impl wire::Sink for LoopSink {
+    fn forward(&self, conn: usize, id: u64, name: String, req: String) {
+        let (tx, waker) = &self.loops[owner(&name, self.threads)];
+        let _ = tx.send(Msg::WireIn { conn, id, name, req });
+        let _ = waker.wake();
+    }
+    fn reply(&self, back: usize, id: u64, reply: (u16, String)) {
+        let (tx, waker) = &self.loops[back];
+        let _ = tx.send(Msg::WireReply { id, reply });
+        let _ = waker.wake();
+    }
 }
 
 fn split_answer(a: &str) -> (u16, String) {
