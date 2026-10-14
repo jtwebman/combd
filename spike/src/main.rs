@@ -12,6 +12,8 @@ mod aot;
 mod aot_gen;
 mod engine;
 mod host;
+mod own;
+mod sim;
 mod store;
 mod http;
 mod interp;
@@ -490,6 +492,25 @@ fn main_with(args: &[&str]) {
         ["api-bench", "wasmtime", lang] => api_bench("wasmtime", &wt::Wt::new(WT_FUEL, None), lang),
         #[cfg(feature = "aot-lite")]
         ["api-bench", "aot", lang] => api_bench("aot", &aot::Aot, lang),
+        // The D2 ownership simulator: `sim [seeds] [bug]`.
+        ["sim", ..] => {
+            let n: u64 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(1000);
+            let bugs = match args.get(2).copied() {
+                Some("skip_proof") => own::Bugs { skip_proof: true, ..Default::default() },
+                Some("load_before_cas") => own::Bugs { load_before_cas: true, ..Default::default() },
+                Some("no_manifest") => own::Bugs { no_manifest: true, ..Default::default() },
+                Some("reuse_epoch") => own::Bugs { reuse_epoch: true, ..Default::default() },
+                _ => own::Bugs::default(),
+            };
+            let t = Instant::now();
+            let (stats, bad) = sim::run_many(0..n, bugs);
+            println!("sim      {n} seeds in {:.1} s: {stats:?}", t.elapsed().as_secs_f64());
+            if let Some((seed, why)) = bad {
+                println!("sim      seed {seed} broke an invariant: {why}");
+                std::process::exit(1);
+            }
+            println!("sim      every invariant held");
+        }
         ["aot-gen", input, output] => {
             let wasm = std::fs::read(input).unwrap();
             match aot_gen::generate(&wasm, input) {

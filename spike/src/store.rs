@@ -409,7 +409,7 @@ mod tests {
         q(&db, "CREATE TABLE t(a)");
         let wal_len = || db.wal_file().unwrap().metadata().unwrap().len();
         let mut max = 0;
-        for i in 0..400 {
+        for _ in 0..400 {
             db.begin().unwrap();
             let big = format!("{{\"q\":\"INSERT INTO t VALUES (?)\",\"p\":[\"{}\"]}}", "x".repeat(40_000));
             db.exec_json(big.as_bytes());

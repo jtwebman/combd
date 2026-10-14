@@ -825,7 +825,10 @@ Next for this tier, biggest first:
    [spike/RESULTS.md](spike/RESULTS.md). Still to race: Durable Objects with
    state, cold start over HTTP, and memory per object at scale.
 1. **Spec + decision core + simulator** for ownership and the output gate. No
-   network yet.
+   network yet. **Done 2026-10-14:** TLC checks 4.9 million states, and four
+   known-bad versions fail; the core runs 100,000 simulator seeds (10.4M
+   acknowledged writes, 167k crashes, 167k freezes) with every invariant
+   holding. See [spike/RESULTS.md](spike/RESULTS.md) and [spec/](spec/).
 2. **Single node (D1).** HTTP in, route to cell, SQLite, alarms, supervisor,
    hibernation, egress broker, mTLS admin port.
    **Started 2026-10-14:** objects, host SQLite with an authorizer, the output

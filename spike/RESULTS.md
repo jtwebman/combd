@@ -730,6 +730,54 @@ cores: 4,748 hot writes, 127,890 hot reads, 1,534 writes over 1,000 objects.
 Still to do: the Cloudflare JS API for objects (jsc doesn't compile classes
 yet).
 
+## D2 ownership: a spec, a decision core, and a simulator
+
+The next step is many nodes, with the bucket as the only coordinator. Before
+any networking, the plan calls for three things, and all three exist now.
+
+**1. A TLA+ spec** (`spec/Ownership.tla`, run `spec/check.sh`). A CAS
+ownership record, a new epoch on every activation, a read-back after a lost
+CAS reply, a manifest that records which data a new owner took over, and an
+output gate that re-reads the record before any write is acknowledged. The
+model has crashes, lost replies, late uploads, and two processes with the same
+node name (a frozen one and its restart). No clocks: safety must hold with
+any clock. TLC checks all 4,894,718 states with no error. Each known-bad
+version fails on a different invariant:
+
+| Bug | Caught by |
+|---|---|
+| acknowledge without re-reading the record | lost acknowledged write |
+| read the old history before winning the CAS | lost acknowledged write |
+| no manifest: rebuild from every segment | history rewrite |
+| a same-node wake keeps its epoch | two writers in one epoch |
+
+**2. A pure decision core** (`spike/src/own.rs`): `Core::on(now, event) ->
+effects`, with no I/O, clock, or randomness. Leases are heartbeats judged by
+the observer's own clock, for liveness only. Manifests and segments are
+write-once, a second fence the spec doesn't need: even a process that reused
+an epoch couldn't overwrite its predecessor's data.
+
+**3. A deterministic simulator** (`spike/src/sim.rs`, `combd-spike sim N`).
+The real core runs in 3 nodes against a fake bucket with real conditional
+writes. Bucket calls take 1 to 50 ms (sometimes 500), 3% of requests and
+replies get lost, clocks run up to 10% fast or slow, and processes crash or
+freeze (the supervisor often starts a new one, and the frozen one later wakes
+up stale). An oracle checks the spec's three invariants, plus that a read
+sees every write acknowledged before it was sent. One seed is one exact run.
+
+**100,000 seeds, every invariant held:** 10.4 million acknowledged writes,
+7.3 million reads, 1.03 million ownership changes, 167,431 crashes, and
+167,063 freezes, in 81 seconds on one core.
+
+The same four bugs, switched on in the core, are caught within 2,000 seeds
+each (most on seed 0 to 2, the slowest on seed 227). For the epoch-reuse bug,
+the switch also has to turn off the write-once fence, or it can't show.
+
+The fault rates are harsh on purpose, so liveness is low: 23% of requests
+failed and clients retried. That's the next thing to measure with gentler
+faults, along with real cells (Wasm is deterministic enough to run inside the
+simulator) and a real executor on many nodes, with MinIO as the bucket.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,
