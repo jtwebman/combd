@@ -723,6 +723,7 @@ fn main_with(args: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -997,6 +998,7 @@ mod tests {
             max_objects: 10_000,
             stop: Arc::default(),
             sync_delay: Duration::ZERO,
+            fleet: None,
         }
     }
 
@@ -1047,6 +1049,62 @@ mod tests {
         }
         assert!(a < b, "{a} should sort before {b}");
         assert_ne!(a, http::uuid_v7());
+    }
+
+    /// Fleet mode on a real bucket (set COMBD_S3, COMBD_S3_KEY, COMBD_S3_SECRET):
+    /// two nodes with mTLS. Alarms fire; an alarm set on a node that then
+    /// stops fires on the other; an evicted object comes back from the bucket.
+    #[test]
+    fn fleet_alarms_and_eviction() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 2).unwrap();
+        let bucket = format!("combd-test-{}-{}", std::process::id(), Instant::now().elapsed().as_nanos() % 100_000);
+        let wbase = 24000 + (std::process::id() % 1000) as u16 * 2;
+        let peers: HashMap<own::Node, String> = (0..2).map(|n| (n, format!("127.0.0.1:{}", wbase + n as u16))).collect();
+        let node = |n: own::Node, idle_ms: u64| {
+            let fc = fleet::FleetCfg {
+                node: n,
+                lease_ms: 1000,
+                s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
+                peers: peers.clone(),
+                wire_port: wbase + n as u16,
+                wire_certs: Some(dir.0.join("certs")),
+                insecure: false,
+            };
+            let c = http::Config { idle: Duration::from_millis(idle_ms), fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
+            do_server(interp::Interp { max_pages: 16384 }, c)
+        };
+        let (a, stop_a, ta) = node(0, 60_000);
+        let (b, _, _) = node(1, 300);
+        // Ask through `port` until it answers 200.
+        let ok = |port: u16, method: &str, path: &str, body: &str| -> String {
+            for _ in 0..100 {
+                let (c, r) = http(port, method, path, body);
+                if c == 200 {
+                    return r;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("{method} {path} never answered 200");
+        };
+        // 1. An alarm fires on its owner.
+        ok(a, "POST", "/do/al1/alarm", "300");
+        assert!(eventually(5000, || ok(b, "GET", "/do/al1/alarms", "").contains("\"fired\":1")), "{}", ok(b, "GET", "/do/al1/alarms", ""));
+        // 2. Node A sets an alarm, then stops: node B finds it in the index,
+        //    takes the object over from the bucket, and fires it.
+        ok(a, "POST", "/do/al2/alarm", "1500");
+        stop_a.store(true, std::sync::atomic::Ordering::Relaxed);
+        ta.join().unwrap();
+        assert!(eventually(10_000, || http(b, "GET", "/do/al2/alarms", "").1.contains("\"fired\":1")), "{:?}", http(b, "GET", "/do/al2/alarms", ""));
+        // 3. Eviction: B lets an idle object go; it comes back from the bucket.
+        ok(b, "POST", "/do/ev/incr", "");
+        ok(b, "POST", "/do/ev/incr", "");
+        assert!(eventually(3000, || stat(b, "evictions") >= 1), "nothing was evicted");
+        assert_eq!(ok(b, "GET", "/do/ev/count", ""), "{\"count\":2}");
     }
 
     /// Objects by id: `/do/new` hands one out, `/do/id/<uuid>` reaches it.

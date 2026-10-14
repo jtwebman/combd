@@ -881,8 +881,8 @@ What changes as the fleet grows:
 3. **Fleet (D2).** Bucket leases, CAS ownership, epochs, routing between nodes
    over mTLS. Kill tests.
    **Running 2026-10-14:** three nodes on Silo in Docker; SIGKILL and freeze
-   tests keep every object correct. Wire is plain TCP so far (mTLS next);
-   alarms and eviction are D1-only so far. See
+   tests keep every object correct, over mTLS, with alarms and eviction.
+   Next: D3 peer proofs for fast writes. See
    [spike/RESULTS.md](spike/RESULTS.md).
 4. **WebSockets** with hibernation.
 5. **Bring your own database.** Host-owned pools, Postgres first.

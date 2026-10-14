@@ -37,8 +37,18 @@
 //! object from the bucket. An answer leaves only after its changes are in the
 //! bucket and a fresh read of the ownership record shows we still own the
 //! object: the output gate for D2, instead of a local fsync. A request for an
-//! object another node owns is forwarded there over the wire. ponytail:
-//! alarms and eviction are D1-only for now.
+//! object another node owns is forwarded there over the wire.
+//! - Eviction hands an idle object back to the core; the next request claims
+//!   it again (a new epoch) and restores it from the bucket.
+//! - Alarms live in the object's SQLite, so they travel with its segments.
+//!   An index in the bucket (`alarm/<id>/<due>`, holding the name) lets the
+//!   fleet find due alarms of objects that aren't running anywhere. It's
+//!   written before the segment that sets the alarm is uploaded, so it's never
+//!   missing; a stale entry costs one wasted fire, which checks storage and
+//!   cleans it up. Loop 0 scans it each second and fires due alarms as
+//!   ordinary routed requests; a fire that finds nothing due does nothing.
+//!   ponytail: every node scans the whole index. At scale each node scans
+//!   only the objects that place onto it.
 
 use crate::engine::{CellVm, Engine, Outcome};
 use crate::fleet::{FleetCfg, Frame};
@@ -82,6 +92,8 @@ pub struct Config {
     /// Tests only: every fsync takes at least this long, to prove the output
     /// gate waits for it.
     pub sync_delay: Duration,
+    /// Fleet mode (D2), or `None` for one node on its own disk (D1).
+    pub fleet: Option<FleetCfg>,
 }
 
 impl Config {
@@ -94,6 +106,7 @@ impl Config {
             max_objects: num("COMBD_MAX_OBJECTS", 10_000),
             stop: Arc::default(),
             sync_delay: Duration::ZERO,
+            fleet: FleetCfg::from_env(),
         }
     }
 }
@@ -151,8 +164,24 @@ struct FleetShared {
 
 enum Job {
     Call { op: own::OpId, call: own::Call, back: usize },
+    /// Fetch an object's segments, and its alarm index entries.
     Fetch { obj: own::Obj, act: Act, segs: Vec<String>, back: usize },
+    /// Move an object's alarm index entry from `old` to `new` (due times).
+    Index { name: String, obj: own::Obj, old: Option<i64>, new: Option<i64>, back: usize },
+    /// The due alarms in the index.
+    AlarmScan { back: usize },
 }
+
+fn alarm_prefix(obj: own::Obj) -> String {
+    format!("alarm/{obj:032x}/")
+}
+
+fn alarm_key(obj: own::Obj, at: i64) -> String {
+    format!("alarm/{obj:032x}/{at:013}")
+}
+
+/// Loop 0 scans the alarm index this often.
+const ALARM_SCAN: Duration = Duration::from_secs(1);
 
 /// A forwarded request with no reply in time gets a 503 (the peer may be
 /// frozen), so the client can retry. "In time" is measured per peer, as TCP
@@ -197,8 +226,12 @@ enum Msg {
     Checkpointed { obj: String },
     /// Fleet mode: a bucket call's result.
     Bucket { op: own::OpId, res: own::Res },
-    /// Fleet mode: an object's segments, for a restore.
-    Fetched { obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String> },
+    /// Fleet mode: an object's segments, for a restore, and its alarm index entries.
+    Fetched { obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64> },
+    /// Fleet mode: an alarm index move finished.
+    Indexed { name: String, new: Option<i64>, ok: bool },
+    /// Fleet mode: due alarms from the index: (name, due).
+    AlarmsDue { due: Vec<(String, i64)> },
     /// Fleet mode: another node forwarded us a request.
     WireIn { conn: usize, id: u64, name: String, req: String },
     /// Fleet mode: the answer to a request we forwarded.
@@ -279,6 +312,31 @@ struct Object<E: Engine> {
     held: Vec<(u64, Origin, (u16, String))>,
     /// Paused for a checkpoint: requests wait until it's done.
     checkpointing: bool,
+    /// Fleet mode: the alarm index entry, as far as we know; one move at a
+    /// time; and a seal held until the index has the alarm it carries.
+    index_at: Option<i64>,
+    index_busy: bool,
+    seal_wait: Option<(Act, Vec<u8>)>,
+}
+
+impl<E: Engine> Object<E> {
+    fn new(db: Db) -> Object<E> {
+        Object {
+            cell: None,
+            db: Arc::new(Mutex::new(db)),
+            busy: false,
+            waiting: VecDeque::new(),
+            last_used: Instant::now(),
+            committed: 0,
+            synced: 0,
+            syncing: false,
+            held: vec![],
+            checkpointing: false,
+            index_at: None,
+            index_busy: false,
+            seal_wait: None,
+        }
+    }
 }
 
 /// A parsed request.
@@ -329,7 +387,7 @@ where
     serve_with(eng, prog, port, Config::from_env())
 }
 
-pub fn serve_with<E>(eng: &E, prog: &E::Program, port: u16, cfg: Config)
+pub fn serve_with<E>(eng: &E, prog: &E::Program, port: u16, mut cfg: Config)
 where
     E: Engine + Sync,
     E::Program: Sync,
@@ -390,7 +448,7 @@ where
             }
         });
     }
-    let fleet = FleetCfg::from_env().map(|fc| start_fleet(fc, &peers, cfg.threads));
+    let fleet = cfg.fleet.take().map(|fc| start_fleet(fc, &peers, cfg.threads));
     let sh = Shared {
         cfg,
         peers,
@@ -426,6 +484,8 @@ where
                     names: HashMap::new(),
                     wire_out: HashMap::new(),
                     rtt: HashMap::new(),
+                    alarm_fire: HashMap::new(),
+                    last_scan: Instant::now(),
                     last_tick: Instant::now(),
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l)) {
@@ -467,6 +527,9 @@ struct Loop<'a, E: Engine> {
     wire_out: HashMap<u64, (Origin, own::Node, Instant, Duration)>,
     /// Each peer's round trip: (smoothed, variation), in seconds.
     rtt: HashMap<own::Node, (f64, f64)>,
+    /// Alarms loop 0 fired from the index: name -> (due, tries, not again before).
+    alarm_fire: HashMap<String, (i64, u32, i64)>,
+    last_scan: Instant,
     last_tick: Instant,
 }
 
@@ -486,7 +549,33 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
             let Ok(job) = rx.lock().unwrap().recv() else { return };
             let (back, msg) = match job {
                 Job::Call { op, call, back } => (back, Msg::Bucket { op, res: crate::fleet::run_call(&s3, &call) }),
-                Job::Fetch { obj, act, segs, back } => (back, Msg::Fetched { obj, act, data: crate::fleet::fetch(&s3, &segs) }),
+                Job::Fetch { obj, act, segs, back } => {
+                    let index = s3.list(&alarm_prefix(obj)).unwrap_or_default().iter().filter_map(|k| k.rsplit('/').next()?.parse().ok()).collect();
+                    (back, Msg::Fetched { obj, act, data: crate::fleet::fetch(&s3, &segs), index })
+                }
+                Job::Index { name, obj, old, new, back } => {
+                    // The new entry first, then the old one goes: never a moment with neither.
+                    let put = new.map_or(Ok(()), |at| s3.put(&alarm_key(obj, at), name.as_bytes(), &crate::s3::Cond::Any).map(|_| ()));
+                    let del = match old.filter(|o| Some(*o) != new) {
+                        Some(o) if put.is_ok() => s3.delete(&alarm_key(obj, o)),
+                        _ => Ok(()),
+                    };
+                    (back, Msg::Indexed { name, new, ok: put.is_ok() && del.is_ok() })
+                }
+                Job::AlarmScan { back } => {
+                    let now = now_ms();
+                    let due = s3
+                        .list("alarm/")
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|k| {
+                            let at: i64 = k.rsplit('/').next()?.parse().ok()?;
+                            (at <= now).then_some((k, at))
+                        })
+                        .filter_map(|(k, at)| Some((String::from_utf8(s3.get(&k).ok()??.0).ok()?, at)))
+                        .collect();
+                    (back, Msg::AlarmsDue { due })
+                }
             };
             let (tx, waker) = &loops[back];
             let _ = tx.send(msg);
@@ -494,19 +583,19 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
         });
     }
     // The wire: mTLS between nodes, unless plain TCP is asked for.
-    let tls = match std::env::var("COMBD_WIRE_CERTS") {
-        Ok(dir) => match wire::load_tls(std::path::Path::new(&dir), fc.node) {
+    let tls = match &fc.wire_certs {
+        Some(dir) => match wire::load_tls(dir, fc.node) {
             Ok(t) => Some(t),
             Err(e) => {
-                eprintln!("combd     can't load the wire certificates from {dir}: {e}");
+                eprintln!("combd     can't load the wire certificates from {}: {e}", dir.display());
                 std::process::exit(1);
             }
         },
-        Err(_) if std::env::var("COMBD_WIRE_INSECURE").as_deref() == Ok("1") => {
+        None if fc.insecure => {
             eprintln!("combd     WARNING: the wire is plain TCP (COMBD_WIRE_INSECURE=1)");
             None
         }
-        Err(_) => {
+        None => {
             eprintln!("combd     set COMBD_WIRE_CERTS (see `combd-spike wire-certs`), or COMBD_WIRE_INSECURE=1 for plain TCP");
             std::process::exit(1);
         }
@@ -580,6 +669,13 @@ impl<E: Engine> Loop<'_, E> {
                 if self.me == 0 && self.last_tick.elapsed() >= Duration::from_millis(renew) {
                     self.last_tick = Instant::now();
                     self.core_on(own::Event::Tick);
+                }
+                if self.me == 0 && self.last_scan.elapsed() >= ALARM_SCAN {
+                    self.last_scan = Instant::now();
+                    self.job(Job::AlarmScan { back: 0 });
+                }
+                if self.last_sweep.elapsed() >= TICK {
+                    self.fleet_sweep();
                 }
             } else {
                 self.fire_alarms();
@@ -663,7 +759,17 @@ impl<E: Engine> Loop<'_, E> {
                     self.kick_sync(&obj);
                 }
                 Msg::Bucket { op, res } => self.core_on(own::Event::Reply { op, res }),
-                Msg::Fetched { obj, act, data } => self.fetched(obj, act, data),
+                Msg::Fetched { obj, act, data, index } => self.fetched(obj, act, data, index),
+                Msg::Indexed { name, new, ok } => {
+                    if let Some(o) = self.objects.get_mut(&name) {
+                        o.index_busy = false;
+                        if ok {
+                            o.index_at = new;
+                        }
+                    }
+                    self.reconcile(&name);
+                }
+                Msg::AlarmsDue { due } => self.alarms_due(due),
                 Msg::WireIn { conn, id, name, req } => self.submit(Origin::Wire(conn, id), name, req),
                 Msg::WireReply { id, reply } => {
                     if let Some((origin, node, sent, _)) = self.wire_out.remove(&id) {
@@ -934,7 +1040,10 @@ impl<E: Engine> Loop<'_, E> {
             }
             match self.run_object(name, origin, req) {
                 Ok(true) => return,
-                Ok(false) => continue, // a stale alarm: nothing ran
+                Ok(false) => {
+                    self.fleet_skip(name, origin); // a stale alarm: nothing ran
+                    continue;
+                }
                 Err(reply) => {
                     let _ = self.deliver(origin, reply);
                 }
@@ -1063,27 +1172,19 @@ impl<E: Engine> Loop<'_, E> {
             };
             self.sh.stats.objects_live.fetch_add(1, Relaxed);
             self.sh.stats.objects_opened.fetch_add(1, Relaxed);
-            let o = Object {
-                cell: None,
-                db: Arc::new(Mutex::new(db)),
-                busy: false,
-                waiting: VecDeque::new(),
-                last_used: Instant::now(),
-                committed: 0,
-                synced: 0,
-                syncing: false,
-                held: vec![],
-                checkpointing: false,
-            };
-            self.objects.insert(name.clone(), o);
+            self.objects.insert(name.clone(), Object::new(db));
         }
         let o = self.objects.get_mut(&name).unwrap();
         if o.busy || o.checkpointing {
             o.waiting.push_back((origin, req));
             return;
         }
-        if let Err(reply) = self.run_object(&name, origin, req) {
-            let _ = self.deliver(origin, reply);
+        match self.run_object(&name, origin, req) {
+            Ok(true) => {}
+            Ok(false) => self.fleet_skip(&name, origin),
+            Err(reply) => {
+                let _ = self.deliver(origin, reply);
+            }
         }
     }
 
@@ -1098,6 +1199,18 @@ impl<E: Engine> Loop<'_, E> {
             if let Err(e) = db.begin() {
                 eprintln!("object {name:?}: begin failed: {e}");
                 return Err((500, "{\"error\":\"storage\"}".into()));
+            }
+            if matches!(origin, Origin::Fleet(_)) && req.starts_with("do ALARM ") {
+                // Fleet alarms: run only if storage says one is due now.
+                match db.alarm() {
+                    Some(t) if t <= now_ms() => {
+                        let _ = db.set_alarm(None); // the handler can set a new one
+                    }
+                    _ => {
+                        db.rollback();
+                        return Ok(false);
+                    }
+                }
             }
             if let Origin::Alarm { at, .. } = origin {
                 // The index and the heap are hints: storage says if it's still due.
@@ -1198,7 +1311,18 @@ impl<E: Engine> Loop<'_, E> {
                     c
                 };
                 match changes {
-                    Ok(changes) => self.core_on(own::Event::Sealed { obj, act, changes }),
+                    Ok(changes) => {
+                        // The index must have an alarm before the segment that sets it
+                        // goes up, or a crash could leave an alarm nobody finds.
+                        let o = self.objects.get_mut(&name).unwrap();
+                        let alarm = o.db.lock().unwrap().alarm();
+                        if alarm.is_some() && o.index_at != alarm {
+                            o.seal_wait = Some((act, changes));
+                            self.reconcile(&name);
+                        } else {
+                            self.core_on(own::Event::Sealed { obj, act, changes });
+                        }
+                    }
                     Err(e) => {
                         eprintln!("object {name:?}: seal failed: {e}");
                         self.objects.remove(&name);
@@ -1217,7 +1341,7 @@ impl<E: Engine> Loop<'_, E> {
     }
 
     /// An object's segments arrived: rebuild its database, then serve.
-    fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>) {
+    fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>) {
         let Some(name) = self.names.get(&obj).cloned() else { return };
         let path = store::path_for(&self.sh.cfg.data, &name);
         if self.objects.remove(&name).is_some() {
@@ -1228,19 +1352,16 @@ impl<E: Engine> Loop<'_, E> {
             Ok(db) => {
                 self.sh.stats.objects_live.fetch_add(1, Relaxed);
                 self.sh.stats.objects_opened.fetch_add(1, Relaxed);
-                let o = Object {
-                    cell: None,
-                    db: Arc::new(Mutex::new(db)),
-                    busy: false,
-                    waiting: VecDeque::new(),
-                    last_used: Instant::now(),
-                    committed: 0,
-                    synced: 0,
-                    syncing: false,
-                    held: vec![],
-                    checkpointing: false,
-                };
-                self.objects.insert(name, o);
+                let mut o = Object::new(db);
+                // The newest index entry counts; older ones (from a crash) go.
+                let mut index = index;
+                index.sort();
+                o.index_at = index.pop();
+                for old in index {
+                    self.job(Job::Index { name: name.clone(), obj, old: Some(old), new: None, back: self.me });
+                }
+                self.objects.insert(name.clone(), o);
+                self.reconcile(&name);
                 true
             }
             Err(e) => {
@@ -1282,11 +1403,94 @@ impl<E: Engine> Loop<'_, E> {
             fr.resp = Some(reply);
             fr.act
         });
+        self.reconcile(&name);
         self.next_waiting(&name);
         if let Some(act) = act {
             self.core_on(own::Event::Ran { obj: own::obj_id(&name), act, req, changed });
         }
         None
+    }
+
+    /// An alarm request found nothing due: it's done, and changed nothing.
+    fn fleet_skip(&mut self, name: &str, origin: Origin) {
+        let Origin::Fleet(req) = origin else { return };
+        let act = self.freqs.get_mut(&req).map(|fr| {
+            fr.resp = Some((200, "{}".into()));
+            fr.act
+        });
+        self.reconcile(name);
+        if let Some(act) = act {
+            self.core_on(own::Event::Ran { obj: own::obj_id(name), act, req, changed: false });
+        }
+    }
+
+    /// Move the object's alarm index entry toward what its storage says, one
+    /// move at a time, and release a seal that was waiting for it.
+    fn reconcile(&mut self, name: &str) {
+        let me = self.me;
+        let Some(o) = self.objects.get_mut(name) else { return };
+        // Mid-request, the alarm may be about to change; look again after.
+        if o.busy {
+            return;
+        }
+        let want = o.db.lock().unwrap().alarm();
+        if o.index_at == want {
+            if let Some((act, changes)) = o.seal_wait.take() {
+                self.core_on(own::Event::Sealed { obj: own::obj_id(name), act, changes });
+            }
+            return;
+        }
+        if o.index_busy {
+            return;
+        }
+        o.index_busy = true;
+        let old = o.index_at;
+        self.job(Job::Index { name: name.to_string(), obj: own::obj_id(name), old, new: want, back: me });
+    }
+
+    /// Eviction: hand objects that have been idle too long back to the core.
+    fn fleet_sweep(&mut self) {
+        self.last_sweep = Instant::now();
+        let idle = self.sh.cfg.idle;
+        let gone: Vec<String> = self
+            .objects
+            .iter()
+            .filter(|(_, o)| !o.busy && o.waiting.is_empty() && !o.index_busy && o.seal_wait.is_none() && o.last_used.elapsed() >= idle)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in gone {
+            let before = self.objects.len();
+            self.core_on(own::Event::Release { obj: own::obj_id(&name) });
+            if self.objects.len() < before {
+                self.sh.stats.evictions.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    /// Due alarms from the index: fire each as an ordinary request, routed to
+    /// its owner. A fire that keeps failing backs off (0.5 s, doubling, up to
+    /// a minute). ponytail: it never gives up, where Cloudflare stops after 6.
+    fn alarms_due(&mut self, due: Vec<(String, i64)>) {
+        let now = now_ms();
+        for (name, at) in due {
+            let e = self.alarm_fire.entry(name.clone()).or_insert((at, 0, 0));
+            if e.0 == at && now < e.2 {
+                continue; // fired recently; let it run
+            }
+            let tries = if e.0 == at { e.1 + 1 } else { 0 };
+            *e = (at, tries, now + (ALARM_BACKOFF_MS << tries.min(7)).min(60_000));
+            self.sh.stats.alarms_fired.fetch_add(1, Relaxed);
+            let req = format!("do ALARM / {}", tries.min(ALARM_TRIES));
+            let o = owner(&name, self.sh.cfg.threads);
+            if o == self.me {
+                self.submit(Origin::Alarm { at, tries }, name, req);
+            } else {
+                let (tx, waker) = &self.sh.peers[o];
+                let _ = tx.send(Msg::Run { origin: Origin::Alarm { at, tries }, obj: name, req });
+                let _ = waker.wake();
+            }
+        }
+        self.alarm_fire.retain(|_, e| now < e.2 + 600_000);
     }
 
     /// Send a request to the node that owns its object, over the wire.

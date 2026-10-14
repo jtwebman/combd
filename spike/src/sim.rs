@@ -258,6 +258,11 @@ impl Sim {
                 }
                 self.deliver(p, Event::Tick);
                 self.maybe_fault(p);
+                // Eviction: now and then, let an object go.
+                if self.rng.chance(0.02) {
+                    let obj = self.rng.below(self.s.objects as u64) as Obj;
+                    self.deliver(p, Event::Release { obj });
+                }
             }
             Msg::Bucket(p, op, call, lose_reply) => {
                 let res = self.apply(&call);

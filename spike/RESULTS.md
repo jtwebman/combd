@@ -860,7 +860,36 @@ acknowledged writes/s steady (1,288 on plain TCP, so TLS costs about 7%),
 904/s through a SIGKILL (longest failure stretch 3.3 s, about one lease),
 730/s through a 4 s freeze, every object correct.
 
-Not in fleet mode yet: alarms, eviction, and the D3 peer path.
+**Alarms and eviction in fleet mode.**
+- **Eviction:** an idle object is handed back to the core (`Release`); the
+  next request claims it again, with a new epoch, and restores it from the
+  bucket. The simulator now releases objects at random too; 5,000 seeds still
+  hold every invariant, and the four known bugs are still caught.
+- **Alarms** live in the object's SQLite, so they travel with its segments.
+  An index in the bucket (`alarm/<id>/<due>`, holding the name) lets the
+  fleet find due alarms of objects that aren't running anywhere. It's written
+  before the segment that sets the alarm is uploaded, so it's never missing;
+  a stale entry costs one wasted fire, which checks storage and cleans up.
+  Loop 0 of each node scans it every second and fires due alarms as ordinary
+  routed requests. A fire that finds nothing due does nothing, so duplicate
+  fires are harmless.
+- **Test `fleet_alarms_and_eviction`** (two nodes in one process, mTLS, a
+  real bucket): an alarm fires; an alarm set on node A fires on node B after
+  A stops; an evicted object comes back with its count. With index writes
+  turned off, it fails ("fired": 0).
+
+**A security bug found on the way, in D1 too:** the host runs an alarm as the
+cell request `do ALARM ...`, and the HTTP front passed any method through,
+so a client sending the method `ALARM` could run an object's alarm handler.
+Only standard methods are accepted now.
+
+The cluster rerun after this: 1,034 writes/s steady (1,192 last time; the
+new per-request work is two small SQLite reads, so this is likely noise, but
+not A/B checked), 946/s through a SIGKILL, 894/s through a freeze, every
+object correct.
+
+Not in fleet mode yet: the D3 peer path. ponytail: every node scans the whole
+alarm index; at scale each node scans only the objects that place onto it.
 
 ## Security: memory is always zero
 

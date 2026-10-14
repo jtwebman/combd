@@ -218,6 +218,16 @@ impl S3 {
         }
     }
 
+    pub fn delete(&self, key: &str) -> Io<()> {
+        let r = self.send("DELETE", key, &[], &[], b"")?;
+        // 404: already gone, which is what we wanted.
+        if matches!(r.status, 200 | 204 | 404) {
+            Ok(())
+        } else {
+            Err(Self::fail("delete", &r))
+        }
+    }
+
     /// Every key under `prefix`, in order.
     pub fn list(&self, prefix: &str) -> Io<Vec<String>> {
         let mut keys = vec![];

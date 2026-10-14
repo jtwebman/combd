@@ -119,6 +119,9 @@ pub enum Event {
     Reply { op: OpId, res: Res },
     /// Time passes: renew our lease.
     Tick,
+    /// Let an idle object go (eviction). Ignored unless nothing is running,
+    /// waiting, or being uploaded. The next request claims it again.
+    Release { obj: Obj },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -344,6 +347,17 @@ impl Core {
                 }
             }
             Event::Restored { obj, act, ok } => self.restored(obj, act, ok),
+            Event::Release { obj } => {
+                let st = self.st(obj);
+                let idle = match &st.phase {
+                    Phase::Serving(s) => s.running.is_empty() && s.batch.is_empty() && s.flight.is_none() && !s.sealing,
+                    _ => false,
+                };
+                if idle && st.waiting.is_empty() {
+                    st.phase = Phase::Idle;
+                    self.out.push(Effect::Drop { obj });
+                }
+            }
             Event::Reply { op, res } => {
                 if let Some(w) = self.ops.remove(&op) {
                     self.reply(now, w, res);

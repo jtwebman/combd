@@ -29,6 +29,9 @@ pub struct FleetCfg {
     pub s3: S3,
     pub peers: HashMap<Node, String>,
     pub wire_port: u16,
+    /// The wire's certificates, or `None` with `insecure` for plain TCP.
+    pub wire_certs: Option<std::path::PathBuf>,
+    pub insecure: bool,
 }
 
 impl FleetCfg {
@@ -45,7 +48,9 @@ impl FleetCfg {
             .collect();
         let wire_port = std::env::var("COMBD_WIRE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7100);
         let lease_ms = std::env::var("COMBD_LEASE_MS").ok().and_then(|p| p.parse().ok()).unwrap_or(10_000);
-        Some(FleetCfg { node, lease_ms, s3, peers, wire_port })
+        let wire_certs = std::env::var("COMBD_WIRE_CERTS").ok().map(Into::into);
+        let insecure = std::env::var("COMBD_WIRE_INSECURE").as_deref() == Ok("1");
+        Some(FleetCfg { node, lease_ms, s3, peers, wire_port, wire_certs, insecure })
     }
 }
 
