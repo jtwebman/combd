@@ -453,6 +453,61 @@ reading each answer. All six language cells have it. The test
 `answers_are_released` fails without the fix. The rerun: **zero traps and
 zero failed responses across 4.9 million requests.**
 
+## Guard pages instead of bounds checks
+
+Behind the `aot-guard` feature, each cell reserves 4 GiB + 64 KiB of address
+space (no RAM) and maps only its live memory read-write. Loads and stores in
+generated code have no bounds checks. A Wasm address is a u32 plus a static
+offset under 64 KiB, so it always lands inside the reservation; past live
+memory it hits a guard page.
+
+A small C shim (`spike/aot/src/trap.c`, sigsetjmp/siglongjmp) turns that fault
+into a trap, but only when the faulting address is inside the reservation of
+the cell running on that thread. Any other fault goes to the previous handler,
+so real host crashes still crash. `guard.rs` and `trap.c` hold the only
+`unsafe` code; generated code stays `forbid(unsafe_code)`. Offsets of 64 KiB
+or more keep an explicit check.
+
+Two bugs found on the way, both by tests:
+1. **An `unsafe` bug.** `Mem::new` used struct-update syntax, so a temporary
+   `Mem` was dropped and unmapped the reservation it had just made. Every
+   cell crashed at once. Fixed by building it in place.
+2. **A slow trap setup.** `sigsetjmp(buf, 1)` saved the signal mask with a
+   system call on every call, so small requests got 2x slower. Installing the
+   handler with `SA_NODEFER` means the mask never needs restoring, so
+   `sigsetjmp(buf, 0)` is enough.
+
+The test `out_of_bounds_traps_on_every_engine` reads far past a cell's memory
+on the interpreter, Wasmtime, and AOT. Under AOT it goes through the fault
+handler 100 times in a row, and the host carries on each time.
+
+In-process, Linux (us per request):
+
+| | Checked bounds | **Guard pages** | Native Rust |
+|---|---|---|---|
+| GET /api/users/42 | 0.46 | **0.46** | 0.17 |
+| GET /api/users | 1.89 | **1.54** | 0.79 |
+| POST /api/orders | 4.71 | **3.54** | 2.40 |
+
+On macOS, sort went from 20.5 to 15.4 ms (native: 12.0). The QuickJS cell got
+21% to 25% faster per request, and 39% faster on fib 25. One regression: sieve
+is slightly slower with guards (12.9 to 14.1 ms vs 11.9 ms checked). Our
+guess, not yet verified, is that raw-pointer access stops LLVM from optimizing
+that byte loop as well as slices allow.
+
+HTTP, one core per server, same session (req/s):
+
+| | combd Rust cell | Bun | combd JS cell |
+|---|---|---|---|
+| GET /api/users/42 | **202,593** | 153,240 | 91,103 |
+| GET /api/users | **189,972** | 141,287 | 30,490 |
+| POST /api/orders | **116,740** | 84,757 | 26,913 |
+
+The Rust cell beats Bun by 1.32x to 1.38x on every route, and the POST route
+(JSON parsing) now leads by the widest margin. One outlier to recheck: the
+first route showed a 27 ms p99 in this run, against 0.23 ms in the last. The
+other routes stayed under 0.4 ms.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

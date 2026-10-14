@@ -805,9 +805,13 @@ Done: 1-byte traps (results in registers), memory as its own argument, a stack
 budget in a register, fuel in a register, one bounds check per access, lazy
 zero-skipping snapshot copies.
 
+Done (2026-10-13): **guard pages** behind `aot-guard` (`guard.rs` +
+`trap.c`, the only `unsafe` code). JSON route 3.54 us in-process, and 1.32x to
+1.38x Bun's throughput over HTTP.
+
 Next for this tier, biggest first:
-1. **Guard pages instead of bounds checks** (about 30% left), in the audited
-   `unsafe` crate: reserve, map live memory only, turn faults into traps.
+1. **A JS-to-Rust pipeline** for the simple routes (JS → Rust → Wasm → this
+   tier). See "Our own JS engine".
 2. **Pausing mid-call:** a stack per cell first, deopt to the interpreter
    later.
 3. **SDK: an opt-in per-request arena allocator** for Rust cells (bump
