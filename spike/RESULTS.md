@@ -942,8 +942,39 @@ the rest went the bucket way while a peer was down. Each D3 bug (ack on one
 peer, no fence, drop before upload, seal early) is caught on the first
 2,000 seeds, most on seed 0.
 
-Next: put it into real nodes. That means peer append and fence calls on the
-mTLS wire, a peer store on disk with fsync, then racing it on the cluster.
+**4. Real nodes.** Peer calls ride the mTLS wire as two new frame kinds.
+Each node runs its peer store on one thread: take every waiting call, apply
+them, write them to `peers.log`, one fsync, then answer them all (group
+commit again). Startup replays the log and cuts off a torn last record; a
+big log is rewritten from a snapshot. `COMBD_REPLICAS=2` turns it on. Test
+`fleet_peer_writes`: three nodes, writes acknowledged by peers, then the
+owner stops and another node fences, recovers, and has all 30 writes.
+
+**The cluster race** (`REPLICAS=2 sh bench/cluster/run.sh`), D2 and D3
+alternated, three runs each, on the same build:
+
+| Test (median of 3) | D2 writes/s | D3 writes/s | D2 p50 | D3 p50 |
+|---|---|---|---|---|
+| Steady | 821 | 1,301 | 28 ms | 14 ms |
+| SIGKILL a node | 605 | 1,166 | 25 ms | 14 ms |
+| Freeze a node 4 s | 636 | 756 | 27 ms | 16 ms |
+
+Every object was correct in all 18 runs. 98% of D3's acknowledgements came
+from peers, and takeovers really recovered entries from peer tails. D3 won
+8 of 9 pairs, and its p50 was about half of D2's in every run.
+
+These numbers are rough. The MacBook was busy with other agents' work, and
+runs swung 2x to 5x with nothing changed (one D2 freeze run fell to 84/s).
+An A/B against the code from before the D3 core showed no D2 regression
+(steady averages 828 vs 827), but only alternating runs can be trusted
+here. Honest numbers need quiet Linux machines.
+
+**A gap, made safe for now:** if a peer loses its disk and comes back as the
+same node, its empty store would answer a fence knowing nothing, and writes
+it confirmed could be lost. So a node whose lease is in the bucket but whose
+peer store is gone refuses to start. The real fix (a store that knows it's
+new, and an owner that then uses another peer's tail) needs its own spec
+work first. Also, a peer no longer skips ahead past what the bucket has.
 
 ## Security: memory is always zero
 

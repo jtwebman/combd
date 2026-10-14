@@ -14,7 +14,7 @@ set -e
 SECS=${SECS:-15}
 THREADS=${THREADS:-32}
 OBJECTS=${OBJECTS:-50}
-IMG=combd-spike-aot
+IMG=${IMG:-combd-spike-aot}
 SILO=pgsty/silo:RELEASE.2026-09-16T00-00-00Z
 NET=combd-fleet
 PEERS=0=node0:7100,1=node1:7100,2=node2:7100

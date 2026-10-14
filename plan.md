@@ -882,8 +882,11 @@ What changes as the fleet grows:
    over mTLS. Kill tests.
    **Running 2026-10-14:** three nodes on Silo in Docker; SIGKILL and freeze
    tests keep every object correct, over mTLS, with alarms and eviction.
-   **D3, 2026-10-14:** spec (TLC, 39.9M states) and core and simulator
-   (50,000 seeds) done. Next: the peer wire and an on-disk peer store. See
+   **D3, 2026-10-14:** spec (TLC, 39.9M states), core and simulator
+   (50,000 seeds), and real nodes (peer wire, on-disk peer store). On the
+   cluster D3 roughly doubles writes through a node kill and halves p50.
+   Next: handle a peer that lost its disk (spec first), then quiet Linux
+   machines for honest numbers. See
    [spike/RESULTS.md](spike/RESULTS.md).
 4. **WebSockets** with hibernation.
 5. **Bring your own database.** Host-owned pools, Postgres first.
