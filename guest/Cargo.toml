@@ -10,6 +10,11 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["arena"]
+# combd SDK idea: a per-request arena allocator (Wasm builds only).
+arena = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

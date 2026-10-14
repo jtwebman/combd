@@ -571,6 +571,35 @@ code lives (node logs, sealing, takeover recovery). We earn it last.
 option for us: a custom SQLite VFS in the host, so we see every page write
 directly and turn it into a log entry. Decide in the D1 spike.
 
+## Fuzzing: catch the bugs normal tests miss
+
+The TinyGo bug (an `if` right after a stack op left the stack pointer one
+slot high) was found by luck: one compiler happened to emit that pattern.
+Fuzzers find those on purpose. Next up, after the HTTP race:
+
+1. **Differential fuzzing of every engine.** `wasm-smith` makes random valid
+   Wasm modules. Each one runs on our interpreter, our AOT tier, and
+   Wasmtime. Results, traps, and final memory must match exactly. Any
+   difference is a bug in one of them. Shrink the module to the smallest one
+   that still disagrees, and keep it as a regression test.
+2. **Translator fuzzing.** Mix register ops and stack ops in random orders,
+   with random block shapes, branch depths, and `local.tee` chains, to stress
+   the virtual stack, lazy `sp`, and fused branches.
+3. **Pause and resume fuzzing.** Run the same module with random slice sizes
+   (1, 7, 100, ...) and random snapshots mid-call. The answer must not change.
+4. **Host API fuzzing.** Random arguments to every WASI and combd import:
+   bad pointers, huge lengths, overlapping buffers. The host must never panic
+   or read outside the cell.
+5. **Security properties as fuzz targets:**
+   - a new cell never sees an old cell's bytes,
+   - memory limits always hold,
+   - a trap never leaks into a neighbor.
+6. **Races and crashes:** the deterministic simulator below, for the
+   distributed parts.
+
+Fuzzers run nonstop in CI on a spare machine. Every failure they find becomes
+a permanent regression test.
+
 ## How we prove it's correct
 
 1. **TLA+ (or Quint) spec first** for ownership, epochs, leases, and the output

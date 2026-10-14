@@ -127,6 +127,11 @@ pub mod api {
         })
     }
 
+    /// Build long-lived data before any request arena is active.
+    pub fn warm() {
+        users();
+    }
+
     pub fn handle(method: &str, path: &str, body: &str) -> String {
         let seg: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         match (method, seg.as_slice()) {
@@ -186,6 +191,92 @@ pub fn run(req: &str, counter: impl FnOnce() -> i64) -> String {
     }
 }
 
+/// A per-request arena, as the combd Rust SDK could offer it. Inside
+/// `scope`, every allocation is a pointer bump in one region and every free is
+/// free. The region resets when the scope ends. Anything that must outlive the
+/// request has to be copied out, and statics must be warmed outside a scope.
+/// A mistake here can only hurt this cell's own (sandboxed) memory.
+#[cfg(all(target_arch = "wasm32", feature = "arena"))]
+mod arena {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    const SIZE: usize = 4 << 20;
+
+    pub struct Arena {
+        on: Cell<bool>,
+        base: Cell<usize>,
+        next: Cell<usize>,
+    }
+
+    // A Wasm cell runs on one thread.
+    unsafe impl Sync for Arena {}
+
+    impl Arena {
+        fn owns(&self, p: *mut u8) -> bool {
+            let (p, b) = (p as usize, self.base.get());
+            b != 0 && p >= b && p < b + SIZE
+        }
+    }
+
+    unsafe impl GlobalAlloc for Arena {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if self.on.get() {
+                let p = (self.next.get() + l.align() - 1) & !(l.align() - 1);
+                if p + l.size() <= self.base.get() + SIZE {
+                    self.next.set(p + l.size());
+                    return p as *mut u8;
+                }
+            }
+            System.alloc(l)
+        }
+
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if !self.owns(p) {
+                System.dealloc(p, l);
+            }
+        }
+
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            // The newest allocation can grow in place.
+            if self.on.get() && p as usize + l.size() == self.next.get() && p as usize + new <= self.base.get() + SIZE {
+                self.next.set(p as usize + new);
+                return p;
+            }
+            let q = self.alloc(Layout::from_size_align_unchecked(new, l.align()));
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                self.dealloc(p, l);
+            }
+            q
+        }
+    }
+
+    #[global_allocator]
+    pub static A: Arena = Arena { on: Cell::new(false), base: Cell::new(0), next: Cell::new(0) };
+
+    pub fn scope<R>(f: impl FnOnce() -> R) -> R {
+        if A.base.get() == 0 {
+            let b = unsafe { System.alloc(Layout::from_size_align(SIZE, 16).unwrap()) } as usize;
+            A.base.set(b);
+            A.next.set(b);
+        }
+        A.on.set(A.base.get() != 0);
+        let r = f();
+        A.on.set(false);
+        A.next.set(A.base.get());
+        r
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "arena")))]
+mod arena {
+    #[allow(dead_code)] // only the Wasm build calls it
+    pub fn scope<R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod cell {
     #[link(wasm_import_module = "combd")]
@@ -205,8 +296,14 @@ mod cell {
     #[no_mangle]
     pub extern "C" fn handle(ptr: *mut u8, len: u32) -> u64 {
         let req = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
-        let out = super::run(core::str::from_utf8(&req).unwrap_or(""), || unsafe { counter_incr() });
-        let out = Box::into_raw(out.into_bytes().into_boxed_slice());
+        super::api::warm(); // statics live outside the request arena
+        // Everything the request allocates dies with it, except the answer,
+        // which is copied out before the arena resets.
+        let answer = super::arena::scope(|| super::run(core::str::from_utf8(&req).unwrap_or(""), || unsafe { counter_incr() }));
+        // The arena is off now and nothing has reused it yet: copy the answer out.
+        let out: Box<[u8]> = answer.as_bytes().into();
+        drop(answer);
+        let out = Box::into_raw(out);
         let len = out.len() as u64;
         ((out as *mut u8 as u64) << 32) | len
     }

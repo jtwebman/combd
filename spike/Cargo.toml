@@ -22,6 +22,9 @@ aot-unchecked-experiment = ["aot-lite", "combd-aot/experiment-unchecked"]
 combd-guest = { path = "../guest" }
 combd-aot = { path = "aot", optional = true, default-features = false }
 wasmparser = "0.261"
+# The HTTP front: epoll/kqueue event loop and hyper's request parser.
+mio = { version = "1", features = ["net", "os-poll"] }
+httparse = "1"
 wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
 
 [profile.release]

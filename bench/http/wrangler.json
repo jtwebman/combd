@@ -1,0 +1,6 @@
+{
+  "name": "bench",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-09-01",
+  "no_bundle": true
+}

@@ -13,6 +13,7 @@ mod aot;
 mod aot_gen;
 mod engine;
 mod host;
+mod http;
 mod interp;
 #[cfg(feature = "wasmtime")]
 mod wt;
@@ -548,6 +549,28 @@ fn main() {
         ["js-bench", "wasmtime"] => js_bench("wasmtime", &wt::Wt::new(WT_FUEL, None)),
         #[cfg(feature = "wasmtime")]
         ["js-mem", "wasmtime"] => js_mem("wasmtime", &wt::Wt::new(WT_FUEL, None)),
+        ["serve", engine, cell, port] => {
+            let wasm = match cell {
+                "rust" => wasm(),
+                "js" => js_cell().0,
+                _ => panic!("cell must be rust or js"),
+            };
+            let port: u16 = port.parse().unwrap();
+            match engine {
+                "interp" => {
+                    let eng = interp::Interp { max_pages: 16384 };
+                    http::serve(&eng, &eng.load(&wasm).unwrap(), port)
+                }
+                #[cfg(feature = "aot-lite")]
+                "aot" => http::serve(&aot::Aot, &aot::Aot.load(&wasm).unwrap(), port),
+                #[cfg(feature = "wasmtime")]
+                "wasmtime" => {
+                    let eng = wt::Wt::new(WT_FUEL, None);
+                    http::serve(&eng, &eng.load(&wasm).unwrap(), port)
+                }
+                _ => panic!("unknown engine"),
+            }
+        }
         ["langs"] => {
             let mut ok = langs("interp", &interp::Interp { max_pages: 16384 });
             #[cfg(feature = "wasmtime")]
