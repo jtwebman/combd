@@ -78,9 +78,13 @@ const MAX_WS_READ: usize = 4 * crate::ws::MAX_MESSAGE;
 const MAX_WS_WRITE: usize = 8 << 20;
 /// A socket's messages queued at its object, before we stop reading it.
 const MAX_WS_INFLIGHT: u32 = 64;
-/// Names are hex-encoded into file names (`store::path_for`), which most
-/// file systems cap at 255 bytes: 120 bytes is 240, plus `.sqlite`.
-const MAX_NAME: usize = 120;
+/// Slices per round of the run queue, shared between orgs when more than
+/// one has work (fewer tasks than this: everyone runs every round).
+const ROUND: usize = 64;
+
+/// File names are a hash of the name (`store::path_for`), so this is only a
+/// sanity cap: `<org>/<app>/<process>/<id>` fits with room to spare.
+const MAX_NAME: usize = 512;
 /// An alarm that keeps failing is tried this many times, then dropped.
 const ALARM_TRIES: u32 = 6;
 /// The first retry waits this long; each next one waits twice as long.
@@ -172,6 +176,8 @@ struct SyncJob {
     obj: String,
     gen: u64,
     back: usize,
+    /// A new object's folders: fsynced too, or a power cut could lose its file.
+    dirs: Vec<PathBuf>,
 }
 
 /// What the loops share.
@@ -465,6 +471,8 @@ struct Object<E: Engine> {
     committed: u64,
     synced: u64,
     syncing: bool,
+    /// A new object's folders, fsynced with its first commit.
+    new_dirs: Vec<PathBuf>,
     /// Answers waiting for an fsync: (the commit they need, origin, answer,
     /// and the WebSocket sends that wait with it).
     held: Vec<(u64, Origin, (u16, String), Vec<WsOut>)>,
@@ -485,6 +493,7 @@ struct Object<E: Engine> {
 impl<E: Engine> Object<E> {
     fn new(db: Db) -> Object<E> {
         Object {
+            new_dirs: vec![],
             cell: None,
             db: Arc::new(Mutex::new(db)),
             busy: false,
@@ -568,36 +577,68 @@ where
     E: Engine + Sync,
     E::Program: Sync,
 {
-    let mut cfg = Config::from_env();
-    match load_app(eng, dir) {
-        Ok((app, pg, environ)) => {
-            cfg.pg = pg;
-            cfg.environ = Arc::new(environ);
+    serve_apps_in(eng, &[("local".into(), dir.to_path_buf())], port)
+}
+
+/// Every app under `root`, laid out as `<org>/<app>/` (the org is the
+/// tenant: in a fleet it comes from who deployed, here from the folder).
+pub fn serve_apps<E>(eng: &E, root: &std::path::Path, port: u16)
+where
+    E: Engine + Sync,
+    E::Program: Sync,
+{
+    let mut apps = vec![];
+    let dirs = |d: &std::path::Path| -> Vec<std::path::PathBuf> {
+        let mut v: Vec<_> = std::fs::read_dir(d).map(|r| r.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect()).unwrap_or_default();
+        v.sort();
+        v
+    };
+    for org in dirs(root) {
+        for app in dirs(&org) {
+            apps.push((org.file_name().unwrap().to_string_lossy().into_owned(), app));
+        }
+    }
+    serve_apps_in(eng, &apps, port)
+}
+
+fn serve_apps_in<E>(eng: &E, apps: &[(String, std::path::PathBuf)], port: u16)
+where
+    E: Engine + Sync,
+    E::Program: Sync,
+{
+    match load_apps(eng, apps) {
+        Ok((app, pg)) => {
+            let cfg = Config { pg, ..Config::from_env() };
             serve_with(eng, &app, port, cfg)
         }
         Err(e) => {
+            // Any mistake in any app, and nothing starts.
             eprintln!("combd     {e}");
             std::process::exit(1);
         }
     }
 }
 
-/// The app in `dir`, ready to serve: its processes and modules, its pools,
-/// and its env vars.
-pub fn load_app<E: Engine>(eng: &E, dir: &std::path::Path) -> Result<(App<E::Program>, Option<crate::pg::PgCfg>, Vec<Vec<u8>>), String> {
-    let (r, pg, environ) = app_settings(dir)?.ok_or("no manifest (combd.toml, combd.yaml, or combd.json)")?;
-    let app = App::from_manifest(dir, &r, |w| eng.load(w).map_err(|e| e.to_string()))?;
-    Ok((app, pg, environ))
+/// One app in `dir` (org `local`), ready to serve.
+pub fn load_app<E: Engine>(eng: &E, dir: &std::path::Path) -> Result<(App<E::Program>, Option<crate::pg::PgCfg>), String> {
+    load_apps(eng, &[("local".into(), dir.to_path_buf())])
 }
 
-/// The app's manifest in `dir`, resolved for the local `dev` environment:
-/// its pools, and its env vars.
-pub fn app_settings(dir: &std::path::Path) -> Result<Option<(crate::manifest::Resolved, Option<crate::pg::PgCfg>, Vec<Vec<u8>>)>, String> {
-    let Some(m) = crate::manifest::load(dir)? else { return Ok(None) };
-    let r = m.resolve(&crate::manifest::load_dev(dir)?).map_err(|e| format!("the dev environment:\n  {e}"))?;
-    let environ = r.environ.iter().map(|(k, v)| format!("{k}={v}").into_bytes()).collect();
-    let pg = crate::pg::PgCfg::from_manifest(&r);
-    Ok(Some((r, pg, environ)))
+/// Apps (org, folder), each from its manifest resolved for the local `dev`
+/// environment: their processes and modules, and their pools (named
+/// `<org>/<app>/<pool>`).
+pub fn load_apps<E: Engine>(eng: &E, apps: &[(String, std::path::PathBuf)]) -> Result<(App<E::Program>, Option<crate::pg::PgCfg>), String> {
+    let mut loaded = vec![];
+    for (org, dir) in apps {
+        let at = format!("{org}/{}", dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        let m = crate::manifest::load(dir).map_err(|e| format!("{at}: {e}"))?.ok_or(format!("{at}: no manifest (combd.toml, combd.yaml, or combd.json)"))?;
+        let r = m.resolve(&crate::manifest::load_dev(dir).map_err(|e| format!("{at}: {e}"))?).map_err(|e| format!("{at}: the dev environment:\n  {e}"))?;
+        loaded.push((org.clone(), dir.clone(), m, r));
+    }
+    let list: Vec<crate::app::AppDir> = loaded.iter().map(|(org, dir, m, r)| crate::app::AppDir { org, dir, resolved: r, app: &m.app, domains: &m.domains }).collect();
+    let app = App::from_apps(&list, |w| eng.load(w).map_err(|e| e.to_string()))?;
+    let pools: Vec<crate::pg::PoolCfg> = loaded.iter().flat_map(|(org, _, m, r)| crate::pg::PgCfg::from_manifest(r, &format!("{org}/{}", m.app)).map(|c| c.pools).unwrap_or_default()).collect();
+    Ok((app, (!pools.is_empty()).then_some(crate::pg::PgCfg { pools })))
 }
 
 pub fn serve_with<E>(eng: &E, app: &App<E::Program>, port: u16, mut cfg: Config)
@@ -636,7 +677,7 @@ where
             // what the fsync costs. It breaks the output gate's promise.
             std::thread::sleep(delay);
             let t = Instant::now();
-            let ok = no_fsync || job.file.sync_data().is_ok();
+            let ok = no_fsync || (job.file.sync_data().is_ok() && job.dirs.iter().all(|d| std::fs::File::open(d).and_then(|f| f.sync_all()).is_ok()));
             let us = t.elapsed().as_micros() as u64;
             max_us.fetch_max(us, Relaxed);
             if us >= 10_000 {
@@ -936,7 +977,7 @@ impl<E: Engine> Loop<'_, E> {
         let mut events = Events::with_capacity(1024);
         self.poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
         for p in 0..self.app.procs.len() {
-            let mut first = fresh(self.eng, self.app, p, &self.sh.cfg.environ)?;
+            let mut first = fresh(self.eng, self.app, p, &self.environ_for(p))?;
             self.ev_mode[p] = first.vm.has_export("on_request");
             self.pools[p].push(first);
         }
@@ -1019,9 +1060,24 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }
             self.ev_tick();
-            // One round of the run queue: every request gets one slice.
+            // One round of the run queue: every request gets one slice, but
+            // each org gets an equal share of the round, so one busy tenant
+            // can't crowd out the rest. An org that needs less than its share
+            // gets all it needs; what it leaves goes unspent this round, and
+            // the round is shorter (the poll comes sooner).
+            let share = self.round_share();
+            let mut used: HashMap<&str, usize> = HashMap::new();
             for _ in 0..self.tasks.len() {
                 let mut t = self.tasks.pop_front().unwrap();
+                if let Some(share) = share {
+                    let org = self.app.tenants[self.app.procs[t.cell.proc].tenant].org.as_str();
+                    let n = used.entry(org).or_default();
+                    if *n >= share {
+                        self.tasks.push_back(t);
+                        continue;
+                    }
+                    *n += 1;
+                }
                 let answer = match t.cell.vm.run(crate::SLICE) {
                     Outcome::Yield => {
                         // A compiled cell paused inside a database call: park it.
@@ -1212,7 +1268,7 @@ impl<E: Engine> Loop<'_, E> {
             Some(i) => i,
             None => {
                 self.ev_gen += 1;
-                let inst = EvInst { gen: self.ev_gen, proc, cell: Some(fresh(self.eng, self.app, proc, &self.sh.cfg.environ)?), reqs: HashMap::new(), tickets: HashMap::new(), queue: VecDeque::new(), running: None };
+                let inst = EvInst { gen: self.ev_gen, proc, cell: Some(fresh(self.eng, self.app, proc, &self.environ_for(proc))?), reqs: HashMap::new(), tickets: HashMap::new(), queue: VecDeque::new(), running: None };
                 self.sh.stats.ev_instances.fetch_add(1, Relaxed);
                 match self.ev.iter().position(Option::is_none) {
                     Some(i) => {
@@ -1366,12 +1422,12 @@ impl<E: Engine> Loop<'_, E> {
         match op {
             AsyncOp::Timer(ms) => self.ev_timers.push(Reverse((Instant::now() + Duration::from_millis(ms), i, gen, ticket))),
             AsyncOp::Call(_) => unreachable!("handled above"),
-            AsyncOp::PgOpen(r) => match binding(&r).filter(|b| pools.has(b)).map(|b| self.may_lease(proc, &b).map(|()| b)) {
+            AsyncOp::PgOpen(r) => match binding(&r).filter(|b| pools.has(&self.app.pool_key(proc, b))).map(|b| self.may_lease(proc, &b).map(|()| self.app.pool_key(proc, &b))) {
                 Some(Ok(b)) => pools.lease(&b, Box::new(move |r| reply(DbDone::Pinned(r)))),
                 Some(Err(e)) => reply(DbDone::Answer(json_err(&e))),
                 None => reply(DbDone::Answer(json_err("pg_open_async: name a database binding (\"db\")"))),
             },
-            AsyncOp::PgQuery(0, r) => match binding(&r).map(|b| self.may_lease(proc, &b).map(|()| b)) {
+            AsyncOp::PgQuery(0, r) => match binding(&r).map(|b| self.may_lease(proc, &b).map(|()| self.app.pool_key(proc, &b))) {
                 Some(Ok(b)) => pools.query(&b, r, Box::new(move |a| reply(DbDone::Answer(a)))),
                 Some(Err(e)) => reply(DbDone::Answer(json_err(&e))),
                 None => reply(DbDone::Answer(json_err("pg_query_async: name a database binding (\"db\"), or use a handle"))),
@@ -1539,18 +1595,19 @@ impl<E: Engine> Loop<'_, E> {
         match op {
             DbOp::Call(_) => unreachable!("handled above"),
             DbOp::Open(req) => {
-                let Some(b) = binding(&req).filter(|b| pools.has(b)) else { return self.db_resume(t, interp, 0, fail("pg_open: name a database binding (\"db\")".into())) };
-                if let Err(e) = self.may_lease(t.cell.proc, &b) {
+                let proc = t.cell.proc;
+                let Some(b) = binding(&req).filter(|b| pools.has(&self.app.pool_key(proc, b))) else { return self.db_resume(t, interp, 0, fail("pg_open: name a database binding (\"db\")".into())) };
+                if let Err(e) = self.may_lease(proc, &b) {
                     return self.db_resume(t, interp, 0, fail(e));
                 }
-                pools.lease(&b, Box::new(move |r| reply(DbDone::Pinned(r))));
+                pools.lease(&self.app.pool_key(proc, &b), Box::new(move |r| reply(DbDone::Pinned(r))));
             }
             DbOp::Query(0, req) => {
                 let Some(b) = binding(&req) else { return self.db_resume(t, interp, 0, fail("pg_query: name a database binding (\"db\"), or use a handle".into())) };
                 if let Err(e) = self.may_lease(t.cell.proc, &b) {
                     return self.db_resume(t, interp, 0, fail(e));
                 }
-                pools.query(&b, req, Box::new(move |a| reply(DbDone::Answer(a))));
+                pools.query(&self.app.pool_key(t.cell.proc, &b), req, Box::new(move |a| reply(DbDone::Answer(a))));
             }
             DbOp::Query(h, req) => {
                 if !owns(self, &t, h) {
@@ -1961,7 +2018,7 @@ impl<E: Engine> Loop<'_, E> {
                 o.syncing = true;
                 o.checkpointing = ckpt;
                 self.sh.stats.fsyncs.fetch_add(1, Relaxed);
-                let job = SyncJob { file, db_path, ckpt, obj: name.to_string(), gen, back: self.me };
+                let job = SyncJob { file, db_path, ckpt, obj: name.to_string(), gen, back: self.me, dirs: std::mem::take(&mut o.new_dirs) };
                 let _ = self.sh.sync.lock().unwrap().send(job);
             }
             Err(e) => {
@@ -2215,7 +2272,7 @@ impl<E: Engine> Loop<'_, E> {
         }
         let mut cell = match self.pools[p].pop() {
             Some(cell) => cell,
-            None => fresh(self.eng, self.app, p, &self.sh.cfg.environ)?,
+            None => fresh(self.eng, self.app, p, &self.environ_for(p))?,
         };
         if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
             eprintln!("cell trapped starting a request: {trap}");
@@ -2250,7 +2307,8 @@ impl<E: Engine> Loop<'_, E> {
         let v: serde_json::Value = serde_json::from_slice(msg).map_err(|_| "want JSON: {\"to\", \"method\", \"path\", \"body\"}".to_string())?;
         let target = v["to"].as_str().ok_or("name the process: \"to\"")?;
         let caller = &self.app.procs[from].name;
-        let t = self.app.proc_named(target).filter(|t| self.app.procs[*t].callers.contains(&from)).ok_or_else(|| format!("denied: {caller} may not call {target}"))?;
+        let tenant = self.app.procs[from].tenant;
+        let t = self.app.proc_in(tenant, target).filter(|t| !self.app.router.legacy && self.app.procs[*t].callers.contains(&from)).ok_or_else(|| format!("denied: {caller} may not call {target}"))?;
         let proc = &self.app.procs[t];
         let method = v["method"].as_str().unwrap_or("POST");
         if !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].contains(&method) {
@@ -2273,7 +2331,7 @@ impl<E: Engine> Loop<'_, E> {
         };
         let r = if proc.durable {
             let id = v["id"].as_str().filter(|id| !id.is_empty() && !id.contains('/')).ok_or(format!("{target} is durable: name the object, \"id\""))?;
-            let name = format!("{target}/{id}");
+            let name = self.app.object_name(t, id);
             if name.len() > MAX_NAME {
                 return Err("id: too long".into());
             }
@@ -2281,7 +2339,26 @@ impl<E: Engine> Loop<'_, E> {
         } else {
             self.run_cell(origin, t, line("api"))
         };
-        r.map_err(|e| e.to_string())
+        r.map_err(|e: std::io::Error| e.to_string())
+    }
+
+    /// Each org's slices this round (`None`: one org, no limit).
+    fn round_share(&self) -> Option<usize> {
+        if self.app.router.legacy || self.tasks.len() <= ROUND {
+            return None;
+        }
+        let mut orgs: Vec<&str> = self.tasks.iter().map(|t| self.app.tenants[self.app.procs[t.cell.proc].tenant].org.as_str()).collect();
+        orgs.sort_unstable();
+        orgs.dedup();
+        (orgs.len() > 1).then(|| (ROUND / orgs.len()).max(1))
+    }
+
+    /// The env vars a process's cells get: its app's (no manifest: the node's).
+    fn environ_for(&self, proc: usize) -> Arc<Vec<Vec<u8>>> {
+        if self.app.router.legacy {
+            return self.sh.cfg.environ.clone();
+        }
+        self.app.tenants[self.app.procs[proc].tenant].environ.clone()
     }
 
     /// May process `proc` lease from pool `pool`? Its `owners` decide (with
@@ -2316,7 +2393,9 @@ impl<E: Engine> Loop<'_, E> {
             if self.core.is_some() {
                 return; // dropped while its request waited; the core failed it
             }
-            let db = match Db::open(&store::path_for(&self.sh.cfg.data, &name)) {
+            let path = store::path_for(&self.sh.cfg.data, &name);
+            let dirs = if path.exists() { Ok(vec![]) } else { store::make_dirs(&self.sh.cfg.data, &path) };
+            let db = match dirs.and_then(|d| Db::open(&path).map(|db| (db, d)).map_err(std::io::Error::other)) {
                 Ok(db) => db,
                 Err(e) => {
                     eprintln!("object {name:?}: can't open storage: {e}");
@@ -2326,7 +2405,9 @@ impl<E: Engine> Loop<'_, E> {
             };
             self.sh.stats.objects_live.fetch_add(1, Relaxed);
             self.sh.stats.objects_opened.fetch_add(1, Relaxed);
-            self.objects.insert(name.clone(), Object::new(db));
+            let mut o = Object::new(db.0);
+            o.new_dirs = db.1;
+            self.objects.insert(name.clone(), o);
         }
         let o = self.objects.get_mut(&name).unwrap();
         if o.busy || o.checkpointing {
@@ -2345,8 +2426,9 @@ impl<E: Engine> Loop<'_, E> {
     /// Begin one request on an object: its warm cell (or a fresh one), inside
     /// a transaction. `Ok(false)`: nothing to run (a stale alarm).
     fn run_object(&mut self, name: &str, origin: Origin, mut req: String) -> Result<bool, (u16, String)> {
-        let (eng, app, environ) = (self.eng, self.app, self.sh.cfg.environ.clone());
+        let (eng, app) = (self.eng, self.app);
         let proc = app.object_proc(name);
+        let environ = self.environ_for(proc);
         // WebSocket events say what they are in their text, the same here
         // and when forwarded from the node that holds the connection.
         let sock_of = |s: &str| s.trim_start_matches('/').parse::<u64>().ok();
@@ -2557,6 +2639,8 @@ impl<E: Engine> Loop<'_, E> {
     fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>) {
         let Some(name) = self.names.get(&obj).cloned() else { return };
         let path = store::path_for(&self.sh.cfg.data, &name);
+        // Its folder; durability here comes from the peers and the bucket.
+        let _ = store::make_dirs(&self.sh.cfg.data, &path);
         if self.remove_object(&name).is_some() {
             self.sh.stats.objects_live.fetch_sub(1, Relaxed);
         }

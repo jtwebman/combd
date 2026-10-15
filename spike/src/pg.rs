@@ -69,7 +69,8 @@ impl PoolCfg {
 
 impl PgCfg {
     /// The Postgres pools of a resolved manifest (`None`: there are none).
-    pub fn from_manifest(r: &crate::manifest::Resolved) -> Option<PgCfg> {
+    /// Named `<prefix>/<pool>` (`<org>/<app>`), so no two apps' pools meet.
+    pub fn from_manifest(r: &crate::manifest::Resolved, prefix: &str) -> Option<PgCfg> {
         let pools: Vec<PoolCfg> = r
             .pools
             .iter()
@@ -79,7 +80,7 @@ impl PgCfg {
                 let (p, m) = (&p.settings, &member.settings);
                 let n = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
                 Some(PoolCfg {
-                    name: name.clone(),
+                    name: format!("{prefix}/{name}"),
                     url: m["url"].as_str()?.to_string(),
                     max: n(&p["max"]) as usize,
                     wait_ms: n(&p["wait_ms"]),

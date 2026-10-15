@@ -75,10 +75,38 @@ pub struct Db {
 }
 
 /// Where an object's file lives. Names come from users, so the file name is
-/// the name in hex: no path tricks, no collisions.
+/// a hash of the name (SHA-256): no path tricks, no collisions, and no length
+/// limit. An app's objects (`<org>/<app>/...`) live in its own folder,
+/// `<org>/<app>/`, so an app's data can be found, sized, and deleted.
 pub fn path_for(dir: &Path, name: &str) -> PathBuf {
-    let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
-    dir.join(format!("{hex}.sqlite"))
+    use sha2::Digest;
+    let hex: String = sha2::Sha256::digest(name.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    let ident = |s: &str| !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    let mut parts = name.splitn(4, '/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(org), Some(app), Some(_), Some(_)) if ident(org) && ident(app) => dir.join(org).join(app).join(format!("{hex}.sqlite")),
+        _ => dir.join(format!("{hex}.sqlite")),
+    }
+}
+
+/// The folders between `dir` and an object's file that don't exist yet:
+/// made now, and fsynced (with their parents) once the object first commits,
+/// or a power cut could lose the new file.
+pub fn make_dirs(dir: &Path, file: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut new = vec![];
+    let mut p = file.parent();
+    while let Some(d) = p.filter(|d| d.starts_with(dir) && !d.exists()) {
+        new.push(d.to_path_buf());
+        p = d.parent();
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Each new folder, deepest first, then the one that held the topmost
+    // (with no new folders: the one the new file is in).
+    let top = new.last().and_then(|d| d.parent()).or(file.parent()).unwrap_or(dir).to_path_buf();
+    new.push(top);
+    Ok(new)
 }
 
 impl Db {
@@ -551,6 +579,13 @@ mod tests {
         let p = path_for(Path::new("/data"), "../../etc/passwd");
         assert_eq!(p.parent(), Some(Path::new("/data")));
         assert!(!p.to_string_lossy().contains(".."));
+        // An app's objects go in its folder; anything odd doesn't.
+        assert_eq!(path_for(Path::new("/data"), "acme/shop/room/r1").parent(), Some(Path::new("/data/acme/shop")));
+        assert_eq!(path_for(Path::new("/data"), "../x/room/r1").parent(), Some(Path::new("/data")));
+        assert_eq!(path_for(Path::new("/data"), "Acme/shop/room/r1").parent(), Some(Path::new("/data")));
+        assert_ne!(path_for(Path::new("/d"), "acme/shop/room/r1"), path_for(Path::new("/d"), "acme/shop/room/r2"));
+        // No length limit: the file name is always 64 hex digits.
+        assert_eq!(path_for(Path::new("/d"), &"x".repeat(5000)).file_name().unwrap().len(), 64 + ".sqlite".len());
     }
 
     #[test]

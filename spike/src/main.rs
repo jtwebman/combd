@@ -811,6 +811,16 @@ fn main_with(args: &[&str]) {
         ["langs", "aot"] => std::process::exit(if langs("aot", &aot::Aot) { 0 } else { 1 }),
         #[cfg(feature = "aot-lite")]
         [test, "aot"] => run(test, "aot", &aot::Aot),
+        // Every app under `root/<org>/<app>/`, one node, shared process.
+        ["serve-apps", engine, root, port] => {
+            let (root, port) = (std::path::Path::new(root), port.parse().unwrap());
+            match engine {
+                "interp" => http::serve_apps(&interp::Interp { max_pages: 16384 }, root, port),
+                #[cfg(feature = "aot-lite")]
+                "aot" => http::serve_apps(&aot::Aot, root, port),
+                _ => panic!("unknown engine (interp, aot)"),
+            }
+        }
         // An app: its manifest and modules in `dir`, the `dev` environment.
         ["serve-app", engine, dir, port] => {
             let (dir, port) = (std::path::Path::new(dir), port.parse().unwrap());
@@ -1899,11 +1909,11 @@ pools:
         std::fs::copy(GUEST_EV, manifest::module_path(&app.0, "api")).unwrap();
         std::fs::write(app.0.join("combd.dev.toml"), format!("[vars]\nREGION = \"us-east\"\n[secrets]\npg-url = {pg_url:?}\n")).unwrap();
         let eng = interp::Interp { max_pages: 16384 };
-        let (a, pg, environ) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let (a, pg) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
         let p = &pg.as_ref().unwrap().pools[0];
-        assert_eq!((p.name.as_str(), p.max, p.wait_ms, p.retries), ("main", 4, 2000, 0));
+        assert_eq!((p.name.as_str(), p.max, p.wait_ms, p.retries), ("local/shop/main", 4, 2000, 0), "pools are named for their app");
         let dir = store::tempdir::Dir::new();
-        let (port, _, _) = server_app(eng, http::Config { pg, environ: Arc::new(environ), ..cfg(&dir.0, 1) }, move |_| a);
+        let (port, _, _) = server_app(eng, http::Config { pg, ..cfg(&dir.0, 1) }, move |_| a);
         assert_eq!(http(port, "GET", "/env/REGION", ""), (200, "{\"value\":\"us-east\"}".into()));
         assert_eq!(http(port, "GET", "/env/PG_MAX", ""), (200, "{\"value\":\"4\"}".into()));
         assert_eq!(http(port, "GET", "/env/PG_URL", "").1, serde_json::json!({ "value": pg_url }).to_string(), "secrets are env vars too");
@@ -1917,7 +1927,7 @@ pools:
         // A mistake in the environment: nothing starts.
         std::fs::write(app.0.join("combd.dev.toml"), "[vars]\nREGION = \"Not Valid\"\n").unwrap();
         // (No unwrap_err: that would need Debug, and a pool's config holds its password.)
-        let Err(e) = http::app_settings(&app.0) else { panic!("a bad environment must not start") };
+        let Err(e) = http::load_app(&interp::Interp { max_pages: 16384 }, &app.0) else { panic!("a bad environment must not start") };
         assert!(e.contains("REGION") && e.contains("doesn't match") && e.contains("PG_URL: required"), "{e}");
     }
 
@@ -1949,12 +1959,12 @@ routes = ["/room/:id/*"]
         std::fs::create_dir(app.0.join("modules")).unwrap();
         std::fs::copy(GUEST_EV, manifest::module_path(&app.0, "ev")).unwrap();
         std::fs::copy(GUEST, manifest::module_path(&app.0, "classic")).unwrap();
-        let (a, pg, environ) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let (a, pg) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(a.progs.len(), 2, "one program per kind");
         let dir = store::tempdir::Dir::new();
         // One loop: an instance's memory is its own, so with two loops the
         // hit counts would depend on which loop took the connection.
-        let c = http::Config { pg, environ: Arc::new(environ), ..cfg(&dir.0, 1) };
+        let c = http::Config { pg, ..cfg(&dir.0, 1) };
         let (port, _, _) = server_app(eng, c, move |_| a);
         // Two processes on one module: their own instances, their own state.
         for n in 1..=3 {
@@ -1970,7 +1980,7 @@ routes = ["/room/:id/*"]
             assert_eq!(http(port, "POST", "/room/r1/incr", ""), (200, format!("{{\"count\":{n}}}")));
         }
         assert_eq!(http(port, "GET", "/room/r2/count", ""), (200, "{\"count\":0}".into()));
-        assert!(on_disk(&dir.0, "room/r1", "SELECT v FROM kv").contains("[[2]]"));
+        assert!(on_disk(&dir.0, "local/shop/room/r1", "SELECT v FROM kv").contains("[[2]]"));
         // Nothing else: no route, the old fixed routes, a route's prefix.
         for path in ["/nope", "/do/r1/count", "/room", "/hello/extra"] {
             assert_eq!(http(port, "GET", path, "").0, 404, "{path}");
@@ -2009,9 +2019,9 @@ routes = ["/admin/*"]
         std::fs::create_dir(app.0.join("modules")).unwrap();
         std::fs::copy(GUEST_EV, manifest::module_path(&app.0, "ev")).unwrap();
         std::fs::copy(GUEST, manifest::module_path(&app.0, "classic")).unwrap();
-        let (a, pg, environ) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let (a, pg) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
         let dir = store::tempdir::Dir::new();
-        let (port, _, _) = server_app(eng, http::Config { pg, environ: Arc::new(environ), ..cfg(&dir.0, 2) }, move |_| a);
+        let (port, _, _) = server_app(eng, http::Config { pg, ..cfg(&dir.0, 2) }, move |_| a);
         let call = |msg: serde_json::Value| -> serde_json::Value {
             let (code, body) = http(port, "POST", "/call", &msg.to_string());
             assert_eq!(code, 200, "{body}");
@@ -2056,6 +2066,135 @@ routes = ["/admin/*"]
     #[test]
     fn processes_call_and_send_on_aot() {
         processes_call_and_send(aot::Aot);
+    }
+
+    /// Six apps of three orgs on one node, all with the same processes and
+    /// the same object ids: nothing crosses between them, and one busy org
+    /// can't crowd out another.
+    #[test]
+    fn six_tenants_share_a_node_and_nothing_else() {
+        let root = store::tempdir::Dir::new();
+        let apps: Vec<(String, String)> = ["acme", "globex", "initech"].iter().flat_map(|o| ["shop", "blog"].iter().map(move |a| (o.to_string(), a.to_string()))).collect();
+        let manifest = |org: &str, app: &str| {
+            format!(r#"
+[app]
+name = "{app}"
+domains = ["{app}.{org}.test"]
+[vars]
+TENANT = {{ type = "string" }}
+[processes.api]
+kind = "ev"
+routes = ["/env/*", "/call", "/pg/q"]
+[processes.worker]
+kind = "classic"
+routes = ["/api/*"]
+callers = ["api"]
+[processes.room]
+kind = "classic"
+durable = true
+routes = ["/room/:id/*"]
+callers = ["api"]
+"#)
+        };
+        let mut dirs = vec![];
+        for (org, app) in &apps {
+            let d = root.0.join(org).join(app);
+            std::fs::create_dir_all(d.join("modules")).unwrap();
+            let mut m = manifest(org, app);
+            // One app has a pool; the others must never reach it.
+            if (org.as_str(), app.as_str()) == ("acme", "shop") {
+                m = m.replace("[processes.room]", "[processes.pg-conn]\nkind = \"combd:postgres\"\nurl = \"postgres://nobody@127.0.0.1:1/x\"\n[pools.main]\nmember = \"pg-conn\"\nowners = [\"api\"]\n[processes.room]");
+            }
+            std::fs::write(d.join("combd.toml"), m).unwrap();
+            std::fs::write(d.join("combd.dev.toml"), format!("[vars]\nTENANT = \"{org}/{app}\"\n")).unwrap();
+            std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
+            std::fs::copy(GUEST, manifest::module_path(&d, "classic")).unwrap();
+            dirs.push((org.clone(), d));
+        }
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, pg) = http::load_apps(&eng, &dirs).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((a.tenants.len(), a.procs.len(), a.progs.len()), (6, 18, 2), "six apps, two programs: the same bytes load once");
+        let data = store::tempdir::Dir::new();
+        // One loop, so the fairness check below shares one run queue.
+        let (port, _, _) = server_app(eng, http::Config { pg, ..cfg(&data.0, 1) }, move |_| a);
+        let host = |org: &str, app: &str| format!("{app}.{org}.test");
+        for (i, (org, app)) in apps.iter().enumerate() {
+            let h = host(org, app);
+            // Its own env vars.
+            assert_eq!(http_to(port, &h, "GET", "/env/TENANT", ""), (200, format!("{{\"value\":\"{org}/{app}\"}}")));
+            // Its own objects: the same id, a different count in each app.
+            for _ in 0..=i {
+                assert_eq!(http_to(port, &h, "POST", "/room/r1/incr", "").0, 200);
+            }
+        }
+        for (i, (org, app)) in apps.iter().enumerate() {
+            let h = host(org, app);
+            assert_eq!(http_to(port, &h, "GET", "/room/r1/count", "").1, format!("{{\"count\":{}}}", i + 1), "{org}/{app}");
+            assert!(on_disk(&data.0, &format!("{org}/{app}/room/r1"), "SELECT v FROM kv").contains(&format!("[[{}]]", i + 1)));
+            assert!(data.0.join(org).join(app).is_dir(), "its own folder");
+            // Its own processes: `room` and `worker` are always its own.
+            let (_, body) = http_to(port, &h, "POST", "/call", &serde_json::json!({ "to": "room", "id": "r1", "method": "GET", "path": "/count" }).to_string());
+            assert!(body.contains(&format!("{{\\\"count\\\":{}}}", i + 1)), "{org}/{app}: {body}");
+            let (_, body) = http_to(port, &h, "POST", "/call", &serde_json::json!({ "to": "worker", "method": "GET", "path": "/api/users/1" }).to_string());
+            assert!(body.contains("\"status\":200"), "{body}");
+            // Never another app's pool.
+            if (org.as_str(), app.as_str()) != ("acme", "shop") {
+                let (_, body) = http_to(port, &h, "POST", "/pg/q", "{\"q\":\"SELECT 1\"}");
+                assert!(body.contains("isn't an owner of pool main"), "{org}/{app}: {body}");
+            }
+        }
+        // Only its domains: an unknown host, or another app's path, is a 404.
+        assert_eq!(http_to(port, "nobody.test", "GET", "/env/TENANT", "").0, 404);
+        assert_eq!(http_to(port, "x", "GET", "/room/r1/count", "").0, 404);
+        // Fairness: acme floods with 100 slow requests while globex sends 6.
+        // Shared by request, globex would finish with everyone else; shared
+        // by org, its batch is done long before acme's.
+        let mut n = 20;
+        loop {
+            let t = Instant::now();
+            assert_eq!(http_to(port, &host("acme", "shop"), "GET", &format!("/api/fib/{n}"), "").0, 200);
+            if t.elapsed() >= Duration::from_millis(20) || n >= 32 {
+                break;
+            }
+            n += 1;
+        }
+        let start = Instant::now();
+        let batch = |h: String, count: usize| {
+            let path = format!("/api/fib/{n}");
+            std::thread::spawn(move || {
+                let hs: Vec<_> = (0..count).map(|_| {
+                    let (h, p) = (h.clone(), path.clone());
+                    std::thread::spawn(move || http_to(port, &h, "GET", &p, "").0)
+                }).collect();
+                assert!(hs.into_iter().all(|h| h.join().unwrap() == 200));
+                start.elapsed()
+            })
+        };
+        let acme = batch(host("acme", "shop"), 100);
+        std::thread::sleep(Duration::from_millis(30));
+        let globex = batch(host("globex", "shop"), 6);
+        let (ta, tg) = (acme.join().unwrap(), globex.join().unwrap());
+        eprintln!("fairness: globex's 6 done in {tg:?}, acme's 100 in {ta:?}");
+        assert!(tg.as_secs_f64() < ta.as_secs_f64() * 0.6, "globex took {tg:?}, acme {ta:?}");
+    }
+
+    #[test]
+    fn apps_must_not_share_domains() {
+        let root = store::tempdir::Dir::new();
+        let mk = |org: &str, app: &str, domains: &str| {
+            let d = root.0.join(org).join(app);
+            std::fs::create_dir_all(d.join("modules")).unwrap();
+            std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
+            std::fs::write(d.join("combd.toml"), format!("[app]\nname = \"{app}\"\n{domains}\n[processes.api]\nkind = \"ev\"\nroutes = [\"/*\"]\n")).unwrap();
+            (org.to_string(), d)
+        };
+        let eng = interp::Interp { max_pages: 16384 };
+        let two = [mk("a", "x", "domains = [\"same.test\"]"), mk("b", "y", "domains = [\"same.test\"]")];
+        let Err(e) = http::load_apps(&eng, &two) else { panic!("two apps on one domain") };
+        assert!(e.contains("domain same.test is already a/x's"), "{e}");
+        let nodomain = [mk("c", "x", "domains = [\"c.test\"]"), mk("d", "y", "")];
+        let Err(e) = http::load_apps(&eng, &nodomain) else { panic!("an app with no domains, among others") };
+        assert!(e.contains("d/y: with more than one app, each one names its domains"), "{e}");
     }
 
     #[test]

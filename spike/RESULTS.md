@@ -1432,6 +1432,42 @@ their process and on disk as `room/r1`, and 404s), `routes_pick_the_most_
 specific`, and the parser fuzzer now runs every mangled request through a
 manifest's routes too.
 
+## Many tenants on one node (shared process)
+
+`combd-spike serve-apps <engine> <root> <port>` serves every app under
+`<root>/<org>/<app>/`. The org is the tenant, and comes from who deployed
+(in a fleet, the account; here, the folder), never from an app's manifest,
+where anyone could write any org. Everything is scoped to its app:
+- objects are `<org>/<app>/<process>/<id>`, stored under `<org>/<app>/`;
+- pools are `<org>/<app>/<pool>` (a cell still says `"db": "main"`);
+- env vars and secrets are per app; `call`s and leases resolve only inside
+  the caller's app, so there is no way to even name another app's process;
+- each app lists its `domains`; its routes answer only on them, and no two
+  apps may share one (an app with no domains is allowed only when alone).
+- The same module bytes in many apps load once (hashed).
+- **Fairness is per org:** when more than 64 slices are queued and more
+  than one org has work, each round gives every org an equal share. An org
+  that needs less gets all it needs. An org with 50 apps gets one share.
+
+Object file names are now a SHA-256 of the name (in the app's folder), so
+there's no length limit. **And a durability gap closed:** a new object's
+folders (and the folder holding its file) were never fsynced, so on some
+file systems a power cut right after its first answer could lose the new
+file. Now its first commit fsyncs them before any answer leaves.
+
+**Test `six_tenants_share_a_node_and_nothing_else`:** 3 orgs, 2 apps each,
+all with the same `api`, `worker`, and `room` processes and the same object
+id: each sees only its own env var, count, folder, and processes; none can
+use the one app's pool; unknown hosts get 404s; six apps load two programs.
+Fairness, 100 slow requests from acme against 6 from globex on one loop:
+globex's batch finished in about 0.54 s and acme's in 1.41 s (three runs).
+With fairness turned off, both finished together at 1.62 s, which the test
+fails. `apps_must_not_share_domains` covers the load-time checks.
+
+Not yet: one process per tenant (needed before strangers share a node:
+cells in one process can leak through CPU timing), per-org caps on memory
+and in-flight requests, per-app stats, and environments in the name.
+
 ## Event cells: many requests per instance
 
 A Worker that exports `on_request` is an event cell (`guest-ev/`), like a

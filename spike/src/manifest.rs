@@ -72,6 +72,9 @@ enum Side {
 #[derive(Debug)]
 pub struct Manifest {
     pub app: String,
+    /// The hosts its routes answer on. With more than one app on a node,
+    /// every app names its own, and no two share one.
+    pub domains: Vec<String>,
     pub vars: BTreeMap<String, Spec>,
     pub secrets: BTreeMap<String, Spec>,
     pub processes: BTreeMap<String, Process>,
@@ -278,8 +281,23 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
     if !ident(&name) {
         errs.push(format!("app.name {name:?}: use lowercase letters, digits, - and _ (at most 63)"));
     }
-    for k in app.keys().filter(|k| *k != "name") {
+    for k in app.keys().filter(|k| *k != "name" && *k != "domains") {
         errs.push(format!("app.{k}: unknown key"));
+    }
+    let mut domains = vec![];
+    match app.get("domains") {
+        None => {}
+        Some(Json::Array(list)) => {
+            for d in list {
+                let ok = d.as_str().filter(|h| parse_route(&format!("{h}/")).is_ok_and(|r| r.host.is_some()));
+                match ok {
+                    Some(h) if !domains.iter().any(|x: &String| x == h) => domains.push(h.to_string()),
+                    Some(h) => errs.push(format!("app.domains: {h} twice")),
+                    None => errs.push(format!("app.domains: {d}: want a lowercase host name like shop.example.com")),
+                }
+            }
+        }
+        Some(_) => errs.push("app.domains: want a list of host names".into()),
     }
     let specs = |side: Side, sect: &str, errs: &mut Vec<String>| -> BTreeMap<String, Spec> {
         let mut out = BTreeMap::new();
@@ -411,8 +429,15 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
             errs.push(format!("processes.{n}: nothing can reach it ({})", if p.kind.starts_with("combd:") { "no pool hands it out" } else { "no routes, and no callers" }));
         }
     }
+    for p in processes.values() {
+        for r in &p.routes {
+            if let Some(h) = r.host.as_ref().filter(|h| !domains.is_empty() && !domains.contains(h)) {
+                errs.push(format!("route {}: {h} isn't one of app.domains", r.text));
+            }
+        }
+    }
     if errs.is_empty() {
-        Ok(Manifest { app: name, vars, secrets, processes, pools })
+        Ok(Manifest { app: name, domains, vars, secrets, processes, pools })
     } else {
         Err(errs)
     }
