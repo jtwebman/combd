@@ -25,9 +25,11 @@
 (* slots up to k trimmed. A trimmed slot's key is gone, so it's empty      *)
 (* again: a slow writer whose check was based on an old head could write  *)
 (* it, and "only if empty" would let it. So after a write, the writer      *)
-(* reads the snapshot: if it covers the slot, the write didn't count (no   *)
-(* reader will ever look there); check again and retry. A node too far    *)
-(* behind loads the snapshot instead of the trimmed slots.                 *)
+(* reads the snapshot: if it covers the slot, the write didn't count;      *)
+(* check again and retry. But the stray bytes are in the slot now, and a   *)
+(* reader catching up could read them: so a reader, too, reads the        *)
+(* snapshot again after reading slots, and if it covers them, starts from  *)
+(* the snapshot instead. (The simulator found the reader's half of this.)  *)
 (*                                                                         *)
 (* Leases, heartbeats, and leaders aren't modeled: they're for liveness    *)
 (* (who pushes, who notices a node is down). Safety must hold without them.*)
@@ -43,6 +45,7 @@ CONSTANTS Nodes, Apps, Domains, MaxLog,
           BUG_APPLY_ANY_ORDER,   \* apply a push whatever its place in the log
           BUG_TRIM_NO_GATE,      \* acknowledge a write without checking the snapshot
           BUG_TRIM_EARLY,        \* trim slots the snapshot doesn't cover yet
+          BUG_READ_NO_GATE,      \* catch up without reading the snapshot again
           BUG_UNCOVERED_CHECK    \* check against this node's copy, but write at the
                                  \* log's head: the conditional write doesn't cover
                                  \* what was checked (per-app pointers, the first design)
@@ -52,11 +55,12 @@ Changes == [app : Apps, dom : Domains]
 VARIABLES
     log,                \* the bucket: the log (all of it, for the invariants),
     snapAt, trimmed,    \* a snapshot of the state at slot snapAt, slots up to trimmed gone
+    stray,              \* what a slow writer put in a trimmed slot: slot -> change
     phase, base, want,  \* each writer: its step, the head it read, its change
     copy, pushes,       \* each node's copy, and pushes on the way
     acked               \* history, for the invariants: changes acknowledged
 
-vars == <<log, snapAt, trimmed, phase, base, want, copy, pushes, acked>>
+vars == <<log, snapAt, trimmed, stray, phase, base, want, copy, pushes, acked>>
 
 Range(s) == {s[i] : i \in DOMAIN s}
 IsPrefix(a, b) == Len(a) <= Len(b) /\ SubSeq(b, 1, Len(a)) = a
@@ -73,6 +77,7 @@ Init ==
     /\ log = <<>>
     /\ snapAt = 0
     /\ trimmed = 0
+    /\ stray = [k \in {} |-> want]
     /\ phase = [n \in Nodes |-> "idle"]
     /\ base = [n \in Nodes |-> 0]
     /\ want = [n \in Nodes |-> [app |-> CHOOSE a \in Apps : TRUE, dom |-> CHOOSE d \in Domains : TRUE]]
@@ -92,7 +97,7 @@ Prepare(n, c) ==
     /\ want' = [want EXCEPT ![n] = c]
     /\ phase' = [phase EXCEPT ![n] = "write"]
     /\ acked' = IF BUG_ACK_BEFORE_WRITE THEN acked \cup {c} ELSE acked
-    /\ UNCHANGED <<log, snapAt, trimmed, copy, pushes>>
+    /\ UNCHANGED <<log, snapAt, trimmed, stray, copy, pushes>>
 
 \* Write slot base+1, only if it's empty. Then acknowledge, and push it.
 Write(n) ==
@@ -103,18 +108,21 @@ Write(n) ==
        THEN /\ log' = Append(log, want[n])
             /\ acked' = acked \cup {want[n]}
             /\ pushes' = pushes \cup {[to |-> m, at |-> base'[n] + 1, c |-> want[n]] : m \in Nodes}
+            /\ UNCHANGED stray
        \* A trimmed slot is empty again, so the write lands, where nobody will
        \* ever read it. The snapshot covers it: unless that check is skipped,
        \* the write doesn't count.
-       ELSE IF base'[n] + 1 <= trimmed
+       ELSE IF base'[n] + 1 <= trimmed /\ base'[n] + 1 \notin DOMAIN stray
             THEN /\ acked' = IF BUG_TRIM_NO_GATE THEN acked \cup {want[n]} ELSE acked
+                 /\ stray' = [k \in DOMAIN stray \cup {base'[n] + 1} |-> IF k = base'[n] + 1 THEN want[n] ELSE stray[k]]
                  /\ UNCHANGED <<log, pushes>>
        ELSE IF BUG_BLIND_SLOT /\ Len(log) >= base'[n] + 1
             THEN /\ log' = [log EXCEPT ![base'[n] + 1] = want[n]]
                  /\ acked' = acked \cup {want[n]}
                  /\ pushes' = pushes \cup {[to |-> m, at |-> base'[n] + 1, c |-> want[n]] : m \in Nodes}
+                 /\ UNCHANGED stray
             \* Taken: someone wrote first. Start over: read, check again.
-            ELSE UNCHANGED <<log, acked, pushes>>
+            ELSE UNCHANGED <<log, acked, pushes, stray>>
     /\ phase' = [phase EXCEPT ![n] = "idle"]
     /\ UNCHANGED <<snapAt, trimmed, want, copy>>
 
@@ -122,7 +130,7 @@ Write(n) ==
 GiveUp(n) ==
     /\ phase[n] = "write"
     /\ phase' = [phase EXCEPT ![n] = "idle"]
-    /\ UNCHANGED <<log, snapAt, trimmed, base, want, copy, pushes, acked>>
+    /\ UNCHANGED <<log, snapAt, trimmed, stray, base, want, copy, pushes, acked>>
 
 \* A push arrives: applied if it's the next entry; a duplicate or a later one
 \* waits for the bucket. It may be kept (to arrive again) or dropped.
@@ -133,40 +141,44 @@ Deliver(p) ==
                ELSE copy
     /\ \E keep \in BOOLEAN : pushes' = IF keep THEN pushes ELSE pushes \ {p}
     /\ Len(copy'[p.to]) <= MaxLog
-    /\ UNCHANGED <<log, snapAt, trimmed, phase, base, want, acked>>
+    /\ UNCHANGED <<log, snapAt, trimmed, stray, phase, base, want, acked>>
 
 Lose(p) ==
     /\ p \in pushes
     /\ pushes' = pushes \ {p}
-    /\ UNCHANGED <<log, snapAt, trimmed, phase, base, want, copy, acked>>
+    /\ UNCHANGED <<log, snapAt, trimmed, stray, phase, base, want, copy, acked>>
 
-\* Catch up from the bucket: the next entry this node doesn't have, or, if
-\* that slot is trimmed, the snapshot (the state at snapAt).
+\* Catch up from the bucket: read the next slot. If it's trimmed, what's
+\* there (if anything) is a stray write that never counted: reading the
+\* snapshot again shows it's covered, so the node starts from the snapshot
+\* (the state at snapAt). The bug skips that, and takes the stray bytes.
 Fetch(n) ==
     /\ Len(copy[n]) < Len(log)
     /\ LET next == Len(copy[n]) + 1
        IN IF next > trimmed
           THEN copy' = [copy EXCEPT ![n] = Append(@, log[next])]
-          ELSE /\ snapAt > Len(copy[n])
-               /\ copy' = [copy EXCEPT ![n] = SubSeq(log, 1, snapAt)]
-    /\ UNCHANGED <<log, snapAt, trimmed, phase, base, want, pushes, acked>>
+          ELSE IF BUG_READ_NO_GATE /\ next \in DOMAIN stray
+               THEN copy' = [copy EXCEPT ![n] = Append(@, stray[next])]
+               ELSE /\ snapAt > Len(copy[n])
+                    /\ copy' = [copy EXCEPT ![n] = SubSeq(log, 1, snapAt)]
+    /\ UNCHANGED <<log, snapAt, trimmed, stray, phase, base, want, pushes, acked>>
 
 \* A node writes a snapshot of its copy (the state at its length).
 Snapshot(n) ==
     /\ Len(copy[n]) > snapAt
     /\ snapAt' = Len(copy[n])
-    /\ UNCHANGED <<log, trimmed, phase, base, want, copy, pushes, acked>>
+    /\ UNCHANGED <<log, trimmed, stray, phase, base, want, copy, pushes, acked>>
 
 \* Trim: delete the slots the snapshot covers (or, the bug, more).
 Trim ==
     /\ \E k \in (trimmed + 1)..(IF BUG_TRIM_EARLY THEN Len(log) ELSE snapAt) : trimmed' = k
-    /\ UNCHANGED <<log, snapAt, phase, base, want, copy, pushes, acked>>
+    /\ UNCHANGED <<log, snapAt, stray, phase, base, want, copy, pushes, acked>>
 
 \* A node crashes: its copy survives on disk, or (in memory) is gone.
 Crash(n) ==
     /\ \E keep \in BOOLEAN : copy' = IF keep THEN copy ELSE [copy EXCEPT ![n] = <<>>]
     /\ phase' = [phase EXCEPT ![n] = "idle"]
-    /\ UNCHANGED <<log, snapAt, trimmed, base, want, pushes, acked>>
+    /\ UNCHANGED <<log, snapAt, trimmed, stray, base, want, pushes, acked>>
 
 Next ==
     \/ \E n \in Nodes, c \in Changes : Prepare(n, c)

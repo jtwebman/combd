@@ -12,6 +12,8 @@ mod admin;
 mod aot;
 mod aot_gen;
 mod app;
+mod catalog;
+mod catsim;
 mod deploy;
 mod engine;
 mod fleet;
@@ -702,6 +704,32 @@ fn main_with(args: &[&str]) {
             }
         }
         // The ownership simulator: `sim [seeds|A..B] [bug|none] [replicas] [splits|only-splits] [wipes]`.
+        // The catalog's simulator: `catsim N [bug]`.
+        ["catsim", n, ref rest @ ..] => {
+            let n: u64 = n.parse().unwrap();
+            let mut bugs = catalog::Bugs::default();
+            match rest.first().copied() {
+                Some("ack_before_write") => bugs.ack_before_write = true,
+                Some("blind_slot") => bugs.blind_slot = true,
+                Some("apply_any_order") => bugs.apply_any_order = true,
+                Some("uncovered_check") => bugs.uncovered_check = true,
+                Some("trim_no_gate") => bugs.trim_no_gate = true,
+                Some("trim_early") => bugs.trim_early = true,
+                Some("read_no_gate") => bugs.read_no_gate = true,
+                Some(b) => panic!("unknown bug {b}"),
+                None => {}
+            }
+            let t = Instant::now();
+            let (st, bad) = catsim::run_many(0..n, bugs);
+            println!("catsim   {n} seeds in {:.1} s: {st:?}", t.elapsed().as_secs_f64());
+            match bad {
+                Some((seed, e)) => {
+                    println!("catsim   seed {seed}: {e}");
+                    std::process::exit(1);
+                }
+                None => println!("catsim   every invariant held"),
+            }
+        }
         ["sim", ..] => {
             // `N` seeds from 0, or `A..B` to replay some.
             let seeds = match args.get(1).and_then(|v| v.split_once("..")) {

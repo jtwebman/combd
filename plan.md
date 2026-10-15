@@ -1154,10 +1154,15 @@ object), or one combined upload per node every 5 to 30 s (cost by node, not
 object). The longer the wait, the longer the newest writes live only on
 the two peers. Comes right after the catalog, with the replication spec's
 timing checked again. **The node's operator decides:** `COMBD_UPLOAD_MS`
-(default 10 s, capped at about 5 minutes; 0 is today's as-fast-as-it-
-answers) and `COMBD_UPLOAD_BYTES` (upload early at this much, default 1 MB).
+(default 10 s; no cap, but a warning in the logs above 5 minutes; 0 is
+today's as-fast-as-it-answers) and `COMBD_UPLOAD_BYTES` (upload early at this much, default 1 MB).
 Maybe later a per-app setting in the manifest, shorter than the node's,
-never longer.
+never longer. "Never upload" (memory only, durable in the peers alone,
+across data centers) is a different mode, not a big number: peers drop
+entries only once the bucket has them, so with no uploads they'd keep
+every write forever, and a takeover would replay all of it. It needs
+snapshots and compaction among the peers, more peers (3 to 5 across
+zones), its own spec check, and a loud warning. Later, if wanted.
 
 **Storage behind a small interface, two roles.** The cores only ask for
 get, put-if-unchanged, put-if-absent, delete, and list; only the S3 client

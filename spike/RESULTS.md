@@ -1432,6 +1432,33 @@ their process and on disk as `room/r1`, and 404s), `routes_pick_the_most_
 specific`, and the parser fuzzer now runs every mangled request through a
 manifest's routes too.
 
+## The catalog: core and simulator
+
+`spike/src/catalog.rs` is the catalog's decision core (no I/O), and
+`spike/src/catsim.rs` runs it on three nodes against a fake bucket where a
+deleted key is simply gone: calls of 1 to 50 ms (sometimes 500), lost
+requests and replies, lost, repeated, and reordered pushes, crashes that
+keep or lose a node's copy, and random snapshots that trim the log. An
+oracle checks the spec's invariants after every step, and, once the faults
+stop, that every node has caught up to the whole log (which the spec
+doesn't check). A lost reply to a write is followed by reading the slot
+back (entries carry an id), never a blind retry.
+
+**It found a hole in the protocol and the spec.** A node catching up read a
+trimmed slot just as a slow writer filled it with an entry whose own check
+would reject it, and applied it: its copy held a change that was never in
+the log (seed 703 of the first long run). The spec let only writers meet a
+trimmed slot; readers read the true log, not the bucket's bytes. Now a
+reader holds what it read, reads the snapshot again, and if it covers any
+of it, starts from the snapshot. Both the code and the spec have it, and a
+seventh known-bad version (no second read) must fail in both.
+
+`combd-spike catsim 5000`: 518,510 acknowledged writes, 45,000 snapshots,
+15,000 crashes, every invariant held, every node caught up. Each of the
+seven known-bad versions is caught, the same way TLC catches it, except
+"trim too early", which the code shows is worse than the spec says: it
+loses acknowledged writes, not just strands a node.
+
 ## Deploys
 
 combd knows nothing about people: only tokens and what each may do. Users,

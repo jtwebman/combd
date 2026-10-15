@@ -29,7 +29,7 @@ fail() {
     done
 }
 pass MCCatalog MCCatalog
-fail MCCatalog CatAckBeforeWrite CatBlindSlot CatApplyAnyOrder CatUncoveredCheck CatTrimNoGate CatTrimEarly
+fail MCCatalog CatAckBeforeWrite CatBlindSlot CatApplyAnyOrder CatUncoveredCheck CatTrimNoGate CatTrimEarly CatReadNoGate
 pass MCOwnership MCOwnership
 fail MCOwnership BugSkipProof BugLoadBeforeCas BugNoManifest BugReuseEpoch
 pass MCReplication MCReplication

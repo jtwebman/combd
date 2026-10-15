@@ -14,15 +14,19 @@ crash and keep its copy (disk) or lose it (memory).
 The log is trimmed: a node writes a snapshot (the state at slot k, from its
 copy), and only then are slots up to k deleted. A deleted slot is empty
 again, so a slow writer whose check used an old head could write it, and
-"only if empty" would let it, into a place no reader will ever look. So
-after a write, the writer reads the snapshot: if it covers the slot, the
-write didn't count, and it checks again. A node too far behind loads the
-snapshot.
+"only if empty" would let it. So after a write, the writer reads the
+snapshot: if it covers the slot, the write didn't count, and it checks
+again. But the stray bytes stay in the slot, and a node catching up could
+read them: so a reader, too, reads the snapshot again after reading slots,
+and if it covers them, starts from the snapshot instead. The first version
+of this spec let only writers meet a trimmed slot (readers read the true
+log, not the bucket's bytes); the simulator found the reader's half, and
+the spec has it now.
 
 Four invariants: no acknowledged change is lost, every node's copy is the
 start of the log, no two apps ever hold one domain (in the log or any
-copy), and every node can still catch up. 14.6 million states, no errors.
-Six known-bad versions must fail:
+copy), and every node can still catch up. 58.2 million states, no errors
+(13 minutes). Seven known-bad versions must fail:
 
 | Bug | Caught by |
 |---|---|
@@ -32,6 +36,7 @@ Six known-bad versions must fail:
 | check against this node's copy, but write at the head | OneAppPerDomain |
 | acknowledge a write without checking the snapshot | NoLostAckedChange |
 | trim slots the snapshot doesn't cover yet | CanCatchUp |
+| catch up without reading the snapshot again | CopyIsPrefix |
 
 The last is the first deploy design: each app's own pointer, checked
 against the deploying node's view. Two deploys on two nodes could both
