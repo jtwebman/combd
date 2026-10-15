@@ -6,7 +6,8 @@
 //! stack per cell or deopt to the interpreter (see the plan's AOT tier).
 
 use crate::engine::{CellVm, Engine, Import, Outcome};
-use crate::host::{self, HostState, Mem};
+use crate::host::{self, DbOp, HostState, Mem};
+use std::sync::{Arc, Mutex};
 use combd_aot::rt::{Ctx, Host, Mem as AotMem};
 use combd_aot::Compiled;
 
@@ -38,20 +39,47 @@ impl Mem for SliceMem<'_> {
     }
 }
 
-#[derive(Clone)]
 struct AotHost {
     imports: Vec<Import>,
     st: HostState,
+    mail: Arc<Mutex<Mail>>,
+}
+
+/// A database call between a paused compiled cell and its event loop. While
+/// the call runs on its fiber, the loop can't reach the cell's host state,
+/// so the request and the answer pass through here.
+#[derive(Default)]
+struct Mail {
+    pending: Option<DbOp>,
+    answer: Option<(u64, Vec<u8>)>,
 }
 
 impl Host for AotHost {
     fn call(&mut self, import: u32, args: &[u64], mem: &mut [u8]) -> Result<u64, String> {
         let imp = self.imports.get(import as usize).ok_or("unknown import")?;
+        // Only a cell on a fiber can pause inside a host call.
+        self.st.can_park = cfg!(feature = "aot-guard");
         let r = host::call(imp, args, &mut SliceMem(mem), &mut self.st)?;
+        #[cfg(feature = "aot-guard")]
+        if let Some(op) = self.st.pending.take() {
+            self.mail.lock().unwrap().pending = Some(op);
+            // Pause until the loop has the answer (it parks this cell; it
+            // doesn't resume it before then).
+            loop {
+                if !combd_aot::fiber::yield_now() {
+                    self.mail.lock().unwrap().pending = None;
+                    return Err(format!("{}: a database call needs a pausable cell", imp.name));
+                }
+                if let Some((v, out)) = self.mail.lock().unwrap().answer.take() {
+                    self.st.pg_out = out;
+                    return Ok(v);
+                }
+            }
+        }
         Ok(r.first().copied().unwrap_or(0))
     }
     fn boxed_clone(&self) -> Box<dyn Host> {
-        Box::new(self.clone())
+        Box::new(AotHost { imports: self.imports.clone(), st: self.st.clone(), mail: Default::default() })
     }
     fn as_any(&mut self) -> &mut dyn std::any::Any {
         self
@@ -64,6 +92,7 @@ impl Host for AotHost {
 pub struct AotVm {
     /// The cell between calls. `None` while a call is in flight on its fiber.
     state: Option<(Ctx, AotMem)>,
+    mail: Arc<Mutex<Mail>>,
     m: &'static Compiled,
     pending: Option<(u32, Vec<u64>)>,
     #[cfg(feature = "aot-guard")]
@@ -101,10 +130,12 @@ impl Engine for Aot {
 
     fn spawn(&self, m: &&'static Compiled) -> Result<AotVm, String> {
         let imports = m.imports.iter().map(|(md, n, r)| Import { module: md.to_string(), name: n.to_string(), results: *r }).collect();
-        let host = Box::new(AotHost { imports, st: HostState::default() });
+        let mail: Arc<Mutex<Mail>> = Default::default();
+        let host = Box::new(AotHost { imports, st: HostState::default(), mail: mail.clone() });
         let (c, mem) = (m.new)(host).map_err(|t| t.to_string())?;
         Ok(AotVm {
             state: Some((c, mem)),
+            mail,
             m,
             pending: None,
             #[cfg(feature = "aot-guard")]
@@ -220,11 +251,26 @@ impl CellVm for AotVm {
         c.host.as_any().downcast_mut::<AotHost>().map(|h| &mut h.st)
     }
 
+    fn db_pending(&mut self) -> Option<DbOp> {
+        self.mail.lock().unwrap().pending.take()
+    }
+
+    fn db_done(&mut self, value: u64, out: Vec<u8>) {
+        self.mail.lock().unwrap().answer = Some((value, out));
+    }
+
     /// Between calls a compiled cell is plain data, so it can be copied.
     fn snapshot(&self) -> Option<AotVm> {
         let (c, mem) = self.state.as_ref()?;
+        // The copy gets its own mailbox, shared with its own host.
+        let mut c = c.clone();
+        let mail: Arc<Mutex<Mail>> = Default::default();
+        if let Some(h) = c.host.as_any().downcast_mut::<AotHost>() {
+            h.mail = mail.clone();
+        }
         self.pending.is_none().then(|| AotVm {
-            state: Some((c.clone(), mem.clone())),
+            state: Some((c, mem.clone())),
+            mail,
             m: self.m,
             pending: None,
             #[cfg(feature = "aot-guard")]

@@ -50,6 +50,14 @@ pub trait CellVm {
     fn host_state(&mut self) -> Option<&mut crate::host::HostState> {
         None
     }
+    /// A database call this cell is waiting on, for engines that pause
+    /// inside a host call (the compiled tier's fibers). The interpreter
+    /// leaves it in its `HostState` instead.
+    fn db_pending(&mut self) -> Option<crate::host::DbOp> {
+        None
+    }
+    /// The answer to that call: the import's result, and what `pg_read` gets.
+    fn db_done(&mut self, _value: u64, _out: Vec<u8>) {}
     /// A full copy of the cell, even mid-call. `None` if the engine can't.
     fn snapshot(&self) -> Option<Self>
     where

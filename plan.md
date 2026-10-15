@@ -1023,6 +1023,11 @@ What changes as the fleet grows:
    object's storage, so it survives a takeover. Next: numbers. See
    [spike/RESULTS.md](spike/RESULTS.md).
 5. **Bring your own database.** Host-owned pools, Postgres first.
+   **Started 2026-10-15:** pooled statements, and pinned handles: a Worker's
+   lasts its request, a Durable Object's lasts across messages, with
+   transactions, row locks, and advisory locks. Cells wait paused (both
+   engines). Next: TLS, a fleet-wide cap, LISTEN/NOTIFY. See
+   [spike/RESULTS.md](spike/RESULTS.md).
 6. **Fast fleet writes (D3).** Done early, as part of step 3 (see "What
    building taught us").
 7. **JavaScript** (our JS-to-Rust compiler, Workers APIs next), then **more

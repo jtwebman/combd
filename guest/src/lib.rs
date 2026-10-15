@@ -163,6 +163,24 @@ pub mod api {
                 let n: u32 = n.parse::<u32>().unwrap_or(0).min(40);
                 format!("200 {{\"n\":{n},\"fib\":{}}}", super::fib(n))
             }
+            // Postgres from a Worker: one pooled statement; or a list of
+            // them on one handle, in this request (a transaction, if the list
+            // says BEGIN ... COMMIT). `tx-crash` runs the list, then panics:
+            // the host must roll it back.
+            ("POST", ["api", "pg", "q"]) => format!("200 {}", super::pg::query(0, body)),
+            ("POST", ["api", "pg", route @ ("tx" | "tx-crash")]) => {
+                let list: Vec<serde_json::Value> = serde_json::from_str(body).unwrap_or_default();
+                let h = match super::pg::open("main") {
+                    Ok(h) => h,
+                    Err(e) => return format!("503 {e}"),
+                };
+                let out: Vec<serde_json::Value> = list.iter().map(|q| serde_json::from_str(&super::pg::query(h, &q.to_string())).unwrap_or_default()).collect();
+                if *route == "tx-crash" {
+                    panic!("crash inside a transaction");
+                }
+                super::pg::close(h);
+                format!("200 {}", serde_json::Value::Array(out))
+            }
             _ => "404 {\"error\":\"not found\"}".into(),
         }
     }
@@ -174,6 +192,69 @@ pub mod api {
 /// The host wraps each request in a transaction and commits it before the
 /// answer leaves. If this cell crashes, the host rolls the request back and
 /// starts a fresh cell, and the state is loaded again from storage.
+/// Postgres through the host: a binding name, never a socket or a password.
+pub mod pg {
+    use serde_json::json;
+
+    #[cfg(target_arch = "wasm32")]
+    #[link(wasm_import_module = "combd")]
+    extern "C" {
+        fn pg_open(ptr: *const u8, len: u32) -> u64;
+        fn pg_query(handle: u64, ptr: *const u8, len: u32) -> u32;
+        fn pg_read(ptr: *mut u8, cap: u32) -> u32;
+        fn pg_close(handle: u64) -> u32;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    unsafe fn pg_open(_: *const u8, _: u32) -> u64 {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    unsafe fn pg_query(_: u64, _: *const u8, _: u32) -> u32 {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    unsafe fn pg_read(_: *mut u8, _: u32) -> u32 {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    unsafe fn pg_close(_: u64) -> u32 {
+        1
+    }
+
+    /// The last answer, `n` bytes.
+    fn read(n: usize) -> String {
+        let mut buf = vec![0u8; n];
+        let got = unsafe { pg_read(buf.as_mut_ptr(), n as u32) } as usize;
+        buf.truncate(got);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Pin a connection on `db`.
+    pub fn open(db: &str) -> Result<u64, String> {
+        let req = json!({ "db": db }).to_string();
+        match unsafe { pg_open(req.as_ptr(), req.len() as u32) } {
+            0 => Err(read(4096)),
+            h => Ok(h),
+        }
+    }
+
+    /// One statement (`{"q", "p"}`): on handle `h`, or pooled on "main" (0).
+    pub fn query(h: u64, req: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(req).unwrap_or(json!({ "q": req }));
+        if h == 0 {
+            v["db"] = json!("main");
+        }
+        let req = v.to_string();
+        let n = unsafe { pg_query(h, req.as_ptr(), req.len() as u32) } as usize;
+        read(n)
+    }
+
+    pub fn close(h: u64) -> bool {
+        unsafe { pg_close(h) == 0 }
+    }
+}
+
 pub mod room {
     use serde_json::{json, Value};
     use std::cell::RefCell;
@@ -188,6 +269,8 @@ pub mod room {
 
     thread_local! {
         static ROOM: RefCell<Option<Room>> = const { RefCell::new(None) };
+        /// This object's pinned Postgres session, if it opened one.
+        static PG_SESSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -376,6 +459,26 @@ pub mod room {
                     "200 {}".into()
                 }
                 ("POST", "/broadcast") => format!("200 {}", json!({ "sent": broadcast(body) })),
+                // Postgres from a Durable Object. `/pg/open` pins a session to
+                // the object: it lasts across requests and messages, so a
+                // transaction, a row lock, or an advisory lock can too.
+                ("POST", "/pg/q") => format!("200 {}", super::pg::query(0, body)),
+                ("POST", "/pg/open") => match super::pg::open("main") {
+                    Ok(h) => {
+                        PG_SESSION.with(|s| s.set(h));
+                        format!("200 {}", json!({ "handle": h }))
+                    }
+                    Err(e) => format!("503 {e}"),
+                },
+                ("POST", "/pg/s") => match PG_SESSION.with(|s| s.get()) {
+                    0 => "409 {\"error\":\"no session: POST /pg/open\"}".into(),
+                    h => format!("200 {}", super::pg::query(h, body)),
+                },
+                ("POST", "/pg/close") => {
+                    let h = PG_SESSION.with(|s| s.replace(0));
+                    format!("200 {}", json!({ "closed": h != 0 && super::pg::close(h) }))
+                }
+                ("POST", "/pg/crash") => panic!("crash while holding a session"),
                 ("GET", "/ws-stats") => format!("200 {}", json!({ "joins": kv("joins"), "closes": kv("closes"), "sockets": sockets().len() })),
                 // Write, then crash: the host must roll the write back.
                 ("POST", "/crash") => {

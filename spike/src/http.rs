@@ -101,6 +101,12 @@ pub struct Config {
     pub sync_delay: Duration,
     /// Fleet mode (D2), or `None` for one node on its own disk (D1).
     pub fleet: Option<FleetCfg>,
+    /// Postgres bindings (`pg.rs`), if any.
+    pub pg: Option<crate::pg::PgCfg>,
+    /// An object holding a database handle stays in memory until the handle
+    /// has been idle this long; then the handle closes (rolling back, and
+    /// releasing its locks) and the object can leave.
+    pub session_idle: Duration,
 }
 
 impl Config {
@@ -114,6 +120,8 @@ impl Config {
             stop: Arc::default(),
             sync_delay: Duration::ZERO,
             fleet: FleetCfg::from_env(),
+            pg: crate::pg::PgCfg::from_env(),
+            session_idle: Duration::from_millis(num("COMBD_PG_SESSION_IDLE_MS", 60_000) as u64),
         }
     }
 }
@@ -161,6 +169,8 @@ struct SyncJob {
 
 /// What the loops share.
 struct Shared {
+    /// Postgres pools, one per binding (`pg.rs`).
+    pg: Option<crate::pg::Pools>,
     cfg: Config,
     peers: Vec<(Sender<Msg>, Arc<Waker>)>,
     sync: Mutex<Sender<SyncJob>>,
@@ -274,6 +284,24 @@ enum Msg {
     WsPush { name: String, sock: u64, op: u8, payload: Vec<u8> },
     /// Fleet mode: a push of ours couldn't reach the socket's node.
     WsLost { name: String, sock: u64 },
+    /// A database call a parked cell waits on is done.
+    DbDone { park: u64, done: DbDone },
+}
+
+/// What a database call came back with.
+enum DbDone {
+    Answer(Vec<u8>),
+    /// A connection was pinned (on this binding), or why not.
+    Pinned(String, Result<usize, String>),
+}
+
+/// A pinned Postgres connection a cell holds.
+struct PgHandle {
+    binding: String,
+    worker: usize,
+    /// The object it belongs to (it outlives requests), or `None` for a
+    /// stateless request's (it closes when the request ends).
+    obj: Option<String>,
 }
 
 /// Fleet mode: a request the decision core knows about.
@@ -355,6 +383,8 @@ struct Task<E: Engine> {
     /// 101), and gone sockets this request takes off the list.
     ws_open: Option<u64>,
     ws_drop: Vec<u64>,
+    /// Postgres handles a stateless request opened (they close with it).
+    pg: Vec<u64>,
 }
 
 /// A Durable Object in memory.
@@ -382,6 +412,9 @@ struct Object<E: Engine> {
     seal_wait: Option<(Act, Vec<u8>)>,
     /// Its WebSocket list (`_combd_sockets`), read once it's needed.
     socks: Option<BTreeSet<u64>>,
+    /// Postgres handles it holds (pinned connections), and when one was last used.
+    pg: Vec<u64>,
+    pg_used: Instant,
 }
 
 impl<E: Engine> Object<E> {
@@ -401,6 +434,8 @@ impl<E: Engine> Object<E> {
             index_busy: false,
             seal_wait: None,
             socks: None,
+            pg: vec![],
+            pg_used: Instant::now(),
         }
     }
 }
@@ -517,7 +552,9 @@ where
         });
     }
     let fleet = cfg.fleet.take().map(|fc| start_fleet(fc, &peers, cfg.threads, &cfg.data));
+    let pg = cfg.pg.as_ref().map(crate::pg::Pools::start);
     let sh = Shared {
+        pg,
         cfg,
         peers,
         sync: Mutex::new(sync_tx),
@@ -573,6 +610,9 @@ where
                     },
                     ws_gone: HashMap::new(),
                     ws_lost: Default::default(),
+                    parked: HashMap::new(),
+                    next_park: 0,
+                    pg_handles: HashMap::new(),
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l)) {
                     eprintln!("event loop stopped: {e}");
@@ -631,6 +671,11 @@ struct Loop<'a, E: Engine> {
     ws_gone: HashMap<String, BTreeSet<u64>>,
     /// Lost sockets we've told their object about already.
     ws_lost: std::collections::HashSet<u64>,
+    /// Cells waiting on the database, by park number; and the Postgres
+    /// handles cells on this loop hold.
+    parked: HashMap<u64, (Task<E>, bool)>,
+    next_park: u64,
+    pg_handles: HashMap<u64, PgHandle>,
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
@@ -840,12 +885,19 @@ impl<E: Engine> Loop<'_, E> {
                 let mut t = self.tasks.pop_front().unwrap();
                 let answer = match t.cell.vm.run(crate::SLICE) {
                     Outcome::Yield => {
-                        self.tasks.push_back(t);
+                        // A compiled cell paused inside a database call: park it.
+                        match t.cell.vm.db_pending() {
+                            Some(op) => self.park(t, op, false),
+                            None => self.tasks.push_back(t),
+                        }
                         continue;
                     }
                     Outcome::HostCall { import, args } => match crate::serve(&mut t.cell.vm, import, &args, &mut t.cell.st) {
                         Ok(()) => {
-                            self.tasks.push_back(t);
+                            match t.cell.st.pending.take() {
+                                Some(op) => self.park(t, op, true),
+                                None => self.tasks.push_back(t),
+                            }
                             continue;
                         }
                         Err(trap) => Err(trap),
@@ -892,6 +944,7 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Msg::WsPush { name, sock, op, payload } => self.ws_local(&name, sock, op, &payload)?,
                 Msg::WsLost { name, sock } => self.socket_lost(&name, sock),
+                Msg::DbDone { park, done } => self.db_done(park, done),
                 Msg::Reply { who, reply } => self.deliver(Origin::Local(who), reply)?,
                 Msg::Synced { obj, gen, ok } => self.synced(&obj, gen, ok)?,
                 Msg::Checkpointed { obj } => {
@@ -991,6 +1044,117 @@ impl<E: Engine> Loop<'_, E> {
             Some(n) if !ws.is_empty() => self.apply_ws(n, ws),
             _ => Ok(()),
         }
+    }
+
+    /// An object leaves memory: its database handles close (rolling back and
+    /// releasing locks; Postgres would too once the connection went).
+    fn remove_object(&mut self, name: &str) -> Option<Object<E>> {
+        let o = self.objects.remove(name)?;
+        for &h in &o.pg {
+            self.pg_close(h);
+        }
+        Some(o)
+    }
+
+    /// Close a database handle: its connection is reset and goes back.
+    fn pg_close(&mut self, h: u64) {
+        let Some(ph) = self.pg_handles.remove(&h) else { return };
+        if let Some(o) = ph.obj.as_ref().and_then(|n| self.objects.get_mut(n)) {
+            o.pg.retain(|&x| x != h);
+        }
+        if let Some(p) = &self.sh.pg {
+            p.unpin(&ph.binding, ph.worker);
+        }
+    }
+
+    /// A cell waits on a database call: hand it to the pool and park the
+    /// cell (paused, no CPU) until the answer is back. `interp`: it paused at
+    /// a host call (the interpreter); else on its fiber (compiled).
+    fn park(&mut self, t: Task<E>, op: crate::host::DbOp, interp: bool) {
+        use crate::host::DbOp;
+        let fail = |m: String| json_err(&m);
+        let binding = |req: &[u8]| serde_json::from_slice::<serde_json::Value>(req).ok().and_then(|v| v["db"].as_str().map(String::from));
+        // May this cell use handle `h`? Its object's, or its request's.
+        let owns = |me: &Self, t: &Task<E>, h: u64| match &t.obj {
+            Some(n) => me.objects.get(n).is_some_and(|o| o.pg.contains(&h)),
+            None => t.pg.contains(&h),
+        };
+        let Some(pools) = &self.sh.pg else { return self.db_resume(t, interp, 0, fail("no database bindings are set up".into())) };
+        self.next_park += 1;
+        let park = self.next_park;
+        let (tx, waker) = self.sh.peers[self.me].clone();
+        let reply = move |done: DbDone| {
+            let _ = tx.send(Msg::DbDone { park, done });
+            let _ = waker.wake();
+        };
+        match op {
+            DbOp::Open(req) => {
+                let Some(b) = binding(&req).filter(|b| pools.has(b)) else { return self.db_resume(t, interp, 0, fail("pg_open: name a database binding (\"db\")".into())) };
+                let b2 = b.clone();
+                pools.pin(&b, Box::new(move |r| reply(DbDone::Pinned(b2, r))));
+            }
+            DbOp::Query(0, req) => {
+                let Some(b) = binding(&req) else { return self.db_resume(t, interp, 0, fail("pg_query: name a database binding (\"db\"), or use a handle".into())) };
+                pools.query(&b, req, Box::new(move |a| reply(DbDone::Answer(a))));
+            }
+            DbOp::Query(h, req) => {
+                if !owns(self, &t, h) {
+                    return self.db_resume(t, interp, 0, fail(format!("pg_query: no such handle {h}")));
+                }
+                let ph = &self.pg_handles[&h];
+                if let Some(o) = ph.obj.as_ref().and_then(|n| self.objects.get_mut(n)) {
+                    o.pg_used = Instant::now();
+                }
+                pools.query_on(&ph.binding, ph.worker, req, Box::new(move |a| reply(DbDone::Answer(a))));
+            }
+            DbOp::Close(h) => {
+                let ok = owns(self, &t, h);
+                if ok {
+                    self.pg_close(h);
+                }
+                let mut t = t;
+                t.pg.retain(|&x| x != h);
+                return self.db_resume(t, interp, (!ok) as u64, vec![]);
+            }
+        }
+        self.parked.insert(park, (t, interp));
+    }
+
+    /// A database call is back: hand the answer to its cell, and run it again.
+    fn db_done(&mut self, park: u64, done: DbDone) {
+        let Some((mut t, interp)) = self.parked.remove(&park) else { return };
+        let (value, out) = match done {
+            DbDone::Answer(a) => (a.len() as u64, a),
+            DbDone::Pinned(_, Err(e)) => (0, json_err(&e)),
+            DbDone::Pinned(binding, Ok(worker)) => {
+                // A handle id: unique on this loop, never 0.
+                self.next_park += 1;
+                let h = self.next_park << 8 | self.me as u64;
+                self.pg_handles.insert(h, PgHandle { binding, worker, obj: t.obj.clone() });
+                match &t.obj {
+                    Some(n) => {
+                        if let Some(o) = self.objects.get_mut(n) {
+                            o.pg.push(h);
+                            o.pg_used = Instant::now();
+                        }
+                    }
+                    None => t.pg.push(h),
+                }
+                (h, vec![])
+            }
+        };
+        self.db_resume(t, interp, value, out);
+    }
+
+    fn db_resume(&mut self, mut t: Task<E>, interp: bool, value: u64, out: Vec<u8>) {
+        if interp {
+            t.cell.st.pg_out = out;
+            let r: &[u64] = if t.cell.st.pending_results == 0 { &[] } else { &[value] };
+            t.cell.vm.resume(r);
+        } else {
+            t.cell.vm.db_done(value, out);
+        }
+        self.tasks.push_back(t);
     }
 
     /// A request committed: its handshake joined the socket list, and the
@@ -1187,7 +1351,20 @@ impl<E: Engine> Loop<'_, E> {
     /// operation, and the guard-page AOT tier doesn't promise it's exact
     /// at a trap either (LLVM may drop a store around a load that faults).
     fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> Option<((u16, String), Vec<WsOut>)> {
-        let Task { mut cell, obj, origin, ws_open, ws_drop } = t;
+        let Task { mut cell, obj, origin, ws_open, ws_drop, pg } = t;
+        // A stateless request's handles end with it; a crash ends an
+        // object's (rolling back, releasing its locks).
+        for h in pg {
+            self.pg_close(h);
+        }
+        if answer.is_err() {
+            if let Some(name) = &obj {
+                let hs = self.objects.get(name).map(|o| o.pg.clone()).unwrap_or_default();
+                for h in hs {
+                    self.pg_close(h);
+                }
+            }
+        }
         // WebSocket sends go out only if the request succeeds, and only
         // after its writes are on disk (with the answer).
         let ws = if answer.is_ok() { std::mem::take(&mut cell.host().ws_out) } else { vec![] };
@@ -1340,7 +1517,7 @@ impl<E: Engine> Loop<'_, E> {
             // disk (the "fsyncgate" lesson). Fail what's held, and drop the
             // object so the next request reads what's really there.
             eprintln!("object {name:?}: fsync failed, dropping it");
-            let o = self.objects.remove(name).unwrap();
+            let o = self.remove_object(name).unwrap();
             self.sh.stats.objects_live.fetch_sub(1, Relaxed);
             let mut failed: Vec<(Origin, (u16, String), Vec<WsOut>)> =
                 o.held.into_iter().map(|(_, origin, ..)| (origin, (500, "{\"error\":\"storage\"}".to_string()), vec![])).collect();
@@ -1401,7 +1578,14 @@ impl<E: Engine> Loop<'_, E> {
     fn sweep(&mut self) {
         self.last_sweep = Instant::now();
         let idle = self.sh.cfg.idle;
-        let free = |o: &Object<E>| !o.busy && o.waiting.is_empty() && !o.syncing && o.held.is_empty() && !o.checkpointing;
+        // Database handles keep an object here until they've been idle for
+        // `session_idle`; then they close, and it can leave.
+        let session_idle = self.sh.cfg.session_idle;
+        let stale: Vec<u64> = self.objects.values().filter(|o| !o.busy && !o.pg.is_empty() && o.pg_used.elapsed() >= session_idle).flat_map(|o| o.pg.clone()).collect();
+        for h in stale {
+            self.pg_close(h);
+        }
+        let free = |o: &Object<E>| !o.busy && o.waiting.is_empty() && !o.syncing && o.held.is_empty() && !o.checkpointing && o.pg.is_empty();
         let mut gone: Vec<String> = self.objects.iter().filter(|(_, o)| free(o) && o.last_used.elapsed() >= idle).map(|(n, _)| n.clone()).collect();
         let over = self.objects.len().saturating_sub(gone.len()).saturating_sub(self.sh.cfg.max_objects);
         if over > 0 {
@@ -1411,7 +1595,7 @@ impl<E: Engine> Loop<'_, E> {
             gone.extend(lru.into_iter().take(over).map(|(n, _)| n.clone()));
         }
         for name in gone {
-            self.objects.remove(&name);
+            self.remove_object(&name);
             self.sh.stats.objects_live.fetch_sub(1, Relaxed);
             self.sh.stats.evictions.fetch_add(1, Relaxed);
         }
@@ -1555,7 +1739,7 @@ impl<E: Engine> Loop<'_, E> {
                     self.queue_reply(who, (500, String::new()));
                     return Ok(());
                 }
-                self.tasks.push_back(Task { origin: Origin::Local(who), cell, obj: None, ws_open: None, ws_drop: vec![] });
+                self.tasks.push_back(Task { origin: Origin::Local(who), cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![] });
             }
             Req::Object(name, cell_req) => {
                 let o = owner(&name, self.sh.cfg.threads);
@@ -1706,7 +1890,7 @@ impl<E: Engine> Loop<'_, E> {
             return Err((500, String::new()));
         }
         o.busy = true;
-        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open, ws_drop });
+        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open, ws_drop, pg: vec![] });
         Ok(true)
     }
 }
@@ -1794,7 +1978,7 @@ impl<E: Engine> Loop<'_, E> {
                     }
                     Err(e) => {
                         eprintln!("object {name:?}: seal failed: {e}");
-                        self.objects.remove(&name);
+                        self.remove_object(&name);
                     }
                 }
             }
@@ -1810,8 +1994,8 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }
             Effect::Drop { obj } => {
-                if let Some(name) = self.names.get(&obj) {
-                    if self.objects.remove(name).is_some() {
+                if let Some(name) = self.names.get(&obj).cloned() {
+                    if self.remove_object(&name).is_some() {
                         self.sh.stats.objects_live.fetch_sub(1, Relaxed);
                     }
                 }
@@ -1823,7 +2007,7 @@ impl<E: Engine> Loop<'_, E> {
     fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>) {
         let Some(name) = self.names.get(&obj).cloned() else { return };
         let path = store::path_for(&self.sh.cfg.data, &name);
-        if self.objects.remove(&name).is_some() {
+        if self.remove_object(&name).is_some() {
             self.sh.stats.objects_live.fetch_sub(1, Relaxed);
         }
         let db = data.and_then(|segs| store::restore(&path, &segs).map_err(|e| e.to_string())).and_then(|()| Db::open(&path).map_err(|e| e.to_string()));
@@ -2052,6 +2236,10 @@ impl wire::Sink for LoopSink {
         let _ = tx.send(Msg::WsLost { name, sock });
         let _ = waker.wake();
     }
+}
+
+fn json_err(m: &str) -> Vec<u8> {
+    serde_json::json!({ "error": m }).to_string().into_bytes()
 }
 
 /// The socket a handshake's answer accepts, if it's a 101.

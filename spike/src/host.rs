@@ -31,6 +31,27 @@ pub struct HostState {
     pub ws_out: Vec<WsOut>,
     /// The binary message this event carries (`ws_msg` copies it out).
     pub ws_in: Vec<u8>,
+    /// Postgres: a call the event loop must do while the cell waits, and the
+    /// answer to the last one, until `pg_read` takes it. Only engines that
+    /// can pause a cell inside a host call set `can_park`.
+    pub pending: Option<DbOp>,
+    pub pg_out: Vec<u8>,
+    pub can_park: bool,
+    /// How many results the waiting import declared (0 or 1).
+    pub pending_results: u32,
+}
+
+/// A Postgres call. The cell waits (paused, no CPU) while the host does it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DbOp {
+    /// Pin a connection: `{"db": binding}`. The result is a handle (0: no;
+    /// why is in `pg_read`).
+    Open(Vec<u8>),
+    /// One statement, `{"db", "q", "p"}`: on a pinned handle, or pooled
+    /// (handle 0). The result is the answer's length, for `pg_read`.
+    Query(u64, Vec<u8>),
+    /// Done with a handle: it rolls back, releases its locks, and goes back.
+    Close(u64),
 }
 
 /// A WebSocket action a cell asked for.
@@ -208,6 +229,35 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
                 return Err("ws_list: bad pointer".into());
             }
             st.ws_ids.len() as u64
+        }
+        // Postgres (`pg.rs`): `pg_open(ptr, len)`, `pg_query(handle, ptr,
+        // len)`, `pg_close(handle)` wait for the host; `pg_read(ptr)` copies
+        // the last answer out.
+        ("combd", name @ ("pg_open" | "pg_query" | "pg_close")) => {
+            if !st.can_park {
+                return Err(format!("{name}: this engine can't wait on a database yet"));
+            }
+            let req = |p: u64, l: u64| -> Result<Vec<u8>, String> {
+                if l > 1 << 20 {
+                    return Err(format!("{name}: request too large"));
+                }
+                mem.read(p as u32, l as u32).ok_or_else(|| format!("{name}: bad pointer"))
+            };
+            st.pending = Some(match name {
+                "pg_open" => DbOp::Open(req(arg(0)?, arg(1)?)?),
+                "pg_query" => DbOp::Query(arg(0)?, req(arg(1)?, arg(2)?)?),
+                _ => DbOp::Close(arg(0)?),
+            });
+            0 // the real result comes when the host is done
+        }
+        // `pg_read(ptr, cap)`: at most `cap` bytes; returns how many.
+        ("combd", "pg_read") => {
+            let out = std::mem::take(&mut st.pg_out);
+            let n = out.len().min(arg(1)? as usize);
+            if !mem.write(arg(0)? as u32, &out[..n]) {
+                return Err("pg_read: bad pointer".into());
+            }
+            n as u64
         }
         ("env", "abort") => return Err("abort".into()),
         ("wasi_snapshot_preview1", "proc_exit") => return Err(format!("exit {}", arg(0)? as i32)),

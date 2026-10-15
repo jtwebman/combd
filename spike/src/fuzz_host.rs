@@ -54,6 +54,7 @@ const IMPORTS: &[(&str, &str, usize)] = &[
     ("combd", "ws_list", 2),
     ("combd", "ws_send_binary", 3),
     ("combd", "ws_msg", 1),
+    ("combd", "pg_read", 2),
     ("env", "abort", 4),
     ("wasi_snapshot_preview1", "fd_write", 4),
     ("wasi_snapshot_preview1", "fd_read", 4),

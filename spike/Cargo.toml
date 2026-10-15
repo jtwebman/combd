@@ -47,6 +47,7 @@ wasm-smith = { version = "0.261", optional = true }
 arbitrary = { version = "1", optional = true }
 # Hand-written AOT cases (`aot-cases/*.wat`) for the fuzz batch.
 wat = { version = "1", optional = true }
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
 
 [profile.release]
 lto = "thin"

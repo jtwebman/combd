@@ -1257,6 +1257,61 @@ own message again. The single-node test sends all 256 byte values both ways.
 Not yet: per-socket attachments (cells can keep that in SQLite), and
 numbers (idle sockets per GB, wake-up time, cross-node message time).
 
+## Bring your own database: Postgres
+
+The host owns the connections (`spike/src/pg.rs`). Each binding
+(`COMBD_PG_<NAME>=postgres://...`) gets a pool of worker threads, one
+connection each. A cell names a binding; it never sees a socket or a
+password. Its imports: `pg_open(req)` pins a connection and returns a
+handle, `pg_query(handle, req)` runs one statement (handle 0: pooled, on
+any free connection), `pg_read(ptr, cap)` copies the answer (the same JSON
+as the object's own SQLite), and `pg_close(handle)`.
+
+**A cell waiting on the database is paused, and costs no CPU.** On the
+interpreter the host call just doesn't resume yet; on the guard-page AOT tier
+the call pauses the cell's fiber, the same way a fuel slice does, and its
+request and answer pass through a small mailbox while the cell's state is on
+the fiber. The event loop parks the cell (out of the run queue, so it isn't
+woken for nothing) and runs everything else. Wasmtime can't pause there, so
+there `pg_*` crashes the cell with a clear message.
+
+**Where a handle lives decides what it can hold:**
+- A Worker's handle belongs to its request and closes when the request
+  ends: a transaction within one request.
+- A Durable Object's handle belongs to the object, across requests and
+  WebSocket messages: `BEGIN` in one message, `COMMIT` in a later one,
+  with row locks (`FOR UPDATE`) and session advisory locks
+  (`pg_advisory_lock`) held in between.
+- A handle closes on `pg_close`, when the cell crashes, when its object
+  leaves memory or this node loses it, and when it's been idle for
+  `COMBD_PG_SESSION_IDLE_MS` (60 s). An object with an open handle stays in
+  memory until then. Closing resets the connection (`ROLLBACK; DISCARD
+  ALL`), so a transaction rolls back and every lock is released, and the
+  connection goes back to the pool.
+
+**Rules from the plan:** pooled connections are reset after every statement
+(a `SET`, temp table, or lock never reaches the next user); every connection
+has a statement timeout (5 s; a lock wait counts); at most pool size minus
+one connections can be pinned, so pooled queries always find room; requests
+that find no free connection wait in order; answers are capped at 16 MB,
+counted as they grow.
+
+**Test `postgres_on_the_interpreter` / `postgres_on_aot`**, against a real
+Postgres 18: every mapped type both ways (int, bigint, float, bool, text,
+jsonb, null) and SQLSTATE codes on errors; a pooled `SET` that never leaks; a
+Worker's transaction in one request, and crashes mid-transaction that roll
+back without leaking their connections; a Durable Object's transaction over
+three messages with a row lock, while another object's update waits for it
+and other requests keep getting answered; an advisory lock held across
+messages (`pg_try_advisory_lock` elsewhere says no, then yes); a crash that
+releases its object's locks; a blocking `pg_advisory_lock` that parks the
+cell without stalling the loop; and an idle session that closes, releases its
+lock, and lets its object leave memory.
+
+Not yet: TLS to Postgres, a fleet-wide connection cap (each node has its own
+pool), LISTEN/NOTIFY as events, query caching, read replicas, MySQL, and
+numbers.
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

@@ -19,6 +19,7 @@ mod sim;
 mod store;
 mod wire;
 mod ws;
+mod pg;
 #[cfg(test)]
 mod spectest;
 #[cfg(feature = "fuzz")]
@@ -354,10 +355,17 @@ impl<V: CellVm> host::Mem for VmMem<'_, V> {
     }
 }
 
-/// Answer a `HostCall` and hand the result back to the cell.
+/// Answer a `HostCall` and hand the result back to the cell. A call the host
+/// must wait on (Postgres) leaves `st.pending` set and the cell paused; the
+/// event loop resumes it with `resume_db` later.
 fn serve<V: CellVm>(vm: &mut V, import: u32, args: &[u64], st: &mut HostState) -> Result<(), String> {
     let imp = vm.import(import).ok_or("unknown import")?.clone();
+    st.can_park = true; // an interpreter cell can wait any time
     let r = host::call(&imp, args, &mut VmMem(vm), st)?;
+    if st.pending.is_some() {
+        st.pending_results = imp.results;
+        return Ok(());
+    }
     vm.resume(&r);
     Ok(())
 }
@@ -368,7 +376,12 @@ fn finish<V: CellVm>(vm: &mut V, slice: u32, st: &mut HostState) -> Result<Vec<u
         match vm.run(slice) {
             Outcome::Done(r) => return Ok(r),
             Outcome::Yield => {}
-            Outcome::HostCall { import, args } => serve(vm, import, &args, st)?,
+            Outcome::HostCall { import, args } => {
+                serve(vm, import, &args, st)?;
+                if st.pending.take().is_some() {
+                    return Err("a database call can't wait here".into());
+                }
+            }
             Outcome::Trap(t) => return Err(t),
         }
     }
@@ -1171,6 +1184,8 @@ mod tests {
             stop: Arc::default(),
             sync_delay: Duration::ZERO,
             fleet: None,
+            pg: None,
+            session_idle: Duration::from_secs(60),
         }
     }
 
@@ -1565,6 +1580,134 @@ mod tests {
         assert!(back, "node 1 never took the room over");
         assert!(stat(b, "fences") + stat(b, "objects_opened") >= 1);
         assert!(http(b, "GET", "/do/fws/msgs", "").1.contains("from node 1"), "the room's state came along");
+    }
+
+    /// Bring your own database: Postgres through the host, from a Worker and
+    /// from Durable Objects. Pooled statements, transactions within a request,
+    /// and sessions an object holds across many messages, with row locks and
+    /// advisory locks. Needs `COMBD_PG_TEST=postgres://...`.
+    fn postgres_end_to_end<E: Engine + Sync + Send + 'static>(eng: E, tag: &str)
+    where
+        E::Program: Sync + Send,
+    {
+        let Ok(url) = std::env::var("COMBD_PG_TEST") else {
+            eprintln!("skipping: set COMBD_PG_TEST to a Postgres URL");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        let pg = pg::PgCfg { bindings: vec![("main".into(), url)], pool: 4, max_pinned: 3, statement_timeout_ms: 3000 };
+        let c = http::Config { pg: Some(pg), idle: Duration::from_millis(300), session_idle: Duration::from_millis(1500), ..cfg(&dir.0, 2) };
+        let (port, _, _) = do_server(eng, c);
+        let t = format!("t_{tag}_{}", std::process::id());
+        let q = |path: &str, sql: &str, p: serde_json::Value| -> serde_json::Value {
+            let (code, body) = http(port, "POST", path, &serde_json::json!({ "q": sql, "p": p }).to_string());
+            assert!(code == 200 || code == 500, "{path}: {code} {body}");
+            serde_json::from_str(&body).unwrap_or(serde_json::json!({ "status": code, "body": body }))
+        };
+        let rows = |v: &serde_json::Value| v["rows"].clone();
+        // 1. Pooled statements, every type we map, both ways.
+        let r = q("/api/pg/q", &format!("CREATE TABLE {t} (k int PRIMARY KEY, v text, n bigint, f float8, b bool, j jsonb)"), serde_json::json!([]));
+        assert!(r["error"].is_null(), "{r}");
+        let r = q("/api/pg/q", &format!("INSERT INTO {t} VALUES ($1, $2, $3, $4, $5, $6)"), serde_json::json!([1, "one", 5_000_000_000i64, 1.5, true, {"a": [1, 2]}]));
+        assert_eq!(r["changes"], 1, "{r}");
+        let r = q("/api/pg/q", &format!("SELECT k, v, n, f, b, j FROM {t}"), serde_json::json!([]));
+        assert_eq!(rows(&r), serde_json::json!([[1, "one", 5_000_000_000i64, 1.5, true, {"a": [1, 2]}]]), "{r}");
+        let r = q("/api/pg/q", "SELEKT 1", serde_json::json!([]));
+        assert_eq!(r["code"], "42601", "{r}");
+        // 2. Pooled connections are reset: a `SET` never reaches the next user.
+        for _ in 0..8 {
+            q("/api/pg/q", "SET search_path TO nowhere", serde_json::json!([]));
+        }
+        for _ in 0..8 {
+            assert!(q("/api/pg/q", &format!("SELECT count(*) FROM {t}"), serde_json::json!([]))["error"].is_null());
+        }
+        // 3. A Worker's transaction, within one request; a crash rolls back,
+        //    and its connection comes back (more crashes than pins).
+        let tx = |path: &str, ks: &[i32]| {
+            let mut list = vec![serde_json::json!({"q": "BEGIN"})];
+            list.extend(ks.iter().map(|k| serde_json::json!({ "q": format!("INSERT INTO {t} (k, v) VALUES ($1, 'tx')"), "p": [k] })));
+            // A crash comes before the COMMIT, mid-transaction.
+            if path.ends_with("/tx") {
+                list.push(serde_json::json!({"q": "COMMIT"}));
+            }
+            http(port, "POST", path, &serde_json::Value::Array(list).to_string())
+        };
+        assert_eq!(tx("/api/pg/tx", &[2, 3]).0, 200);
+        for k in 10..15 {
+            assert_eq!(tx("/api/pg/tx-crash", &[k]).0, 500);
+        }
+        assert_eq!(tx("/api/pg/tx", &[4]).0, 200, "crashed transactions leaked their connections");
+        let ks = rows(&q("/api/pg/q", &format!("SELECT k FROM {t} ORDER BY k"), serde_json::json!([])));
+        assert_eq!(ks, serde_json::json!([[1], [2], [3], [4]]), "the crashed inserts must be rolled back");
+        // 4. A Durable Object's transaction over several messages, with a row
+        //    lock. Another object's update waits for it, and nothing else does.
+        assert_eq!(http(port, "POST", "/do/acct/pg/open", "").0, 200);
+        q("/do/acct/pg/s", "BEGIN", serde_json::json!([]));
+        let r = q("/do/acct/pg/s", &format!("SELECT v FROM {t} WHERE k = 1 FOR UPDATE"), serde_json::json!([]));
+        assert_eq!(rows(&r), serde_json::json!([["one"]]), "{r}");
+        let t2 = t.clone();
+        let waiter = std::thread::spawn(move || {
+            let st = Instant::now();
+            let (code, body) = http(port, "POST", "/do/other/pg/q", &serde_json::json!({ "q": format!("UPDATE {t2} SET v = 'other' WHERE k = 1") }).to_string());
+            (code, body, st.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        let st = Instant::now();
+        assert_eq!(http(port, "GET", "/api/users/42", "").0, 200);
+        assert!(st.elapsed() < Duration::from_millis(200), "a lock wait stalled the event loop: {:?}", st.elapsed());
+        assert!(!waiter.is_finished(), "the other update should wait for the row lock");
+        q("/do/acct/pg/s", &format!("UPDATE {t} SET v = 'acct' WHERE k = 1"), serde_json::json!([]));
+        q("/do/acct/pg/s", "COMMIT", serde_json::json!([]));
+        let (code, body, waited) = waiter.join().unwrap();
+        assert!(code == 200 && body.contains("\"changes\":1") && waited >= Duration::from_millis(400), "{code} {body} {waited:?}");
+        assert_eq!(rows(&q("/api/pg/q", &format!("SELECT v FROM {t} WHERE k = 1"), serde_json::json!([]))), serde_json::json!([["other"]]));
+        // 5. An advisory lock held across messages.
+        // Lock keys are global to the database: each run gets its own range.
+        let base: i64 = (std::process::id() as i64 % 10_000) * 1000 + if tag == "aot" { 500 } else { 0 };
+        let lock = |path: &str, f: &str, k: i64| rows(&q(path, &format!("SELECT {f}($1)"), serde_json::json!([base + k])))[0][0].clone();
+        lock("/do/acct/pg/s", "pg_advisory_lock", 42);
+        assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 42), false);
+        assert_eq!(lock("/do/acct/pg/s", "pg_advisory_unlock", 42), true);
+        assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 42), true);
+        assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 42), true, "a pooled lock must not outlive its statement");
+        // 6. A crash releases the object's session and its locks.
+        lock("/do/acct/pg/s", "pg_advisory_lock", 43);
+        assert_eq!(http(port, "POST", "/do/acct/pg/crash", "").0, 500);
+        assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 43), true);
+        assert_eq!(http(port, "POST", "/do/acct/pg/s", "{\"q\":\"SELECT 1\"}").0, 409, "a fresh cell has no session");
+        // 7. A blocking lock wait parks the cell; the loop goes on.
+        assert_eq!(http(port, "POST", "/do/acct/pg/open", "").0, 200);
+        lock("/do/acct/pg/s", "pg_advisory_lock", 44);
+        assert_eq!(http(port, "POST", "/do/other2/pg/open", "").0, 200);
+        let w2 = std::thread::spawn(move || http(port, "POST", "/do/other2/pg/s", &format!("{{\"q\":\"SELECT pg_advisory_lock({})\"}}", base + 44)));
+        std::thread::sleep(Duration::from_millis(300));
+        let st = Instant::now();
+        assert_eq!(http(port, "GET", "/api/users/42", "").0, 200);
+        assert!(st.elapsed() < Duration::from_millis(200));
+        assert!(!w2.is_finished());
+        lock("/do/acct/pg/s", "pg_advisory_unlock", 44);
+        assert_eq!(w2.join().unwrap().0, 200);
+        assert_eq!(http(port, "POST", "/do/other2/pg/close", "").1, "{\"closed\":true}");
+        // 8. An idle session closes after `session_idle`, and so do its locks;
+        //    until then it keeps its object in memory.
+        lock("/do/acct/pg/s", "pg_advisory_lock", 45);
+        let ev = stat(port, "evictions");
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 45), false, "the session keeps its object (and lock) while it's fresh");
+        assert!(eventually(4000, || lock("/do/other/pg/q", "pg_try_advisory_lock", 45) == true), "an idle session must close");
+        assert!(eventually(2000, || stat(port, "evictions") > ev));
+        q("/api/pg/q", &format!("DROP TABLE {t}"), serde_json::json!([]));
+    }
+
+    #[test]
+    fn postgres_on_the_interpreter() {
+        postgres_end_to_end(interp::Interp { max_pages: 16384 }, "interp");
+    }
+
+    #[cfg(feature = "aot-guard")]
+    #[test]
+    fn postgres_on_aot() {
+        postgres_end_to_end(aot::Aot, "aot");
     }
 
     /// Objects by id: `/do/new` hands one out, `/do/id/<uuid>` reaches it.

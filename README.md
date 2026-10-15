@@ -103,6 +103,12 @@ next message wakes it with its state intact. Pings never wake it at all.
 Text and binary both work, across a fleet too: a client can reach any node,
 and the room's sockets survive its owner going down.
 
+**Your own Postgres.** Cells reach a database through the host, which keeps
+the connections and the password. A Worker can run a transaction in one
+request. A Durable Object can hold one across many messages, with row locks
+and advisory locks, and a crash rolls it back and lets the locks go. A cell
+waiting on the database is paused and costs no CPU.
+
 **Durable Objects across a fleet.** Several combd nodes share one S3 bucket,
 which decides who owns each object. Writes are confirmed by two peer nodes,
 so they don't wait on the bucket, and the bucket gets them in batches. Kill
