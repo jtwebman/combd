@@ -1109,6 +1109,41 @@ Where each language stands (what its compiler needs from us):
   Wasm, GraalVM, newer TeaVM). That's a managed heap, struct and array
   types, and subtyping in both engines: its own track, after v0.1.
 
+## The catalog: app state in the bucket, a copy on every node (2026-10-15)
+
+Per-request bucket fees were the real cost of running a fleet: every node
+renewed its lease in the bucket every 3.3 s (a read and a write), about
+$0.14 a node a day on S3 ($14 a day at 100 nodes), and checking deploys by
+polling every app's pointer would have been far worse. And the first deploy
+design had a real bug (two deploys on two nodes could claim one domain).
+
+So, designed with the user:
+- **The bucket is the source of truth, written before anything is
+  acknowledged.** The catalog (apps, versions, vars, secrets, encrypted) is
+  an append-only log: slot n+1 is written only if empty, so every change
+  gets one place in one order with no leader needed for safety. Checks run
+  against the log's head and are retried if the slot was taken.
+- **Every node keeps a copy in SQLite** (in memory, or on disk for a fast
+  restart on the same machine), applies pushes in order, and fetches gaps.
+- **Heartbeats go over the wire, not the bucket.** Leases were never part
+  of the safety proofs (the ownership spec lets any process claim at any
+  time), so this changes no proof: a node wrongly judged dead just loses
+  its objects at the next check. A leader (one conditional lease in the
+  bucket for the whole fleet) takes the heartbeats and fans out pushes.
+- **Object ownership stays per object in the bucket**, touched only on a
+  claim or takeover. No node keeps every app or object: nodes load apps on
+  demand, and a very large fleet splits into cells (each its own catalog
+  and leader) with a small map from tenant to cell.
+- **No user data in it.** It's one ordered log: one writer's worth of
+  throughput, and every node holds it. User data lives in Durable Objects
+  (sharded, with SQLite each) or Postgres. A small capped app KV (flags,
+  config) may come later.
+
+Spec: `spec/Catalog.tla` (1.6 million states, four known-bad versions
+caught, one of them the first deploy design). Next: snapshots and trimming
+in the spec, then the simulator, then the code (deploys, vars, and secrets
+move onto it), then real nodes with kill and split tests.
+
 ## Build order (when we do build)
 
 0. **DONE 2026-10-13. Spike: the engine race.** Results in

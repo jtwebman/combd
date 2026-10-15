@@ -1,5 +1,37 @@
 # Specs
 
+`Catalog.tla` is the catalog: deploys, vars, secrets, the state of every
+app. The bucket keeps it as an append-only log, and every node keeps a copy
+(SQLite, in memory or on disk). A write reads the log's head, checks its
+change against the state there (here: no two apps hold one domain), writes
+the next slot only if it's empty (a conditional write), and is acknowledged
+only after that. Two writers can never both take a slot, so there's one
+order and no leader is needed for safety. Writers push each change to
+every node; pushes may be lost, repeated, or come in any order, and a node
+applies entry n+1 only after n, fetching gaps from the bucket. A node may
+crash and keep its copy (disk) or lose it (memory).
+
+Three invariants: no acknowledged change is lost, every node's copy is the
+start of the log, and no two apps ever hold one domain (in the log or any
+copy). 1.6 million states, no errors. Four known-bad versions must fail:
+
+| Bug | Caught by |
+|---|---|
+| acknowledge before the write | NoLostAckedChange |
+| write a slot without "only if empty" | NoLostAckedChange |
+| apply pushes in any order | CopyIsPrefix |
+| check against this node's copy, but write at the head | OneAppPerDomain |
+
+The last is the first deploy design: each app's own pointer, checked
+against the deploying node's view. Two deploys on two nodes could both
+claim a domain. TLC shows it; the log fixes it.
+
+Leases, heartbeats, and leaders aren't in it: they're for liveness. The
+ownership spec below already lets any process claim at any time, because
+its safety never rested on leases, so moving node heartbeats from the
+bucket to the wire changes no proof. Not modeled yet: snapshots and
+trimming the log (a node too far behind loads a snapshot instead).
+
 `Ownership.tla` is the D2 protocol for who owns a Durable Object, with the
 bucket as the only coordinator: a compare-and-swap ownership record, a new
 epoch for every activation, a manifest that says which data the new owner
