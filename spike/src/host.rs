@@ -15,6 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[derive(Default, Clone)]
 pub struct HostState {
     pub counter: i64,
+    /// The app's env vars (`NAME=value`), for WASI's `environ_get`.
+    pub environ: Arc<Vec<Vec<u8>>>,
     /// stdout and stderr, capped at `MAX_OUT`.
     pub out: Vec<u8>,
     /// A Durable Object's storage. Cells without it get an error from `sql`.
@@ -359,7 +361,7 @@ fn wasi(name: &str, a: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Option<
     let n = match name {
         "fd_write" | "fd_read" => 4,
         "clock_time_get" => 3,
-        "random_get" | "clock_res_get" | "args_sizes_get" | "environ_sizes_get" => 2,
+        "random_get" | "clock_res_get" | "args_sizes_get" | "environ_sizes_get" | "environ_get" => 2,
         _ => 0,
     };
     (a.len() >= n).then(|| wasi_run(name, a, mem, st))
@@ -410,11 +412,34 @@ fn wasi_run(name: &str, a: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> u64
             put(mem, arg(2), &(ns / CLOCK_GRAIN * CLOCK_GRAIN).to_le_bytes())
         }
         "clock_res_get" => put(mem, arg(1), &CLOCK_GRAIN.to_le_bytes()),
-        "args_sizes_get" | "environ_sizes_get" => match put(mem, arg(0), &0u32.to_le_bytes()) {
+        "args_sizes_get" => match put(mem, arg(0), &0u32.to_le_bytes()) {
             OK => put(mem, arg(1), &0u32.to_le_bytes()),
             err => err,
         },
-        "args_get" | "environ_get" | "sched_yield" => OK,
+        // Each var is `NAME=value\0`; `environ_get(ptrs, buf)` writes one
+        // pointer per var into `ptrs`, and the strings into `buf`.
+        "environ_sizes_get" => {
+            let size: usize = st.environ.iter().map(|e| e.len() + 1).sum();
+            match put(mem, arg(0), &(st.environ.len() as u32).to_le_bytes()) {
+                OK => put(mem, arg(1), &(size as u32).to_le_bytes()),
+                err => err,
+            }
+        }
+        "environ_get" => {
+            let (mut ptrs, mut buf) = (arg(0), arg(1));
+            for e in st.environ.iter() {
+                let mut z = e.clone();
+                z.push(0);
+                if put(mem, ptrs, &buf.to_le_bytes()) != OK || put(mem, buf, &z) != OK {
+                    return EFAULT;
+                }
+                ptrs = ptrs.wrapping_add(4);
+                buf = buf.wrapping_add(z.len() as u32);
+            }
+            OK
+        }
+        "sched_yield" => OK,
+        "args_get" => OK,
         n if n.starts_with("path_") => ENOTCAPABLE,
         _ => ENOSYS,
     }

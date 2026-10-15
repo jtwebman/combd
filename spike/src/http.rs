@@ -103,12 +103,10 @@ pub struct Config {
     pub fleet: Option<FleetCfg>,
     /// Postgres bindings (`pg.rs`), if any.
     pub pg: Option<crate::pg::PgCfg>,
-    /// An object holding a database handle stays in memory until the handle
-    /// has been idle this long; then the handle closes (rolling back, and
-    /// releasing its locks) and the object can leave.
-    pub session_idle: Duration,
     /// Event cells: requests in flight per instance before another one starts.
     pub ev_max: usize,
+    /// The app's env vars, as WASI hands them out: `NAME=value` each.
+    pub environ: Arc<Vec<Vec<u8>>>,
 }
 
 impl Config {
@@ -122,9 +120,9 @@ impl Config {
             stop: Arc::default(),
             sync_delay: Duration::ZERO,
             fleet: FleetCfg::from_env(),
-            pg: crate::pg::PgCfg::from_env(),
-            session_idle: Duration::from_millis(num("COMBD_PG_SESSION_IDLE_MS", 60_000) as u64),
+            pg: None,
             ev_max: num("COMBD_EV_MAX", 32).max(1),
+            environ: Arc::default(),
         }
     }
 }
@@ -409,9 +407,9 @@ impl<E: Engine> Cell<E> {
     }
 }
 
-fn fresh<E: Engine>(eng: &E, prog: &E::Program) -> std::io::Result<Cell<E>> {
+fn fresh<E: Engine>(eng: &E, prog: &E::Program, environ: &Arc<Vec<Vec<u8>>>) -> std::io::Result<Cell<E>> {
     let mut vm = eng.spawn(prog).map_err(std::io::Error::other)?;
-    let mut st = HostState::default();
+    let mut st = HostState { environ: environ.clone(), ..HostState::default() };
     crate::init(&mut vm, &mut st).map_err(std::io::Error::other)?;
     Ok(Cell { vm, st })
 }
@@ -532,7 +530,28 @@ where
     E: Engine + Sync,
     E::Program: Sync,
 {
-    serve_with(eng, prog, port, Config::from_env())
+    let mut cfg = Config::from_env();
+    match app_settings(std::path::Path::new(".")) {
+        Ok((pg, environ)) => {
+            cfg.pg = pg;
+            cfg.environ = Arc::new(environ);
+        }
+        Err(e) => {
+            // Any mistake and nothing starts.
+            eprintln!("combd     {e}");
+            std::process::exit(1);
+        }
+    }
+    serve_with(eng, prog, port, cfg)
+}
+
+/// The app's manifest in `dir`, resolved for the local `dev` environment:
+/// its pools, and its env vars.
+pub fn app_settings(dir: &std::path::Path) -> Result<(Option<crate::pg::PgCfg>, Vec<Vec<u8>>), String> {
+    let Some(m) = crate::manifest::load(dir)? else { return Ok((None, vec![])) };
+    let r = m.resolve(&crate::manifest::load_dev(dir)?).map_err(|e| format!("the dev environment:\n  {e}"))?;
+    let environ = r.environ.iter().map(|(k, v)| format!("{k}={v}").into_bytes()).collect();
+    Ok((crate::pg::PgCfg::from_manifest(&r), environ))
 }
 
 pub fn serve_with<E>(eng: &E, prog: &E::Program, port: u16, mut cfg: Config)
@@ -863,7 +882,7 @@ impl<E: Engine> Loop<'_, E> {
     fn run(&mut self, mut listener: TcpListener) -> std::io::Result<()> {
         let mut events = Events::with_capacity(1024);
         self.poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
-        let mut first = fresh(self.eng, self.prog)?;
+        let mut first = fresh(self.eng, self.prog, &self.sh.cfg.environ)?;
         self.ev_mode = first.vm.has_export("on_request");
         self.pool.push(first);
         // Alarms from before a restart.
@@ -1128,7 +1147,7 @@ impl<E: Engine> Loop<'_, E> {
             Some(i) => i,
             None => {
                 self.ev_gen += 1;
-                let inst = EvInst { gen: self.ev_gen, cell: Some(fresh(self.eng, self.prog)?), reqs: HashMap::new(), tickets: HashMap::new(), queue: VecDeque::new(), running: None };
+                let inst = EvInst { gen: self.ev_gen, cell: Some(fresh(self.eng, self.prog, &self.sh.cfg.environ)?), reqs: HashMap::new(), tickets: HashMap::new(), queue: VecDeque::new(), running: None };
                 self.sh.stats.ev_instances.fetch_add(1, Relaxed);
                 match self.ev.iter().position(Option::is_none) {
                     Some(i) => {
@@ -1909,9 +1928,10 @@ impl<E: Engine> Loop<'_, E> {
         self.last_sweep = Instant::now();
         let idle = self.sh.cfg.idle;
         // Database handles keep an object here until they've been idle for
-        // `session_idle`; then they close, and it can leave.
-        let session_idle = self.sh.cfg.session_idle;
-        let stale: Vec<u64> = self.objects.values().filter(|o| !o.busy && !o.pg.is_empty() && o.pg_used.elapsed() >= session_idle).flat_map(|o| o.pg.clone()).collect();
+        // their pool's `session_idle_ms`; then they close, and it can leave.
+        let handles = &self.pg_handles;
+        let idle_for = |o: &Object<E>| o.pg.iter().filter_map(|h| handles.get(h)).map(|ph| ph.lease.session_idle).min();
+        let stale: Vec<u64> = self.objects.values().filter(|o| !o.busy && idle_for(o).is_some_and(|d| o.pg_used.elapsed() >= d)).flat_map(|o| o.pg.clone()).collect();
         for h in stale {
             self.pg_close(h);
         }
@@ -2065,7 +2085,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Cell(cell_req) => {
                 let mut cell = match self.pool.pop() {
                     Some(cell) => cell,
-                    None => fresh(self.eng, self.prog)?,
+                    None => fresh(self.eng, self.prog, &self.sh.cfg.environ)?,
                 };
                 if let Err(trap) = crate::start(&mut cell.vm, &cell_req, &mut cell.st) {
                     eprintln!("cell trapped starting a request: {trap}");
@@ -2129,7 +2149,7 @@ impl<E: Engine> Loop<'_, E> {
     /// Begin one request on an object: its warm cell (or a fresh one), inside
     /// a transaction. `Ok(false)`: nothing to run (a stale alarm).
     fn run_object(&mut self, name: &str, origin: Origin, mut req: String) -> Result<bool, (u16, String)> {
-        let (eng, prog) = (self.eng, self.prog);
+        let (eng, prog, environ) = (self.eng, self.prog, self.sh.cfg.environ.clone());
         // WebSocket events say what they are in their text, the same here
         // and when forwarded from the node that holds the connection.
         let sock_of = |s: &str| s.trim_start_matches('/').parse::<u64>().ok();
@@ -2203,7 +2223,7 @@ impl<E: Engine> Loop<'_, E> {
         }
         let mut cell = match o.cell.take() {
             Some(c) => c,
-            None => match fresh(eng, prog) {
+            None => match fresh(eng, prog, &environ) {
                 Ok(mut c) => {
                     c.host().db = Some(o.db.clone());
                     c

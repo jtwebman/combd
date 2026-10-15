@@ -20,6 +20,23 @@ extern "C" {
     fn ev_read(ptr: *mut u8, cap: u32) -> u32;
 }
 
+// The app's env vars, the way any WASI program gets them.
+#[link(wasm_import_module = "wasi_snapshot_preview1")]
+extern "C" {
+    fn environ_sizes_get(count: *mut u32, size: *mut u32) -> u32;
+    fn environ_get(ptrs: *mut *mut u8, buf: *mut u8) -> u32;
+}
+
+fn env_var(name: &str) -> Option<String> {
+    let (mut n, mut size) = (0u32, 0u32);
+    unsafe { environ_sizes_get(&mut n, &mut size) };
+    let mut ptrs = vec![core::ptr::null_mut::<u8>(); n as usize];
+    let mut buf = vec![0u8; size as usize];
+    unsafe { environ_get(ptrs.as_mut_ptr(), buf.as_mut_ptr()) };
+    let want = format!("{name}=");
+    buf.split(|&b| b == 0).filter_map(|e| core::str::from_utf8(e).ok()).find_map(|e| e.strip_prefix(want.as_str()).map(String::from))
+}
+
 type Then = Box<dyn FnOnce(Vec<u8>)>;
 
 thread_local! {
@@ -102,6 +119,10 @@ pub extern "C" fn on_request(req: u64, ptr: *mut u8, len: u32) {
             answer(req, "200 {\"ok\":true}");
             sleep(req, num(1), |_| LATER.with(|l| *l.borrow_mut() += 1));
         }
+        ("GET", ["env", name]) => match env_var(name) {
+            Some(v) => answer(req, &format!("200 {}", json!({ "value": v }))),
+            None => answer(req, "404 {\"error\":\"not set\"}"),
+        },
         ("GET", ["later-count"]) => answer(req, &format!("200 {}", json!({ "later": LATER.with(|l| *l.borrow()) }))),
         // Crash after `ms`: every unanswered request on this instance fails.
         ("GET", ["crash", _]) => sleep(req, num(1), |_| core::arch::wasm32::unreachable()),

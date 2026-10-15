@@ -1259,15 +1259,16 @@ numbers (idle sockets per GB, wake-up time, cross-node message time).
 
 ## Bring your own database: Postgres
 
-The host runs one pool per binding (`COMBD_PG_<NAME>=postgres://...`):
+The host runs one pool per `[pools.<name>]` in the app's manifest:
 a manager (`spike/src/pool.rs`, pure decisions, tested on its own) and
 members, each one connection on its own thread (`spike/src/pg.rs`). The
 first ask starts a member; an ask while all are busy starts another, up to
-`COMBD_PG_MAX`; then asks wait in line and fail after `COMBD_PG_WAIT_MS`.
+`max`; then asks wait in line and fail after `wait_ms`.
 A lease is checked on every call, so a holder whose lease ran out can't
 reach the next holder's. A member takes back a lease held past
-`COMBD_PG_LEASE_MS` on its own (it rolls back; the holder's next call gets
-an error), and stops after `COMBD_PG_IDLE_MS` free. A cell names a binding;
+`lease_ms` on its own (it rolls back; the holder's next call gets an
+error), and stops after `idle_ms` free. A failed connect is tried again
+`connection.retries` times, with backoff. A cell names a pool;
 it never sees a socket or a password. Its imports: `pg_open(req)` leases a
 member and returns a handle, `pg_query(handle, req)` runs one statement
 (handle 0: a lease for one statement), `pg_read(ptr, cap)` copies the answer
@@ -1300,7 +1301,7 @@ there `pg_*` crashes the cell with a clear message.
   (`pg_advisory_lock`) held in between.
 - A handle closes on `pg_close`, when the cell crashes, when its object
   leaves memory or this node loses it, and when it's been idle for
-  `COMBD_PG_SESSION_IDLE_MS` (60 s). An object with an open handle stays in
+  the pool's `session_idle_ms` (60 s). An object with an open handle stays in
   memory until then. Closing resets the connection (`ROLLBACK; DISCARD
   ALL`), so a transaction rolls back and every lock is released, and the
   connection goes back to the pool.
@@ -1333,6 +1334,49 @@ more fit.
 Not yet: the pool across a fleet (one manager, nearest member, cross-node
 calls, takeover), LISTEN/NOTIFY as events, query caching, read replicas, MySQL, and
 numbers.
+
+## The manifest: typed settings, vars, and secrets
+
+An app ships one of `combd.toml`, `combd.yaml`, or `combd.json`
+(`spike/src/manifest.rs`). All three read into the same tree and get the
+same checks, and every mistake is reported at once. Any mistake and nothing
+starts. No more env vars for app settings: node settings (threads, data
+dir, fleet) stay with whoever runs the machine.
+
+- `[vars]` and `[secrets]` declare every env var the app gets. A default
+  gives a var its type (`PG_MAX = 8` is an int), or it says one; no default
+  means every environment must set it, and `?` on the name makes it
+  optional. A secret maps an env var to a secret's name and never has a
+  default: a default would be in git, and in every environment. A name
+  can't be both.
+- Types: `string` (`pattern`, and `min`/`max` length in characters),
+  `int` (i64), `float` (f64), `bool`, `datetime` (RFC 3339 with an offset,
+  `min`/`max` compared as instants), `url`, and `enum`. Hard caps: 16 KiB a
+  value, 256 KiB of env vars in all, 512 names, a 1 MiB file, 1 KiB
+  patterns. Patterns use Rust's `regex`: no look-around or backreferences,
+  so matching is linear (a test runs `(a+)+$` on 16 KiB in no time).
+- `[processes.<name>]` sets a process kind's settings, and each kind lists
+  what it takes, typed the same way (`combd:postgres`: `url`,
+  `connection.timeout_ms`, `connection.retries`, `statement_timeout_ms`).
+  `[pools.<name>]` is generic: a `member` process plus `max`, `wait_ms`,
+  `lease_ms`, `idle_ms`, `session_idle_ms`, `on_manager_loss`.
+- `"$NAME"` uses a var or secret, and must be exactly the type the setting
+  wants: no conversions. An optional name can't fill a required setting.
+  Values are checked again per environment against the setting's own
+  limits, since a var's may be wider. `$$` is a literal `$`.
+- Every var and secret reaches cells as an env var (WASI `environ`).
+- The local `dev` environment is `combd.dev.{toml,yaml,json}` beside the
+  manifest, refused if git tracks it. An error about a secret never shows
+  its value, and a pool's config has no `Debug`, so it can't be printed.
+
+**Tests:** `manifest::tests` (all three formats resolve the same; 17 kinds
+of mistake in one file, all reported; references and their types;
+datetimes and their limits; caps; patterns), and
+`the_manifest_sets_up_vars_secrets_and_pools` (vars and secrets reach a
+cell's `environ`, the pool runs a query, a bad environment doesn't start).
+
+Next: environments in the control plane (per pull request, `--from`, a
+TTL, their own storage), and secrets encrypted there.
 
 ## Event cells: many requests per instance
 

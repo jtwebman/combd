@@ -19,6 +19,7 @@ mod sim;
 mod store;
 mod wire;
 mod ws;
+mod manifest;
 mod pg;
 mod pool;
 #[cfg(test)]
@@ -1193,8 +1194,8 @@ mod tests {
             sync_delay: Duration::ZERO,
             fleet: None,
             pg: None,
-            session_idle: Duration::from_secs(60),
             ev_max: 32,
+            environ: Arc::default(),
         }
     }
 
@@ -1604,8 +1605,8 @@ mod tests {
             return;
         };
         let dir = store::tempdir::Dir::new();
-        let pg = pg::PgCfg { bindings: vec![("main".into(), url)], max: 3, statement_timeout_ms: 3000, idle_ms: 60_000, lease_ms: 60_000, wait_ms: 5000 };
-        let c = http::Config { pg: Some(pg), idle: Duration::from_millis(300), session_idle: Duration::from_millis(1500), ..cfg(&dir.0, 2) };
+        let pg = pg::PgCfg { pools: vec![pg::PoolCfg { max: 3, statement_timeout_ms: 3000, session_idle_ms: 1500, ..pg::PoolCfg::new("main", &url) }] };
+        let c = http::Config { pg: Some(pg), idle: Duration::from_millis(300), ..cfg(&dir.0, 2) };
         let (port, _, _) = do_server(eng, c);
         let t = format!("t_{tag}_{}", std::process::id());
         let q = |path: &str, sql: &str, p: serde_json::Value| -> serde_json::Value {
@@ -1721,7 +1722,7 @@ mod tests {
             return;
         };
         let dir = store::tempdir::Dir::new();
-        let pg = pg::PgCfg { bindings: vec![("main".into(), url)], max: 2, statement_timeout_ms: 3000, idle_ms: 60_000, lease_ms: 1500, wait_ms: 300 };
+        let pg = pg::PgCfg { pools: vec![pg::PoolCfg { max: 2, statement_timeout_ms: 3000, lease_ms: 1500, wait_ms: 300, ..pg::PoolCfg::new("main", &url) }] };
         let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { pg: Some(pg), ..cfg(&dir.0, 2) });
         let q = |path: &str, sql: &str| http(port, "POST", path, &serde_json::json!({ "q": sql }).to_string());
         // Two sessions: the pool is at max.
@@ -1807,7 +1808,7 @@ mod tests {
         };
         let dir = store::tempdir::Dir::new();
         let wasm = std::fs::read(GUEST_EV).unwrap();
-        let pg = pg::PgCfg { bindings: vec![("main".into(), url)], max: 10, statement_timeout_ms: 3000, idle_ms: 60_000, lease_ms: 60_000, wait_ms: 5000 };
+        let pg = pg::PgCfg { pools: vec![pg::PoolCfg { max: 10, statement_timeout_ms: 3000, ..pg::PoolCfg::new("main", &url) }] };
         let (port, _, _) = server_for(eng, http::Config { pg: Some(pg), ..cfg(&dir.0, 1) }, wasm);
         let t = format!("ev_{tag}_{}", std::process::id());
         let q = |sql: &str| http(port, "POST", "/pg/q", &serde_json::json!({ "q": sql }).to_string());
@@ -1848,6 +1849,46 @@ mod tests {
     #[test]
     fn event_cells_postgres_on_aot() {
         event_cells_postgres(aot::Aot, "aot");
+    }
+
+    /// The manifest end to end: typed vars and secrets reach cells as env
+    /// vars, and a pool is set up from it. A mistake stops everything.
+    #[test]
+    fn the_manifest_sets_up_vars_secrets_and_pools() {
+        let app = store::tempdir::Dir::new();
+        let pg_url = std::env::var("COMBD_PG_TEST").unwrap_or("postgres://nobody@127.0.0.1:1/x".into());
+        std::fs::write(app.0.join("combd.yaml"), r#"
+app: { name: shop }
+vars:
+  REGION: { type: string, pattern: "^[a-z]+-[a-z]+$" }
+  PG_MAX: { type: int, min: 1, default: 4 }
+  "MY_FLAG?": { type: bool }
+secrets:
+  PG_URL: { secret: pg-url, type: url }
+processes:
+  pg-conn: { kind: "combd:postgres", url: $PG_URL, connection: { retries: 0 } }
+pools:
+  main: { member: pg-conn, max: $PG_MAX, wait_ms: 2000 }
+"#).unwrap();
+        std::fs::write(app.0.join("combd.dev.toml"), format!("[vars]\nREGION = \"us-east\"\n[secrets]\npg-url = {pg_url:?}\n")).unwrap();
+        let (pg, environ) = http::app_settings(&app.0).unwrap();
+        let p = &pg.as_ref().unwrap().pools[0];
+        assert_eq!((p.name.as_str(), p.max, p.wait_ms, p.retries), ("main", 4, 2000, 0));
+        let dir = store::tempdir::Dir::new();
+        let wasm = std::fs::read(GUEST_EV).unwrap();
+        let (port, _, _) = server_for(interp::Interp { max_pages: 16384 }, http::Config { pg, environ: Arc::new(environ), ..cfg(&dir.0, 1) }, wasm);
+        assert_eq!(http(port, "GET", "/env/REGION", ""), (200, "{\"value\":\"us-east\"}".into()));
+        assert_eq!(http(port, "GET", "/env/PG_MAX", ""), (200, "{\"value\":\"4\"}".into()));
+        assert_eq!(http(port, "GET", "/env/PG_URL", "").1, serde_json::json!({ "value": pg_url }).to_string(), "secrets are env vars too");
+        assert_eq!(http(port, "GET", "/env/MY_FLAG", "").0, 404, "an unset optional isn't set");
+        if std::env::var("COMBD_PG_TEST").is_ok() {
+            assert!(http(port, "POST", "/pg/q", "{\"q\":\"SELECT 41 + 1\"}").1.contains("[[42]]"));
+        }
+        // A mistake in the environment: nothing starts.
+        std::fs::write(app.0.join("combd.dev.toml"), "[vars]\nREGION = \"Not Valid\"\n").unwrap();
+        // (No unwrap_err: that would need Debug, and a pool's config holds its password.)
+        let Err(e) = http::app_settings(&app.0) else { panic!("a bad environment must not start") };
+        assert!(e.contains("REGION") && e.contains("doesn't match") && e.contains("PG_URL: required"), "{e}");
     }
 
     #[test]

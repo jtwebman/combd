@@ -631,6 +631,45 @@ callback at a time; requests interleave only where the cell waits.
   queued requests at once (N is its choice: ask for 10 with 2 waiting, get
   2), for one transaction and one fsync, with an answer for each.
 
+### Settings: the manifest, environments, vars, and secrets
+
+An app's settings live in one manifest shipped with its code: `combd.toml`,
+`combd.yaml`, or `combd.json` (all three read the same; humans like TOML
+or YAML, AI writes JSON fast). It describes the app's shape, the same in
+every environment:
+- `[vars]` and `[secrets]` declare every env var, typed. No default means
+  required; `?` means optional. Secrets map to a secret's name and never
+  have defaults. Processes read both as normal env vars.
+- `[processes.*]` set a kind's settings, which the kind declares and types;
+  `[pools.*]` are generic (a member process plus settings). `"$NAME"`
+  references must match types exactly. Any mismatch and nothing starts.
+
+**Environments live in the control plane, not the file.** Teams make one
+per pull request: `combd env create pr-123 --from staging --ttl 7d`. An env
+inherits values from the one it came from and overrides what differs.
+`combd var set` and `combd secret put` work only on declared names, and
+check the type when the value is set. A deploy fails early if an env is
+missing a required name. Each env has its own Durable Object namespace,
+storage, and pools, so a preview can never touch production's objects;
+deleting an env deletes its data. Secrets are encrypted at rest (a data key
+per app, sealed by a KMS master key; AES-256-GCM with the app, env, and
+name bound in), write-only in the API, and scrubbed from logs. Local dev is
+an env named `dev`, backed by a gitignored file.
+
+### Everything is a process
+
+Workers, event cells, Durable Objects, pool managers, and pool members are
+all processes, told apart by placement (anywhere, or one owner), state
+(none, or its own SQLite), and concurrency (one event at a time, or many).
+What they hold (a pool lease, a WebSocket, a database session, a timer) is
+a **handle**: an owner, a release, a timeout, and cleanup when the owner
+crashes. A per-node ingress pool owns the TCP sockets, parses HTTP, and
+routes by domain and path to a process as an event. A WebSocket is a handle
+the node keeps: the process gets events and can hibernate or crash while
+the socket lives on. Users can write their own member kinds (a MySQL
+connection, a rate-limited API client); a member implements `on_start`,
+`on_call`, `on_release`, and `on_stop`, and the pool does the rest.
+
 ### Supervisors: let it crash, then tell someone
 
 The control plane supervises everything (it already restarts what crashes)
@@ -1093,7 +1132,9 @@ What changes as the fleet grows:
    transactions, row locks, and advisory locks. Cells wait paused (both
    engines). Then the per-node pools were scrapped for one pool per
    database (above): single node done (growth to max, a line with a wait
-   time, lease timeouts, idle stop). Next: the fleet (nearest member,
+   time, lease timeouts, idle stop). Then the manifest replaced env vars
+   (typed vars and secrets, process and pool settings, strict checks).
+   Next: the process model, then the fleet pool (nearest member,
    cross-node calls, takeover), then TLS, LISTEN/NOTIFY. See
    [spike/RESULTS.md](spike/RESULTS.md).
 6. **Fast fleet writes (D3).** Done early, as part of step 3 (see "What

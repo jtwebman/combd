@@ -36,43 +36,62 @@ pub type Reply = Box<dyn FnOnce(Vec<u8>) + Send>;
 /// A lease, or why there isn't one.
 pub type LeaseReply = Box<dyn FnOnce(Result<Lease, String>) + Send>;
 
+/// Every Postgres pool in the app's manifest.
 #[derive(Clone)]
 pub struct PgCfg {
-    /// (binding, connection URL).
-    pub bindings: Vec<(String, String)>,
-    /// Members per pool, at most.
+    pub pools: Vec<PoolCfg>,
+}
+
+/// One pool and its member process's settings (`manifest.rs` checked them).
+#[derive(Clone)]
+pub struct PoolCfg {
+    pub name: String,
+    pub url: String,
     pub max: usize,
-    pub statement_timeout_ms: u64,
-    pub idle_ms: u64,
-    pub lease_ms: u64,
     pub wait_ms: u64,
+    pub lease_ms: u64,
+    pub idle_ms: u64,
+    /// An object's lease unused this long is released.
+    pub session_idle_ms: u64,
+    pub statement_timeout_ms: u64,
+    pub connect_timeout_ms: u64,
+    /// Connect attempts after the first, with backoff.
+    pub retries: u32,
+}
+
+impl PoolCfg {
+    /// The manifest's defaults, for tests.
+    #[cfg(test)]
+    pub fn new(name: &str, url: &str) -> PoolCfg {
+        PoolCfg { name: name.into(), url: url.into(), max: 8, wait_ms: 5000, lease_ms: 60_000, idle_ms: 60_000, session_idle_ms: 60_000, statement_timeout_ms: 5000, connect_timeout_ms: 5000, retries: 3 }
+    }
 }
 
 impl PgCfg {
-    /// `COMBD_PG_<NAME>=postgres://...` per binding (the name is lowercased),
-    /// and for every pool: `COMBD_PG_MAX` (connections, default 8),
-    /// `COMBD_PG_TIMEOUT_MS` (per statement, 5 s), `COMBD_PG_IDLE_MS` (a free
-    /// connection closes, 60 s), `COMBD_PG_LEASE_MS` (longest hold, 60 s),
-    /// `COMBD_PG_WAIT_MS` (longest wait in line, 5 s).
-    pub fn from_env() -> Option<PgCfg> {
-        let knobs = ["MAX", "TIMEOUT_MS", "IDLE_MS", "LEASE_MS", "WAIT_MS", "SESSION_IDLE_MS"];
-        let bindings: Vec<(String, String)> = std::env::vars()
-            .filter_map(|(k, v)| Some((k.strip_prefix("COMBD_PG_")?.to_string(), v)))
-            .filter(|(k, _)| !knobs.contains(&k.as_str()))
-            .map(|(k, v)| (k.to_lowercase(), v))
+    /// The Postgres pools of a resolved manifest (`None`: there are none).
+    pub fn from_manifest(r: &crate::manifest::Resolved) -> Option<PgCfg> {
+        let pools: Vec<PoolCfg> = r
+            .pools
+            .iter()
+            .filter_map(|(name, p)| {
+                let (kind, m) = r.processes.get(p["member"].as_str()?)?;
+                (kind == "combd:postgres").then_some(())?;
+                let n = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
+                Some(PoolCfg {
+                    name: name.clone(),
+                    url: m["url"].as_str()?.to_string(),
+                    max: n(&p["max"]) as usize,
+                    wait_ms: n(&p["wait_ms"]),
+                    lease_ms: n(&p["lease_ms"]),
+                    idle_ms: n(&p["idle_ms"]),
+                    session_idle_ms: n(&p["session_idle_ms"]),
+                    statement_timeout_ms: n(&m["statement_timeout_ms"]),
+                    connect_timeout_ms: n(&m["connection.timeout_ms"]),
+                    retries: n(&m["connection.retries"]) as u32,
+                })
+            })
             .collect();
-        if bindings.is_empty() {
-            return None;
-        }
-        let num = |k: &str, d: u64| std::env::var(format!("COMBD_PG_{k}")).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        Some(PgCfg {
-            bindings,
-            max: num("MAX", 8).max(1) as usize,
-            statement_timeout_ms: num("TIMEOUT_MS", 5000),
-            idle_ms: num("IDLE_MS", 60_000),
-            lease_ms: num("LEASE_MS", 60_000),
-            wait_ms: num("WAIT_MS", 5000),
-        })
+        (!pools.is_empty()).then_some(PgCfg { pools })
     }
 }
 
@@ -82,6 +101,8 @@ impl PgCfg {
 pub struct Lease {
     id: u64,
     member: Sender<Job>,
+    /// Its pool's `session_idle_ms`.
+    pub session_idle: Duration,
 }
 
 impl Lease {
@@ -122,25 +143,27 @@ pub struct Pools {
 impl Pools {
     pub fn start(cfg: &PgCfg) -> Pools {
         let mut pools = HashMap::new();
-        for (name, url) in &cfg.bindings {
-            let mut pg: Config = match url.parse() {
+        for p in &cfg.pools {
+            let mut pg: Config = match p.url.parse() {
                 Ok(c) => c,
-                Err(e) => {
-                    eprintln!("combd     postgres binding {name:?}: bad URL: {e}");
+                Err(_) => {
+                    // Never print the URL: it holds a password.
+                    eprintln!("combd     pools.{}: its url isn't a Postgres URL", p.name);
                     std::process::exit(1);
                 }
             };
             // Startup options are what RESET (and so DISCARD ALL) goes back
             // to. A session left in a transaction (its node died) ends on the
             // server soon after its lease would have.
-            pg.options(&format!("-c statement_timeout={} -c idle_in_transaction_session_timeout={}", cfg.statement_timeout_ms, cfg.lease_ms + 5000));
-            pg.connect_timeout(Duration::from_secs(5));
+            pg.options(&format!("-c statement_timeout={} -c idle_in_transaction_session_timeout={}", p.statement_timeout_ms, p.lease_ms + 5000));
+            pg.connect_timeout(Duration::from_millis(p.connect_timeout_ms));
             pg.keepalives(true).keepalives_idle(Duration::from_secs(10));
             pg.application_name("combd");
             let (tx, rx) = channel();
-            let (me, cfg) = (tx.clone(), cfg.clone());
-            std::thread::spawn(move || run_pool(pg, cfg, rx, me));
-            pools.insert(name.clone(), tx);
+            let (me, p) = (tx.clone(), p.clone());
+            let name = p.name.clone();
+            std::thread::spawn(move || run_pool(pg, p, rx, me));
+            pools.insert(name, tx);
         }
         Pools { pools }
     }
@@ -176,7 +199,8 @@ impl Pools {
 }
 
 /// The pool's thread: `pool::Core` decides, this does what it says.
-fn run_pool(pg: Config, cfg: PgCfg, rx: Receiver<Msg>, me: Sender<Msg>) {
+fn run_pool(pg: Config, cfg: PoolCfg, rx: Receiver<Msg>, me: Sender<Msg>) {
+    let session_idle = Duration::from_millis(cfg.session_idle_ms);
     let mut core = pool::Core::new(pool::Cfg { max: cfg.max, idle_ms: cfg.idle_ms, wait_ms: cfg.wait_ms });
     let t0 = Instant::now();
     let now = || t0.elapsed().as_millis() as u64;
@@ -196,7 +220,7 @@ fn run_pool(pg: Config, cfg: PgCfg, rx: Receiver<Msg>, me: Sender<Msg>) {
                 match r {
                     Ok(()) => {
                         if let Some(reply) = asks.remove(&ask) {
-                            reply(Ok(Lease { id: lease, member: members[&m].clone() }));
+                            reply(Ok(Lease { id: lease, member: members[&m].clone(), session_idle }));
                         }
                     }
                     // Full: the core puts the ask back in line.
@@ -231,7 +255,7 @@ fn run_pool(pg: Config, cfg: PgCfg, rx: Receiver<Msg>, me: Sender<Msg>) {
                     let tx = members[&member].clone();
                     let _ = tx.send(Job::Lease(next_lease));
                     if let Some(r) = asks.remove(&ask) {
-                        r(Ok(Lease { id: next_lease, member: tx }));
+                        r(Ok(Lease { id: next_lease, member: tx, session_idle }));
                     }
                 }
                 pool::Out::Start { ask, member, .. } => {
@@ -239,8 +263,8 @@ fn run_pool(pg: Config, cfg: PgCfg, rx: Receiver<Msg>, me: Sender<Msg>) {
                     let (tx, jobs) = channel();
                     members.insert(member, tx);
                     starting.insert(member, (ask, next_lease));
-                    let (pg, me, lease_ms, lease) = (pg.clone(), me.clone(), cfg.lease_ms, next_lease);
-                    std::thread::spawn(move || run_member(member, pg, lease, lease_ms, jobs, me));
+                    let (pg, me, lease_ms, lease, retries) = (pg.clone(), me.clone(), cfg.lease_ms, next_lease, cfg.retries);
+                    std::thread::spawn(move || run_member(member, pg, retries, lease, lease_ms, jobs, me));
                 }
                 pool::Out::Fail { ask } => {
                     if let Some(r) = asks.remove(&ask) {
@@ -259,16 +283,26 @@ fn run_pool(pg: Config, cfg: PgCfg, rx: Receiver<Msg>, me: Sender<Msg>) {
 
 /// One member: a connection on its own thread, leased to one holder at a
 /// time, from its first lease (the ask it started for).
-fn run_member(id: u64, pg: Config, first: u64, lease_ms: u64, jobs: Receiver<Job>, pool: Sender<Msg>) {
-    let mut client = match pg.connect(NoTls) {
-        Ok(c) => c,
-        Err(e) => {
-            let full = e.code() == Some(&SqlState::TOO_MANY_CONNECTIONS);
-            if !full {
-                eprintln!("combd     postgres: can't connect: {e}");
+fn run_member(id: u64, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs: Receiver<Job>, pool: Sender<Msg>) {
+    // A failed connect is tried again, 100 ms then doubling, `retries`
+    // times. "Too many clients" isn't: the pool puts the ask back in line.
+    let mut tries = 0;
+    let mut client = loop {
+        match pg.connect(NoTls) {
+            Ok(c) => break c,
+            Err(e) => {
+                let full = e.code() == Some(&SqlState::TOO_MANY_CONNECTIONS);
+                if !full && tries < retries {
+                    std::thread::sleep(Duration::from_millis(100 << tries));
+                    tries += 1;
+                    continue;
+                }
+                if !full {
+                    eprintln!("combd     postgres: can't connect: {e}");
+                }
+                let _ = pool.send(Msg::Started(id, Err(full)));
+                return;
             }
-            let _ = pool.send(Msg::Started(id, Err(full)));
-            return;
         }
     };
     let mut lease = Some((first, Instant::now() + Duration::from_millis(lease_ms)));
