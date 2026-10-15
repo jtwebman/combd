@@ -1086,15 +1086,28 @@ v0.1 runs.** Two finish lines.
 Waits until after v0.1: supervisors, user-written pool kinds, `enqueue`,
 per-PR environments, `fetch` beyond what the JS line needs.
 
-**The JS line: Cloudflare Workers as they were at launch (2017-2018).** With
-agents writing most code, the language matters less than strict config,
-clear errors, and a small API, so Rust in Wasm is the main path. JS gets a
-solid baseline, not Node: the `fetch` handler (both forms), `Request`,
-`Response`, `Headers`, `fetch()` out through the egress allowlist, `URL`,
-`URLSearchParams`, `TextEncoder`/`TextDecoder`, `atob`/`btoa`,
-`crypto.getRandomValues` and `crypto.subtle` (digest, HMAC, AES-GCM),
-`console`, timers within a request, and `waitUntil`. Not Node APIs, not
-npm packages that need them, not full streams or Cache.
+**Languages: any that compiles to Wasm. JS is paused.** (Decided
+2026-10-15.) With agents writing most code, the language matters less than
+strict config, clear errors, and a small API, and backend JS may have seen
+its best days. So apps are Wasm, run by our interpreter or compiled to Rust
+by the AOT tier, and the docs cover the popular languages. `jsc/` stays in
+the repo, unmaintained; the docs say "JS support coming soon". If JS comes
+back, the target is Workers at launch (2017-2018): the `fetch` handler,
+`Request`/`Response`/`Headers`, `fetch()`, `URL`, text encoding, base64,
+`crypto.subtle` basics, timers, `waitUntil`; not Node.
+
+Where each language stands (what its compiler needs from us):
+- **Today:** Rust, C, Go, Zig, AssemblyScript (`langs/`, all three engines).
+- **Next, plain linear-memory Wasm:** Swift (official WASI SDK) and C#
+  (.NET's WASI build runs Mono inside Wasm: likely 10+ MB and slow cold
+  starts; test before promising).
+- **With work:** Python. CPython builds for WASI but reads its stdlib from
+  disk, and cells have no filesystem, so bundle it or give apps a
+  read-only one. An interpreter inside our engine: AOT tier only, tens of
+  MB per instance.
+- **Blocked on Wasm GC (and exception handling):** Kotlin and Java (Kotlin/
+  Wasm, GraalVM, newer TeaVM). That's a managed heap, struct and array
+  types, and subtyping in both engines: its own track, after v0.1.
 
 ## Build order (when we do build)
 

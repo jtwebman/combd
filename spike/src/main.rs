@@ -10,6 +10,7 @@
 #[cfg(feature = "aot-lite")]
 mod aot;
 mod aot_gen;
+mod app;
 mod engine;
 mod fleet;
 mod host;
@@ -810,20 +811,30 @@ fn main_with(args: &[&str]) {
         ["langs", "aot"] => std::process::exit(if langs("aot", &aot::Aot) { 0 } else { 1 }),
         #[cfg(feature = "aot-lite")]
         [test, "aot"] => run(test, "aot", &aot::Aot),
+        // An app: its manifest and modules in `dir`, the `dev` environment.
+        ["serve-app", engine, dir, port] => {
+            let (dir, port) = (std::path::Path::new(dir), port.parse().unwrap());
+            match engine {
+                "interp" => http::serve_app(&interp::Interp { max_pages: 16384 }, dir, port),
+                #[cfg(feature = "aot-lite")]
+                "aot" => http::serve_app(&aot::Aot, dir, port),
+                _ => panic!("unknown engine (interp, aot)"),
+            }
+        }
         ["serve", engine, cell, port] => {
             let wasm = self::cell(cell);
             let port: u16 = port.parse().unwrap();
             match engine {
                 "interp" => {
                     let eng = interp::Interp { max_pages: 16384 };
-                    http::serve(&eng, &eng.load(&wasm).unwrap(), port)
+                    http::serve(&eng, eng.load(&wasm).unwrap(), port)
                 }
                 #[cfg(feature = "aot-lite")]
-                "aot" => http::serve(&aot::Aot, &aot::Aot.load(&wasm).unwrap(), port),
+                "aot" => http::serve(&aot::Aot, aot::Aot.load(&wasm).unwrap(), port),
                 #[cfg(feature = "wasmtime")]
                 "wasmtime" => {
                     let eng = wt::Wt::new(WT_FUEL, None);
-                    http::serve(&eng, &eng.load(&wasm).unwrap(), port)
+                    http::serve(&eng, eng.load(&wasm).unwrap(), port)
                 }
                 _ => panic!("unknown engine"),
             }
@@ -1168,12 +1179,20 @@ mod tests {
     where
         E::Program: Sync + Send,
     {
+        let ev_max = cfg.ev_max;
+        server_app(eng, cfg, move |eng| app::App::single(eng.load(&wasm).unwrap(), ev_max))
+    }
+
+    fn server_app<E: Engine + Sync + Send + 'static>(eng: E, cfg: http::Config, make: impl FnOnce(&E) -> app::App<E::Program> + Send + 'static) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>)
+    where
+        E::Program: Sync + Send,
+    {
         static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
         let port = 21000 + (std::process::id() % 2000) as u16 * 10 + PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let stop = cfg.stop.clone();
         let t = std::thread::spawn(move || {
-            let prog = eng.load(&wasm).unwrap();
-            http::serve_with(&eng, &prog, port, cfg);
+            let app = make(&eng);
+            http::serve_with(&eng, &app, port, cfg);
         });
         for _ in 0..200 {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -1218,9 +1237,13 @@ mod tests {
 
     /// One HTTP request on its own connection: (status, body).
     fn http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
+        http_to(port, "x", method, path, body)
+    }
+
+    fn http_to(port: u16, host: &str, method: &str, path: &str, body: &str) -> (u16, String) {
         use std::io::{Read, Write};
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        write!(s, "{method} {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}", body.len()).unwrap();
+        write!(s, "{method} {path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}", body.len()).unwrap();
         let mut out = String::new();
         let r = s.read_to_string(&mut out);
         assert!(r.is_ok() && out.len() >= 12, "{method} {path}: no answer ({r:?}, {out:?})");
@@ -1874,7 +1897,7 @@ pools:
         std::fs::create_dir(app.0.join("modules")).unwrap();
         std::fs::copy(GUEST_EV, manifest::module_path(&app.0, "api")).unwrap();
         std::fs::write(app.0.join("combd.dev.toml"), format!("[vars]\nREGION = \"us-east\"\n[secrets]\npg-url = {pg_url:?}\n")).unwrap();
-        let (pg, environ) = http::app_settings(&app.0).unwrap();
+        let Ok(Some((_, pg, environ))) = http::app_settings(&app.0) else { panic!("the manifest should load") };
         let p = &pg.as_ref().unwrap().pools[0];
         assert_eq!((p.name.as_str(), p.max, p.wait_ms, p.retries), ("main", 4, 2000, 0));
         let dir = store::tempdir::Dir::new();
@@ -1892,6 +1915,73 @@ pools:
         // (No unwrap_err: that would need Debug, and a pool's config holds its password.)
         let Err(e) = http::app_settings(&app.0) else { panic!("a bad environment must not start") };
         assert!(e.contains("REGION") && e.contains("doesn't match") && e.contains("PG_URL: required"), "{e}");
+    }
+
+    /// An app of several processes, from its manifest: routes by host and
+    /// path, each process its own cells and state, objects scoped to their
+    /// process, and nothing else reachable.
+    fn an_app_of_processes<E: Engine + Sync + Send + 'static>(eng: E)
+    where
+        E::Program: Sync + Send,
+    {
+        let app = store::tempdir::Dir::new();
+        std::fs::write(app.0.join("combd.toml"), r#"
+[app]
+name = "shop"
+[processes.edge]
+kind = "ev"
+routes = ["/hello", "/sleep/*"]
+[processes.admin]
+kind = "ev"
+routes = ["admin.test/hello"]
+[processes.api]
+kind = "classic"
+routes = ["/api/*"]
+[processes.room]
+kind = "classic"
+durable = true
+routes = ["/room/:id/*"]
+"#).unwrap();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::copy(GUEST_EV, manifest::module_path(&app.0, "ev")).unwrap();
+        std::fs::copy(GUEST, manifest::module_path(&app.0, "classic")).unwrap();
+        let (a, pg, environ) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(a.progs.len(), 2, "one program per kind");
+        let dir = store::tempdir::Dir::new();
+        // One loop: an instance's memory is its own, so with two loops the
+        // hit counts would depend on which loop took the connection.
+        let c = http::Config { pg, environ: Arc::new(environ), ..cfg(&dir.0, 1) };
+        let (port, _, _) = server_app(eng, c, move |_| a);
+        // Two processes on one module: their own instances, their own state.
+        for n in 1..=3 {
+            assert_eq!(http(port, "GET", "/hello", ""), (200, format!("{{\"hits\":{n}}}")));
+        }
+        assert_eq!(http_to(port, "admin.test", "GET", "/hello", ""), (200, "{\"hits\":1}".into()));
+        assert_eq!(http_to(port, "ADMIN.test:8080", "GET", "/hello", ""), (200, "{\"hits\":2}".into()), "hosts ignore case and port");
+        assert_eq!(http(port, "GET", "/sleep/20", ""), (200, "{\"slept\":20}".into()));
+        // A classic worker on its routes.
+        assert_eq!(http(port, "GET", "/api/users/42", "").0, 200);
+        // Objects, scoped to their process.
+        for n in 1..=2 {
+            assert_eq!(http(port, "POST", "/room/r1/incr", ""), (200, format!("{{\"count\":{n}}}")));
+        }
+        assert_eq!(http(port, "GET", "/room/r2/count", ""), (200, "{\"count\":0}".into()));
+        assert!(on_disk(&dir.0, "room/r1", "SELECT v FROM kv").contains("[[2]]"));
+        // Nothing else: no route, the old fixed routes, a route's prefix.
+        for path in ["/nope", "/do/r1/count", "/room", "/hello/extra"] {
+            assert_eq!(http(port, "GET", path, "").0, 404, "{path}");
+        }
+    }
+
+    #[test]
+    fn an_app_of_processes_on_the_interpreter() {
+        an_app_of_processes(interp::Interp { max_pages: 16384 });
+    }
+
+    #[cfg(feature = "aot-guard")]
+    #[test]
+    fn an_app_of_processes_on_aot() {
+        an_app_of_processes(aot::Aot);
     }
 
     #[test]

@@ -418,7 +418,7 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
     }
 }
 
-fn parse_route(r: &str) -> Result<Route, String> {
+pub(crate) fn parse_route(r: &str) -> Result<Route, String> {
     if r.len() > 256 {
         return Err("longer than 256 bytes".into());
     }

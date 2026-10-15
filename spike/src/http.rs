@@ -54,6 +54,7 @@ use crate::engine::{CellVm, Engine, Outcome};
 use crate::fleet::{DiskPeers, FleetCfg, Frame};
 use crate::wire::{self, Wire};
 use crate::own::{self, Act, Core, Effect};
+use crate::app::{App, Hit, Router};
 use crate::host::{now_ms, AsyncOp, EvAction, HostState, WsOut};
 use crate::store::{self, AlarmIndex, Db};
 use mio::net::{TcpListener, TcpStream};
@@ -77,7 +78,9 @@ const MAX_WS_READ: usize = 4 * crate::ws::MAX_MESSAGE;
 const MAX_WS_WRITE: usize = 8 << 20;
 /// A socket's messages queued at its object, before we stop reading it.
 const MAX_WS_INFLIGHT: u32 = 64;
-const MAX_NAME: usize = 256;
+/// Names are hex-encoded into file names (`store::path_for`), which most
+/// file systems cap at 255 bytes: 120 bytes is 240, plus `.sqlite`.
+const MAX_NAME: usize = 120;
 /// An alarm that keeps failing is tried this many times, then dropped.
 const ALARM_TRIES: u32 = 6;
 /// The first retry waits this long; each next one waits twice as long.
@@ -301,6 +304,8 @@ enum Msg {
 /// the cell waits (an async call), which it chose.
 struct EvInst<E: Engine> {
     gen: u64,
+    /// Its process.
+    proc: usize,
     /// `None` while a callback runs.
     cell: Option<Cell<E>>,
     reqs: HashMap<u64, EvReq>,
@@ -394,6 +399,8 @@ struct WsConn {
 struct Cell<E: Engine> {
     vm: E::Vm,
     st: HostState,
+    /// Its process (`App::procs`).
+    proc: usize,
 }
 
 impl<E: Engine> Cell<E> {
@@ -407,11 +414,11 @@ impl<E: Engine> Cell<E> {
     }
 }
 
-fn fresh<E: Engine>(eng: &E, prog: &E::Program, environ: &Arc<Vec<Vec<u8>>>) -> std::io::Result<Cell<E>> {
-    let mut vm = eng.spawn(prog).map_err(std::io::Error::other)?;
+fn fresh<E: Engine>(eng: &E, app: &App<E::Program>, proc: usize, environ: &Arc<Vec<Vec<u8>>>) -> std::io::Result<Cell<E>> {
+    let mut vm = eng.spawn(&app.progs[app.procs[proc].prog]).map_err(std::io::Error::other)?;
     let mut st = HostState { environ: environ.clone(), ..HostState::default() };
     crate::init(&mut vm, &mut st).map_err(std::io::Error::other)?;
-    Ok(Cell { vm, st })
+    Ok(Cell { vm, st, proc })
 }
 
 /// A request in flight.
@@ -487,9 +494,12 @@ impl<E: Engine> Object<E> {
 enum Req {
     /// A WebSocket handshake for an object: name, path, `sec-websocket-key`.
     Upgrade(String, String, String),
-    Cell(String),
+    /// A worker process's request.
+    Cell(usize, String),
     Object(String, String),
     Stats,
+    /// A manifest's routes don't match.
+    NotFound,
     /// A new object id.
     NewId,
 }
@@ -525,36 +535,57 @@ fn owner(name: &str, threads: usize) -> usize {
     (h % threads as u64) as usize
 }
 
-pub fn serve<E>(eng: &E, prog: &E::Program, port: u16)
+/// One program, the old fixed routes, no manifest.
+pub fn serve<E>(eng: &E, prog: E::Program, port: u16)
+where
+    E: Engine + Sync,
+    E::Program: Sync,
+{
+    let cfg = Config::from_env();
+    let app = App::single(prog, cfg.ev_max);
+    serve_with(eng, &app, port, cfg)
+}
+
+/// The app in `dir`: its manifest, resolved for the local `dev` environment,
+/// and its modules. Any mistake and nothing starts.
+pub fn serve_app<E>(eng: &E, dir: &std::path::Path, port: u16)
 where
     E: Engine + Sync,
     E::Program: Sync,
 {
     let mut cfg = Config::from_env();
-    match app_settings(std::path::Path::new(".")) {
-        Ok((pg, environ)) => {
+    match load_app(eng, dir) {
+        Ok((app, pg, environ)) => {
             cfg.pg = pg;
             cfg.environ = Arc::new(environ);
+            serve_with(eng, &app, port, cfg)
         }
         Err(e) => {
-            // Any mistake and nothing starts.
             eprintln!("combd     {e}");
             std::process::exit(1);
         }
     }
-    serve_with(eng, prog, port, cfg)
+}
+
+/// The app in `dir`, ready to serve: its processes and modules, its pools,
+/// and its env vars.
+pub fn load_app<E: Engine>(eng: &E, dir: &std::path::Path) -> Result<(App<E::Program>, Option<crate::pg::PgCfg>, Vec<Vec<u8>>), String> {
+    let (r, pg, environ) = app_settings(dir)?.ok_or("no manifest (combd.toml, combd.yaml, or combd.json)")?;
+    let app = App::from_manifest(dir, &r, |w| eng.load(w).map_err(|e| e.to_string()))?;
+    Ok((app, pg, environ))
 }
 
 /// The app's manifest in `dir`, resolved for the local `dev` environment:
 /// its pools, and its env vars.
-pub fn app_settings(dir: &std::path::Path) -> Result<(Option<crate::pg::PgCfg>, Vec<Vec<u8>>), String> {
-    let Some(m) = crate::manifest::load(dir)? else { return Ok((None, vec![])) };
+pub fn app_settings(dir: &std::path::Path) -> Result<Option<(crate::manifest::Resolved, Option<crate::pg::PgCfg>, Vec<Vec<u8>>)>, String> {
+    let Some(m) = crate::manifest::load(dir)? else { return Ok(None) };
     let r = m.resolve(&crate::manifest::load_dev(dir)?).map_err(|e| format!("the dev environment:\n  {e}"))?;
     let environ = r.environ.iter().map(|(k, v)| format!("{k}={v}").into_bytes()).collect();
-    Ok((crate::pg::PgCfg::from_manifest(&r), environ))
+    let pg = crate::pg::PgCfg::from_manifest(&r);
+    Ok(Some((r, pg, environ)))
 }
 
-pub fn serve_with<E>(eng: &E, prog: &E::Program, port: u16, mut cfg: Config)
+pub fn serve_with<E>(eng: &E, app: &App<E::Program>, port: u16, mut cfg: Config)
 where
     E: Engine + Sync,
     E::Program: Sync,
@@ -633,12 +664,12 @@ where
             sc.spawn(move || {
                 let mut lp = Loop {
                     eng,
-                    prog,
+                    app,
                     sh,
                     me,
                     inbox,
                     poll,
-                    pool: vec![],
+                    pools: (0..app.procs.len()).map(|_| vec![]).collect(),
                     tasks: VecDeque::new(),
                     objects: HashMap::new(),
                     alarms: BinaryHeap::new(),
@@ -677,7 +708,7 @@ where
                     parked: HashMap::new(),
                     next_park: 0,
                     pg_handles: HashMap::new(),
-                    ev_mode: false,
+                    ev_mode: vec![false; app.procs.len()],
                     ev: vec![],
                     ev_gen: 0,
                     next_ev_req: 0,
@@ -694,12 +725,13 @@ where
 /// Everything one event loop owns.
 struct Loop<'a, E: Engine> {
     eng: &'a E,
-    prog: &'a E::Program,
+    app: &'a App<E::Program>,
     sh: &'a Shared,
     me: usize,
     inbox: Receiver<Msg>,
     poll: Poll,
-    pool: Vec<Cell<E>>,
+    /// Warm cells, per process.
+    pools: Vec<Vec<Cell<E>>>,
     tasks: VecDeque<Task<E>>,
     objects: HashMap<String, Object<E>>,
     /// Alarms of objects this loop owns: (due, name). Entries can be stale;
@@ -745,9 +777,10 @@ struct Loop<'a, E: Engine> {
     parked: HashMap<u64, (Task<E>, bool)>,
     next_park: u64,
     pg_handles: HashMap<u64, PgHandle>,
-    /// Event cells: whether this program is one (it exports `on_request`),
-    /// its instances, and their timers (due, instance, generation, ticket).
-    ev_mode: bool,
+    /// Event cells: which processes are (their module exports
+    /// `on_request`), their instances, and their timers (due, instance,
+    /// generation, ticket).
+    ev_mode: Vec<bool>,
     ev: Vec<Option<EvInst<E>>>,
     ev_gen: u64,
     next_ev_req: u64,
@@ -882,9 +915,11 @@ impl<E: Engine> Loop<'_, E> {
     fn run(&mut self, mut listener: TcpListener) -> std::io::Result<()> {
         let mut events = Events::with_capacity(1024);
         self.poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
-        let mut first = fresh(self.eng, self.prog, &self.sh.cfg.environ)?;
-        self.ev_mode = first.vm.has_export("on_request");
-        self.pool.push(first);
+        for p in 0..self.app.procs.len() {
+            let mut first = fresh(self.eng, self.app, p, &self.sh.cfg.environ)?;
+            self.ev_mode[p] = first.vm.has_export("on_request");
+            self.pools[p].push(first);
+        }
         // Alarms from before a restart.
         let threads = self.sh.cfg.threads;
         for (name, at) in self.sh.index.lock().unwrap().all().unwrap_or_default() {
@@ -1140,14 +1175,14 @@ impl<E: Engine> Loop<'_, E> {
 
     /// A request for an event cell: the least busy instance with room takes
     /// it, or a new one starts.
-    fn ev_request(&mut self, origin: Origin, req: String) -> std::io::Result<()> {
-        let cap = self.sh.cfg.ev_max;
-        let pick = self.ev.iter().enumerate().filter_map(|(i, e)| e.as_ref().filter(|e| e.reqs.len() < cap).map(|e| (e.reqs.len(), i))).min().map(|(_, i)| i);
+    fn ev_request(&mut self, origin: Origin, proc: usize, req: String) -> std::io::Result<()> {
+        let cap = self.app.procs[proc].max_concurrent;
+        let pick = self.ev.iter().enumerate().filter_map(|(i, e)| e.as_ref().filter(|e| e.proc == proc && e.reqs.len() < cap).map(|e| (e.reqs.len(), i))).min().map(|(_, i)| i);
         let i = match pick {
             Some(i) => i,
             None => {
                 self.ev_gen += 1;
-                let inst = EvInst { gen: self.ev_gen, cell: Some(fresh(self.eng, self.prog, &self.sh.cfg.environ)?), reqs: HashMap::new(), tickets: HashMap::new(), queue: VecDeque::new(), running: None };
+                let inst = EvInst { gen: self.ev_gen, proc, cell: Some(fresh(self.eng, self.app, proc, &self.sh.cfg.environ)?), reqs: HashMap::new(), tickets: HashMap::new(), queue: VecDeque::new(), running: None };
                 self.sh.stats.ev_instances.fetch_add(1, Relaxed);
                 match self.ev.iter().position(Option::is_none) {
                     Some(i) => {
@@ -1342,8 +1377,8 @@ impl<E: Engine> Loop<'_, E> {
         }
         // An idle instance goes, unless it's the first: that one stays warm.
         // ponytail: drops at once; keep it for `idle` if start-up cost shows.
-        let first = self.ev.iter().position(Option::is_some);
         let inst = self.ev[i].as_ref().unwrap();
+        let first = self.ev.iter().position(|e| e.as_ref().is_some_and(|e| e.proc == inst.proc));
         if first != Some(i) && inst.reqs.is_empty() && inst.queue.is_empty() && inst.cell.is_some() {
             self.ev[i] = None;
         }
@@ -1721,7 +1756,7 @@ impl<E: Engine> Loop<'_, E> {
         let Some(name) = obj else {
             return Some((match answer {
                 Ok(a) => {
-                    self.pool.push(cell);
+                    self.pools[cell.proc].push(cell);
                     split_answer(&a)
                 }
                 Err(trap) => {
@@ -2025,7 +2060,7 @@ impl<E: Engine> Loop<'_, E> {
             return Ok(());
         }
         let who = (id, c.gen);
-        let req = match parse(c) {
+        let req = match parse(c, &self.app.router) {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(()),
             Err(()) => {
@@ -2081,11 +2116,12 @@ impl<E: Engine> Loop<'_, E> {
                 self.queue_reply(who, (200, body));
             }
             Req::NewId => self.queue_reply(who, (200, format!("{{\"id\":\"{}\"}}", uuid_v7()))),
-            Req::Cell(cell_req) if self.ev_mode => self.ev_request(Origin::Local(who), cell_req)?,
-            Req::Cell(cell_req) => {
-                let mut cell = match self.pool.pop() {
+            Req::NotFound => self.queue_reply(who, (404, "{\"error\":\"no route\"}".into())),
+            Req::Cell(p, cell_req) if self.ev_mode[p] => self.ev_request(Origin::Local(who), p, cell_req)?,
+            Req::Cell(p, cell_req) => {
+                let mut cell = match self.pools[p].pop() {
                     Some(cell) => cell,
-                    None => fresh(self.eng, self.prog, &self.sh.cfg.environ)?,
+                    None => fresh(self.eng, self.app, p, &self.sh.cfg.environ)?,
                 };
                 if let Err(trap) = crate::start(&mut cell.vm, &cell_req, &mut cell.st) {
                     eprintln!("cell trapped starting a request: {trap}");
@@ -2149,7 +2185,8 @@ impl<E: Engine> Loop<'_, E> {
     /// Begin one request on an object: its warm cell (or a fresh one), inside
     /// a transaction. `Ok(false)`: nothing to run (a stale alarm).
     fn run_object(&mut self, name: &str, origin: Origin, mut req: String) -> Result<bool, (u16, String)> {
-        let (eng, prog, environ) = (self.eng, self.prog, self.sh.cfg.environ.clone());
+        let (eng, app, environ) = (self.eng, self.app, self.sh.cfg.environ.clone());
+        let proc = app.object_proc(name);
         // WebSocket events say what they are in their text, the same here
         // and when forwarded from the node that holds the connection.
         let sock_of = |s: &str| s.trim_start_matches('/').parse::<u64>().ok();
@@ -2223,7 +2260,7 @@ impl<E: Engine> Loop<'_, E> {
         }
         let mut cell = match o.cell.take() {
             Some(c) => c,
-            None => match fresh(eng, prog, &environ) {
+            None => match fresh(eng, app, proc, &environ) {
                 Ok(mut c) => {
                     c.host().db = Some(o.db.clone());
                     c
@@ -2606,13 +2643,13 @@ fn split_answer(a: &str) -> (u16, String) {
 }
 
 /// Take one whole request off the front of the read buffer.
-fn parse(c: &mut Conn) -> Result<Option<Req>, ()> {
-    parse_buf(&mut c.rbuf, &mut c.close_after)
+fn parse(c: &mut Conn, router: &Router) -> Result<Option<Req>, ()> {
+    parse_buf(&mut c.rbuf, &mut c.close_after, router)
 }
 
 /// `parse` on just the bytes read so far (and the connection's close flag),
 /// so it can be tested and fuzzed without a socket.
-fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool) -> Result<Option<Req>, ()> {
+fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Result<Option<Req>, ()> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
     let hlen = match req.parse(rbuf) {
@@ -2623,7 +2660,11 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool) -> Result<Option<Req>, 
     let mut clen: Option<usize> = None;
     let mut close = false;
     let (mut upgrade, mut ws_key, mut ws_ok) = (false, None, false);
+    let mut host = "";
     for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("host") {
+            host = std::str::from_utf8(h.value).map_err(|_| ())?;
+        }
         if h.name.eq_ignore_ascii_case("upgrade") && h.value.eq_ignore_ascii_case(b"websocket") {
             upgrade = true;
         } else if h.name.eq_ignore_ascii_case("sec-websocket-key") {
@@ -2663,6 +2704,29 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool) -> Result<Option<Req>, 
         return Err(());
     }
     let line = |kind: &str, path: &str| if body.is_empty() { format!("{kind} {method} {path}") } else { format!("{kind} {method} {path} {body}") };
+    // A manifest's routes: by host, then path (the query string isn't part of it).
+    if !router.legacy && path != "/_combd/stats" {
+        let r = match router.route(host, path.split('?').next().unwrap_or("")) {
+            Some(Hit::Object(name, sub)) => {
+                if name.len() > MAX_NAME {
+                    return Err(());
+                }
+                match (upgrade, ws_key) {
+                    (true, Some(key)) if method == "GET" && ws_ok && clen == 0 && !sub.contains(char::is_whitespace) => {
+                        rbuf.drain(..hlen);
+                        return Ok(Some(Req::Upgrade(name, sub, key)));
+                    }
+                    (true, _) => return Err(()),
+                    _ => Req::Object(name, line("do", &sub)),
+                }
+            }
+            Some(Hit::Cell(_)) if upgrade => return Err(()),
+            Some(Hit::Cell(p)) => Req::Cell(p, line("api", path)),
+            None => Req::NotFound,
+        };
+        rbuf.drain(..hlen + clen);
+        return Ok(Some(r));
+    }
     // The object and the path inside it, for `/do/<name>/...` and `/do/id/<uuid>/...`.
     let object = |path: &str| -> Result<Option<(String, String)>, ()> {
         if let Some(rest) = path.strip_prefix("/do/id/") {
@@ -2697,7 +2761,7 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool) -> Result<Option<Req>, 
     } else if let Some((name, sub)) = object(path)? {
         Req::Object(name, line("do", &sub))
     } else {
-        Req::Cell(line("api", path))
+        Req::Cell(0, line("api", path))
     };
     rbuf.drain(..hlen + clen);
     Ok(Some(r))
@@ -2747,9 +2811,16 @@ mod tests {
     fn drain(buf: &[u8]) -> Result<usize, ()> {
         let mut rbuf = buf.to_vec();
         let mut close = false;
+        // Both ways: the old fixed routes, and a manifest's.
+        let routed = Router::from(&[("shop.test/api/*", "api", false), ("/room/:id/*", "room", true), ("/a/:x/b", "x", false), ("/", "root", false)]);
+        let mut rbuf2 = rbuf.clone();
+        let mut close2 = false;
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut n = 0;
-            while let Ok(Some(_)) = parse_buf(&mut rbuf, &mut close) {
+            while let Ok(Some(_)) = parse_buf(&mut rbuf, &mut close, &Router::legacy()) {
+                n += 1;
+            }
+            while let Ok(Some(_)) = parse_buf(&mut rbuf2, &mut close2, &routed) {
                 n += 1;
             }
             n
@@ -2767,6 +2838,23 @@ mod tests {
         }
     }
 
+    /// A manifest's routes: specific beats general, and ids are path segments.
+    #[test]
+    fn routes_pick_the_most_specific() {
+        let r = Router::from(&[("/*", "any", false), ("/room/:id/*", "room", true), ("shop.test/*", "shop", false), ("/room/new", "new", false)]);
+        let hit = |host: &str, path: &str| match r.route(host, path) {
+            Some(Hit::Cell(p)) => format!("cell {p}"),
+            Some(Hit::Object(n, sub)) => format!("{n} {sub}"),
+            None => "none".into(),
+        };
+        assert_eq!(hit("x", "/room/r1/count"), "room/r1 /count");
+        assert_eq!(hit("x", "/room/r1"), "room/r1 /");
+        assert_eq!(hit("x", "/room/new"), "cell 3", "a literal beats a capture");
+        assert_eq!(hit("shop.test", "/room/r1"), "cell 2", "a host beats any host");
+        assert_eq!(hit("x", "/room//x"), "cell 0", "an empty id isn't one");
+        assert_eq!(hit("x", "/"), "cell 0");
+    }
+
     /// Valid requests, damaged at random: the parser must never panic.
     #[test]
     fn mangled_requests_never_panic_the_parser() {
@@ -2776,6 +2864,10 @@ mod tests {
             b"GET /do/id/0190b5a2-7c3e-7000-8000-000000000000/count HTTP/1.1\r\n\r\n",
             b"POST /do/new HTTP/1.1\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
             b"GET /_combd/stats HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n",
+            b"GET /api/x?y=1 HTTP/1.1\r\nhost: SHOP.test:443\r\n\r\n",
+            b"GET /room/r1/ws HTTP/1.1\r\nhost: x\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            b"POST /room//x HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\n\r\nhi",
+            b"GET /a/q/b HTTP/1.1\r\nhost: x\r\n\r\n",
         ];
         let lens: &[&[u8]] = &[b"18446744073709551615", b"0", b"1", b"4294967296", b"-5", b" 3 ", b"3,3", b"999999999999"];
         let mut rng = crate::sim::Rng::new(1);

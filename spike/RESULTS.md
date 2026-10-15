@@ -1385,6 +1385,29 @@ cell's `environ`, the pool runs a query, a bad environment doesn't start).
 Next: environments in the control plane (per pull request, `--from`, a
 TTL, their own storage), and secrets encrypted there.
 
+## An app of processes
+
+`combd-spike serve-app <engine> <dir> <port>` serves an app from its
+manifest (`spike/src/app.rs`): one program per kind (`modules/<kind>.wasm`,
+loaded once), and each process with its own warm cells, event-cell
+instances, and settings (`max_concurrent`). Requests are routed by host
+(case and port ignored) and path (query string ignored), most specific
+first: a host beats any host, then a literal beats a capture beats `*`. A
+durable process's object is `<process>/<id>`, so two processes never share
+an object, and its request sees the path after the route's `*`. Anything
+no route matches is a 404, the old fixed `/do/` routes included. With no
+manifest, `serve` works as before.
+
+Object names were allowed up to 256 bytes, but they're hex-encoded into
+file names, which most file systems cap at 255 bytes: names over 124 bytes
+could never open. The cap is 120 now.
+
+**Tests:** `an_app_of_processes_*` (two processes on one module keep their
+own instances and state, host routes, a classic worker, objects scoped to
+their process and on disk as `room/r1`, and 404s), `routes_pick_the_most_
+specific`, and the parser fuzzer now runs every mangled request through a
+manifest's routes too.
+
 ## Event cells: many requests per instance
 
 A Worker that exports `on_request` is an event cell (`guest-ev/`), like a
@@ -1415,6 +1438,10 @@ fresh state. **`event_cells_postgres_*`**, against a real Postgres: 10
 transactions that each pause 300 ms halfway run interleaved on one instance
 in about 300 ms; one that fails halfway rolls back alone; every pinned
 connection goes back.
+
+An instance's memory is its own: not shared with other instances, other
+event loops, or other nodes (like a global in a Worker's isolate). State
+that must be shared goes in a Durable Object.
 
 Not yet: event-mode Durable Objects.
 
