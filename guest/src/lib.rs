@@ -215,6 +215,9 @@ pub mod room {
             pub fn now_ms() -> i64;
             pub fn alarm_set(at_ms: i64);
             pub fn alarm_get() -> i64;
+            pub fn ws_send(id: u64, ptr: *const u8, len: u32) -> u32;
+            pub fn ws_list(ptr: *mut u64, cap: u32) -> u32;
+            pub fn ws_close(id: u64, code: u32) -> u32;
         }
     }
 
@@ -227,6 +230,32 @@ pub mod room {
         pub unsafe fn alarm_get() -> i64 {
             -1
         }
+        pub unsafe fn ws_send(_: u64, _: *const u8, _: u32) -> u32 {
+            1
+        }
+        pub unsafe fn ws_list(_: *mut u64, _: u32) -> u32 {
+            0
+        }
+        pub unsafe fn ws_close(_: u64, _: u32) -> u32 {
+            1
+        }
+    }
+
+    /// The object's open WebSockets.
+    fn sockets() -> Vec<u64> {
+        let mut ids = vec![0u64; 64];
+        let n = unsafe { host::ws_list(ids.as_mut_ptr(), ids.len() as u32) } as usize;
+        if n > ids.len() {
+            ids = vec![0u64; n];
+            unsafe { host::ws_list(ids.as_mut_ptr(), n as u32) };
+        }
+        ids.truncate(n);
+        ids
+    }
+
+    /// Send to every socket; how many took it.
+    fn broadcast(msg: &str) -> usize {
+        sockets().into_iter().filter(|&id| unsafe { host::ws_send(id, msg.as_ptr(), msg.len() as u32) } == 0).count()
     }
 
     fn kv(k: &str) -> i64 {
@@ -297,6 +326,37 @@ pub mod room {
                     set_kv("alarms", kv("alarms") + 1);
                     "200 {}".into()
                 }
+                // WebSockets: a chat room. A message is saved (it outlives
+                // hibernation) and sent to everyone. `/ws-deny` refuses.
+                ("WSOPEN", "/ws-deny") => "403 {\"error\":\"no sockets here\"}".into(),
+                ("WSOPEN", _) => {
+                    set_kv("joins", kv("joins") + 1);
+                    "101 {}".into()
+                }
+                ("WSMSG", from) => {
+                    if body == "bye" {
+                        let id: u64 = from.trim_start_matches('/').parse().unwrap_or(0);
+                        unsafe { host::ws_close(id, 4000) };
+                        return "200 {}".into();
+                    }
+                    if body == "crash" {
+                        broadcast("never sent");
+                        panic!("crash in a socket event");
+                    }
+                    sql("INSERT INTO msgs (body) VALUES (?)", &[json!(body)]);
+                    room.msgs.push_back(body.to_string());
+                    if room.msgs.len() > KEEP {
+                        room.msgs.pop_front();
+                    }
+                    broadcast(&json!({ "from": from.trim_start_matches('/'), "text": body }).to_string());
+                    "200 {}".into()
+                }
+                ("WSCLOSE", _) => {
+                    set_kv("closes", kv("closes") + 1);
+                    "200 {}".into()
+                }
+                ("POST", "/broadcast") => format!("200 {}", json!({ "sent": broadcast(body) })),
+                ("GET", "/ws-stats") => format!("200 {}", json!({ "joins": kv("joins"), "closes": kv("closes"), "sockets": sockets().len() })),
                 // Write, then crash: the host must roll the write back.
                 ("POST", "/crash") => {
                     sql("INSERT INTO msgs (body) VALUES ('never saved')", &[]);

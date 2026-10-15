@@ -54,12 +54,12 @@ use crate::engine::{CellVm, Engine, Outcome};
 use crate::fleet::{DiskPeers, FleetCfg, Frame};
 use crate::wire::{self, Wire};
 use crate::own::{self, Act, Core, Effect};
-use crate::host::{now_ms, HostState};
+use crate::host::{now_ms, HostState, WsOut};
 use crate::store::{self, AlarmIndex, Db};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -70,6 +70,13 @@ use std::time::{Duration, Instant};
 const LISTENER: Token = Token(usize::MAX);
 const WAKER: Token = Token(usize::MAX - 1);
 const MAX_REQUEST: usize = 1 << 20;
+/// A WebSocket's unread bytes: a whole message, and more queued behind it.
+/// A client that sends faster than its object keeps up is closed past this.
+const MAX_WS_READ: usize = 4 * crate::ws::MAX_MESSAGE;
+/// A WebSocket's unsent bytes. A client that reads too slowly is closed past this.
+const MAX_WS_WRITE: usize = 8 << 20;
+/// A socket's messages queued at its object, before we stop reading it.
+const MAX_WS_INFLIGHT: u32 = 64;
 const MAX_NAME: usize = 256;
 /// An alarm that keeps failing is tried this many times, then dropped.
 const ALARM_TRIES: u32 = 6;
@@ -133,6 +140,11 @@ struct Stats {
     bucket_acks: AtomicU64,
     fences: AtomicU64,
     tail_entries: AtomicU64,
+    /// WebSockets open, and messages in from them.
+    sockets_open: AtomicU64,
+    ws_messages: AtomicU64,
+    /// Handshakes another loop accepted and handed to the object's loop.
+    ws_handoffs: AtomicU64,
 }
 
 /// Make an object's commits up to `gen` durable, then tell loop `back`.
@@ -227,6 +239,9 @@ enum Origin {
     Fleet(own::ReqId),
     /// Fleet mode: a request another node forwarded (connection, frame id).
     Wire(usize, u64),
+    /// A WebSocket event: its connection, socket id, and whether it's the
+    /// handshake (`WSOPEN`, answered with 101 to accept).
+    Socket(Who, u64, bool),
 }
 
 /// Between loops.
@@ -253,6 +268,8 @@ enum Msg {
     WireReply { id: u64, reply: (u16, String) },
     /// Fleet mode: the answer to a peer call (`None`: lost).
     PeerReply { id: u64, res: Option<own::PeerRes> },
+    /// A WebSocket handshake for an object you own: take the connection.
+    Adopt { s: TcpStream, rbuf: Vec<u8>, name: String, path: String, key: String },
 }
 
 /// Fleet mode: a request the decision core knows about.
@@ -278,6 +295,24 @@ struct Conn {
     close_after: bool,
     /// A request from this connection is running or waiting; the next one waits.
     busy: bool,
+    /// Set once the connection asked to be a WebSocket.
+    ws: Option<WsConn>,
+}
+
+/// A WebSocket. It belongs to an object, but outlives it: an idle object
+/// leaves memory (hibernates) while its sockets stay open, and the next
+/// message brings it back.
+struct WsConn {
+    obj: String,
+    id: u64,
+    key: String,
+    dec: crate::ws::Decoder,
+    /// The handshake is done (the object answered 101).
+    open: bool,
+    /// We've sent a close, or it's gone: no more events for the object.
+    gone: bool,
+    /// Messages handed to the object and not done yet.
+    inflight: u32,
 }
 
 /// A warm cell, reused across requests like a Worker instance.
@@ -325,8 +360,9 @@ struct Object<E: Engine> {
     committed: u64,
     synced: u64,
     syncing: bool,
-    /// Answers waiting for an fsync: (the commit they need, origin, answer).
-    held: Vec<(u64, Origin, (u16, String))>,
+    /// Answers waiting for an fsync: (the commit they need, origin, answer,
+    /// and the WebSocket sends that wait with it).
+    held: Vec<(u64, Origin, (u16, String), Vec<WsOut>)>,
     /// Paused for a checkpoint: requests wait until it's done.
     checkpointing: bool,
     /// Fleet mode: the alarm index entry, as far as we know; one move at a
@@ -358,6 +394,8 @@ impl<E: Engine> Object<E> {
 
 /// A parsed request.
 enum Req {
+    /// A WebSocket handshake for an object: name, path, `sec-websocket-key`.
+    Upgrade(String, String, String),
     Cell(String),
     Object(String, String),
     Stats,
@@ -513,6 +551,8 @@ where
                     alarm_fire: HashMap::new(),
                     last_scan: Instant::now(),
                     last_tick: Instant::now(),
+                    sockets: HashMap::new(),
+                    next_sock: 0,
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l)) {
                     eprintln!("event loop stopped: {e}");
@@ -560,6 +600,10 @@ struct Loop<'a, E: Engine> {
     alarm_fire: HashMap<String, (i64, u32, i64)>,
     last_scan: Instant,
     last_tick: Instant,
+    /// Each object's WebSockets on this loop: socket id -> connection. They
+    /// stay while the object is out of memory.
+    sockets: HashMap<String, BTreeMap<u64, Who>>,
+    next_sock: u64,
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
@@ -789,9 +833,9 @@ impl<E: Engine> Loop<'_, E> {
                     }
                     Outcome::Trap(trap) => Err(trap),
                 };
-                let origin = t.origin;
-                if let Some(reply) = self.finish_task(t, answer) {
-                    self.deliver(origin, reply)?;
+                let (origin, name) = (t.origin, t.obj.clone());
+                if let Some((reply, ws)) = self.finish_task(t, answer) {
+                    self.release(name.as_deref(), origin, reply, ws)?;
                 }
             }
         }
@@ -801,24 +845,9 @@ impl<E: Engine> Loop<'_, E> {
     fn accept(&mut self, listener: &mut TcpListener) -> std::io::Result<()> {
         loop {
             match listener.accept() {
-                Ok((mut s, _)) => {
+                Ok((s, _)) => {
                     s.set_nodelay(true)?;
-                    let id = self.free.pop().unwrap_or_else(|| {
-                        self.conns.push(None);
-                        self.conns.len() - 1
-                    });
-                    self.poll.registry().register(&mut s, Token(id), Interest::READABLE)?;
-                    self.next_gen += 1;
-                    self.conns[id] = Some(Conn {
-                        s,
-                        gen: self.next_gen,
-                        rbuf: vec![],
-                        wbuf: vec![],
-                        wpos: 0,
-                        writing: false,
-                        close_after: false,
-                        busy: false,
-                    });
+                    self.add_conn(s, vec![])?;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
                 Err(_) => return Ok(()), // another loop took it, or a transient error
@@ -830,6 +859,10 @@ impl<E: Engine> Loop<'_, E> {
         while let Ok(m) = self.inbox.try_recv() {
             match m {
                 Msg::Run { origin, obj, req } => self.submit(origin, obj, req),
+                Msg::Adopt { s, rbuf, name, path, key } => {
+                    let id = self.add_conn(s, rbuf)?;
+                    self.upgrade(id, name, path, key);
+                }
                 Msg::Reply { who, reply } => self.deliver(Origin::Local(who), reply)?,
                 Msg::Synced { obj, gen, ok } => self.synced(&obj, gen, ok)?,
                 Msg::Checkpointed { obj } => {
@@ -894,7 +927,179 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Ok(())
             }
+            Origin::Socket(who, sock, open) => {
+                let Some(c) = self.conn(who) else { return Ok(()) };
+                let Some(w) = c.ws.as_mut() else { return Ok(()) };
+                if !open {
+                    // An event is done: read on if we'd paused.
+                    w.inflight = w.inflight.saturating_sub(1);
+                    return self.ws_read(who.0);
+                }
+                if reply.0 == 101 && !w.gone {
+                    // The object took it: finish the handshake.
+                    w.open = true;
+                    let accept = crate::ws::accept(&w.key);
+                    c.wbuf.extend_from_slice(accept.as_bytes());
+                    self.sh.stats.sockets_open.fetch_add(1, Relaxed);
+                    return self.ws_read(who.0);
+                }
+                // Refused: answer it as plain HTTP, and close.
+                let name = w.obj.clone();
+                w.gone = true;
+                let _ = write!(c.wbuf, "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", reply.0, reply.1.len());
+                c.wbuf.extend_from_slice(reply.1.as_bytes());
+                c.close_after = true;
+                self.unregister(&name, sock);
+                self.settle(who.0)
+            }
         }
+    }
+
+    /// An answer is ready (after the output gate): send it, then do the
+    /// WebSocket sends that waited with it.
+    fn release(&mut self, name: Option<&str>, origin: Origin, reply: (u16, String), ws: Vec<WsOut>) -> std::io::Result<()> {
+        self.deliver(origin, reply)?;
+        match name {
+            Some(n) if !ws.is_empty() => self.apply_ws(n, ws),
+            _ => Ok(()),
+        }
+    }
+
+    /// Do what a cell asked of its object's sockets.
+    fn apply_ws(&mut self, name: &str, ws: Vec<WsOut>) -> std::io::Result<()> {
+        let mut touched = vec![];
+        for out in ws {
+            let (id, frame, close) = match &out {
+                WsOut::Send(id, m) => (*id, crate::ws::text(m), None),
+                WsOut::Close(id, code) => (*id, crate::ws::close(*code), Some(*code)),
+            };
+            let Some(&who) = self.sockets.get(name).and_then(|m| m.get(&id)) else { continue };
+            let Some(c) = self.conn(who) else { continue };
+            let Some(w) = c.ws.as_mut().filter(|w| w.open && !w.gone) else { continue };
+            if c.wbuf.len() - c.wpos + frame.len() > MAX_WS_WRITE {
+                // It reads too slowly to keep up: let it go.
+                w.gone = true;
+                c.close_after = true;
+                c.wbuf.truncate(c.wpos);
+                self.drop_socket(who, crate::ws::TOO_SLOW);
+            } else {
+                c.wbuf.extend_from_slice(&frame);
+                if close.is_some() {
+                    // The object closed it: no event back to the object.
+                    w.gone = true;
+                    c.close_after = true;
+                    self.unregister(name, id);
+                }
+            }
+            touched.push(who.0);
+        }
+        touched.dedup();
+        for id in touched {
+            self.settle(id)?;
+        }
+        Ok(())
+    }
+
+    /// Forget a socket (it closed, or never opened).
+    fn unregister(&mut self, name: &str, sock: u64) {
+        if let Some(m) = self.sockets.get_mut(name) {
+            if m.remove(&sock).is_some() {
+                self.sh.stats.sockets_open.fetch_sub(1, Relaxed);
+            }
+            if m.is_empty() {
+                self.sockets.remove(name);
+            }
+        }
+    }
+
+    /// A socket is done from the client's side (it closed, broke, or broke
+    /// the rules): forget it, and tell its object, waking it if it sleeps.
+    fn drop_socket(&mut self, who: Who, code: u16) {
+        let Some(w) = self.conn(who).and_then(|c| c.ws.as_mut()) else { return };
+        let (name, id, open) = (w.obj.clone(), w.id, w.open);
+        w.gone = true;
+        if self.sockets.get(&name).is_some_and(|m| m.contains_key(&id)) {
+            if open {
+                self.unregister(&name, id);
+            } else if let Some(m) = self.sockets.get_mut(&name) {
+                m.remove(&id); // never opened: never counted
+            }
+            if open {
+                self.submit(Origin::Socket(who, id, false), name, format!("do WSCLOSE /{id} {code}"));
+            }
+        }
+    }
+
+    /// A socket has bytes: hand its messages to its object, answer pings,
+    /// and handle a close. Stops while too many messages wait at the object.
+    fn ws_read(&mut self, id: usize) -> std::io::Result<()> {
+        use crate::ws::Event;
+        loop {
+            let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return Ok(()) };
+            let who = (id, c.gen);
+            let Some(w) = c.ws.as_mut() else { return Ok(()) };
+            if !w.open || w.gone || w.inflight >= MAX_WS_INFLIGHT {
+                break;
+            }
+            match w.dec.next(&mut c.rbuf) {
+                Ok(None) => break,
+                Ok(Some(Event::Text(t))) => {
+                    w.inflight += 1;
+                    let (name, sock) = (w.obj.clone(), w.id);
+                    self.sh.stats.ws_messages.fetch_add(1, Relaxed);
+                    self.submit(Origin::Socket(who, sock, false), name, format!("do WSMSG /{sock} {t}"));
+                }
+                Ok(Some(Event::Ping(p))) => c.wbuf.extend_from_slice(&crate::ws::pong(&p)),
+                Ok(Some(Event::Pong)) => {}
+                Ok(Some(Event::Binary(_))) => {
+                    // ponytail: text only, for now. Binary needs a byte-safe cell event.
+                    c.wbuf.extend_from_slice(&crate::ws::close(crate::ws::UNSUPPORTED));
+                    c.close_after = true;
+                    self.drop_socket(who, crate::ws::UNSUPPORTED);
+                    break;
+                }
+                Ok(Some(Event::Close(code))) => {
+                    // Echo the close (RFC 6455), then tell the object.
+                    let echo = if code == 1005 || !(1000..5000).contains(&code) { 1000 } else { code };
+                    c.wbuf.extend_from_slice(&crate::ws::close(echo));
+                    c.close_after = true;
+                    self.drop_socket(who, code);
+                    break;
+                }
+                Err(code) => {
+                    c.wbuf.extend_from_slice(&crate::ws::close(code));
+                    c.close_after = true;
+                    self.drop_socket(who, code);
+                    break;
+                }
+            }
+        }
+        self.settle(id)
+    }
+
+    /// A handshake for an object this loop owns: register the socket, and ask
+    /// the object (`do WSOPEN <path> <id>`; 101 accepts).
+    fn upgrade(&mut self, id: usize, name: String, path: String, key: String) {
+        let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return };
+        let who = (id, c.gen);
+        self.next_sock += 1;
+        let sock = self.next_sock;
+        c.busy = true; // no more HTTP on this connection
+        c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: Default::default(), open: false, gone: false, inflight: 0 });
+        self.sockets.entry(name.clone()).or_default().insert(sock, who);
+        self.submit(Origin::Socket(who, sock, true), name, format!("do WSOPEN {path} {sock}"));
+    }
+
+    /// A new connection, in a free slot.
+    fn add_conn(&mut self, mut s: TcpStream, rbuf: Vec<u8>) -> std::io::Result<usize> {
+        let id = self.free.pop().unwrap_or_else(|| {
+            self.conns.push(None);
+            self.conns.len() - 1
+        });
+        self.poll.registry().register(&mut s, Token(id), Interest::READABLE)?;
+        self.next_gen += 1;
+        self.conns[id] = Some(Conn { s, gen: self.next_gen, rbuf, wbuf: vec![], wpos: 0, writing: false, close_after: false, busy: false, ws: None });
+        Ok(id)
     }
 
     /// A request is done: put its cell back (or drop it after a crash), close
@@ -904,10 +1109,14 @@ impl<E: Engine> Loop<'_, E> {
     /// A cell that trapped is never used again. Its memory is half an
     /// operation, and the guard-page AOT tier doesn't promise it's exact
     /// at a trap either (LLVM may drop a store around a load that faults).
-    fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> Option<(u16, String)> {
+    fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> Option<((u16, String), Vec<WsOut>)> {
         let Task { mut cell, obj, origin } = t;
+        // WebSocket sends go out only if the request succeeds, and only
+        // after its writes are on disk (with the answer).
+        let ws = if answer.is_ok() { std::mem::take(&mut cell.host().ws_out) } else { vec![] };
+        cell.host().ws_out.clear();
         let Some(name) = obj else {
-            return Some(match answer {
+            return Some((match answer {
                 Ok(a) => {
                     self.pool.push(cell);
                     split_answer(&a)
@@ -917,10 +1126,10 @@ impl<E: Engine> Loop<'_, E> {
                     eprintln!("cell trapped: {trap}");
                     (500, format!("{{\"error\":{trap:?}}}"))
                 }
-            });
+            }, vec![]));
         };
         if let Origin::Fleet(req) = origin {
-            return self.fleet_finish(name, req, cell, answer);
+            return self.fleet_finish(name, req, cell, answer).map(|r| (r, vec![]));
         }
         let o = self.objects.get_mut(&name).expect("object of a running task");
         o.busy = false;
@@ -978,14 +1187,15 @@ impl<E: Engine> Loop<'_, E> {
         // The output gate: an answer leaves only once every commit up to now
         // is on disk, its own included. Reads wait too, since they may have
         // seen a write that isn't on disk yet.
-        let mut out = Some(reply);
+        let mut out = Some((reply, ws));
         if let Some(o) = self.objects.get_mut(&name) {
             if wrote {
                 o.committed += 1;
                 self.sh.stats.commits.fetch_add(1, Relaxed);
             }
             if ok && o.committed > o.synced {
-                o.held.push((o.committed, origin, out.take().unwrap()));
+                let (reply, ws) = out.take().unwrap();
+                o.held.push((o.committed, origin, reply, ws));
                 self.kick_sync(&name);
             }
         }
@@ -1032,12 +1242,12 @@ impl<E: Engine> Loop<'_, E> {
     fn synced(&mut self, name: &str, gen: u64, ok: bool) -> std::io::Result<()> {
         let Some(o) = self.objects.get_mut(name) else { return Ok(()) };
         o.syncing = false;
-        let ready: Vec<(Origin, (u16, String))> = if ok {
+        let ready: Vec<(Origin, (u16, String), Vec<WsOut>)> = if ok {
             o.synced = o.synced.max(gen);
             let synced = o.synced;
-            let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut o.held).into_iter().partition(|(g, _, _)| *g <= synced);
+            let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut o.held).into_iter().partition(|(g, ..)| *g <= synced);
             o.held = rest;
-            done.into_iter().map(|(_, origin, reply)| (origin, reply)).collect()
+            done.into_iter().map(|(_, origin, reply, ws)| (origin, reply, ws)).collect()
         } else {
             // After a failed fsync, nothing in memory can be trusted to be on
             // disk (the "fsyncgate" lesson). Fail what's held, and drop the
@@ -1045,13 +1255,13 @@ impl<E: Engine> Loop<'_, E> {
             eprintln!("object {name:?}: fsync failed, dropping it");
             let o = self.objects.remove(name).unwrap();
             self.sh.stats.objects_live.fetch_sub(1, Relaxed);
-            let mut failed: Vec<(Origin, (u16, String))> =
-                o.held.into_iter().map(|(_, origin, _)| (origin, (500, "{\"error\":\"storage\"}".to_string()))).collect();
-            failed.extend(o.waiting.into_iter().map(|(origin, _)| (origin, (503, "{\"error\":\"storage\"}".to_string()))));
+            let mut failed: Vec<(Origin, (u16, String), Vec<WsOut>)> =
+                o.held.into_iter().map(|(_, origin, ..)| (origin, (500, "{\"error\":\"storage\"}".to_string()), vec![])).collect();
+            failed.extend(o.waiting.into_iter().map(|(origin, _)| (origin, (503, "{\"error\":\"storage\"}".to_string()), vec![])));
             failed
         };
-        for (origin, reply) in ready {
-            self.deliver(origin, reply)?;
+        for (origin, reply, ws) in ready {
+            self.release(Some(name), origin, reply, ws)?;
         }
         self.kick_sync(name);
         Ok(())
@@ -1160,8 +1370,14 @@ impl<E: Engine> Loop<'_, E> {
     /// Flush what's buffered, then close or update write interest.
     fn settle(&mut self, id: usize) -> std::io::Result<()> {
         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return Ok(()) };
-        let closed = flush(c) || (c.close_after && !c.busy && c.wpos == c.wbuf.len());
+        // A WebSocket is always "busy"; it closes once its last bytes are out.
+        let closed = flush(c) || (c.close_after && (!c.busy || c.ws.is_some()) && c.wpos == c.wbuf.len());
         if closed {
+            if c.ws.as_ref().is_some_and(|w| !w.gone) {
+                // Gone without a close frame (RFC 6455's 1006).
+                let who = (id, c.gen);
+                self.drop_socket(who, 1006);
+            }
             if let Some(mut c) = self.conns.get_mut(id).and_then(Option::take) {
                 let _ = self.poll.registry().deregister(&mut c.s);
                 self.free.push(id);
@@ -1181,6 +1397,9 @@ impl<E: Engine> Loop<'_, E> {
     /// A bad request gets a 400 and the connection closes.
     fn start_next(&mut self, id: usize) -> std::io::Result<()> {
         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return Ok(()) };
+        if c.ws.is_some() {
+            return self.ws_read(id);
+        }
         if c.busy {
             return Ok(());
         }
@@ -1198,10 +1417,33 @@ impl<E: Engine> Loop<'_, E> {
         };
         c.busy = true;
         match req {
+            Req::Upgrade(name, path, key) => {
+                if self.core.is_some() {
+                    // ponytail: fleet mode needs sockets that cross nodes.
+                    self.queue_reply(who, (501, "{\"error\":\"WebSockets aren't in fleet mode yet\"}".into()));
+                    if let Some(c) = self.conn(who) {
+                        c.close_after = true;
+                    }
+                    return Ok(());
+                }
+                let o = owner(&name, self.sh.cfg.threads);
+                if o == self.me {
+                    self.upgrade(id, name, path, key);
+                } else {
+                    // The object's loop keeps all its sockets: hand this one over.
+                    let mut c = self.conns[id].take().unwrap();
+                    self.poll.registry().deregister(&mut c.s)?;
+                    self.free.push(id);
+                    let (tx, waker) = &self.sh.peers[o];
+                    self.sh.stats.ws_handoffs.fetch_add(1, Relaxed);
+                    let _ = tx.send(Msg::Adopt { s: c.s, rbuf: c.rbuf, name, path, key });
+                    waker.wake()?;
+                }
+            }
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -1216,7 +1458,10 @@ impl<E: Engine> Loop<'_, E> {
                     s.peer_acks.load(Relaxed),
                     s.bucket_acks.load(Relaxed),
                     s.fences.load(Relaxed),
-                    s.tail_entries.load(Relaxed)
+                    s.tail_entries.load(Relaxed),
+                    s.sockets_open.load(Relaxed),
+                    s.ws_messages.load(Relaxed),
+                    s.ws_handoffs.load(Relaxed)
                 );
                 self.queue_reply(who, (200, body));
             }
@@ -1289,6 +1534,17 @@ impl<E: Engine> Loop<'_, E> {
     /// a transaction. `Ok(false)`: nothing to run (a stale alarm).
     fn run_object(&mut self, name: &str, origin: Origin, req: String) -> Result<bool, (u16, String)> {
         let (eng, prog) = (self.eng, self.prog);
+        // The sockets this request may use: the open ones, and, for a
+        // handshake, its own (sends to it go out after the 101).
+        let me = match origin {
+            Origin::Socket(_, sock, true) => Some(sock),
+            _ => None,
+        };
+        let ids: Vec<u64> = self
+            .sockets
+            .get(name)
+            .map(|m| m.iter().filter(|(&id, &who)| Some(id) == me || self.conns.get(who.0).and_then(Option::as_ref).filter(|c| c.gen == who.1).and_then(|c| c.ws.as_ref()).is_some_and(|w| w.open && !w.gone)).map(|(&id, _)| id).collect())
+            .unwrap_or_default();
         let o = self.objects.get_mut(name).unwrap();
         o.last_used = Instant::now();
         {
@@ -1338,6 +1594,8 @@ impl<E: Engine> Loop<'_, E> {
                 }
             },
         };
+        cell.host().ws_ids = ids;
+        cell.host().ws_out.clear();
         if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
             eprintln!("object {name:?} trapped starting a request: {trap}");
             o.db.lock().unwrap().rollback();
@@ -1686,7 +1944,15 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool) -> Result<Option<Req>, 
     };
     let mut clen: Option<usize> = None;
     let mut close = false;
+    let (mut upgrade, mut ws_key, mut ws_ok) = (false, None, false);
     for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("upgrade") && h.value.eq_ignore_ascii_case(b"websocket") {
+            upgrade = true;
+        } else if h.name.eq_ignore_ascii_case("sec-websocket-key") {
+            ws_key = std::str::from_utf8(h.value).ok().map(|k| k.trim().to_string()).filter(|k| k.len() == 24);
+        } else if h.name.eq_ignore_ascii_case("sec-websocket-version") {
+            ws_ok = h.value == b"13";
+        }
         if h.name.eq_ignore_ascii_case("content-length") {
             // A bad length, or two that disagree, is refused (RFC 9112): read
             // as 0, the body would be taken for the next request.
@@ -1719,22 +1985,39 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool) -> Result<Option<Req>, 
         return Err(());
     }
     let line = |kind: &str, path: &str| if body.is_empty() { format!("{kind} {method} {path}") } else { format!("{kind} {method} {path} {body}") };
+    // The object and the path inside it, for `/do/<name>/...` and `/do/id/<uuid>/...`.
+    let object = |path: &str| -> Result<Option<(String, String)>, ()> {
+        if let Some(rest) = path.strip_prefix("/do/id/") {
+            // `/do/id/<uuid>/<rest>`: an object made by `/do/new`. Its name gets an
+            // `id:` prefix, so it can never meet an object named the same way.
+            let (id, sub) = rest.split_once('/').map_or((rest, "/".to_string()), |(n, s)| (n, format!("/{s}")));
+            return Ok(Some((format!("id:{}", parse_uuid(id).ok_or(())?), sub)));
+        }
+        if let Some(rest) = path.strip_prefix("/do/") {
+            // `/do/<name>/<rest>`: a Durable Object request.
+            let (name, sub) = rest.split_once('/').map_or((rest, "/".to_string()), |(n, s)| (n, format!("/{s}")));
+            if name.is_empty() || name.len() > MAX_NAME {
+                return Err(());
+            }
+            return Ok(Some((name.to_string(), sub)));
+        }
+        Ok(None)
+    };
+    if upgrade {
+        // A WebSocket handshake: only for objects, only version 13, no body.
+        let (Some((name, sub)), Some(key)) = (object(path)?, ws_key) else { return Err(()) };
+        if method != "GET" || !ws_ok || clen != 0 || sub.contains(char::is_whitespace) {
+            return Err(());
+        }
+        rbuf.drain(..hlen);
+        return Ok(Some(Req::Upgrade(name, sub, key)));
+    }
     let r = if path == "/_combd/stats" {
         Req::Stats
     } else if path == "/do/new" {
         Req::NewId
-    } else if let Some(rest) = path.strip_prefix("/do/id/") {
-        // `/do/id/<uuid>/<rest>`: an object made by `/do/new`. Its name gets an
-        // `id:` prefix, so it can never meet an object named the same way.
-        let (id, sub) = rest.split_once('/').map_or((rest, "/".to_string()), |(n, s)| (n, format!("/{s}")));
-        Req::Object(format!("id:{}", parse_uuid(id).ok_or(())?), line("do", &sub))
-    } else if let Some(rest) = path.strip_prefix("/do/") {
-        // `/do/<name>/<rest>`: a Durable Object request.
-        let (name, sub) = rest.split_once('/').map_or((rest, "/".to_string()), |(n, s)| (n, format!("/{s}")));
-        if name.is_empty() || name.len() > MAX_NAME {
-            return Err(());
-        }
-        Req::Object(name.to_string(), line("do", &sub))
+    } else if let Some((name, sub)) = object(path)? {
+        Req::Object(name, line("do", &sub))
     } else {
         Req::Cell(line("api", path))
     };
@@ -1750,7 +2033,7 @@ fn read_all(c: &mut Conn) -> bool {
             Ok(0) => return true,
             Ok(n) => {
                 c.rbuf.extend_from_slice(&buf[..n]);
-                if c.rbuf.len() > MAX_REQUEST {
+                if c.rbuf.len() > if c.ws.is_some() { MAX_WS_READ } else { MAX_REQUEST } {
                     return true;
                 }
             }

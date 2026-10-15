@@ -1016,7 +1016,10 @@ What changes as the fleet grows:
    Next: handle a peer that lost its disk (spec first), then quiet Linux
    machines for honest numbers. See
    [spike/RESULTS.md](spike/RESULTS.md).
-4. **WebSockets** with hibernation.
+4. **WebSockets** with hibernation. **Done 2026-10-14** on one node: the
+   host holds the sockets, idle objects leave memory, a message wakes them.
+   Next: binary messages, fleet mode, and numbers. See
+   [spike/RESULTS.md](spike/RESULTS.md).
 5. **Bring your own database.** Host-owned pools, Postgres first.
 6. **Fast fleet writes (D3).** Done early, as part of step 3 (see "What
    building taught us").

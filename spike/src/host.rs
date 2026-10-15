@@ -25,7 +25,22 @@ pub struct HostState {
     pub alarm_dirty: bool,
     /// Host time this request has used so far (`MAX_HOST_TIME`).
     pub host_time: Duration,
+    /// WebSockets: the object's sockets this request may use, and what it
+    /// asked to send or close (the host does it after the output gate).
+    pub ws_ids: Vec<u64>,
+    pub ws_out: Vec<WsOut>,
 }
+
+/// A WebSocket action a cell asked for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WsOut {
+    Send(u64, String),
+    Close(u64, u16),
+}
+
+/// What one request may queue to send, in all. A broadcast loop copies its
+/// message once per socket; this keeps that bounded.
+pub const MAX_WS_OUT: usize = 16 << 20;
 
 /// The host time one request may use. The cell's fuel counts its own
 /// instructions, not ours, so a cell looping over `sql` would otherwise cost
@@ -117,6 +132,49 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
         ("combd", "alarm_get") => {
             let db = st.db.as_ref().ok_or("alarm_get: this cell has no storage")?;
             db.lock().unwrap().alarm().unwrap_or(-1) as u64
+        }
+        // WebSockets: `ws_send(id, ptr, len)` queues a text message,
+        // `ws_close(id, code)` closes one, `ws_list(ptr, cap)` writes the
+        // object's socket ids (u64, little-endian) and returns how many there
+        // are. 0 is OK; 1: no such socket; 2: too big, or not UTF-8.
+        // (No early `return Ok(..)` here: the result must go through the
+        // check at the end, which matches the import's declared type.)
+        ("combd", "ws_send") => {
+            let (id, len) = (arg(0)?, arg(2)? as u32);
+            let queued: usize = st.ws_out.iter().map(|o| if let WsOut::Send(_, m) = o { m.len() } else { 0 }).sum();
+            if !st.ws_ids.contains(&id) {
+                1
+            } else if len as usize > crate::ws::MAX_MESSAGE || queued + len as usize > MAX_WS_OUT {
+                2
+            } else {
+                match String::from_utf8(mem.read(arg(1)? as u32, len).ok_or("ws_send: bad pointer")?) {
+                    Ok(m) => {
+                        st.ws_out.push(WsOut::Send(id, m));
+                        0
+                    }
+                    Err(_) => 2,
+                }
+            }
+        }
+        ("combd", "ws_close") => {
+            let id = arg(0)?;
+            // Codes a server may send: 1000, or 3000 to 4999 (RFC 6455).
+            let code = arg(1)? as u32;
+            let code = if code == 1000 || (3000..5000).contains(&code) { code as u16 } else { 1000 };
+            if st.ws_ids.contains(&id) {
+                st.ws_out.push(WsOut::Close(id, code));
+                0
+            } else {
+                1
+            }
+        }
+        ("combd", "ws_list") => {
+            let (ptr, cap) = (arg(0)? as u32, arg(1)? as u32);
+            let ids: Vec<u8> = st.ws_ids.iter().take(cap as usize).flat_map(|i| i.to_le_bytes()).collect();
+            if !mem.write(ptr, &ids) {
+                return Err("ws_list: bad pointer".into());
+            }
+            st.ws_ids.len() as u64
         }
         ("env", "abort") => return Err("abort".into()),
         ("wasi_snapshot_preview1", "proc_exit") => return Err(format!("exit {}", arg(0)? as i32)),

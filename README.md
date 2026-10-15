@@ -97,6 +97,10 @@ SQLite file, and each answer waits until its writes are safely on disk. On
 one core, combd beat workerd's Durable Objects by 1.8x on writes, 8.3x on
 reads, and 5.7x on writes spread over 1,000 objects.
 
+**WebSockets that sleep.** An object can hold many WebSockets, like a chat
+room. When it goes quiet it leaves memory, and its sockets stay open; the
+next message wakes it with its state intact. Pings never wake it at all.
+
 **Durable Objects across a fleet.** Several combd nodes share one S3 bucket,
 which decides who owns each object. Writes are confirmed by two peer nodes,
 so they don't wait on the bucket, and the bucket gets them in batches. Kill

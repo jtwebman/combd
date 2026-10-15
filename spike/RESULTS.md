@@ -1193,6 +1193,47 @@ than paid for on every store. The bounds-checked build is exact, and both
 builds still must match the interpreter on results, traps, and memory
 after every call that succeeds.
 
+## WebSockets with hibernation
+
+Cloudflare's hibernatable WebSocket model, on combd's own pieces. The host
+holds the sockets, not the cell: an idle object leaves memory as usual, its
+sockets stay open, and the next message brings it back with a fresh cell
+that loads its state from SQLite. Pings are answered by the host and wake
+nothing.
+
+**How a cell sees it.** Three host-made events, like `ALARM` (clients can't
+send these methods): `do WSOPEN <path> <id>` (answer `101` to accept, or any
+other status to refuse it as plain HTTP), `do WSMSG /<id> <text>`, and
+`do WSCLOSE /<id> <code>`. Three imports: `ws_send(id, ptr, len)`,
+`ws_close(id, code)`, and `ws_list(ptr, cap)` for the object's socket ids.
+
+**Same rules as everything else:**
+- Sends wait for the output gate, with the answer: they go out only once the
+  request's writes are on disk. A request that traps sends nothing.
+- Every socket of an object lives on the object's event loop. A handshake
+  another loop accepts is handed over, TCP stream and all.
+- Caps, from the fuzzing lesson: 1 MiB per message (as Cloudflare's), 16 MB
+  queued per request, 64 messages waiting per socket before we stop
+  reading, and a client that reads too slowly (8 MB unsent) or sends too
+  fast (4 MiB unread) is closed.
+- The protocol code (`spike/src/ws.rs`) checks every RFC 6455 rule a server
+  must: masking, reserved bits, opcodes, control frame sizes, fragments,
+  UTF-8. Its own SHA-1 and base64 (a few dozen lines each) for the handshake.
+
+**Tests.** `websockets_on_the_interpreter` and `websockets_on_aot` run a
+chat room over real TCP on two event loops: broadcast, a ping, hibernation
+(the object leaves memory, both sockets stay, a message wakes it with its
+messages intact), sends from an HTTP request, a crash that sends nothing, a
+close from the object (4000) and from the client (echoed, and the object
+hears it), a refused handshake (403), a frame that breaks the rules (1002),
+and handshakes handed between loops. The frame decoder takes 20,000 damaged
+inputs without panicking, and the host fuzzer covers the three new imports.
+
+Not yet: binary messages (closed with 1003 for now: a cell event needs a
+byte-safe form), sockets in fleet mode (refused with 501: they'd need frames
+across nodes), per-socket attachments (cells can keep that in SQLite), and
+numbers (idle sockets per GB, wake-up time).
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

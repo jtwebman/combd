@@ -18,6 +18,7 @@ mod s3;
 mod sim;
 mod store;
 mod wire;
+mod ws;
 #[cfg(test)]
 mod spectest;
 #[cfg(feature = "fuzz")]
@@ -1336,6 +1337,146 @@ mod tests {
         assert_eq!(ok(b, "GET", "/do/p1/count"), "{\"count\":30}");
         assert!(stat(b, "fences") >= 1, "the takeover should fence: {}", http(b, "GET", "/_combd/stats", "").1);
         assert_eq!(ok(b, "POST", "/do/p1/incr"), "{\"count\":31}");
+    }
+
+    /// A tiny WebSocket client, for tests.
+    struct Ws(std::net::TcpStream);
+
+    impl Ws {
+        /// Connect and handshake; `Err` holds the HTTP answer if refused.
+        fn open(port: u16, path: &str) -> Result<Ws, String> {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(s, "GET {path} HTTP/1.1\r\nhost: x\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").unwrap();
+            let mut head = vec![];
+            let mut b = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if s.read(&mut b).unwrap_or(0) == 0 {
+                    return Err(String::from_utf8_lossy(&head).into_owned());
+                }
+                head.push(b[0]);
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            if !head.starts_with("HTTP/1.1 101") {
+                let mut rest = String::new();
+                let _ = s.read_to_string(&mut rest);
+                return Err(head + &rest);
+            }
+            assert!(head.contains("sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "{head}");
+            Ok(Ws(s))
+        }
+        fn send(&mut self, op: u8, payload: &[u8]) {
+            use std::io::Write;
+            self.0.write_all(&ws::tests::client(true, op, payload)).unwrap();
+        }
+        fn text(&mut self, t: &str) {
+            self.send(1, t.as_bytes());
+        }
+        /// The next frame from the server: (opcode, payload).
+        fn recv(&mut self) -> (u8, Vec<u8>) {
+            use std::io::Read;
+            let mut h = [0u8; 2];
+            self.0.read_exact(&mut h).expect("a frame");
+            assert_eq!(h[1] & 0x80, 0, "a server never masks");
+            let n = match h[1] & 0x7f {
+                126 => {
+                    let mut b = [0u8; 2];
+                    self.0.read_exact(&mut b).unwrap();
+                    u16::from_be_bytes(b) as usize
+                }
+                127 => {
+                    let mut b = [0u8; 8];
+                    self.0.read_exact(&mut b).unwrap();
+                    u64::from_be_bytes(b) as usize
+                }
+                n => n as usize,
+            };
+            let mut p = vec![0u8; n];
+            self.0.read_exact(&mut p).unwrap();
+            (h[0] & 0x0f, p)
+        }
+        fn recv_text(&mut self) -> String {
+            let (op, p) = self.recv();
+            assert_eq!(op, 1, "wanted text, got opcode {op}: {p:?}");
+            String::from_utf8(p).unwrap()
+        }
+    }
+
+    /// WebSockets end to end: a chat room on two event loops, with
+    /// broadcast, pings, hibernation (the object leaves memory, its sockets
+    /// stay), sends from HTTP, a crash that sends nothing, and every kind of
+    /// close.
+    #[test]
+    fn websockets_on_the_interpreter() {
+        websockets_broadcast_hibernate_and_close(interp::Interp { max_pages: 16384 });
+    }
+
+    #[cfg(feature = "aot-guard")]
+    #[test]
+    fn websockets_on_aot() {
+        websockets_broadcast_hibernate_and_close(aot::Aot);
+    }
+
+    fn websockets_broadcast_hibernate_and_close<E: Engine + Sync + Send + 'static>(eng: E)
+    where
+        E::Program: Sync + Send,
+    {
+        let dir = store::tempdir::Dir::new();
+        let c = http::Config { idle: Duration::from_millis(300), ..cfg(&dir.0, 2) };
+        let (port, _, _) = do_server(eng, c);
+        let mut a = Ws::open(port, "/do/chat/ws").unwrap();
+        let mut b = Ws::open(port, "/do/chat/ws").unwrap();
+        // A message reaches everyone, the sender too.
+        a.text("hello");
+        assert!(a.recv_text().contains("\"text\":\"hello\""));
+        assert!(b.recv_text().contains("\"text\":\"hello\""));
+        // The host answers pings itself.
+        a.send(9, b"are you there");
+        assert_eq!(a.recv(), (10, b"are you there".to_vec()));
+        // Hibernation: the object leaves memory, the sockets stay open.
+        assert!(eventually(5000, || stat(port, "evictions") >= 1), "the idle object should leave memory");
+        assert_eq!(stat(port, "sockets_open"), 2);
+        let opened = stat(port, "objects_opened");
+        b.text("after a nap");
+        assert!(a.recv_text().contains("after a nap"));
+        assert!(b.recv_text().contains("after a nap"));
+        assert!(stat(port, "objects_opened") > opened, "a message wakes the object");
+        assert!(http(port, "GET", "/do/chat/msgs", "").1.contains("after a nap"));
+        // Sends from a plain HTTP request.
+        assert_eq!(http(port, "POST", "/do/chat/broadcast", "news"), (200, "{\"sent\":2}".into()));
+        assert_eq!(a.recv_text(), "news");
+        assert_eq!(b.recv_text(), "news");
+        // A crash sends nothing: the next thing anyone gets is the next message.
+        a.text("crash");
+        b.text("still here");
+        assert!(a.recv_text().contains("still here"));
+        assert!(b.recv_text().contains("still here"));
+        // The object closes one; it hears nothing back about it.
+        a.text("bye");
+        assert_eq!(a.recv(), (8, 4000u16.to_be_bytes().to_vec()));
+        // The client closes the other: echoed, and the object hears it.
+        b.send(8, &1000u16.to_be_bytes());
+        assert_eq!(b.recv(), (8, 1000u16.to_be_bytes().to_vec()));
+        assert!(eventually(3000, || http(port, "GET", "/do/chat/ws-stats", "").1.contains("\"closes\":1")), "{}", http(port, "GET", "/do/chat/ws-stats", "").1);
+        assert!(eventually(3000, || stat(port, "sockets_open") == 0));
+        // A refused handshake is plain HTTP.
+        let refused = Ws::open(port, "/do/chat/ws-deny").err().expect("refused");
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        // Sockets on other rooms: some land on a loop that doesn't own their
+        // room, and must be handed over (and still work).
+        let mut rooms: Vec<Ws> = (0..8).map(|i| Ws::open(port, &format!("/do/room{i}/ws")).unwrap()).collect();
+        for (i, r) in rooms.iter_mut().enumerate() {
+            r.text(&format!("hi {i}"));
+            assert!(r.recv_text().contains(&format!("hi {i}")));
+        }
+        assert!(stat(port, "ws_handoffs") >= 1, "no handshake was handed between loops");
+        drop(rooms);
+        // A frame that breaks the rules (not masked) gets a 1002.
+        let mut c = Ws::open(port, "/do/chat/ws").unwrap();
+        use std::io::Write;
+        c.0.write_all(&[0x81, 0x02, b'h', b'i']).unwrap();
+        assert_eq!(c.recv(), (8, 1002u16.to_be_bytes().to_vec()));
     }
 
     /// Objects by id: `/do/new` hands one out, `/do/id/<uuid>` reaches it.
