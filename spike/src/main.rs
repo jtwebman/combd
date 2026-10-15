@@ -1352,6 +1352,7 @@ mod tests {
             pg: None,
             ev_max: 32,
             environ: Arc::default(),
+            public: Default::default(),
         }
     }
 
@@ -2603,6 +2604,96 @@ callers = ["api"]
             assert!(eventually(10_000, || http_to(p, "shop.test", "GET", "/env/V", "").0 == 404), "node {p} still serves it");
         }
         everywhere("blog.test", "/env/V", "{\"value\":\"blog\"}");
+    }
+
+    const ARENA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/arena/app");
+
+    /// The arena example, a whole match through combd: the page, matchmaking,
+    /// a match ticking 20 times a second over WebSockets, sight blocked by
+    /// walls, a pause and a resume, a drop and a reconnect, a drop for good
+    /// (the other player wins), and both players' records.
+    #[test]
+    fn arena_plays_a_match() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::copy(format!("{ARENA}/combd.toml"), app.0.join("combd.toml")).unwrap();
+        std::fs::copy(format!("{ARENA}/modules/game.wasm"), app.0.join("modules/game.wasm")).expect("build the arena first: examples/arena/build.sh");
+        // A short pause limit, so the test doesn't wait 30 s.
+        std::fs::write(app.0.join("combd.dev.toml"), "[vars]\nPAUSE_MS = 800\n").unwrap();
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, pg) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = server_app(eng, http::Config { pg, ..cfg(&dir.0, 2) }, move |_| a);
+        // The page is HTML; a ping says anyone may time it.
+        let raw = |path: &str| {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(s, "GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out
+        };
+        let page = raw("/");
+        assert!(page.starts_with("HTTP/1.1 200") && page.contains("content-type: text/html") && page.contains("<canvas"), "{}", &page[..page.len().min(300)]);
+        assert!(raw("/_combd/ping").contains("access-control-allow-origin: *"));
+        // Two players join and are paired.
+        let post = |path: &str, body: serde_json::Value| -> serde_json::Value {
+            let (code, b) = http(port, "POST", path, &body.to_string());
+            assert_eq!(code, 200, "{path}: {b}");
+            serde_json::from_str(&b).unwrap()
+        };
+        let ta = post("/api/join", serde_json::json!({ "player": "alice", "rtt": { "0": 5 } }))["ticket"].as_str().unwrap().to_string();
+        let tb = post("/api/join", serde_json::json!({ "player": "bob", "rtt": { "0": 7 } }))["ticket"].as_str().unwrap().to_string();
+        let (ma, mb) = (post("/api/poll", serde_json::json!({ "ticket": ta })), post("/api/poll", serde_json::json!({ "ticket": tb })));
+        assert_eq!(ma["match"], mb["match"], "{ma} {mb}");
+        assert_eq!((ma["side"].as_u64(), mb["side"].as_u64(), ma["node"].as_u64()), (Some(0), Some(1), Some(0)));
+        let path = format!("/match/{}/ws", ma["match"].as_str().unwrap());
+        let join = |token: &serde_json::Value| -> Ws {
+            let mut ws = Ws::open(port, &path).unwrap();
+            ws.text(&serde_json::json!({ "t": "hello", "token": token }).to_string());
+            ws
+        };
+        // Read states until one passes `ok` (or give up).
+        let until = |ws: &mut Ws, ms: u64, ok: &dyn Fn(&serde_json::Value) -> bool| -> serde_json::Value {
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_millis(ms) {
+                let Some((1, b)) = ws.recv_within(500) else { continue };
+                let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                if v["t"] == "st" && ok(&v) {
+                    return v;
+                }
+            }
+            panic!("no such state within {ms} ms");
+        };
+        let (mut a, mut b) = (join(&ma["token"]), join(&mb["token"]));
+        let first = until(&mut a, 3000, &|v| v["phase"] == "play");
+        assert!(first["them"].is_null(), "the spawns can't see each other through the middle wall: {first}");
+        // 20 ticks a second.
+        let t = Instant::now();
+        let k0 = first["k"].as_u64().unwrap();
+        let k1 = until(&mut a, 3000, &|v| v["k"].as_u64().unwrap() >= k0 + 10)["k"].as_u64().unwrap();
+        assert!(t.elapsed() < Duration::from_millis(1500), "10 ticks took {:?}", t.elapsed());
+        let _ = k1;
+        // A pause and a resume, by alice.
+        a.text(r#"{"t":"pause"}"#);
+        let v = until(&mut b, 2000, &|v| v["phase"] == "paused");
+        assert_eq!(v["paused_by_you"], false);
+        a.text(r#"{"t":"resume"}"#);
+        until(&mut b, 2000, &|v| v["phase"] == "play");
+        // Bob drops: paused. He's back: it goes on.
+        drop(b);
+        until(&mut a, 2000, &|v| v["phase"] == "paused");
+        let mut b = join(&mb["token"]);
+        until(&mut a, 2000, &|v| v["phase"] == "play");
+        until(&mut b, 2000, &|v| v["phase"] == "play");
+        // Bob drops for good: alice wins once the pause runs out.
+        drop(b);
+        let over = until(&mut a, 5000, &|v| v["phase"] == "over");
+        assert_eq!(over["winner"], true, "{over}");
+        assert!(eventually(3000, || http(port, "GET", "/api/player/alice", "").1 == "{\"losses\":0,\"wins\":1}"), "{:?}", http(port, "GET", "/api/player/alice", ""));
+        assert!(eventually(3000, || http(port, "GET", "/api/player/bob", "").1 == "{\"losses\":1,\"wins\":0}"));
+        let stats: serde_json::Value = serde_json::from_str(&http(port, "GET", "/api/stats", "").1).unwrap();
+        assert_eq!(stats["matches"], 1, "{stats}");
     }
 
     #[test]

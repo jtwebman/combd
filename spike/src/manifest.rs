@@ -525,6 +525,9 @@ fn spec(side: Side, key: &str, v: &Json) -> Result<(String, Spec), String> {
     if side != Side::Setting && !env_name(name) {
         return Err("env var names are A-Z, 0-9 and _, not starting with a digit".into());
     }
+    if side != Side::Setting && name.starts_with("COMBD_") {
+        return Err("COMBD_ names are the host's (COMBD_ORG, COMBD_APP, COMBD_PROCESS, COMBD_NODE)".into());
+    }
     let mut s = Spec { ty: Ty::Str, default: None, optional, min: None, max: None, pattern: None, secret: None };
     let infer = |v: &Json| match v {
         Json::String(_) => Some(Ty::Str),

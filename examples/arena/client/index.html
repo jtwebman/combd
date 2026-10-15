@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arena on combd</title>
+<style>
+  :root { --bg: #0f1218; --panel: #171b23; --ink: #e6e8ee; --dim: #8a90a0; --you: #4da3ff; --them: #ff5d5d; --wall: #3a4152; --shot: #ffd84d; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.4 system-ui, sans-serif; }
+  main { max-width: 1240px; margin: 0 auto; padding: 16px; display: grid; grid-template-columns: 1fr 280px; gap: 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  canvas { width: 100%; aspect-ratio: 3 / 2; background: #12161e; border-radius: 8px; display: block; cursor: crosshair; }
+  aside { background: var(--panel); border-radius: 8px; padding: 12px; }
+  h1 { font-size: 20px; margin: 0 0 4px; } h2 { font-size: 14px; color: var(--dim); margin: 16px 0 6px; font-weight: 600; }
+  input, button { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid #333a48; background: #0f1218; color: var(--ink); }
+  button { background: var(--you); color: #071224; border: 0; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; } td { padding: 2px 4px; } td.r { text-align: right; color: var(--dim); }
+  .best { color: var(--you); font-weight: 600; } .dim { color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <h1>Arena</h1>
+    <div class="dim" id="status">Measuring the nodes...</div>
+    <canvas id="c" width="960" height="640" aria-label="the arena"></canvas>
+    <div class="dim">Move: WASD or the arrow keys. Aim: the mouse. Shoot: click. Pause: P (the other player wins if you don't come back in time). You only see the other player when no wall is in the way.</div>
+  </div>
+  <aside>
+    <label>Name <input id="name" maxlength="24" autocomplete="off"></label>
+    <p><button id="play" disabled>Find a match</button></p>
+    <h2>Nodes (your round trips)</h2>
+    <table id="nodes"></table>
+    <h2>Your record</h2>
+    <div id="record" class="dim">-</div>
+    <h2>Recent matches</h2>
+    <table id="recent"></table>
+  </aside>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const canvas = $("c"), ctx = canvas.getContext("2d");
+const state = { nodes: {}, rtt: {}, map: null, side: 0, last: null, lastSeen: null, phase: "idle", players: [], ws: null, match: null, keys: {}, aim: 0, fire: false };
+const name = $("name");
+name.value = localStorage.getItem("arena-name") || ("player" + Math.floor(Math.random() * 10000));
+name.onchange = () => localStorage.setItem("arena-name", name.value);
+
+function say(t) { $("status").textContent = t; }
+
+// Every node's address, and our round trip to each (the best of four).
+async function measure() {
+  let nodes = {};
+  try { nodes = (await (await fetch("/_combd/nodes")).json()).nodes || {}; } catch (e) {}
+  if (Object.keys(nodes).length === 0) nodes = { 0: location.origin };
+  state.nodes = nodes;
+  for (const [id, url] of Object.entries(nodes)) {
+    let best = Infinity;
+    for (let i = 0; i < 4; i++) {
+      const t = performance.now();
+      try { await fetch(url + "/_combd/ping", { cache: "no-store" }); best = Math.min(best, performance.now() - t); } catch (e) {}
+    }
+    if (best < Infinity) state.rtt[id] = Math.round(best);
+  }
+  const min = Math.min(...Object.values(state.rtt));
+  $("nodes").innerHTML = Object.entries(nodes).map(([id, url]) =>
+    `<tr><td class="${state.rtt[id] === min ? "best" : ""}">node ${id}</td><td class="r">${state.rtt[id] ?? "-"} ms</td></tr>`).join("");
+  say("Ready. Find a match: you'll be paired with someone close to you.");
+  $("play").disabled = false;
+}
+
+async function api(path, body) {
+  const r = await fetch(path, { method: body ? "POST" : "GET", body: body ? JSON.stringify(body) : undefined });
+  return r.json();
+}
+
+async function record() {
+  const r = await api("/api/player/" + encodeURIComponent(name.value));
+  $("record").textContent = `${r.wins || 0} wins, ${r.losses || 0} losses`;
+  const s = await api("/api/stats");
+  $("recent").innerHTML = (s.recent || []).slice(0, 8).map(m =>
+    `<tr><td>${m.players.join(" vs ")}</td><td class="r">node ${m.node}, ${m.worst_rtt} ms</td></tr>`).join("") || `<tr><td class="dim">none yet</td></tr>`;
+}
+
+$("play").onclick = async () => {
+  $("play").disabled = true;
+  say("Looking for someone close to you...");
+  const j = await api("/api/join", { player: name.value, rtt: state.rtt });
+  if (!j.ticket) { say("Couldn't join: " + (j.error || "?")); $("play").disabled = false; return; }
+  for (;;) {
+    await new Promise(r => setTimeout(r, 500));
+    const p = await api("/api/poll", { ticket: j.ticket });
+    if (p.match) { connect(p); return; }
+    if (p.error) { say(p.error); $("play").disabled = false; return; }
+    say(`Waiting for an opponent (${p.queue} in the queue)...`);
+  }
+};
+
+// Straight to the match's node: that's the one picked for both players.
+function connect(m) {
+  state.match = m;
+  const url = (state.nodes[m.node] || location.origin).replace(/^http/, "ws") + `/match/${m.match}/ws`;
+  say(`Match on node ${m.node} (${m.rtt ?? "?"} ms for you).`);
+  const ws = new WebSocket(url);
+  state.ws = ws;
+  ws.onopen = () => ws.send(JSON.stringify({ t: "hello", token: m.token }));
+  ws.onmessage = (e) => {
+    const v = JSON.parse(e.data);
+    if (v.t === "hello") { state.map = v.map; state.side = v.side; state.players = v.players; }
+    if (v.t === "st") {
+      state.last = v; state.phase = v.phase;
+      if (v.them) state.lastSeen = { ...v.them, at: performance.now() };
+      if (v.phase === "over") { say(v.winner ? "You won!" : "You lost."); record(); }
+    }
+  };
+  ws.onclose = () => {
+    if (state.phase === "over" || state.match !== m) { $("play").disabled = false; return; }
+    // Dropped mid-match: the game pauses for us. Come back.
+    say("Connection lost: reconnecting (the match is paused for you)...");
+    setTimeout(() => state.match === m && connect(m), 1000);
+  };
+}
+
+// Input: sent 20 times a second while connected.
+addEventListener("keydown", (e) => {
+  state.keys[e.key.toLowerCase()] = true;
+  // P: pause (the other player's clock starts), or resume your own pause.
+  if (e.key.toLowerCase() === "p" && state.ws && state.ws.readyState === 1) {
+    state.ws.send(JSON.stringify({ t: state.phase === "paused" ? "resume" : "pause" }));
+  }
+});
+addEventListener("keyup", (e) => { state.keys[e.key.toLowerCase()] = false; });
+canvas.addEventListener("mousemove", (e) => {
+  const b = canvas.getBoundingClientRect(), you = state.last && state.last.you;
+  if (!you) return;
+  const x = (e.clientX - b.left) * canvas.width / b.width, y = (e.clientY - b.top) * canvas.height / b.height;
+  state.aim = Math.atan2(y - you.y, x - you.x);
+});
+canvas.addEventListener("mousedown", () => { state.fire = true; });
+addEventListener("mouseup", () => { state.fire = false; });
+setInterval(() => {
+  const ws = state.ws;
+  if (!ws || ws.readyState !== 1) return;
+  const k = state.keys;
+  const mx = (k.d || k.arrowright ? 1 : 0) - (k.a || k.arrowleft ? 1 : 0);
+  const my = (k.s || k.arrowdown ? 1 : 0) - (k.w || k.arrowup ? 1 : 0);
+  ws.send(JSON.stringify({ t: "in", mx, my, aim: state.aim, fire: state.fire }));
+}, 50);
+
+function draw() {
+  const css = getComputedStyle(document.documentElement);
+  const c = (n) => css.getPropertyValue(n);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (state.map) {
+    ctx.fillStyle = c("--wall");
+    for (const [x, y, w, h] of state.map.walls) ctx.fillRect(x, y, w, h);
+  }
+  const v = state.last;
+  if (v) {
+    const r = state.map ? state.map.r : 14;
+    const body = (p, color, alpha) => {
+      ctx.globalAlpha = alpha; ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x + Math.cos(p.aim) * (r + 10), p.y + Math.sin(p.aim) * (r + 10)); ctx.stroke();
+      ctx.globalAlpha = 1;
+    };
+    if (!v.you.dead) body(v.you, c("--you"), 1);
+    if (v.them && !v.them.dead) body(v.them, c("--them"), 1);
+    else if (state.lastSeen) {
+      // Out of sight: where they were last seen, fading.
+      const age = (performance.now() - state.lastSeen.at) / 1000;
+      if (age < 6) { body(state.lastSeen, c("--them"), Math.max(0.1, 0.35 - age / 20)); }
+    }
+    ctx.fillStyle = c("--shot");
+    for (const [x, y] of v.b) { ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill(); }
+    ctx.fillStyle = c("--ink"); ctx.font = "18px system-ui";
+    const names = state.players.length ? [state.players[state.side], state.players[1 - state.side]] : ["you", "them"];
+    ctx.fillText(`${names[0]} ${v.score[0]}  :  ${v.score[1]} ${names[1]}     hp ${"♥".repeat(v.you.hp)}`, 16, 28);
+    const banner = v.phase === "waiting" ? "Waiting for the other player..." :
+      v.phase === "paused" ? (v.paused_by_you ? `You paused: P to go on (${Math.ceil(v.left / 1000)} s, then you lose)` : `Paused by the other player: ${Math.ceil(v.left / 1000)} s, then you win`) :
+      v.phase === "over" ? (v.winner ? "You won!" : "You lost.") : (v.you.dead ? "Respawning..." : "");
+    if (banner) { ctx.font = "28px system-ui"; ctx.textAlign = "center"; ctx.fillText(banner, canvas.width / 2, canvas.height / 2); ctx.textAlign = "start"; }
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+measure().then(record);
+</script>
+</body>
+</html>

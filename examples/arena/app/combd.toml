@@ -1,0 +1,31 @@
+# Arena: a real-time 1 vs 1 game on combd. One module, four processes.
+[app]
+name = "arena"
+
+[vars]
+# How long a pause (or a dropped player) may last before the other wins.
+PAUSE_MS = 30000
+
+# The page, and the join and poll API.
+[processes.lobby]
+kind = "game"
+routes = ["/", "/api/*"]
+
+# One matchmaker for everyone: pairs players who are close to each other.
+[processes.matchmaker]
+kind = "game"
+durable = true
+callers = ["lobby"]
+
+# One object per match: the game, 20 ticks a second, over WebSockets.
+[processes.match]
+kind = "game"
+durable = true
+routes = ["/match/:id/*"]
+callers = ["matchmaker"]
+
+# One object per player: wins and losses.
+[processes.player]
+kind = "game"
+durable = true
+callers = ["lobby", "match"]

@@ -277,7 +277,7 @@ impl Sim {
                 Msg::Tick { node } => {
                     let fx = self.nodes[node].core.on(Event::Tick);
                     self.effects(node, fx);
-                    if self.faults() && self.rng.chance(0.15) {
+                    if self.faults() && self.rng.chance(0.5) {
                         let d = 1 + self.rng.below(200);
                         self.at(d, Msg::Snapshot { node });
                     }
@@ -358,7 +358,7 @@ mod tests {
             ("read_no_gate", Bugs { read_no_gate: true, ..Bugs::default() }),
         ];
         for (name, bugs) in all {
-            let (_, bad) = run_many(0..5000, bugs);
+            let (_, bad) = run_many(0..2000, bugs);
             assert!(bad.is_some(), "{name} passed: the simulator can't see it");
         }
     }

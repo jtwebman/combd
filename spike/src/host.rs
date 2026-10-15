@@ -25,6 +25,8 @@ pub struct HostState {
     pub sql_out: Vec<u8>,
     /// The cell changed its alarm in this request.
     pub alarm_dirty: bool,
+    /// `tick_every`: the beat this request asked for (0: stop).
+    pub tick: Option<u64>,
     /// Host time this request has used so far (`MAX_HOST_TIME`).
     pub host_time: Duration,
     /// WebSockets: the object's sockets this request may use, and what it
@@ -209,6 +211,19 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
             let at = arg(0)? as i64;
             db.lock().unwrap().set_alarm((at > 0).then_some(at)).map_err(|e| format!("alarm_set: {e}"))?;
             st.alarm_dirty = true;
+            0
+        }
+        // `tick_every(ms)`: an object's beat, in memory: `TICK / <n>` every
+        // `ms` (10 ms to 60 s; 0 stops it). Nothing is written to disk, so
+        // a crash or a move to another node stops it until the object asks
+        // again. For game loops, not for work that must happen: that's
+        // `alarm_set`.
+        ("combd", "tick_every") => {
+            if st.db.is_none() {
+                return Err("tick_every: only an object can tick".into());
+            }
+            let ms = arg(0)?;
+            st.tick = Some(if ms == 0 { 0 } else { ms.clamp(10, 60_000) });
             0
         }
         ("combd", "alarm_get") => {

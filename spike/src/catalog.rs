@@ -374,7 +374,6 @@ impl Catalog {
             }
             (Wait::SnapWrite { .. }, _) => self.snapping = false,
             (Wait::Trim, _) => {}
-            (Wait::Gate(_) | Wait::Write(_) | Wait::Slot(_) | Wait::Snap | Wait::ReadBack(_) | Wait::ReadGate, Res::Done) => {}
         }
     }
 

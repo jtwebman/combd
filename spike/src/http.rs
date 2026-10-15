@@ -60,7 +60,7 @@ use crate::store::{self, AlarmIndex, Db};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -114,6 +114,9 @@ pub struct Config {
     pub ev_max: usize,
     /// The app's env vars, as WASI hands them out: `NAME=value` each.
     pub environ: Arc<Vec<Vec<u8>>>,
+    /// Every node's public address, for clients picking the nearest
+    /// (`COMBD_PUBLIC_URLS`: `0=http://a:8080,1=http://b:8080`).
+    pub public: BTreeMap<u32, String>,
 }
 
 impl Config {
@@ -130,6 +133,7 @@ impl Config {
             pg: None,
             ev_max: num("COMBD_EV_MAX", 32).max(1),
             environ: Arc::default(),
+            public: std::env::var("COMBD_PUBLIC_URLS").unwrap_or_default().split(',').filter_map(|kv| kv.split_once('=')).filter_map(|(n, u)| Some((n.trim().parse().ok()?, u.trim().to_string()))).collect(),
         }
     }
 }
@@ -273,6 +277,8 @@ enum Origin {
     Call(usize, u64),
     /// A `send`: nobody hears the answer.
     Discard,
+    /// An object's beat (`tick_every`): nobody hears the answer either.
+    Tick,
 }
 
 /// Who waits on a `call`'s answer.
@@ -528,6 +534,10 @@ enum Req {
     Stats,
     /// A manifest's routes don't match.
     NotFound,
+    /// The fleet's nodes and their public addresses (for clients choosing
+    /// the nearest), and a ping to time a round trip.
+    Nodes,
+    Ping,
     /// A new object id.
     NewId,
 }
@@ -1007,6 +1017,7 @@ where
                     ev_timers: BinaryHeap::new(),
                     calls: HashMap::new(),
                     next_call: 0,
+                    ticks: HashMap::new(),
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l)) {
                     eprintln!("event loop stopped: {e}");
@@ -1085,6 +1096,8 @@ struct Loop<'a, E: Engine> {
     /// `call`s out: id -> who waits, and when it gives up.
     calls: HashMap<u64, (CallTo, Instant)>,
     next_call: u64,
+    /// Objects' beats: name -> (every, next, count).
+    ticks: HashMap<String, (Duration, Instant, u64)>,
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
@@ -1246,7 +1259,7 @@ impl<E: Engine> Loop<'_, E> {
             // Never block while requests are waiting to run.
             let timeout = if self.tasks.is_empty() {
                 let next = self.alarms.peek().map(|Reverse((at, _))| Duration::from_millis((at - now_ms()).max(0) as u64));
-                let timer = self.ev_timers.peek().map(|Reverse((at, ..))| at.saturating_duration_since(Instant::now()));
+                let timer = self.ev_timers.peek().map(|Reverse((at, ..))| *at).into_iter().chain(self.ticks.values().map(|t| t.1)).min().map(|at| at.saturating_duration_since(Instant::now()));
                 let next = match (next, timer) {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
@@ -1313,6 +1326,7 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }
             self.ev_tick();
+            self.fire_ticks();
             // One round of the run queue: every request gets one slice, but
             // each org gets an equal share of the round, so one busy tenant
             // can't crowd out the rest. An org that needs less than its share
@@ -1466,7 +1480,7 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Ok(())
             }
-            Origin::Ev(_) | Origin::Discard => Ok(()),
+            Origin::Ev(_) | Origin::Discard | Origin::Tick => Ok(()),
             Origin::Call(l, id) if l == self.me => {
                 self.call_done(id, reply);
                 Ok(())
@@ -1800,6 +1814,7 @@ impl<E: Engine> Loop<'_, E> {
     /// An object leaves memory: its database handles close (rolling back and
     /// releasing locks; Postgres would too once the connection went).
     fn remove_object(&mut self, name: &str) -> Option<Object<E>> {
+        self.ticks.remove(name);
         let o = self.objects.remove(name)?;
         for &h in &o.pg {
             self.pg_close(h);
@@ -2126,6 +2141,16 @@ impl<E: Engine> Loop<'_, E> {
     /// at a trap either (LLVM may drop a store around a load that faults).
     fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> Option<((u16, String), Vec<WsOut>)> {
         let Task { mut cell, obj, origin, ws_open, ws_drop, pg, .. } = t;
+        // A beat the request asked for, if it succeeded.
+        if let (Some(ms), Some(name), true) = (cell.host().tick.take(), &obj, answer.is_ok()) {
+            if ms == 0 {
+                self.ticks.remove(name);
+            } else {
+                let every = Duration::from_millis(ms);
+                let count = self.ticks.get(name).map_or(0, |t| t.2);
+                self.ticks.insert(name.clone(), (every, Instant::now() + every, count));
+            }
+        }
         // A stateless request's handles end with it; a crash ends an
         // object's (rolling back, releasing its locks).
         for h in pg {
@@ -2347,6 +2372,28 @@ impl<E: Engine> Loop<'_, E> {
     }
 
     /// Run every alarm that's due.
+    /// Objects' beats that are due. A beat is skipped, not queued, while the
+    /// object is busy, so a slow tick never piles up; an object that's left
+    /// memory (or this node) has no beat.
+    fn fire_ticks(&mut self) {
+        let now = Instant::now();
+        let due: Vec<String> = self.ticks.iter().filter(|(_, t)| t.1 <= now).map(|(n, _)| n.clone()).collect();
+        for name in due {
+            let Some(o) = self.objects.get(&name) else {
+                self.ticks.remove(&name);
+                continue;
+            };
+            let idle = !o.busy && o.waiting.is_empty();
+            let t = self.ticks.get_mut(&name).unwrap();
+            t.1 = now + t.0;
+            if idle {
+                t.2 += 1;
+                let n = t.2;
+                self.submit(Origin::Tick, name, format!("do TICK / {n}"));
+            }
+        }
+    }
+
     fn fire_alarms(&mut self) {
         let now = now_ms();
         while self.alarms.peek().is_some_and(|Reverse((at, _))| *at <= now) {
@@ -2370,7 +2417,9 @@ impl<E: Engine> Loop<'_, E> {
             self.pg_close(h);
         }
         let free = |o: &Object<E>| !o.busy && o.waiting.is_empty() && !o.syncing && o.held.is_empty() && !o.checkpointing && o.pg.is_empty();
-        let mut gone: Vec<String> = self.objects.iter().filter(|(_, o)| free(o) && o.last_used.elapsed() >= idle).map(|(n, _)| n.clone()).collect();
+        // A ticking object stays: its beat is its life.
+        let ticks = &self.ticks;
+        let mut gone: Vec<String> = self.objects.iter().filter(|(n, o)| free(o) && !ticks.contains_key(*n) && o.last_used.elapsed() >= idle).map(|(n, _)| n.clone()).collect();
         let over = self.objects.len().saturating_sub(gone.len()).saturating_sub(self.sh.cfg.max_objects);
         if over > 0 {
             let mut lru: Vec<(&String, Instant)> =
@@ -2416,8 +2465,16 @@ impl<E: Engine> Loop<'_, E> {
     /// Buffer an answer for `who`, if it's still connected.
     fn queue_reply(&mut self, who: Who, (status, payload): (u16, String)) {
         if let Some(c) = self.conn(who) {
-            let _ = write!(c.wbuf, "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", payload.len());
-            c.wbuf.extend_from_slice(payload.as_bytes());
+            let (head, body) = reply_parts(&payload);
+            let _ = write!(c.wbuf, "HTTP/1.1 {status} OK\r\n");
+            if !head.iter().any(|h| h.starts_with("content-type:")) {
+                let _ = write!(c.wbuf, "content-type: application/json\r\n");
+            }
+            for h in &head {
+                let _ = write!(c.wbuf, "{h}\r\n");
+            }
+            let _ = write!(c.wbuf, "content-length: {}\r\n\r\n", body.len());
+            c.wbuf.extend_from_slice(body.as_bytes());
             c.busy = false;
         }
     }
@@ -2516,6 +2573,13 @@ impl<E: Engine> Loop<'_, E> {
             }
             Req::NewId => self.queue_reply(who, (200, format!("{{\"id\":\"{}\"}}", uuid_v7()))),
             Req::NotFound => self.queue_reply(who, (404, "{\"error\":\"no route\"}".into())),
+            Req::Ping => self.queue_reply(who, (200, "\0access-control-allow-origin: *\ncache-control: no-store\0{}".into())),
+            Req::Nodes => {
+                let me = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node);
+                let nodes: serde_json::Map<String, serde_json::Value> = self.sh.cfg.public.iter().map(|(n, u)| (n.to_string(), serde_json::Value::String(u.clone()))).collect();
+                let body = serde_json::json!({ "me": me, "nodes": nodes }).to_string();
+                self.queue_reply(who, (200, format!("\0access-control-allow-origin: *\0{body}")));
+            }
             Req::Cell(p, cell_req) => self.run_cell(Origin::Local(who), p, cell_req)?,
             Req::Object(name, cell_req) => self.run_obj(Origin::Local(who), name, cell_req)?,
         }
@@ -2595,7 +2659,15 @@ impl<E: Engine> Loop<'_, E> {
             if name.len() > MAX_NAME {
                 return Err("id: too long".into());
             }
-            self.run_obj(origin, name, line("do"))
+            // `"node"`: start (or reach) the object on that node, as a
+            // matchmaker does to put a match near both players.
+            match (v["node"].as_u64(), &self.sh.fleet) {
+                (Some(n), Some(f)) if n as u32 != f.cfg.node && f.cfg.peers.contains_key(&(n as u32)) => {
+                    self.forward(n as u32, FReq { origin, name, cell_req: line("do"), hops: 0, act: 0, resp: None, ws: vec![], retries: 0 });
+                    Ok(())
+                }
+                _ => self.run_obj(origin, name, line("do")),
+            }
         } else {
             self.run_cell(origin, t, line("api"))
         };
@@ -2659,11 +2731,18 @@ impl<E: Engine> Loop<'_, E> {
     }
 
     /// The env vars a process's cells get: its app's (no manifest: the node's).
+    /// ... plus the host's own: `COMBD_ORG`, `COMBD_APP`, `COMBD_PROCESS`,
+    /// `COMBD_NODE` (an app can't declare `COMBD_` names).
     fn environ_for(&self, proc: usize) -> Arc<Vec<Vec<u8>>> {
         if self.app.router.legacy {
             return self.sh.cfg.environ.clone();
         }
-        self.app.tenants[self.app.procs[proc].tenant].environ.clone()
+        let p = &self.app.procs[proc];
+        let t = &self.app.tenants[p.tenant];
+        let node = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node);
+        let mut e = (*t.environ).clone();
+        e.extend([format!("COMBD_ORG={}", t.org), format!("COMBD_APP={}", t.app), format!("COMBD_PROCESS={}", p.name), format!("COMBD_NODE={node}")].map(String::into_bytes));
+        Arc::new(e)
     }
 
     /// May process `proc` lease from pool `pool`? Its `owners` decide (with
@@ -2678,6 +2757,7 @@ impl<E: Engine> Loop<'_, E> {
     /// A `call` is answered: tell whoever waits (once; a late answer is dropped).
     fn call_done(&mut self, id: u64, (status, body): (u16, String)) {
         let Some((to, _)) = self.calls.remove(&id) else { return };
+        let (_, body) = reply_parts(&body);
         self.call_reply(to, serde_json::json!({ "status": status, "body": body }).to_string().into_bytes());
     }
 
@@ -3198,9 +3278,42 @@ fn ws_accepted(answer: &str, ws_open: Option<u64>) -> Option<u64> {
     ws_open.filter(|_| split_answer(answer).0 == 101)
 }
 
+/// A cell's answer: `"<code> <body>"`, or with headers,
+/// `"<code>\n<name>: <value>\n...\n\n<body>"`. Headers ride along in the
+/// body as `\0<lines>\0<body>` (so they cross loops and the wire unchanged),
+/// and only safe ones get through: never one that frames the message
+/// (`content-length`, `connection`...), so a cell can't split a response.
 fn split_answer(a: &str) -> (u16, String) {
-    let (code, rest) = a.split_once(' ').unwrap_or(("500", ""));
-    (code.parse::<u16>().unwrap_or(500), rest.to_string())
+    let code = a.get(..3).and_then(|c| c.parse::<u16>().ok()).unwrap_or(500);
+    match a.as_bytes().get(3) {
+        Some(b'\n') => {
+            let rest = &a[4..];
+            let (head, body) = rest.split_once("\n\n").unwrap_or((rest, ""));
+            let ok: Vec<String> = head
+                .lines()
+                .filter_map(|l| {
+                    let (n, v) = l.split_once(':')?;
+                    let (n, v) = (n.trim().to_ascii_lowercase(), v.trim());
+                    let allowed = matches!(n.as_str(), "content-type" | "cache-control" | "location" | "set-cookie" | "etag" | "last-modified" | "vary") || n.starts_with("access-control-");
+                    (allowed && !v.contains(['\r', '\n', '\0'])).then(|| format!("{n}: {v}"))
+                })
+                .collect();
+            if ok.is_empty() {
+                (code, body.to_string())
+            } else {
+                (code, format!("\0{}\0{body}", ok.join("\n")))
+            }
+        }
+        _ => (code, a.get(4..).unwrap_or("").to_string()),
+    }
+}
+
+/// An answer's headers (the safe ones `split_answer` kept) and its body.
+fn reply_parts(payload: &str) -> (Vec<&str>, &str) {
+    match payload.strip_prefix('\0').and_then(|r| r.split_once('\0')) {
+        Some((head, body)) => (head.lines().collect(), body),
+        None => (vec![], payload),
+    }
 }
 
 /// Take one whole request off the front of the read buffer.
@@ -3266,6 +3379,11 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
     }
     let line = |kind: &str, path: &str| if body.is_empty() { format!("{kind} {method} {path}") } else { format!("{kind} {method} {path} {body}") };
     // A manifest's routes: by host, then path (the query string isn't part of it).
+    if path == "/_combd/nodes" || path == "/_combd/ping" {
+        let r = if path == "/_combd/ping" { Req::Ping } else { Req::Nodes };
+        rbuf.drain(..hlen + clen);
+        return Ok(Some(r));
+    }
     if !router.legacy && path != "/_combd/stats" {
         let r = match router.route(host, path.split('?').next().unwrap_or("")) {
             Some(Hit::Object(name, sub)) => {
