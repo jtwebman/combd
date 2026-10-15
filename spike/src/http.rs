@@ -245,6 +245,8 @@ const FORWARD_FIRST: Duration = Duration::from_secs(5);
 const BUCKET_THREADS: usize = 32;
 /// How many times a request may be forwarded between nodes.
 const MAX_HOPS: u8 = 1;
+/// Times a request that never ran is routed again before the client hears 503.
+const MAX_NOT_RUN: u8 = 3;
 
 /// Which connection a request answers: (slot, generation).
 type Who = (usize, u64);
@@ -382,6 +384,8 @@ struct FReq {
     /// sends that wait with it.
     resp: Option<(u16, String)>,
     ws: Vec<WsOut>,
+    /// Times it was routed again after "never ran".
+    retries: u8,
 }
 
 struct Conn {
@@ -2553,7 +2557,7 @@ impl<E: Engine> Loop<'_, E> {
         let req = self.next_req;
         let obj = own::obj_id(&name);
         self.names.insert(obj, name.clone());
-        self.freqs.insert(req, FReq { origin, name, cell_req, hops, act: 0, resp: None, ws: vec![] });
+        self.freqs.insert(req, FReq { origin, name, cell_req, hops, act: 0, resp: None, ws: vec![], retries: 0 });
         self.core_on(own::Event::Request { obj, req });
     }
 
@@ -2572,6 +2576,17 @@ impl<E: Engine> Loop<'_, E> {
                 let reply = match ans {
                     own::Answer::Done { .. } => fr.resp.unwrap_or((500, "{\"error\":\"no answer\"}".into())),
                     own::Answer::Failed => (503, "{\"error\":\"retry\"}".into()),
+                    // It never ran: route it again (the core now knows who
+                    // won the object), so nobody sees the race.
+                    own::Answer::NotRun if fr.retries < MAX_NOT_RUN => {
+                        self.next_req += 1;
+                        let req = self.next_req;
+                        let obj = own::obj_id(&fr.name);
+                        self.names.insert(obj, fr.name.clone());
+                        self.freqs.insert(req, FReq { retries: fr.retries + 1, act: 0, resp: None, ws: vec![], ..fr });
+                        return self.core_on(own::Event::Request { obj, req });
+                    }
+                    own::Answer::NotRun => (503, "{\"error\":\"retry\"}".into()),
                     own::Answer::Redirect(n) if fr.hops < MAX_HOPS => return self.forward(n, fr),
                     own::Answer::Redirect(_) => (503, "{\"error\":\"retry\"}".into()),
                 };

@@ -87,6 +87,8 @@ pub struct Stats {
     pub writes_acked: u64,
     pub reads_done: u64,
     pub failed: u64,
+    /// Of `failed`: answered "never ran", and checked that it didn't.
+    pub not_run: u64,
     pub redirects: u64,
     pub epochs: u64,
     pub crashes: u64,
@@ -654,6 +656,15 @@ impl Sim {
                 self.stats.redirects += 1;
                 self.client_send(pd.client, Some((pd.obj, pd.write, n)));
             }
+            Answer::NotRun => {
+                if saw.is_some() {
+                    return Err(format!("request {req} answered \"not run\", but it ran"));
+                }
+                self.stats.failed += 1;
+                self.stats.not_run += 1;
+                let d = 10 + self.rng.below(100);
+                self.at(d, Msg::ClientNext(pd.client));
+            }
             Answer::Failed => {
                 self.stats.failed += 1;
                 let d = 10 + self.rng.below(100);
@@ -723,6 +734,7 @@ pub fn run_with(seeds: std::ops::Range<u64>, settings: &dyn Fn() -> Settings) ->
         total.writes_acked += s.writes_acked;
         total.reads_done += s.reads_done;
         total.failed += s.failed;
+        total.not_run += s.not_run;
         total.redirects += s.redirects;
         total.epochs += s.epochs;
         total.crashes += s.crashes;

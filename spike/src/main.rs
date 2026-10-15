@@ -1197,8 +1197,7 @@ mod tests {
     where
         E::Program: Sync + Send,
     {
-        static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-        let port = 21000 + (std::process::id() % 2000) as u16 * 10 + PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = free_ports(1)[0];
         let stop = cfg.stop.clone();
         let t = std::thread::spawn(move || {
             let app = make(&eng);
@@ -1211,6 +1210,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("server on {port} didn't start");
+    }
+
+    /// A bucket no other test uses. (They used to share one: the name took
+    /// `Instant::now().elapsed()`, which is always about 0, so every fleet
+    /// test in a run met the others' nodes 0, 1, and 2 in the same bucket.)
+    fn test_bucket() -> String {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!("combd-test-{}-{}-{}", std::process::id(), host::now_ms(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// `n` free ports from the OS, never handed out twice in this process.
+    /// (Ports worked out from the process id used to collide: one fleet
+    /// test's wire landed on another's.)
+    fn free_ports(n: usize) -> Vec<u16> {
+        static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(vec![]);
+        let mut given = GIVEN.lock().unwrap();
+        let mut held = vec![];
+        let mut out = vec![];
+        while out.len() < n {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            if !given.contains(&p) {
+                given.push(p);
+                out.push(p);
+            }
+            held.push(l); // held until all are picked, so they differ
+        }
+        out
     }
 
     fn cfg(data: &std::path::Path, threads: usize) -> http::Config {
@@ -1292,9 +1319,9 @@ mod tests {
         };
         let dir = store::tempdir::Dir::new();
         wire::make_certs(&dir.0.join("certs"), 2).unwrap();
-        let bucket = format!("combd-test-{}-{}", std::process::id(), Instant::now().elapsed().as_nanos() % 100_000);
-        let wbase = 24000 + (std::process::id() % 1000) as u16 * 2;
-        let peers: HashMap<own::Node, String> = (0..2).map(|n| (n, format!("127.0.0.1:{}", wbase + n as u16))).collect();
+        let bucket = test_bucket();
+        let wports = free_ports(2);
+        let peers: HashMap<own::Node, String> = (0..2).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
         let node = |n: own::Node, idle_ms: u64| {
             let fc = fleet::FleetCfg {
                 node: n,
@@ -1302,7 +1329,7 @@ mod tests {
                 replicas: 0,
                 s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
                 peers: peers.clone(),
-                wire_port: wbase + n as u16,
+                wire_port: wports[n as usize],
                 wire_certs: Some(dir.0.join("certs")),
                 insecure: false,
             };
@@ -1349,9 +1376,9 @@ mod tests {
         };
         let dir = store::tempdir::Dir::new();
         wire::make_certs(&dir.0.join("certs"), 3).unwrap();
-        let bucket = format!("combd-test-{}-{}", std::process::id(), Instant::now().elapsed().as_nanos() % 100_000);
-        let wbase = 25000 + (std::process::id() % 1000) as u16 * 3;
-        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wbase + n as u16))).collect();
+        let bucket = test_bucket();
+        let wports = free_ports(3);
+        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
         let node = |n: own::Node| {
             let fc = fleet::FleetCfg {
                 node: n,
@@ -1359,7 +1386,7 @@ mod tests {
                 replicas: 2,
                 s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
                 peers: peers.clone(),
-                wire_port: wbase + n as u16,
+                wire_port: wports[n as usize],
                 wire_certs: Some(dir.0.join("certs")),
                 insecure: false,
             };
@@ -1572,9 +1599,9 @@ mod tests {
         };
         let dir = store::tempdir::Dir::new();
         wire::make_certs(&dir.0.join("certs"), 2).unwrap();
-        let bucket = format!("combd-test-{}-{}", std::process::id(), Instant::now().elapsed().as_nanos() % 100_000);
-        let wbase = 26000 + (std::process::id() % 1000) as u16 * 2;
-        let peers: HashMap<own::Node, String> = (0..2).map(|n| (n, format!("127.0.0.1:{}", wbase + n as u16))).collect();
+        let bucket = test_bucket();
+        let wports = free_ports(2);
+        let peers: HashMap<own::Node, String> = (0..2).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
         let node = |n: own::Node| {
             let fc = fleet::FleetCfg {
                 node: n,
@@ -1582,7 +1609,7 @@ mod tests {
                 replicas: 0,
                 s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
                 peers: peers.clone(),
-                wire_port: wbase + n as u16,
+                wire_port: wports[n as usize],
                 wire_certs: Some(dir.0.join("certs")),
                 insecure: false,
             };
@@ -2071,9 +2098,10 @@ routes = ["/admin/*"]
     /// Six apps of three orgs on one node, all with the same processes and
     /// the same object ids: nothing crosses between them, and one busy org
     /// can't crowd out another.
-    #[test]
-    fn six_tenants_share_a_node_and_nothing_else() {
-        let root = store::tempdir::Dir::new();
+    /// Six apps of three orgs under `root`, all with the same processes
+    /// (`api`, `worker`, durable `room`) and their own domain
+    /// (`<app>.<org>.test`) and `TENANT` var. acme/shop alone has a pool.
+    fn six_apps(root: &std::path::Path) -> (Vec<(String, String)>, Vec<(String, std::path::PathBuf)>) {
         let apps: Vec<(String, String)> = ["acme", "globex", "initech"].iter().flat_map(|o| ["shop", "blog"].iter().map(move |a| (o.to_string(), a.to_string()))).collect();
         let manifest = |org: &str, app: &str| {
             format!(r#"
@@ -2084,7 +2112,7 @@ domains = ["{app}.{org}.test"]
 TENANT = {{ type = "string" }}
 [processes.api]
 kind = "ev"
-routes = ["/env/*", "/call", "/pg/q"]
+routes = ["/env/*", "/call", "/send", "/pg/q"]
 [processes.worker]
 kind = "classic"
 routes = ["/api/*"]
@@ -2098,7 +2126,7 @@ callers = ["api"]
         };
         let mut dirs = vec![];
         for (org, app) in &apps {
-            let d = root.0.join(org).join(app);
+            let d = root.join(org).join(app);
             std::fs::create_dir_all(d.join("modules")).unwrap();
             let mut m = manifest(org, app);
             // One app has a pool; the others must never reach it.
@@ -2111,6 +2139,13 @@ callers = ["api"]
             std::fs::copy(GUEST, manifest::module_path(&d, "classic")).unwrap();
             dirs.push((org.clone(), d));
         }
+        (apps, dirs)
+    }
+
+    #[test]
+    fn six_tenants_share_a_node_and_nothing_else() {
+        let root = store::tempdir::Dir::new();
+        let (apps, dirs) = six_apps(&root.0);
         let eng = interp::Interp { max_pages: 16384 };
         let (a, pg) = http::load_apps(&eng, &dirs).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((a.tenants.len(), a.procs.len(), a.progs.len()), (6, 18, 2), "six apps, two programs: the same bytes load once");
@@ -2176,6 +2211,118 @@ callers = ["api"]
         let (ta, tg) = (acme.join().unwrap(), globex.join().unwrap());
         eprintln!("fairness: globex's 6 done in {tg:?}, acme's 100 in {ta:?}");
         assert!(tg.as_secs_f64() < ta.as_secs_f64() * 0.6, "globex took {tg:?}, acme {ta:?}");
+    }
+
+    /// Six apps on three nodes (D3: two peers confirm every write), every
+    /// node getting requests for every app: env vars and workers answer
+    /// locally, objects are found on their owner wherever it is, `call` and
+    /// `send` reach across nodes, and when a node stops the other two take
+    /// over every app's objects with every write.
+    #[test]
+    fn six_tenants_on_three_nodes() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let root = store::tempdir::Dir::new();
+        let (apps, dirs) = six_apps(&root.0);
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 3).unwrap();
+        let bucket = test_bucket();
+        let wports = free_ports(3);
+        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
+        let node = |n: own::Node| {
+            let fc = fleet::FleetCfg {
+                node: n,
+                lease_ms: 1000,
+                replicas: 2,
+                s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
+                peers: peers.clone(),
+                wire_port: wports[n as usize],
+                wire_certs: Some(dir.0.join("certs")),
+                insecure: false,
+            };
+            let eng = interp::Interp { max_pages: 16384 };
+            let (a, pg) = http::load_apps(&eng, &dirs).unwrap_or_else(|e| panic!("{e}"));
+            let c = http::Config { pg, fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 2) };
+            server_app(eng, c, move |_| a)
+        };
+        let (n0, stop0, t0) = node(0);
+        let (n1, _, _) = node(1);
+        let (n2, _, _) = node(2);
+        for p in [n0, n1, n2] {
+            stat(p, "fences"); // every node really serves
+        }
+        let host = |org: &str, app: &str| format!("{app}.{org}.test");
+        // Ask until it answers 200 (a takeover answers 503 for about a lease;
+        // much longer only on a starved machine).
+        let ok = |port: u16, h: &str, method: &str, path: &str, body: &str| -> String {
+            for _ in 0..300 {
+                let (c, r) = http_to(port, h, method, path, body);
+                if c == 200 {
+                    return r;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let last = http_to(port, h, method, path, body);
+            panic!("{h} {method} {path} never answered 200 on {port}: last {last:?}; stats {}", http(port, "GET", "/_combd/stats", "").1);
+        };
+        let nodes = [n0, n1, n2];
+        // Until a node stops, nothing may need a retry: a request that lost a
+        // race for a new object never ran, so the host routes it again.
+        let first = |port: u16, h: &str, method: &str, path: &str, body: &str| -> String {
+            let (c, r) = http_to(port, h, method, path, body);
+            assert_eq!(c, 200, "{h} {method} {path} on {port}: {r}");
+            r
+        };
+        // Every node answers for every app, with that app's env vars.
+        for (org, app) in &apps {
+            for &p in &nodes {
+                assert_eq!(first(p, &host(org, app), "GET", "/env/TENANT", ""), format!("{{\"value\":\"{org}/{app}\"}}"));
+            }
+        }
+        // Every app's `room/r1` gets increments through all three nodes, in
+        // turn: they're forwarded to its owner, wherever that is. Each app
+        // counts on its own.
+        for round in 0..3 {
+            for (i, (org, app)) in apps.iter().enumerate() {
+                for _ in 0..=i {
+                    first(nodes[(round + i) % 3], &host(org, app), "POST", "/room/r1/incr", "");
+                }
+            }
+        }
+        for (i, (org, app)) in apps.iter().enumerate() {
+            let want = format!("{{\"count\":{}}}", 3 * (i + 1));
+            for &p in &nodes {
+                assert_eq!(first(p, &host(org, app), "GET", "/room/r1/count", ""), want, "{org}/{app} on {p}");
+            }
+        }
+        // `call` from any node reaches the owner; `send` too.
+        for (i, (org, app)) in apps.iter().enumerate() {
+            let h = host(org, app);
+            for &p in &nodes {
+                let body = first(p, &h, "POST", "/call", &serde_json::json!({ "to": "room", "id": "r1", "method": "GET", "path": "/count" }).to_string());
+                assert!(body.contains(&format!("{{\\\"count\\\":{}}}", 3 * (i + 1))), "{org}/{app} via {p}: {body}");
+            }
+            for &p in &nodes {
+                assert_eq!(http_to(p, &h, "POST", "/send", &serde_json::json!({ "to": "room", "id": "sent", "path": "/incr" }).to_string()).0, 202);
+            }
+        }
+        for (org, app) in &apps {
+            assert!(eventually(5000, || http_to(n1, &host(org, app), "GET", "/room/sent/count", "").1 == "{\"count\":3}"), "{org}/{app}: {:?}", http_to(n1, &host(org, app), "GET", "/room/sent/count", ""));
+        }
+        assert!(nodes.iter().map(|&p| stat(p, "peer_acks")).sum::<i64>() > 0, "D3: peers confirm writes");
+        // Node 0 stops. The other two take over its objects, in every app,
+        // with every write, and go on.
+        stop0.store(true, std::sync::atomic::Ordering::Relaxed);
+        t0.join().unwrap();
+        for (i, (org, app)) in apps.iter().enumerate() {
+            let h = host(org, app);
+            assert_eq!(ok(n1, &h, "GET", "/room/r1/count", ""), format!("{{\"count\":{}}}", 3 * (i + 1)), "{org}/{app} after the stop");
+            assert_eq!(ok(n2, &h, "POST", "/room/r1/incr", ""), format!("{{\"count\":{}}}", 3 * (i + 1) + 1));
+            assert_eq!(ok(n1, &h, "GET", "/room/r1/count", ""), format!("{{\"count\":{}}}", 3 * (i + 1) + 1));
+            assert_eq!(ok(n2, &h, "GET", "/room/sent/count", ""), "{\"count\":3}");
+        }
     }
 
     #[test]

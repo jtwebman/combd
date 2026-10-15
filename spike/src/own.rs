@@ -203,6 +203,9 @@ pub enum Answer {
     Redirect(Node),
     /// Not done, or not known to be done: try again.
     Failed,
+    /// Never ran (it was still waiting when the object went): safe to try
+    /// again as is, even for a write.
+    NotRun,
 }
 
 #[derive(Debug)]
@@ -921,12 +924,15 @@ impl Core {
             failed.extend(s.sealing.into_iter().flatten());
             failed.extend(s.pends.into_iter().flat_map(|p| p.reqs));
         }
-        failed.extend(st.waiting.drain(..));
+        let waiting: Vec<ReqId> = st.waiting.drain(..).collect();
         st.early = None;
         st.fence = None;
         self.out.push(Effect::Drop { obj: o });
         for r in failed {
             self.answer(r, Answer::Failed);
+        }
+        for r in waiting {
+            self.answer(r, Answer::NotRun);
         }
     }
 

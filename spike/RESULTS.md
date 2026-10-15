@@ -1464,6 +1464,35 @@ globex's batch finished in about 0.54 s and acme's in 1.41 s (three runs).
 With fairness turned off, both finished together at 1.62 s, which the test
 fails. `apps_must_not_share_domains` covers the load-time checks.
 
+**Six tenants on three nodes** (`six_tenants_on_three_nodes`, D3 with two
+peers per object): all three nodes serve all six apps, and requests go to
+every node in turn. Every node answers every app with its own env var;
+every app's `room/r1` takes increments through all three and they agree on
+its count; `call` from any node reaches the object's owner, wherever it is,
+and `send` too; then node 0 stops, and the other two take over every app's
+objects with every write and go on. Until the stop, every request must
+succeed on the first try.
+
+That last rule found a real race. Three nodes asked at once for a new
+object: one won the claim, and the requests still waiting on the losers
+were answered "failed, retry" (503). A client retried, but a `send` has
+nobody to retry it, so half the sends were lost. The ownership core
+couldn't tell "failed" requests that may have run from ones that never
+did, so the host couldn't safely retry either. Now it can: requests that
+were still waiting are answered `NotRun`, and the host routes them again
+(up to three times), so nobody sees the race. The simulator checks the new
+answer strictly: a request answered `NotRun` must never have run (133,000
+such answers in 4,000 seeds, with splits and lost disks: every one held).
+Turning the retry off makes the test fail again.
+
+**And two old test bugs, found when this test failed only in the full
+suite.** Every fleet test named its bucket with `Instant::now().elapsed()`,
+which is always about 0, so all fleet tests in a run shared one bucket and
+met each other's nodes 0, 1, and 2: a stopped node looked alive because
+another test's node 0 kept its heartbeat going (1,184 fences in 30 s). And
+test ports came from the process id, so one fleet test's wire could land on
+another's. Each test now gets its own bucket, and its ports from the OS.
+
 Not yet: one process per tenant (needed before strangers share a node:
 cells in one process can leak through CPU timing), per-org caps on memory
 and in-flight requests, per-app stats, and environments in the name.
