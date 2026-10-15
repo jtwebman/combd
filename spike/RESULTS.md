@@ -1483,10 +1483,15 @@ Found while building it: refusing before reading a body, then closing,
 reset the connection, and the client could miss the answer. The server now
 reads (and drops) up to 1 MB for 2 s after a refusal, never all of it.
 
-Not yet: secrets (next: encrypted in the bucket), the AOT tier for deployed
-modules (it runs only modules built in; deploy nodes run the interpreter),
-pools added by a deploy (they start with the node, until the fleet pool),
-and a push to peers on deploy (they poll every 2 s).
+A bug I'd left: fleet nodes started no Postgres pools at all, so a
+deployed app could never reach its database. Now each app carries its pool
+settings, and a node starts any pool it's missing whenever it takes a new
+app table (at boot, or a deploy; a changed config gets a fresh pool). The
+deploy test deploys an app with a pool and queries it on all three nodes.
+
+Not yet: secrets, the AOT tier for deployed modules (it runs only modules
+built in; deploy nodes run the interpreter), and a push to peers on deploy
+(they poll every 2 s).
 
 ## Many tenants on one node (shared process)
 

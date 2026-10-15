@@ -37,13 +37,14 @@ pub type Reply = Box<dyn FnOnce(Vec<u8>) + Send>;
 pub type LeaseReply = Box<dyn FnOnce(Result<Lease, String>) + Send>;
 
 /// Every Postgres pool in the app's manifest.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct PgCfg {
     pub pools: Vec<PoolCfg>,
 }
 
 /// One pool and its member process's settings (`manifest.rs` checked them).
-#[derive(Clone)]
+/// (No `Debug`: its URL holds a password.)
+#[derive(Clone, PartialEq)]
 pub struct PoolCfg {
     pub name: String,
     pub url: String,
@@ -138,20 +139,33 @@ enum Msg {
 }
 
 /// Every binding's pool, shared by a node's event loops.
+/// Every pool on this node, by name. A deploy can add pools (`ensure`).
 pub struct Pools {
-    pools: HashMap<String, Sender<Msg>>,
+    pools: std::sync::Mutex<HashMap<String, (PoolCfg, Sender<Msg>)>>,
 }
 
 impl Pools {
     pub fn start(cfg: &PgCfg) -> Pools {
-        let mut pools = HashMap::new();
-        for p in &cfg.pools {
+        let p = Pools { pools: std::sync::Mutex::new(HashMap::new()) };
+        p.ensure(&cfg.pools);
+        p
+    }
+
+    /// Start every pool in `cfgs` that isn't running, or runs with other
+    /// settings (a deploy changed them: the new one takes the name, the old
+    /// one's leases run out). ponytail: a replaced pool's thread stays.
+    pub fn ensure(&self, cfgs: &[PoolCfg]) {
+        let mut pools = self.pools.lock().unwrap();
+        for p in cfgs {
+            if pools.get(&p.name).is_some_and(|(c, _)| c == p) {
+                continue;
+            }
             let mut pg: Config = match p.url.parse() {
                 Ok(c) => c,
                 Err(_) => {
                     // Never print the URL: it holds a password.
                     eprintln!("combd     pools.{}: its url isn't a Postgres URL", p.name);
-                    std::process::exit(1);
+                    continue;
                 }
             };
             // Startup options are what RESET (and so DISCARD ALL) goes back
@@ -162,16 +176,14 @@ impl Pools {
             pg.keepalives(true).keepalives_idle(Duration::from_secs(10));
             pg.application_name("combd");
             let (tx, rx) = channel();
-            let (me, p) = (tx.clone(), p.clone());
-            let name = p.name.clone();
-            std::thread::spawn(move || run_pool(pg, p, rx, me));
-            pools.insert(name, tx);
+            let (me, c) = (tx.clone(), p.clone());
+            std::thread::spawn(move || run_pool(pg, c, rx, me));
+            pools.insert(p.name.clone(), (p.clone(), tx));
         }
-        Pools { pools }
     }
 
     pub fn has(&self, binding: &str) -> bool {
-        self.pools.contains_key(binding)
+        self.pools.lock().unwrap().contains_key(binding)
     }
 
     /// One statement on a member leased just for it.
@@ -191,7 +203,8 @@ impl Pools {
 
     /// Lease a member: now, once one's started, or once one's free.
     pub fn lease(&self, binding: &str, reply: LeaseReply) {
-        match self.pools.get(binding) {
+        let tx = self.pools.lock().unwrap().get(binding).map(|(_, tx)| tx.clone());
+        match tx {
             Some(p) => {
                 let _ = p.send(Msg::Ask(reply));
             }

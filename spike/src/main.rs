@@ -2552,6 +2552,19 @@ callers = ["api"]
         deploy("blog", &app("blog", "blog.test", "[\"/env/*\"]", "V = \"blog\"")).unwrap();
         everywhere("blog.test", "/env/V", "{\"value\":\"blog\"}");
         everywhere("shop.test", "/env/V", "{\"value\":\"changed\"}");
+        // An app with a Postgres pool: deployed, its pool starts on every
+        // node, and every node can query. (Its URL is a var until secrets.)
+        if let Ok(pg_url) = std::env::var("COMBD_PG_TEST") {
+            let d = src.0.join("data");
+            std::fs::create_dir_all(d.join("modules")).unwrap();
+            std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
+            std::fs::write(d.join("combd.toml"), "[app]\nname = \"data\"\ndomains = [\"data.test\"]\n[vars]\nPG = { type = \"url\" }\n[processes.api]\nkind = \"ev\"\nroutes = [\"/pg/q\"]\n[processes.pg-conn]\nkind = \"combd:postgres\"\nurl = \"$PG\"\n[pools.main]\nmember = \"pg-conn\"\nowners = [\"api\"]\nmax = 2\n").unwrap();
+            assert_eq!(api(&token, "PUT", "/v1/apps/acme/data/vars", serde_json::json!({ "PG": pg_url }).to_string().as_bytes()).0, 200);
+            deploy("data", &deploy::bundle(&d).unwrap()).unwrap_or_else(|e| panic!("{e}"));
+            for &p in &nodes {
+                assert!(eventually(10_000, || http_to(p, "data.test", "POST", "/pg/q", "{\"q\":\"SELECT 41 + 1\"}").1.contains("[[42]]")), "node {p}: {:?}", http_to(p, "data.test", "POST", "/pg/q", "{\"q\":\"SELECT 41 + 1\"}"));
+            }
+        }
         // A second node 1 would fight the first over everything it owns:
         // it must see the id is taken, and not start.
         assert!(http::node_id_free(&bucket, 1, 1000).unwrap_err().contains("node id 1 is already in use"));

@@ -639,8 +639,7 @@ where
     let mut known = crate::deploy::Known::new();
     let first = sync_apps(eng, &s3, &cache, &mut known, &App::empty())?;
     let live = Live::new(first.unwrap_or_else(App::empty));
-    let mut cfg = cfg;
-    cfg.pg = pg_of(&live.now());
+    let cfg = cfg;
     let scratch = cfg.data.join("scratch");
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     std::thread::scope(|sc| {
@@ -777,13 +776,6 @@ fn load_one(dir: &std::path::Path, env: &crate::manifest::EnvValues) -> Result<(
     let m = crate::manifest::load(dir)?.ok_or("no manifest")?;
     let r = m.resolve(env)?;
     Ok((m, r))
-}
-
-/// The Postgres pools of every live app (named `<org>/<app>/<pool>`).
-fn pg_of<P>(_app: &App<P>) -> Option<crate::pg::PgCfg> {
-    // ponytail: pools start with the node; a deploy that adds a pool needs
-    // a restart until the fleet-wide pool lands (it starts pools on demand).
-    None
 }
 
 /// Deploy `bundle` as `<org>/<app>`: everything is checked first, against
@@ -943,7 +935,8 @@ where
         });
     }
     let fleet = cfg.fleet.take().map(|fc| start_fleet(fc, &peers, cfg.threads, &cfg.data));
-    let pg = cfg.pg.as_ref().map(crate::pg::Pools::start);
+    // Always a set of pools (maybe empty): a deploy can add to it.
+    let pg = Some(crate::pg::Pools::start(&cfg.pg.clone().unwrap_or_default()));
     let sh = Shared {
         pg,
         cfg,
@@ -2637,6 +2630,10 @@ impl<E: Engine> Loop<'_, E> {
     /// New processes (from `from` on): a warm cell each, and whether it's an
     /// event cell.
     fn warm(&mut self, from: usize) -> std::io::Result<()> {
+        // The apps' pools: started here if they're new (idempotent).
+        if let Some(pools) = &self.sh.pg {
+            pools.ensure(&self.app.pools());
+        }
         self.pools.resize_with(self.app.procs.len(), Vec::new);
         self.ev_mode.resize(self.app.procs.len(), false);
         for p in from..self.app.procs.len() {

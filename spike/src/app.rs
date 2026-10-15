@@ -49,6 +49,8 @@ pub struct Tenant {
     pub domains: Vec<String>,
     /// Its env vars, as WASI hands them out.
     pub environ: Arc<Vec<Vec<u8>>>,
+    /// Its Postgres pools (named `<org>/<app>/<pool>`).
+    pub pools: Vec<crate::pg::PoolCfg>,
 }
 
 impl Tenant {
@@ -109,7 +111,7 @@ impl<P> App<P> {
     /// One program, the old routes.
     pub fn single(prog: P, max_concurrent: usize) -> App<P> {
         let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
-        let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default() };
+        let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default(), pools: vec![] };
         App { progs: vec![Arc::new(prog)], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
     }
 
@@ -152,7 +154,8 @@ impl<P> App<P> {
         }
         for a in apps {
             let environ = Arc::new(a.resolved.environ.iter().map(|(k, v)| format!("{k}={v}").into_bytes()).collect());
-            let tenant = Tenant { org: a.org.into(), app: a.app.into(), domains: a.domains.to_vec(), environ };
+            let pools = crate::pg::PgCfg::from_manifest(a.resolved, &format!("{}/{}", a.org, a.app)).map(|c| c.pools).unwrap_or_default();
+            let tenant = Tenant { org: a.org.into(), app: a.app.into(), domains: a.domains.to_vec(), environ, pools };
             match find(&tenants, a.org, a.app) {
                 Some(t) => {
                     tenants[t] = tenant;
@@ -232,6 +235,11 @@ impl<P> App<P> {
         targets.extend(self.router.routes.iter().filter(|x| !procs[x.proc].retired && !gone.contains(&x.tenant)).map(|x| Target { route: x.route.clone(), proc: x.proc, tenant: x.tenant, name: x.name.clone(), durable: x.durable }));
         let domains = tenants.iter().enumerate().map(|(t, x)| if gone.contains(&t) { vec![] } else { x.domains.clone() }).collect();
         Ok(App { progs, procs, tenants, router: Router::new(targets, domains), by_hash, gone })
+    }
+
+    /// Every live app's pools.
+    pub fn pools(&self) -> Vec<crate::pg::PoolCfg> {
+        self.tenants.iter().enumerate().filter(|(t, _)| !self.gone.contains(t)).flat_map(|(_, x)| x.pools.clone()).collect()
     }
 
     /// Process `name` of app `tenant`: a call or a lease never leaves its app.
