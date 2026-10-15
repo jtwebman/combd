@@ -1,113 +1,122 @@
-//! Bring your own database: Postgres, with the host owning the connections.
+//! Bring your own database: Postgres, through a pool the host runs.
 //!
-//! Each binding (`COMBD_PG_<NAME>=postgres://...`) gets a pool of worker
-//! threads, one connection each. A cell never holds a socket or a password;
-//! it names a binding. Two ways to use one:
-//! - **pooled:** one statement on any free connection, then the connection
-//!   is reset (`ROLLBACK; DISCARD ALL`) so nothing (a `SET`, a temp table, a
-//!   lock) reaches the next user;
-//! - **pinned:** a connection reserved for one handle. Everything
-//!   session-scoped works on it: transactions over many calls, row locks,
-//!   advisory locks, `SET`. When the handle closes, the connection is reset
-//!   (which rolls back and releases every lock) and goes back to the pool.
+//! Each binding (`COMBD_PG_<NAME>=postgres://...`) is a pool (`pool.rs`
+//! decides). A **member** is one connection on its own thread. A cell never
+//! holds a socket or a password; it asks the pool for a **lease** on a member.
+//! - The pool starts a member when it's asked and none is free, up to `max`.
+//!   At max, an ask waits in line, and fails after `wait_ms`.
+//! - A lease is the member's alone: everything session-scoped works on it
+//!   (transactions over many calls, row locks, advisory locks, `SET`).
+//! - On release the member resets (`ROLLBACK; DISCARD ALL`), which rolls
+//!   back and releases every lock, and tells the pool it's free.
+//! - A lease past `lease_ms` is taken back by the member itself: it resets,
+//!   and the holder's next call gets an error. It doesn't need the pool for
+//!   that.
+//! - A member free for `idle_ms` stops, and its connection closes.
+//! - "Too many clients" from the database: the ask waits instead of failing.
+//! - A pooled statement is a lease for one statement.
 //!
-//! Every connection has a statement timeout (a lock wait counts), and at most
-//! `max_pinned` connections per binding can be pinned, so pooled queries
-//! always find room. Requests that find no free connection wait in order.
-//!
-//! The answer to a statement is the same JSON as the object's own SQLite:
+//! Every connection has a statement timeout (a lock wait counts). The answer
+//! to a statement is the same JSON as the object's own SQLite:
 //! `{"rows": [[...]], "changes": n}` or `{"error": "...", "code": "SQLSTATE"}`.
 
+use crate::pool;
+use postgres::error::SqlState;
 use postgres::types::{ToSql, Type};
 use postgres::{Client, Config, NoTls};
 use serde_json::{json, Value as Json};
-use std::collections::{HashMap, VecDeque};
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 
 /// The biggest answer a cell can get back (as its SQLite's).
 const MAX_ANSWER: usize = crate::store::MAX_RESULT;
 
 pub type Reply = Box<dyn FnOnce(Vec<u8>) + Send>;
-/// A pinned connection, or why there isn't one.
-pub type PinReply = Box<dyn FnOnce(Result<usize, String>) + Send>;
+/// A lease, or why there isn't one.
+pub type LeaseReply = Box<dyn FnOnce(Result<Lease, String>) + Send>;
 
 #[derive(Clone)]
 pub struct PgCfg {
     /// (binding, connection URL).
     pub bindings: Vec<(String, String)>,
-    pub pool: usize,
-    pub max_pinned: usize,
+    /// Members per pool, at most.
+    pub max: usize,
     pub statement_timeout_ms: u64,
+    pub idle_ms: u64,
+    pub lease_ms: u64,
+    pub wait_ms: u64,
 }
 
 impl PgCfg {
     /// `COMBD_PG_<NAME>=postgres://...` per binding (the name is lowercased),
-    /// `COMBD_PG_POOL` (connections per binding per node, default 8),
-    /// `COMBD_PG_TIMEOUT_MS` (per statement, default 5 s).
+    /// and for every pool: `COMBD_PG_MAX` (connections, default 8),
+    /// `COMBD_PG_TIMEOUT_MS` (per statement, 5 s), `COMBD_PG_IDLE_MS` (a free
+    /// connection closes, 60 s), `COMBD_PG_LEASE_MS` (longest hold, 60 s),
+    /// `COMBD_PG_WAIT_MS` (longest wait in line, 5 s).
     pub fn from_env() -> Option<PgCfg> {
-        let reserved = ["COMBD_PG_POOL", "COMBD_PG_TIMEOUT_MS", "COMBD_PG_SESSION_IDLE_MS"];
+        let knobs = ["MAX", "TIMEOUT_MS", "IDLE_MS", "LEASE_MS", "WAIT_MS", "SESSION_IDLE_MS"];
         let bindings: Vec<(String, String)> = std::env::vars()
-            .filter(|(k, _)| k.starts_with("COMBD_PG_") && !reserved.contains(&k.as_str()))
-            .map(|(k, v)| (k["COMBD_PG_".len()..].to_lowercase(), v))
+            .filter_map(|(k, v)| Some((k.strip_prefix("COMBD_PG_")?.to_string(), v)))
+            .filter(|(k, _)| !knobs.contains(&k.as_str()))
+            .map(|(k, v)| (k.to_lowercase(), v))
             .collect();
         if bindings.is_empty() {
             return None;
         }
-        let num = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        let pool = num("COMBD_PG_POOL", 8).max(2) as usize;
-        Some(PgCfg { bindings, pool, max_pinned: pool - 1, statement_timeout_ms: num("COMBD_PG_TIMEOUT_MS", 5000) })
+        let num = |k: &str, d: u64| std::env::var(format!("COMBD_PG_{k}")).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        Some(PgCfg {
+            bindings,
+            max: num("MAX", 8).max(1) as usize,
+            statement_timeout_ms: num("TIMEOUT_MS", 5000),
+            idle_ms: num("IDLE_MS", 60_000),
+            lease_ms: num("LEASE_MS", 60_000),
+            wait_ms: num("WAIT_MS", 5000),
+        })
+    }
+}
+
+/// A member, leased: calls on it are checked against the lease id, so a
+/// holder whose lease ran out (or was released) can't reach the next one's.
+#[derive(Clone)]
+pub struct Lease {
+    id: u64,
+    member: Sender<Job>,
+}
+
+impl Lease {
+    pub fn query(&self, req: Vec<u8>, reply: Reply) {
+        // A member that's gone can't answer: say so, or the caller waits forever.
+        if let Err(std::sync::mpsc::SendError(Job::Query { reply, .. })) = self.member.send(Job::Query { lease: self.id, req, reply, release: false }) {
+            reply(json!({ "error": "the database session was lost" }).to_string().into_bytes());
+        }
+    }
+
+    /// Done with it: the member resets and goes back to the pool.
+    pub fn release(&self) {
+        let _ = self.member.send(Job::Release(self.id));
     }
 }
 
 enum Job {
-    /// Run a statement; `pinned`: on a reserved connection (no reset after).
-    Query { req: Vec<u8>, pinned: bool, reply: Reply },
-    /// A pinned connection is done: reset it and give it back.
-    Unpin,
+    Lease(u64),
+    Query { lease: u64, req: Vec<u8>, reply: Reply, release: bool },
+    Release(u64),
+    Stop,
 }
 
-enum Waiter {
-    Query(Vec<u8>, Reply),
-    Pin(PinReply),
-}
-
-struct PoolSt {
-    idle: Vec<usize>,
-    pinned: usize,
-    waiting: VecDeque<Waiter>,
-}
-
-struct Pool {
-    workers: Vec<Sender<Job>>,
-    st: Mutex<PoolSt>,
-    max_pinned: usize,
-}
-
-impl Pool {
-    /// A worker is free again: give it the next waiter it can take.
-    fn release(&self, w: usize) {
-        let mut st = self.st.lock().unwrap();
-        let can_pin = st.pinned < self.max_pinned;
-        let next = st.waiting.iter().position(|x| matches!(x, Waiter::Query(..)) || can_pin);
-        match next.and_then(|i| st.waiting.remove(i)) {
-            Some(Waiter::Query(req, reply)) => {
-                drop(st);
-                let _ = self.workers[w].send(Job::Query { req, pinned: false, reply });
-            }
-            Some(Waiter::Pin(reply)) => {
-                st.pinned += 1;
-                drop(st);
-                reply(Ok(w));
-            }
-            None => st.idle.push(w),
-        }
-    }
+/// What the pool's thread hears.
+enum Msg {
+    Ask(LeaseReply),
+    Started(u64, Result<(), bool>),
+    Resetting(u64),
+    Free(u64),
+    Gone(u64),
 }
 
 /// Every binding's pool, shared by a node's event loops.
 pub struct Pools {
-    pools: HashMap<String, Arc<Pool>>,
+    pools: HashMap<String, Sender<Msg>>,
 }
 
 impl Pools {
@@ -121,27 +130,17 @@ impl Pools {
                     std::process::exit(1);
                 }
             };
-            // Startup options are what RESET (and so DISCARD ALL) goes back to.
-            pg.options(&format!("-c statement_timeout={}", cfg.statement_timeout_ms));
-            pg.connect_timeout(std::time::Duration::from_secs(5));
+            // Startup options are what RESET (and so DISCARD ALL) goes back
+            // to. A session left in a transaction (its node died) ends on the
+            // server soon after its lease would have.
+            pg.options(&format!("-c statement_timeout={} -c idle_in_transaction_session_timeout={}", cfg.statement_timeout_ms, cfg.lease_ms + 5000));
+            pg.connect_timeout(Duration::from_secs(5));
+            pg.keepalives(true).keepalives_idle(Duration::from_secs(10));
             pg.application_name("combd");
-            let mut senders = vec![];
-            let mut rxs = vec![];
-            for _ in 0..cfg.pool {
-                let (tx, rx) = channel();
-                senders.push(tx);
-                rxs.push(rx);
-            }
-            let pool = Arc::new(Pool {
-                workers: senders,
-                st: Mutex::new(PoolSt { idle: (0..cfg.pool).collect(), pinned: 0, waiting: VecDeque::new() }),
-                max_pinned: cfg.max_pinned,
-            });
-            for (w, rx) in rxs.into_iter().enumerate() {
-                let (pool, pg) = (pool.clone(), pg.clone());
-                std::thread::spawn(move || worker(w, pg, rx, pool));
-            }
-            pools.insert(name.clone(), pool);
+            let (tx, rx) = channel();
+            let (me, cfg) = (tx.clone(), cfg.clone());
+            std::thread::spawn(move || run_pool(pg, cfg, rx, me));
+            pools.insert(name.clone(), tx);
         }
         Pools { pools }
     }
@@ -150,109 +149,194 @@ impl Pools {
         self.pools.contains_key(binding)
     }
 
-    /// One statement on any free connection.
+    /// One statement on a member leased just for it.
     pub fn query(&self, binding: &str, req: Vec<u8>, reply: Reply) {
-        let Some(p) = self.pools.get(binding) else { return reply(no_binding(binding)) };
-        let mut st = p.st.lock().unwrap();
-        match st.idle.pop() {
-            Some(w) => {
-                drop(st);
-                let _ = p.workers[w].send(Job::Query { req, pinned: false, reply });
-            }
-            None => st.waiting.push_back(Waiter::Query(req, reply)),
-        }
+        self.lease(
+            binding,
+            Box::new(move |l| match l {
+                Ok(l) => {
+                    if let Err(std::sync::mpsc::SendError(Job::Query { reply, .. })) = l.member.send(Job::Query { lease: l.id, req, reply, release: true }) {
+                        reply(json!({ "error": "the database session was lost" }).to_string().into_bytes());
+                    }
+                }
+                Err(e) => reply(json!({ "error": e }).to_string().into_bytes()),
+            }),
+        );
     }
 
-    /// Reserve a connection (when one's free, and pins are under the cap).
-    pub fn pin(&self, binding: &str, reply: PinReply) {
-        let Some(p) = self.pools.get(binding) else { return reply(Err(String::from_utf8_lossy(&no_binding(binding)).into_owned())) };
-        let mut st = p.st.lock().unwrap();
-        if st.pinned < p.max_pinned {
-            if let Some(w) = st.idle.pop() {
-                st.pinned += 1;
-                drop(st);
-                return reply(Ok(w));
-            }
-        }
-        st.waiting.push_back(Waiter::Pin(reply));
-    }
-
-    /// A statement on a pinned connection.
-    pub fn query_on(&self, binding: &str, w: usize, req: Vec<u8>, reply: Reply) {
+    /// Lease a member: now, once one's started, or once one's free.
+    pub fn lease(&self, binding: &str, reply: LeaseReply) {
         match self.pools.get(binding) {
             Some(p) => {
-                let _ = p.workers[w].send(Job::Query { req, pinned: true, reply });
+                let _ = p.send(Msg::Ask(reply));
             }
-            None => reply(no_binding(binding)),
-        }
-    }
-
-    /// Done with a pinned connection: it's reset (rolling back, releasing
-    /// locks) and goes back to the pool.
-    pub fn unpin(&self, binding: &str, w: usize) {
-        if let Some(p) = self.pools.get(binding) {
-            p.st.lock().unwrap().pinned -= 1;
-            let _ = p.workers[w].send(Job::Unpin);
+            None => reply(Err(format!("no database binding {binding:?}"))),
         }
     }
 }
 
-fn no_binding(b: &str) -> Vec<u8> {
-    json!({ "error": format!("no database binding {b:?}") }).to_string().into_bytes()
+/// The pool's thread: `pool::Core` decides, this does what it says.
+fn run_pool(pg: Config, cfg: PgCfg, rx: Receiver<Msg>, me: Sender<Msg>) {
+    let mut core = pool::Core::new(pool::Cfg { max: cfg.max, idle_ms: cfg.idle_ms, wait_ms: cfg.wait_ms });
+    let t0 = Instant::now();
+    let now = || t0.elapsed().as_millis() as u64;
+    let (mut asks, mut next_ask, mut next_lease) = (HashMap::<u64, LeaseReply>::new(), 0u64, 0u64);
+    let mut members: HashMap<u64, Sender<Job>> = HashMap::new();
+    // Members starting: (their ask, their first lease).
+    let mut starting: HashMap<u64, (u64, u64)> = HashMap::new();
+    loop {
+        let outs = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Msg::Ask(reply)) => {
+                next_ask += 1;
+                asks.insert(next_ask, reply);
+                core.ask(now(), next_ask, 0, vec![])
+            }
+            Ok(Msg::Started(m, r)) => {
+                let (ask, lease) = starting.remove(&m).unwrap_or_default();
+                match r {
+                    Ok(()) => {
+                        if let Some(reply) = asks.remove(&ask) {
+                            reply(Ok(Lease { id: lease, member: members[&m].clone() }));
+                        }
+                    }
+                    // Full: the core puts the ask back in line.
+                    Err(true) => {}
+                    Err(false) => {
+                        if let Some(reply) = asks.remove(&ask) {
+                            reply(Err("the database is unreachable".into()));
+                        }
+                    }
+                }
+                if r.is_err() {
+                    members.remove(&m);
+                }
+                core.started(now(), m, r.is_ok(), r == Err(true))
+            }
+            Ok(Msg::Resetting(m)) => {
+                core.resetting(m);
+                vec![]
+            }
+            Ok(Msg::Free(m)) => core.free(now(), m),
+            Ok(Msg::Gone(m)) => {
+                members.remove(&m);
+                core.gone(now(), m)
+            }
+            Err(RecvTimeoutError::Timeout) => core.tick(now()),
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        for o in outs {
+            match o {
+                pool::Out::Grant { ask, member } => {
+                    next_lease += 1;
+                    let tx = members[&member].clone();
+                    let _ = tx.send(Job::Lease(next_lease));
+                    if let Some(r) = asks.remove(&ask) {
+                        r(Ok(Lease { id: next_lease, member: tx }));
+                    }
+                }
+                pool::Out::Start { ask, member, .. } => {
+                    next_lease += 1;
+                    let (tx, jobs) = channel();
+                    members.insert(member, tx);
+                    starting.insert(member, (ask, next_lease));
+                    let (pg, me, lease_ms, lease) = (pg.clone(), me.clone(), cfg.lease_ms, next_lease);
+                    std::thread::spawn(move || run_member(member, pg, lease, lease_ms, jobs, me));
+                }
+                pool::Out::Fail { ask } => {
+                    if let Some(r) = asks.remove(&ask) {
+                        r(Err("no database connection free in time".into()));
+                    }
+                }
+                pool::Out::Stop { member } => {
+                    if let Some(tx) = members.get(&member) {
+                        let _ = tx.send(Job::Stop);
+                    }
+                }
+            }
+        }
+    }
 }
 
-/// One connection's thread. It reconnects when it must, except under a pin:
-/// a pinned session that broke stays broken (its transaction and locks are
-/// gone) until its handle closes.
-fn worker(w: usize, cfg: Config, rx: std::sync::mpsc::Receiver<Job>, pool: Arc<Pool>) {
-    let mut client: Option<Client> = None;
-    let mut broken_pin = false;
-    while let Ok(job) = rx.recv() {
+/// One member: a connection on its own thread, leased to one holder at a
+/// time, from its first lease (the ask it started for).
+fn run_member(id: u64, pg: Config, first: u64, lease_ms: u64, jobs: Receiver<Job>, pool: Sender<Msg>) {
+    let mut client = match pg.connect(NoTls) {
+        Ok(c) => c,
+        Err(e) => {
+            let full = e.code() == Some(&SqlState::TOO_MANY_CONNECTIONS);
+            if !full {
+                eprintln!("combd     postgres: can't connect: {e}");
+            }
+            let _ = pool.send(Msg::Started(id, Err(full)));
+            return;
+        }
+    };
+    let mut lease = Some((first, Instant::now() + Duration::from_millis(lease_ms)));
+    let _ = pool.send(Msg::Started(id, Ok(())));
+    // A broken connection (its session, transaction, and locks are gone)
+    // serves out its lease with errors, then the member stops.
+    let mut broken = false;
+    let end_lease = |client: &mut Client, lease: &mut Option<(u64, Instant)>, broken: bool| -> bool {
+        *lease = None;
+        let _ = pool.send(Msg::Resetting(id));
+        if broken {
+            return false;
+        }
+        // Two statements: in one string they'd share an implicit
+        // transaction, which DISCARD ALL refuses to run in.
+        if client.batch_execute("ROLLBACK").is_err() || client.batch_execute("DISCARD ALL").is_err() {
+            return false;
+        }
+        let _ = pool.send(Msg::Free(id));
+        true
+    };
+    loop {
+        let job = match lease {
+            Some((_, until)) => match jobs.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(j) => Some(j),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match jobs.recv() {
+                Ok(j) => Some(j),
+                Err(_) => break,
+            },
+        };
+        // Past its time: take it back.
+        if lease.is_some_and(|(_, until)| Instant::now() >= until) && !end_lease(&mut client, &mut lease, broken) {
+            break;
+        }
         match job {
-            Job::Query { req, pinned, reply } => {
-                if pinned && broken_pin {
-                    reply(json!({ "error": "the database session was lost" }).to_string().into_bytes());
+            None => {}
+            Some(Job::Lease(l)) => lease = Some((l, Instant::now() + Duration::from_millis(lease_ms))),
+            Some(Job::Query { lease: l, req, reply, release }) => {
+                if lease.map(|x| x.0) != Some(l) {
+                    reply(json!({ "error": "the database lease ran out or was released" }).to_string().into_bytes());
                     continue;
                 }
-                if client.as_ref().is_none_or(|c| c.is_closed()) {
-                    client = cfg.connect(NoTls).map_err(|e| eprintln!("combd     postgres: can't connect: {e}")).ok();
-                }
-                let answer = match client.as_mut() {
-                    Some(c) => run(c, &req),
-                    None => json!({ "error": "the database is unreachable" }),
-                };
-                if client.as_ref().is_some_and(|c| c.is_closed()) {
-                    client = None;
-                    broken_pin |= pinned;
-                }
+                let answer = if broken { json!({ "error": "the database session was lost" }) } else { run(&mut client, &req) };
+                broken |= client.is_closed();
                 let mut bytes = serde_json::to_vec(&answer).unwrap_or_default();
                 if bytes.len() > MAX_ANSWER {
                     bytes = br#"{"error":"result too large"}"#.to_vec();
                 }
+                if release {
+                    let _ = pool.send(Msg::Resetting(id));
+                }
                 reply(bytes);
-                if !pinned {
-                    reset(&mut client);
-                    pool.release(w);
+                if release && !end_lease(&mut client, &mut lease, broken) {
+                    break;
                 }
             }
-            Job::Unpin => {
-                broken_pin = false;
-                reset(&mut client);
-                pool.release(w);
+            Some(Job::Release(l)) => {
+                if lease.map(|x| x.0) == Some(l) && !end_lease(&mut client, &mut lease, broken) {
+                    break;
+                }
             }
+            Some(Job::Stop) => break,
         }
     }
-}
-
-/// Clean before reuse: end any transaction, then drop everything a session
-/// can carry (settings, temp tables, prepared statements, LISTENs, and
-/// advisory locks). If that fails, the connection is closed instead.
-fn reset(client: &mut Option<Client>) {
-    if let Some(c) = client.as_mut() {
-        if c.batch_execute("ROLLBACK; DISCARD ALL").is_err() {
-            *client = None;
-        }
-    }
+    let _ = pool.send(Msg::Gone(id));
 }
 
 /// One statement: `{"q": sql, "p": [params]}`.

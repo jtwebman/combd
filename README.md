@@ -104,7 +104,11 @@ Text and binary both work, across a fleet too: a client can reach any node,
 and the room's sockets survive its owner going down.
 
 **Your own Postgres.** Cells reach a database through the host, which keeps
-the connections and the password. A Worker can run a transaction in one
+the connections and the password, in one pool per database with a max you
+set: run 1000 nodes against a Postgres that takes 100 connections, and it
+never sees more than 100. The pool grows when asked, makes asks wait in line
+at max, takes back connections held too long, and closes idle ones. (One
+node today; one manager for a whole fleet is next.) A Worker can run a transaction in one
 request. A Durable Object can hold one across many messages, with row locks
 and advisory locks, and a crash rolls it back and lets the locks go. A cell
 waiting on the database is paused and costs no CPU.

@@ -20,6 +20,7 @@ mod store;
 mod wire;
 mod ws;
 mod pg;
+mod pool;
 #[cfg(test)]
 mod spectest;
 #[cfg(feature = "fuzz")]
@@ -1603,7 +1604,7 @@ mod tests {
             return;
         };
         let dir = store::tempdir::Dir::new();
-        let pg = pg::PgCfg { bindings: vec![("main".into(), url)], pool: 4, max_pinned: 3, statement_timeout_ms: 3000 };
+        let pg = pg::PgCfg { bindings: vec![("main".into(), url)], max: 3, statement_timeout_ms: 3000, idle_ms: 60_000, lease_ms: 60_000, wait_ms: 5000 };
         let c = http::Config { pg: Some(pg), idle: Duration::from_millis(300), session_idle: Duration::from_millis(1500), ..cfg(&dir.0, 2) };
         let (port, _, _) = do_server(eng, c);
         let t = format!("t_{tag}_{}", std::process::id());
@@ -1629,6 +1630,9 @@ mod tests {
         for _ in 0..8 {
             assert!(q("/api/pg/q", &format!("SELECT count(*) FROM {t}"), serde_json::json!([]))["error"].is_null());
         }
+        // ... and kept: a reset reuses the connection, it doesn't reconnect.
+        let pid = || rows(&q("/api/pg/q", "SELECT pg_backend_pid()", serde_json::json!([])))[0][0].clone();
+        assert_eq!(pid(), pid(), "every reset reconnected");
         // 3. A Worker's transaction, within one request; a crash rolls back,
         //    and its connection comes back (more crashes than pins).
         let tx = |path: &str, ks: &[i32]| {
@@ -1707,6 +1711,40 @@ mod tests {
         q("/api/pg/q", &format!("DROP TABLE {t}"), serde_json::json!([]));
     }
 
+    /// The pool's rules on a real Postgres: it grows to max, then asks wait in
+    /// line and fail after the wait; a release serves the next in line; and
+    /// a lease held too long is taken back (rolled back) by its member.
+    #[test]
+    fn postgres_pool_limits() {
+        let Ok(url) = std::env::var("COMBD_PG_TEST") else {
+            eprintln!("skipping: set COMBD_PG_TEST to a Postgres URL");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        let pg = pg::PgCfg { bindings: vec![("main".into(), url)], max: 2, statement_timeout_ms: 3000, idle_ms: 60_000, lease_ms: 1500, wait_ms: 300 };
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { pg: Some(pg), ..cfg(&dir.0, 2) });
+        let q = |path: &str, sql: &str| http(port, "POST", path, &serde_json::json!({ "q": sql }).to_string());
+        // Two sessions: the pool is at max.
+        assert_eq!(http(port, "POST", "/do/a/pg/open", "").0, 200);
+        assert_eq!(q("/do/a/pg/s", "BEGIN").0, 200);
+        assert_eq!(http(port, "POST", "/do/b/pg/open", "").0, 200);
+        let st = Instant::now();
+        let (_, body) = q("/api/pg/q", "SELECT 1");
+        assert!(body.contains("free in time") && st.elapsed() >= Duration::from_millis(300), "{body} {:?}", st.elapsed());
+        // A release serves the one waiting.
+        let w = std::thread::spawn(move || http(port, "POST", "/api/pg/q", "{\"q\":\"SELECT 7\"}"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(http(port, "POST", "/do/b/pg/close", "").1, "{\"closed\":true}");
+        assert!(w.join().unwrap().1.contains("[[7]]"));
+        // Held past its lease: taken back, and the holder hears about it.
+        std::thread::sleep(Duration::from_millis(1500));
+        let (_, body) = q("/do/a/pg/s", "SELECT 1");
+        assert!(body.contains("lease ran out"), "{body}");
+        // Its member is free again: two more fit.
+        assert_eq!(http(port, "POST", "/do/c/pg/open", "").0, 200);
+        assert_eq!(http(port, "POST", "/do/d/pg/open", "").0, 200);
+    }
+
     const GUEST_EV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../guest-ev/target/wasm32-unknown-unknown/release/combd_guest_ev.wasm");
 
     /// Many requests at once on one instance (event cells): fetch them all.
@@ -1769,7 +1807,7 @@ mod tests {
         };
         let dir = store::tempdir::Dir::new();
         let wasm = std::fs::read(GUEST_EV).unwrap();
-        let pg = pg::PgCfg { bindings: vec![("main".into(), url)], pool: 12, max_pinned: 10, statement_timeout_ms: 3000 };
+        let pg = pg::PgCfg { bindings: vec![("main".into(), url)], max: 10, statement_timeout_ms: 3000, idle_ms: 60_000, lease_ms: 60_000, wait_ms: 5000 };
         let (port, _, _) = server_for(eng, http::Config { pg: Some(pg), ..cfg(&dir.0, 1) }, wasm);
         let t = format!("ev_{tag}_{}", std::process::id());
         let q = |sql: &str| http(port, "POST", "/pg/q", &serde_json::json!({ "q": sql }).to_string());

@@ -335,14 +335,13 @@ const EV_TOTAL: Duration = Duration::from_secs(60);
 /// What a database call came back with.
 enum DbDone {
     Answer(Vec<u8>),
-    /// A connection was pinned (on this binding), or why not.
-    Pinned(String, Result<usize, String>),
+    /// A connection was leased, or why not.
+    Pinned(Result<crate::pg::Lease, String>),
 }
 
-/// A pinned Postgres connection a cell holds.
+/// A leased Postgres connection a cell holds.
 struct PgHandle {
-    binding: String,
-    worker: usize,
+    lease: crate::pg::Lease,
     /// The object it belongs to (it outlives requests), or `None` for a
     /// stateless request's (it closes when the request ends).
     obj: Option<String>,
@@ -1268,10 +1267,7 @@ impl<E: Engine> Loop<'_, E> {
         match op {
             AsyncOp::Timer(ms) => self.ev_timers.push(Reverse((Instant::now() + Duration::from_millis(ms), i, gen, ticket))),
             AsyncOp::PgOpen(r) => match binding(&r).filter(|b| pools.has(b)) {
-                Some(b) => {
-                    let b2 = b.clone();
-                    pools.pin(&b, Box::new(move |r| reply(DbDone::Pinned(b2, r))));
-                }
+                Some(b) => pools.lease(&b, Box::new(move |r| reply(DbDone::Pinned(r)))),
                 None => reply(DbDone::Answer(json_err("pg_open_async: name a database binding (\"db\")"))),
             },
             AsyncOp::PgQuery(0, r) => match binding(&r) {
@@ -1281,7 +1277,7 @@ impl<E: Engine> Loop<'_, E> {
             AsyncOp::PgQuery(h, r) => {
                 let owned = self.ev[i].as_ref().and_then(|e| e.reqs.get(&req)).is_some_and(|q| q.handles.contains(&h));
                 match self.pg_handles.get(&h).filter(|_| owned) {
-                    Some(ph) => pools.query_on(&ph.binding, ph.worker, r, Box::new(move |a| reply(DbDone::Answer(a)))),
+                    Some(ph) => ph.lease.query(r, Box::new(move |a| reply(DbDone::Answer(a)))),
                     None => reply(DbDone::Answer(json_err(&format!("pg_query_async: no such handle {h}")))),
                 }
             }
@@ -1295,18 +1291,15 @@ impl<E: Engine> Loop<'_, E> {
         let alive_req = req.filter(|r| self.ev[i].as_ref().is_some_and(|e| e.reqs.contains_key(r)));
         let payload = match done {
             DbDone::Answer(a) => a,
-            DbDone::Pinned(_, Err(e)) => json_err(&e),
-            DbDone::Pinned(binding, Ok(worker)) => {
+            DbDone::Pinned(Err(e)) => json_err(&e),
+            DbDone::Pinned(Ok(lease)) => {
                 let Some(r) = alive_req else {
                     // Its request (or instance) is gone: give it straight back.
-                    if let Some(p) = &self.sh.pg {
-                        p.unpin(&binding, worker);
-                    }
-                    return;
+                    return lease.release();
                 };
                 self.next_park += 1;
                 let h = self.next_park << 8 | self.me as u64;
-                self.pg_handles.insert(h, PgHandle { binding, worker, obj: None });
+                self.pg_handles.insert(h, PgHandle { lease, obj: None });
                 self.ev[i].as_mut().unwrap().reqs.get_mut(&r).unwrap().handles.push(h);
                 serde_json::json!({ "handle": h }).to_string().into_bytes()
             }
@@ -1402,9 +1395,7 @@ impl<E: Engine> Loop<'_, E> {
         if let Some(o) = ph.obj.as_ref().and_then(|n| self.objects.get_mut(n)) {
             o.pg.retain(|&x| x != h);
         }
-        if let Some(p) = &self.sh.pg {
-            p.unpin(&ph.binding, ph.worker);
-        }
+        ph.lease.release();
     }
 
     /// A cell waits on a database call: hand it to the pool and park the
@@ -1430,8 +1421,7 @@ impl<E: Engine> Loop<'_, E> {
         match op {
             DbOp::Open(req) => {
                 let Some(b) = binding(&req).filter(|b| pools.has(b)) else { return self.db_resume(t, interp, 0, fail("pg_open: name a database binding (\"db\")".into())) };
-                let b2 = b.clone();
-                pools.pin(&b, Box::new(move |r| reply(DbDone::Pinned(b2, r))));
+                pools.lease(&b, Box::new(move |r| reply(DbDone::Pinned(r))));
             }
             DbOp::Query(0, req) => {
                 let Some(b) = binding(&req) else { return self.db_resume(t, interp, 0, fail("pg_query: name a database binding (\"db\"), or use a handle".into())) };
@@ -1445,7 +1435,7 @@ impl<E: Engine> Loop<'_, E> {
                 if let Some(o) = ph.obj.as_ref().and_then(|n| self.objects.get_mut(n)) {
                     o.pg_used = Instant::now();
                 }
-                pools.query_on(&ph.binding, ph.worker, req, Box::new(move |a| reply(DbDone::Answer(a))));
+                ph.lease.query(req, Box::new(move |a| reply(DbDone::Answer(a))));
             }
             DbOp::Close(h) => {
                 let ok = owns(self, &t, h);
@@ -1465,12 +1455,12 @@ impl<E: Engine> Loop<'_, E> {
         let Some((mut t, interp)) = self.parked.remove(&park) else { return };
         let (value, out) = match done {
             DbDone::Answer(a) => (a.len() as u64, a),
-            DbDone::Pinned(_, Err(e)) => (0, json_err(&e)),
-            DbDone::Pinned(binding, Ok(worker)) => {
+            DbDone::Pinned(Err(e)) => (0, json_err(&e)),
+            DbDone::Pinned(Ok(lease)) => {
                 // A handle id: unique on this loop, never 0.
                 self.next_park += 1;
                 let h = self.next_park << 8 | self.me as u64;
-                self.pg_handles.insert(h, PgHandle { binding, worker, obj: t.obj.clone() });
+                self.pg_handles.insert(h, PgHandle { lease, obj: t.obj.clone() });
                 match &t.obj {
                     Some(n) => {
                         if let Some(o) = self.objects.get_mut(n) {

@@ -1259,13 +1259,29 @@ numbers (idle sockets per GB, wake-up time, cross-node message time).
 
 ## Bring your own database: Postgres
 
-The host owns the connections (`spike/src/pg.rs`). Each binding
-(`COMBD_PG_<NAME>=postgres://...`) gets a pool of worker threads, one
-connection each. A cell names a binding; it never sees a socket or a
-password. Its imports: `pg_open(req)` pins a connection and returns a
-handle, `pg_query(handle, req)` runs one statement (handle 0: pooled, on
-any free connection), `pg_read(ptr, cap)` copies the answer (the same JSON
-as the object's own SQLite), and `pg_close(handle)`.
+The host runs one pool per binding (`COMBD_PG_<NAME>=postgres://...`):
+a manager (`spike/src/pool.rs`, pure decisions, tested on its own) and
+members, each one connection on its own thread (`spike/src/pg.rs`). The
+first ask starts a member; an ask while all are busy starts another, up to
+`COMBD_PG_MAX`; then asks wait in line and fail after `COMBD_PG_WAIT_MS`.
+A lease is checked on every call, so a holder whose lease ran out can't
+reach the next holder's. A member takes back a lease held past
+`COMBD_PG_LEASE_MS` on its own (it rolls back; the holder's next call gets
+an error), and stops after `COMBD_PG_IDLE_MS` free. A cell names a binding;
+it never sees a socket or a password. Its imports: `pg_open(req)` leases a
+member and returns a handle, `pg_query(handle, req)` runs one statement
+(handle 0: a lease for one statement), `pg_read(ptr, cap)` copies the answer
+(the same JSON as the object's own SQLite), and `pg_close(handle)`.
+
+**Two bugs the rewrite found.** The old reset sent `ROLLBACK; DISCARD ALL`
+as one string, which runs as one implicit transaction, and `DISCARD ALL`
+refuses to run in one. Every reset failed, and the old pool hid it by
+quietly reconnecting each time: a full connect per statement. Now they're
+two statements, and a test checks that two pooled statements in a row get
+the same backend. That test then caught a race: a pooled statement answers
+before its member resets, so the next ask came in before "free" and started
+a new connection, growing the pool to max under one-at-a-time traffic. Now
+the member says "resetting" before it answers, and an ask waits for it.
 
 **A cell waiting on the database is paused, and costs no CPU.** On the
 interpreter the host call just doesn't resume yet; on the guard-page AOT tier
@@ -1289,11 +1305,12 @@ there `pg_*` crashes the cell with a clear message.
   ALL`), so a transaction rolls back and every lock is released, and the
   connection goes back to the pool.
 
-**Rules from the plan:** pooled connections are reset after every statement
-(a `SET`, temp table, or lock never reaches the next user); every connection
-has a statement timeout (5 s; a lock wait counts); at most pool size minus
-one connections can be pinned, so pooled queries always find room; requests
-that find no free connection wait in order; answers are capped at 16 MB,
+**Rules from the plan:** connections are reset after every lease (a `SET`,
+temp table, or lock never reaches the next user); every connection has a
+statement timeout (5 s; a lock wait counts), and an
+`idle_in_transaction_session_timeout` and TCP keepalives, so a session from
+a node that died frees its slot on the server; "too many clients" from the
+server makes an ask wait, not fail; answers are capped at 16 MB,
 counted as they grow.
 
 **Test `postgres_on_the_interpreter` / `postgres_on_aot`**, against a real
@@ -1308,8 +1325,13 @@ releases its object's locks; a blocking `pg_advisory_lock` that parks the
 cell without stalling the loop; and an idle session that closes, releases its
 lock, and lets its object leave memory.
 
-Not yet: TLS to Postgres, a fleet-wide connection cap (each node has its own
-pool), LISTEN/NOTIFY as events, query caching, read replicas, MySQL, and
+**Test `postgres_pool_limits`** (max 2): two held sessions fill the pool; a
+third ask fails after its wait; a release serves one that's waiting; a
+session held past its lease is taken back and its holder told; then two
+more fit.
+
+Not yet: the pool across a fleet (one manager, nearest member, cross-node
+calls, takeover), LISTEN/NOTIFY as events, query caching, read replicas, MySQL, and
 numbers.
 
 ## Event cells: many requests per instance
@@ -1343,8 +1365,7 @@ transactions that each pause 300 ms halfway run interleaved on one instance
 in about 300 ms; one that fails halfway rolls back alone; every pinned
 connection goes back.
 
-Not yet: event-mode Durable Objects, cells calling objects, and placed
-Postgres pools (per-node pools don't scale to 1000 nodes; see the plan).
+Not yet: event-mode Durable Objects.
 
 ## Security: memory is always zero
 

@@ -353,21 +353,36 @@ database. So the **host keeps the pools**: a few connections per node per
 database, shared by every instance on that node. A cell never holds a socket.
 It holds a `db` binding.
 
-**Update: per-node pools don't scale to a big fleet.** 1000 nodes with a
-pool of 4 each is 4,000 connections, and Postgres defaults to 100 (each costs
-it 5 to 10 MB). The fix is to place the pools: K pool objects
-(`pg-main-0` .. `pg-main-K-1`) each hold M connections, so the total is
-K x M however many nodes there are. Plain queries go round robin; a
-transaction sticks to the object holding its handle. The cost is one hop,
-about 0.2 ms in one data center, on a query that already takes 0.5 to 1 ms
-(the same idea as Hyperdrive). What it needs, as tools users can build their
-own pools with too:
-1. Cells call Durable Objects (`do_fetch`, async, a ticket like the
-   Postgres calls).
-2. Event-mode objects: an object that exports `on_request` takes many
-   requests at once. Opt-in; plain objects stay one at a time.
-3. Lazy node pools: connections open only when something on the node asks,
-   and close when idle, so nodes with no pool object hold none.
+**Update: no per-node pools. One pool per database, for the whole fleet.**
+1000 nodes with a pool of 4 each is 4,000 connections, and Postgres defaults
+to 100 (each costs it 5 to 10 MB). So a pool is one manager per database
+(`pg-main`, `max = 100`), and Postgres never sees more than `max`:
+- **A member** is one connection, started on the node of the caller who
+  asked, so a holder's queries stay on its node. **A lease** is a member
+  checked out by one holder (a request, an event-cell request, an object).
+- **The manager** keeps the books: who holds what, the line, the count.
+  Asked with none free, it starts a member, up to `max`; at max, the ask
+  waits in line and fails after its wait time. A member resetting (just
+  released) is waited for, not doubled: a reset is ~0.2 ms, a connect 2 to
+  5 ms.
+- **At max, the nearest free member is reused.** The asker sends its round
+  trips to other nodes, and the manager picks the closest. Members never move:
+  in a busy fleet (1000 nodes, 100 members) moving would mean a reconnect on
+  almost every lease.
+- **Release:** the member resets (`ROLLBACK`, then `DISCARD ALL`) and tells
+  the manager it's free. A lease held past its time is taken back by the
+  member itself (it rolls back, and the holder's next call gets an error),
+  so that works even when the manager is unreachable. Members free past the
+  idle time stop.
+- **A manager takeover** can briefly overshoot (the old members are still
+  finishing), so "too many clients" from Postgres means "wait in line", not
+  "fail". The new manager tells every node to stop members from older
+  epochs; no heartbeat needed. Per pool, `on_manager_loss`: `finish` (the
+  default: finish the current lease, then stop) or `stop` (die now, like a
+  linked process in an Elixir supervisor tree).
+- **General:** the manager is `pool.rs`, with no I/O and nothing Postgres in
+  it. Postgres is the first member kind (in Rust); users' own kinds (Redis,
+  a rate-limited API client) come later on the same core.
 
 ### How a query flows
 
@@ -615,6 +630,17 @@ callback at a time; requests interleave only where the cell waits.
   doubt. Batching comes next: an object that exports `on_batch` gets up to N
   queued requests at once (N is its choice: ask for 10 with 2 waiting, get
   2), for one transaction and one fsync, with an answer for each.
+
+### Supervisors: let it crash, then tell someone
+
+The control plane supervises everything (it already restarts what crashes)
+and can kill anything at any time: an object, an instance, a pool member, by
+id. Users may add their own supervisor: a Durable Object that gets a crash
+event (what crashed, why, how many requests failed) for everything it
+watches, saved and in order. It can post to Slack, count crashes, or ask the
+control plane to stop or restart a group (one_for_all, with a cap on
+restarts per minute so a crash loop doesn't flap). Needs outbound `fetch`
+from cells first.
 
 ### Fair scheduling (no cell hogs a core)
 
@@ -1065,7 +1091,10 @@ What changes as the fleet grows:
    **Started 2026-10-15:** pooled statements, and pinned handles: a Worker's
    lasts its request, a Durable Object's lasts across messages, with
    transactions, row locks, and advisory locks. Cells wait paused (both
-   engines). Next: TLS, a fleet-wide cap, LISTEN/NOTIFY. See
+   engines). Then the per-node pools were scrapped for one pool per
+   database (above): single node done (growth to max, a line with a wait
+   time, lease timeouts, idle stop). Next: the fleet (nearest member,
+   cross-node calls, takeover), then TLS, LISTEN/NOTIFY. See
    [spike/RESULTS.md](spike/RESULTS.md).
 6. **Fast fleet writes (D3).** Done early, as part of step 3 (see "What
    building taught us").
