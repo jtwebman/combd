@@ -74,8 +74,9 @@ impl PgCfg {
             .pools
             .iter()
             .filter_map(|(name, p)| {
-                let (kind, m) = r.processes.get(p["member"].as_str()?)?;
-                (kind == "combd:postgres").then_some(())?;
+                let member = r.processes.get(p.settings["member"].as_str()?)?;
+                (member.kind == "combd:postgres").then_some(())?;
+                let (p, m) = (&p.settings, &member.settings);
                 let n = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
                 Some(PoolCfg {
                     name: name.clone(),

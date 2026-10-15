@@ -1364,6 +1364,13 @@ dir, fleet) stay with whoever runs the machine.
   wants: no conversions. An optional name can't fill a required setting.
   Values are checked again per environment against the setting's own
   limits, since a var's may be wider. `$$` is a literal `$`.
+- Who may reach whom is config, default deny: `routes` (the internet;
+  `host/path` or `/path`, `:name` captures, a final `*`), `callers` (which
+  processes may `call` or `send` to it), and a pool's `owners` (which may
+  hold a lease). Only the app's own processes can call or own; built-in
+  members are reached only through a pool. A durable process's routes name
+  it with `:id`, and it takes one event at a time. A process nothing can
+  reach is an error. `kind = "api"` is the app's module `modules/api.wasm`.
 - Every var and secret reaches cells as an env var (WASI `environ`).
 - The local `dev` environment is `combd.dev.{toml,yaml,json}` beside the
   manifest, refused if git tracks it. An error about a secret never shows

@@ -1866,10 +1866,13 @@ vars:
 secrets:
   PG_URL: { secret: pg-url, type: url }
 processes:
+  api: { kind: api, routes: ["/*"] }
   pg-conn: { kind: "combd:postgres", url: $PG_URL, connection: { retries: 0 } }
 pools:
-  main: { member: pg-conn, max: $PG_MAX, wait_ms: 2000 }
+  main: { member: pg-conn, owners: [api], max: $PG_MAX, wait_ms: 2000 }
 "#).unwrap();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::copy(GUEST_EV, manifest::module_path(&app.0, "api")).unwrap();
         std::fs::write(app.0.join("combd.dev.toml"), format!("[vars]\nREGION = \"us-east\"\n[secrets]\npg-url = {pg_url:?}\n")).unwrap();
         let (pg, environ) = http::app_settings(&app.0).unwrap();
         let p = &pg.as_ref().unwrap().pools[0];

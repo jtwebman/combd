@@ -74,9 +74,43 @@ pub struct Manifest {
     pub app: String,
     pub vars: BTreeMap<String, Spec>,
     pub secrets: BTreeMap<String, Spec>,
-    /// name -> (kind, settings by dotted key, as written).
-    pub processes: BTreeMap<String, (String, BTreeMap<String, Json>)>,
-    pub pools: BTreeMap<String, BTreeMap<String, Json>>,
+    pub processes: BTreeMap<String, Process>,
+    pub pools: BTreeMap<String, Pool>,
+}
+
+/// A process: its kind, its settings (by dotted key), and who may reach it.
+#[derive(Debug, PartialEq, Clone)]
+pub struct Process {
+    /// `combd:...` for a built-in kind, else the app's module `modules/<kind>.wasm`.
+    pub kind: String,
+    pub settings: BTreeMap<String, Json>,
+    /// Who may reach it from the internet.
+    pub routes: Vec<Route>,
+    /// Which processes may `call` or `send` to it.
+    pub callers: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct Pool {
+    pub settings: BTreeMap<String, Json>,
+    /// Which processes may hold a lease.
+    pub owners: Vec<String>,
+}
+
+/// `host/path` or `/path` (any host). A `:name` segment captures it, and a
+/// final `*` takes the rest.
+#[derive(Debug, PartialEq, Clone)]
+pub struct Route {
+    pub text: String,
+    pub host: Option<String>,
+    pub segs: Vec<Seg>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Seg {
+    Lit(String),
+    Param(String),
+    Rest,
 }
 
 /// One environment's values: vars by env var name, secrets by secret name.
@@ -91,8 +125,8 @@ pub struct EnvValues {
 pub struct Resolved {
     /// What processes see as env vars.
     pub environ: Vec<(String, String)>,
-    pub processes: BTreeMap<String, (String, BTreeMap<String, Json>)>,
-    pub pools: BTreeMap<String, BTreeMap<String, Json>>,
+    pub processes: BTreeMap<String, Process>,
+    pub pools: BTreeMap<String, Pool>,
 }
 
 /// The settings each built-in kind takes, in the same spec format.
@@ -104,6 +138,14 @@ fn schema(kind: &str) -> Option<&'static str> {
             "connection.timeout_ms" = { type = "int", min = 1, max = 600000, default = 5000 }
             "connection.retries" = { type = "int", min = 0, max = 10, default = 3 }
             statement_timeout_ms = { type = "int", min = 1, max = 3600000, default = 5000 }
+            "#
+        }
+        // What every process of the app's own kinds takes.
+        "combd:user" => {
+            r#"
+            timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
+            max_concurrent = { type = "int", min = 1, max = 1000, default = 32 }
+            durable = { type = "bool", default = false }
             "#
         }
         "combd:pool" => {
@@ -171,10 +213,16 @@ fn untoml(v: Json) -> Json {
     }
 }
 
-/// Read and check the manifest in `dir` (`None`: there isn't one).
+/// Read and check the manifest in `dir` (`None`: there isn't one). The
+/// app's own kinds are its modules: `modules/<kind>.wasm`.
 pub fn load(dir: &Path) -> Result<Option<Manifest>, String> {
     let Some((file, tree)) = read_one(dir, "combd")? else { return Ok(None) };
-    from_tree(&tree).map(Some).map_err(|errs| format!("{file}:\n  {}", errs.join("\n  ")))
+    let has_module = |k: &str| module_path(dir, k).is_file();
+    from_tree(&tree, &has_module).map(Some).map_err(|errs| format!("{file}:\n  {}", errs.join("\n  ")))
+}
+
+pub fn module_path(dir: &Path, kind: &str) -> std::path::PathBuf {
+    dir.join("modules").join(format!("{kind}.wasm"))
 }
 
 /// The local `dev` environment: `combd.dev.{toml,yaml,json}` beside the
@@ -203,7 +251,7 @@ pub fn load_dev(dir: &Path) -> Result<EnvValues, String> {
     Ok(env)
 }
 
-fn from_tree(tree: &Json) -> Result<Manifest, Vec<String>> {
+fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest, Vec<String>> {
     let mut errs = vec![];
     let empty = Map::new();
     let top = match tree.as_object() {
@@ -254,21 +302,80 @@ fn from_tree(tree: &Json) -> Result<Manifest, Vec<String>> {
         errs.push(format!("{n} is in both [vars] and [secrets]: pick one"));
     }
     let names: BTreeMap<String, Spec> = vars.iter().chain(&secrets).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let procs = table("processes", &mut errs);
+    // The app's own processes: the only ones that can call, or hold a lease.
+    let user = |n: &str| procs.get(n).and_then(|p| p.get("kind")).and_then(Json::as_str).is_some_and(|k| !k.starts_with("combd:"));
+    let names_of = |at: &str, v: Option<Json>, errs: &mut Vec<String>| -> Vec<String> {
+        let Some(v) = v else { return vec![] };
+        let Some(list) = v.as_array().and_then(|a| a.iter().map(|x| x.as_str().map(String::from)).collect::<Option<Vec<_>>>()) else {
+            errs.push(format!("{at}: want a list of process names"));
+            return vec![];
+        };
+        for n in &list {
+            if !procs.contains_key(n) {
+                errs.push(format!("{at}: no process {n:?}"));
+            } else if !user(n) {
+                errs.push(format!("{at}: {n} is a built-in kind; only the app's own processes can do this"));
+            }
+        }
+        list
+    };
     let mut processes = BTreeMap::new();
-    for (pname, p) in table("processes", &mut errs) {
+    let mut seen_routes: BTreeMap<String, String> = BTreeMap::new();
+    for (pname, p) in &procs {
         let at = format!("processes.{pname}");
-        if !ident(&pname) {
+        if !ident(pname) {
             errs.push(format!("{at}: use lowercase letters, digits, - and _ in names"));
         }
         let mut flat = BTreeMap::new();
-        flatten("", &p, &mut flat);
+        flatten("", p, &mut flat);
         let kind = flat.remove("kind").and_then(|k| k.as_str().map(String::from)).unwrap_or_default();
-        if schema(&kind).is_none() || kind == "combd:pool" {
-            errs.push(format!("{at}.kind {kind:?}: not a process kind (so far: combd:postgres)"));
+        let (routes_v, callers_v) = (flat.remove("routes"), flat.remove("callers"));
+        let builtin = kind.starts_with("combd:");
+        if builtin {
+            if schema(&kind).is_none() || !POOLABLE.contains(&kind.as_str()) {
+                errs.push(format!("{at}.kind {kind:?}: not a built-in kind (so far: combd:postgres)"));
+                continue;
+            }
+            if routes_v.is_some() || callers_v.is_some() {
+                errs.push(format!("{at}: {kind} is reached through a pool, so it takes no routes or callers"));
+            }
+        } else if !ident(&kind) {
+            errs.push(format!("{at}.kind {kind:?}: name one of the app's modules (modules/<kind>.wasm), or a built-in combd: kind"));
             continue;
+        } else if !has_module(&kind) {
+            errs.push(format!("{at}.kind: no module modules/{kind}.wasm"));
         }
-        check_settings(&at, &settings_of(&kind), &flat, &names, &mut errs);
-        processes.insert(pname, (kind, flat));
+        let schema_kind = if builtin { kind.as_str() } else { "combd:user" };
+        check_settings(&at, &settings_of(schema_kind), &flat, &names, &mut errs);
+        let durable = flat.get("durable") == Some(&Json::Bool(true));
+        if durable && flat.contains_key("max_concurrent") {
+            errs.push(format!("{at}.max_concurrent: a durable object takes one event at a time"));
+        }
+        let mut routes = vec![];
+        if let Some(v) = routes_v {
+            match v.as_array().and_then(|a| a.iter().map(Json::as_str).collect::<Option<Vec<_>>>()) {
+                None => errs.push(format!("{at}.routes: want a list of routes")),
+                Some(list) => {
+                    for r in list {
+                        match parse_route(r) {
+                            Ok(route) => {
+                                if durable && !route.segs.contains(&Seg::Param("id".into())) {
+                                    errs.push(format!("{at}.routes: {r:?}: a durable object's route names it with :id"));
+                                }
+                                if let Some(other) = seen_routes.insert(shape(&route), pname.clone()) {
+                                    errs.push(format!("{at}.routes: {r:?} is the same route as one of {other}'s"));
+                                }
+                                routes.push(route);
+                            }
+                            Err(e) => errs.push(format!("{at}.routes: {r:?}: {e}")),
+                        }
+                    }
+                }
+            }
+        }
+        let callers = names_of(&format!("{at}.callers"), callers_v, &mut errs);
+        processes.insert(pname.clone(), Process { kind, settings: flat, routes, callers });
     }
     let mut pools = BTreeMap::new();
     for (name, p) in table("pools", &mut errs) {
@@ -278,22 +385,88 @@ fn from_tree(tree: &Json) -> Result<Manifest, Vec<String>> {
         }
         let mut flat = BTreeMap::new();
         flatten("", &p, &mut flat);
-        check_settings(&at, &settings_of("combd:pool"), &flat, &names, &mut errs);
-        match flat.get("member").and_then(Json::as_str) {
-            Some(m) => match processes.get(m) {
-                Some((kind, _)) if POOLABLE.contains(&kind.as_str()) => {}
-                Some((kind, _)) => errs.push(format!("{at}.member: {m} is {kind}, which a pool can't hand out")),
-                None => errs.push(format!("{at}.member: no process {m:?}")),
-            },
-            None => {}
+        let owners_v = flat.remove("owners");
+        if owners_v.is_none() {
+            errs.push(format!("{at}.owners: required: which processes may hold a lease"));
         }
-        pools.insert(name, flat);
+        let owners = names_of(&format!("{at}.owners"), owners_v, &mut errs);
+        check_settings(&at, &settings_of("combd:pool"), &flat, &names, &mut errs);
+        if let Some(m) = flat.get("member").and_then(Json::as_str) {
+            match processes.get(m) {
+                Some(p) if POOLABLE.contains(&p.kind.as_str()) => {}
+                Some(p) => errs.push(format!("{at}.member: {m} is {}, which a pool can't hand out", p.kind)),
+                None => errs.push(format!("{at}.member: no process {m:?}")),
+            }
+        }
+        pools.insert(name, Pool { settings: flat, owners });
+    }
+    // Nothing declared that nothing can reach.
+    for (n, p) in &processes {
+        let reachable = if p.kind.starts_with("combd:") {
+            pools.values().any(|pool| pool.settings.get("member").and_then(Json::as_str) == Some(n))
+        } else {
+            !p.routes.is_empty() || !p.callers.is_empty()
+        };
+        if !reachable && !p.kind.is_empty() {
+            errs.push(format!("processes.{n}: nothing can reach it ({})", if p.kind.starts_with("combd:") { "no pool hands it out" } else { "no routes, and no callers" }));
+        }
     }
     if errs.is_empty() {
         Ok(Manifest { app: name, vars, secrets, processes, pools })
     } else {
         Err(errs)
     }
+}
+
+fn parse_route(r: &str) -> Result<Route, String> {
+    if r.len() > 256 {
+        return Err("longer than 256 bytes".into());
+    }
+    let (host, path) = match r.find('/') {
+        Some(0) => (None, r),
+        Some(i) => (Some(&r[..i]), &r[i..]),
+        None => return Err("want host/path or /path".into()),
+    };
+    if let Some(h) = host {
+        let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if h.len() > 253 || !h.split('.').all(label_ok) {
+            return Err(format!("{h:?}: want a lowercase host name like shop.example.com"));
+        }
+    }
+    let mut segs = vec![];
+    let parts: Vec<&str> = path[1..].split('/').collect();
+    for (i, seg) in parts.iter().enumerate() {
+        let last = i + 1 == parts.len();
+        match *seg {
+            "" if last => {}
+            "" => return Err("an empty segment (//)".into()),
+            "*" if last => segs.push(Seg::Rest),
+            "*" => return Err("* goes only at the end".into()),
+            p if p.starts_with(':') => {
+                let n = &p[1..];
+                if !ident(n) {
+                    return Err(format!("{p}: name it with lowercase letters, digits, - and _"));
+                }
+                if segs.contains(&Seg::Param(n.into())) {
+                    return Err(format!("{p} twice"));
+                }
+                segs.push(Seg::Param(n.into()));
+            }
+            p if p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)) => segs.push(Seg::Lit(p.into())),
+            p => return Err(format!("{p:?}: use letters, digits, - . _ ~ in a path")),
+        }
+    }
+    Ok(Route { text: r.to_string(), host: host.map(String::from), segs })
+}
+
+/// Two routes with the same shape match the same requests.
+fn shape(r: &Route) -> String {
+    let segs: Vec<String> = r.segs.iter().map(|s| match s {
+        Seg::Lit(l) => l.clone(),
+        Seg::Param(_) => ":".into(),
+        Seg::Rest => "*".into(),
+    }).collect();
+    format!("{}/{}", r.host.as_deref().unwrap_or(""), segs.join("/"))
 }
 
 fn ident(s: &str) -> bool {
@@ -665,8 +838,15 @@ impl Manifest {
             }
             out
         };
-        let processes = self.processes.iter().map(|(n, (kind, got))| (n.clone(), (kind.clone(), fill(&format!("processes.{n}"), kind, got, &mut errs)))).collect();
-        let pools = self.pools.iter().map(|(n, got)| (n.clone(), fill(&format!("pools.{n}"), "combd:pool", got, &mut errs))).collect();
+        let processes = self
+            .processes
+            .iter()
+            .map(|(n, p)| {
+                let kind = if p.kind.starts_with("combd:") { p.kind.as_str() } else { "combd:user" };
+                (n.clone(), Process { settings: fill(&format!("processes.{n}"), kind, &p.settings, &mut errs), ..p.clone() })
+            })
+            .collect();
+        let pools = self.pools.iter().map(|(n, p)| (n.clone(), Pool { settings: fill(&format!("pools.{n}"), "combd:pool", &p.settings, &mut errs), owners: p.owners.clone() })).collect();
         if !errs.is_empty() {
             return Err(errs.join("\n  "));
         }
@@ -684,8 +864,13 @@ impl Manifest {
 mod tests {
     use super::*;
 
+    /// A temp app with these files, and modules `api`, `admin`, and `imager`.
     fn dir(files: &[(&str, &str)]) -> crate::store::tempdir::Dir {
         let d = crate::store::tempdir::Dir::new();
+        std::fs::create_dir(d.0.join("modules")).unwrap();
+        for m in ["api", "admin", "imager"] {
+            std::fs::write(module_path(&d.0, m), b"").unwrap();
+        }
         for (n, t) in files {
             std::fs::write(d.0.join(n), t).unwrap();
         }
@@ -707,6 +892,11 @@ STARTS = { type = "datetime", default = 2026-10-15T08:00:00Z }
 PG_MAIN_URL = { secret = "pg-url", type = "url" }
 "SIGNING_KEY?" = "jwt-key"
 
+[processes.api]
+kind = "api"
+routes = ["shop.example.com/api/*"]
+timeout_ms = 10000
+
 [processes.pg-conn]
 kind = "combd:postgres"
 url = "$PG_MAIN_URL"
@@ -714,6 +904,7 @@ connection.timeout_ms = 3000
 
 [pools.main]
 member = "pg-conn"
+owners = ["api"]
 max = "$PG_MAX"
 "#;
 
@@ -729,12 +920,13 @@ secrets:
   PG_MAIN_URL: { secret: pg-url, type: url }
   SIGNING_KEY?: jwt-key
 processes:
+  api: { kind: api, routes: [shop.example.com/api/*], timeout_ms: 10000 }
   pg-conn:
     kind: combd:postgres
     url: $PG_MAIN_URL
     connection: { timeout_ms: 3000 }
 pools:
-  main: { member: pg-conn, max: $PG_MAX }
+  main: { member: pg-conn, owners: [api], max: $PG_MAX }
 "#;
 
     const JSON: &str = r#"{
@@ -747,8 +939,11 @@ pools:
     "STARTS": {"type": "datetime", "default": "2026-10-15T08:00:00Z"}
   },
   "secrets": {"PG_MAIN_URL": {"secret": "pg-url", "type": "url"}, "SIGNING_KEY?": "jwt-key"},
-  "processes": {"pg-conn": {"kind": "combd:postgres", "url": "$PG_MAIN_URL", "connection": {"timeout_ms": 3000}}},
-  "pools": {"main": {"member": "pg-conn", "max": "$PG_MAX"}}
+  "processes": {
+    "api": {"kind": "api", "routes": ["shop.example.com/api/*"], "timeout_ms": 10000},
+    "pg-conn": {"kind": "combd:postgres", "url": "$PG_MAIN_URL", "connection": {"timeout_ms": 3000}}
+  },
+  "pools": {"main": {"member": "pg-conn", "owners": ["api"], "max": "$PG_MAX"}}
 }"#;
 
     fn env(vars: &[(&str, Json)], secrets: &[(&str, &str)]) -> EnvValues {
@@ -763,9 +958,16 @@ pools:
         assert_eq!(got[1], got[2]);
         let r = &got[0];
         let pool = &r.pools["main"];
+        assert_eq!(pool.owners, ["api"]);
+        let pool = &pool.settings;
         assert_eq!((pool["max"].clone(), pool["on_manager_loss"].clone(), pool["wait_ms"].clone()), (100.into(), "finish".into(), 5000.into()));
-        let (kind, pg) = &r.processes["pg-conn"];
+        let pg = &r.processes["pg-conn"];
+        let (kind, pg) = (&pg.kind, &pg.settings);
         assert_eq!((kind.as_str(), pg["url"].as_str(), pg["connection.timeout_ms"].as_i64(), pg["connection.retries"].as_i64()), ("combd:postgres", Some("postgres://db/x"), Some(3000), Some(3)));
+        let api = &r.processes["api"];
+        assert_eq!((api.settings["timeout_ms"].as_i64(), api.settings["max_concurrent"].as_i64(), api.settings["durable"].as_bool()), (Some(10000), Some(32), Some(false)));
+        assert_eq!(api.routes[0].host.as_deref(), Some("shop.example.com"));
+        assert_eq!(api.routes[0].segs, [Seg::Lit("api".into()), Seg::Rest]);
         let environ: BTreeMap<_, _> = r.environ.iter().cloned().collect();
         assert_eq!(environ["PG_MAX"], "100");
         assert_eq!(environ["LOG_LEVEL"], "info");
@@ -825,7 +1027,7 @@ on_manager_loss = "panic"
             "processes.pg.url: $NOPE isn't declared",
             "processes.pg.connection.timeout_ms: 0 is outside 1 to 600000",
             "processes.pg.colour: unknown setting",
-            "processes.x.kind \"mysql\": not a process kind",
+            "processes.x.kind: no module modules/mysql.wasm",
             "pools.p.member: no process \"missing\"",
             "pools.p.on_manager_loss: \"panic\": one of finish, stop",
             "extra: unknown section",
@@ -836,23 +1038,108 @@ on_manager_loss = "panic"
 
     #[test]
     fn references_must_be_the_same_type_and_set() {
-        let base = "[app]\nname = \"a\"\n[processes.pg]\nkind = \"combd:postgres\"\nurl = \"postgres://x\"\n";
+        let base = "[app]\nname = \"a\"\n[processes.api]\nkind = \"api\"\nroutes = [\"/*\"]\n[processes.pg]\nkind = \"combd:postgres\"\nurl = \"postgres://x\"\n";
         // An int var into a url setting: no conversions.
-        assert!(errors(&format!("{base}[vars]\nU = 5\n[pools.p]\nmember = \"pg\"\nmax = \"$U\"\nwait_ms = \"$W\"\n")).contains("pools.p.wait_ms: $W isn't declared"));
-        assert!(errors(&format!("{base}[vars]\nF = 1.5\n[pools.p]\nmember = \"pg\"\nmax = \"$F\"\n")).contains("pools.p.max: wants int, $F is float"));
+        assert!(errors(&format!("{base}[vars]\nU = 5\n[pools.p]\nmember = \"pg\"\nowners = [\"api\"]\nmax = \"$U\"\nwait_ms = \"$W\"\n")).contains("pools.p.wait_ms: $W isn't declared"));
+        assert!(errors(&format!("{base}[vars]\nF = 1.5\n[pools.p]\nmember = \"pg\"\nowners = [\"api\"]\nmax = \"$F\"\n")).contains("pools.p.max: wants int, $F is float"));
         // An optional var can't fill a required setting.
         let m = "[app]\nname = \"a\"\n[secrets]\n\"U?\" = { secret = \"u\", type = \"url\" }\n[processes.pg]\nkind = \"combd:postgres\"\nurl = \"$U\"\n";
+        // (It's unreachable too; the check we want is still there.)
         assert!(errors(m).contains("processes.pg.url: needs a value, and $U is optional"));
         // A var's own limits may be wider: the environment's value is checked
         // against the setting's too, before anything starts.
-        let m = load(&dir(&[("combd.toml", &format!("{base}[vars]\nM = {{ type = \"int\" }}\n[pools.p]\nmember = \"pg\"\nmax = \"$M\"\n"))]).0).unwrap().unwrap();
+        let m = load(&dir(&[("combd.toml", &format!("{base}[vars]\nM = {{ type = \"int\" }}\n[pools.p]\nmember = \"pg\"\nowners = [\"api\"]\nmax = \"$M\"\n"))]).0).unwrap().unwrap();
         assert!(m.resolve(&env(&[("M", 0.into())], &[])).unwrap_err().contains("pools.p.max: 0 is outside 1 to 10000"));
         assert!(m.resolve(&env(&[], &[])).unwrap_err().contains("M: required"));
         assert!(m.resolve(&env(&[("M", "lots".into())], &[])).unwrap_err().contains("M: want int"));
         assert!(m.resolve(&env(&[("M", 4.into()), ("N", 1.into())], &[])).unwrap_err().contains("N: not declared"));
         // `$$` is a literal dollar.
-        let m = load(&dir(&[("combd.toml", "[app]\nname = \"a\"\n[processes.pg]\nkind = \"combd:postgres\"\nurl = \"$$x://y\"\n")]).0).unwrap_err();
+        let m = load(&dir(&[("combd.toml", "[app]\nname = \"a\"\n[processes.pg]\nkind = \"combd:postgres\"\nurl = \"$$x://y\"\n[processes.api]\nkind = \"api\"\nroutes = [\"/\"]\n[pools.p]\nmember = \"pg\"\nowners = [\"api\"]\n")]).0).unwrap_err();
         assert!(m.contains("\"$x://y\": want a URL"), "{m}");
+    }
+
+    #[test]
+    fn who_may_reach_whom() {
+        let ok = r#"
+[app]
+name = "shop"
+[processes.api]
+kind = "api"
+routes = ["shop.example.com/api/*", "/health"]
+[processes.admin-api]
+kind = "admin"
+routes = ["admin.example.com/*"]
+[processes.image-maker]
+kind = "imager"
+callers = ["api", "admin-api"]
+timeout_ms = 120000
+[processes.room]
+kind = "api"
+durable = true
+routes = ["/room/:id/*"]
+[processes.pg-conn]
+kind = "combd:postgres"
+url = "postgres://x"
+[pools.pg-pool]
+member = "pg-conn"
+owners = ["api", "admin-api"]
+"#;
+        let m = load(&dir(&[("combd.toml", ok)]).0).unwrap().unwrap();
+        assert_eq!(m.processes["image-maker"].callers, ["api", "admin-api"]);
+        assert!(m.processes["image-maker"].routes.is_empty(), "internal only");
+        assert_eq!(m.processes["room"].routes[0].segs, [Seg::Lit("room".into()), Seg::Param("id".into()), Seg::Rest]);
+        let e = errors(
+            r#"
+[app]
+name = "shop"
+[processes.api]
+kind = "api"
+routes = ["/a/:x", "/a/:y", "Bad.Host/x", "/x/*/y", "/q/:x/:x", "no-slash", "/sp ace"]
+callers = ["nobody"]
+[processes.lonely]
+kind = "admin"
+[processes.ghost]
+kind = "nomodule"
+routes = ["/g"]
+[processes.obj]
+kind = "api"
+durable = true
+max_concurrent = 4
+routes = ["/obj/:name"]
+[processes.pg-conn]
+kind = "combd:postgres"
+url = "postgres://x"
+routes = ["/pg"]
+[processes.pg-unused]
+kind = "combd:postgres"
+url = "postgres://x"
+[pools.a]
+member = "pg-conn"
+[pools.b]
+member = "pg-conn"
+owners = ["pg-unused", "missing"]
+"#,
+        );
+        for want in [
+            "processes.api.routes: \"/a/:y\" is the same route as one of api's",
+            "\"Bad.Host/x\": \"Bad.Host\": want a lowercase host name",
+            "\"/x/*/y\": * goes only at the end",
+            "\"/q/:x/:x\": :x twice",
+            "\"no-slash\": want host/path or /path",
+            "\"/sp ace\"",
+            "processes.api.callers: no process \"nobody\"",
+            "processes.lonely: nothing can reach it",
+            "processes.ghost.kind: no module modules/nomodule.wasm",
+            "processes.obj.max_concurrent: a durable object takes one event at a time",
+            "processes.obj.routes: \"/obj/:name\": a durable object's route names it with :id",
+            "processes.pg-conn: combd:postgres is reached through a pool, so it takes no routes or callers",
+            "processes.pg-unused: nothing can reach it (no pool hands it out)",
+            "pools.a.owners: required",
+            "pools.b.owners: pg-unused is a built-in kind",
+            "pools.b.owners: no process \"missing\"",
+        ] {
+            assert!(e.contains(want), "missing {want:?} in:\n{e}");
+        }
     }
 
     #[test]
