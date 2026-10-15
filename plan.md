@@ -1153,7 +1153,22 @@ uploads can wait: per object every 10 s or 1 MB (about $0.04 a day per busy
 object), or one combined upload per node every 5 to 30 s (cost by node, not
 object). The longer the wait, the longer the newest writes live only on
 the two peers. Comes right after the catalog, with the replication spec's
-timing checked again.
+timing checked again. **The node's operator decides:** `COMBD_UPLOAD_MS`
+(default 10 s, capped at about 5 minutes; 0 is today's as-fast-as-it-
+answers) and `COMBD_UPLOAD_BYTES` (upload early at this much, default 1 MB).
+Maybe later a per-app setting in the manifest, shorter than the node's,
+never longer.
+
+**Storage behind a small interface, two roles.** The cores only ask for
+get, put-if-unchanged, put-if-absent, delete, and list; only the S3 client
+under them is hard-wired. Split it: a coordination store (the catalog log,
+ownership records, the leader lease: tiny, needs compare-and-swap) and a
+data store (object segments and snapshots: big, append-only, cheap bulk
+writes). Each gets a backend: S3 or R2 for both by default, Postgres for
+coordination, and at very large scale whatever the operator runs. The
+startup storage test runs against any backend, so a store that can't
+really do compare-and-swap is never used. The catalog code is built on
+this from the start; the bucket code moves behind it then.
 
 ## Build order (when we do build)
 
