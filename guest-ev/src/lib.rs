@@ -18,6 +18,8 @@ extern "C" {
     fn pg_query_async(req: u64, handle: u64, ptr: *const u8, len: u32) -> u64;
     fn pg_close_async(req: u64, handle: u64) -> u32;
     fn ev_read(ptr: *mut u8, cap: u32) -> u32;
+    fn call_async(req: u64, ptr: *const u8, len: u32) -> u64;
+    fn send_async(req: u64, ptr: *const u8, len: u32) -> u32;
 }
 
 // The app's env vars, the way any WASI program gets them.
@@ -127,6 +129,12 @@ pub extern "C" fn on_request(req: u64, ptr: *mut u8, len: u32) {
         // Crash after `ms`: every unanswered request on this instance fails.
         ("GET", ["crash", _]) => sleep(req, num(1), |_| core::arch::wasm32::unreachable()),
         // One pooled statement: body is {"q", "p"}.
+        // Another process: the body is the call, the answer is its result.
+        ("POST", ["call"]) => wait(unsafe { call_async(req, body.as_ptr(), body.len() as u32) }, move |b| answer(req, &format!("200 {}", String::from_utf8_lossy(&b)))),
+        ("POST", ["send"]) => {
+            let ok = unsafe { send_async(req, body.as_ptr(), body.len() as u32) } == 1;
+            answer(req, if ok { "202 {}" } else { "507 {}" });
+        }
         ("POST", ["pg", "q"]) => {
             let mut q: Value = serde_json::from_str(&body).unwrap_or(json!({ "q": body }));
             q["db"] = json!("main");

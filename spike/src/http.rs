@@ -261,6 +261,19 @@ enum Origin {
     Socket(Who, u64, bool),
     /// An event cell's callback (on instance N): its answers go by `respond`.
     Ev(usize),
+    /// A `call` from another process: (the caller's loop, the call's id).
+    Call(usize, u64),
+    /// A `send`: nobody hears the answer.
+    Discard,
+}
+
+/// Who waits on a `call`'s answer.
+#[derive(Clone, Copy)]
+enum CallTo {
+    /// An event cell's ticket (instance, generation, ticket).
+    Ev(usize, u64, u64),
+    /// A parked cell.
+    Park(u64),
 }
 
 /// Between loops.
@@ -297,6 +310,8 @@ enum Msg {
     DbDone { park: u64, done: DbDone },
     /// An event cell's async call is done: (instance, its generation, ticket).
     EvDone { inst: usize, gen: u64, ticket: u64, done: DbDone },
+    /// The answer to a `call` this loop made.
+    CallDone { id: u64, reply: (u16, String) },
 }
 
 /// An event cell: one instance serving many requests at once, like a Node
@@ -713,6 +728,8 @@ where
                     ev_gen: 0,
                     next_ev_req: 0,
                     ev_timers: BinaryHeap::new(),
+                    calls: HashMap::new(),
+                    next_call: 0,
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l)) {
                     eprintln!("event loop stopped: {e}");
@@ -785,6 +802,9 @@ struct Loop<'a, E: Engine> {
     ev_gen: u64,
     next_ev_req: u64,
     ev_timers: BinaryHeap<Reverse<(Instant, usize, u64, u64)>>,
+    /// `call`s out: id -> who waits, and when it gives up.
+    calls: HashMap<u64, (CallTo, Instant)>,
+    next_call: u64,
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
@@ -1071,6 +1091,7 @@ impl<E: Engine> Loop<'_, E> {
                 Msg::WsLost { name, sock } => self.socket_lost(&name, sock),
                 Msg::DbDone { park, done } => self.db_done(park, done),
                 Msg::EvDone { inst, gen, ticket, done } => self.ev_done(inst, gen, ticket, done),
+                Msg::CallDone { id, reply } => self.call_done(id, reply),
                 Msg::Reply { who, reply } => self.deliver(Origin::Local(who), reply)?,
                 Msg::Synced { obj, gen, ok } => self.synced(&obj, gen, ok)?,
                 Msg::Checkpointed { obj } => {
@@ -1135,7 +1156,16 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Ok(())
             }
-            Origin::Ev(_) => Ok(()),
+            Origin::Ev(_) | Origin::Discard => Ok(()),
+            Origin::Call(l, id) if l == self.me => {
+                self.call_done(id, reply);
+                Ok(())
+            }
+            Origin::Call(l, id) => {
+                let (tx, waker) = &self.sh.peers[l];
+                let _ = tx.send(Msg::CallDone { id, reply });
+                waker.wake()
+            }
             Origin::Socket(who, sock, open) => {
                 let Some(c) = self.conn(who) else { return Ok(()) };
                 let Some(w) = c.ws.as_mut() else { return Ok(()) };
@@ -1265,7 +1295,8 @@ impl<E: Engine> Loop<'_, E> {
         if let Some(q) = inst.running.take().and_then(|r| inst.reqs.get_mut(&r)) {
             q.open = q.open.saturating_sub(1);
         }
-        let (gen, mut replies, mut ops, mut closes) = (inst.gen, vec![], vec![], vec![]);
+        let (gen, mut replies, mut ops, mut closes, mut sends) = (inst.gen, vec![], vec![], vec![], vec![]);
+        let from = inst.proc;
         for a in actions {
             match a {
                 EvAction::Respond(req, text) => {
@@ -1281,6 +1312,7 @@ impl<E: Engine> Loop<'_, E> {
                         ops.push((req, ticket, op));
                     }
                 }
+                EvAction::Send(m) => sends.push(m),
                 EvAction::PgClose(req, h) => {
                     if let Some(q) = inst.reqs.get_mut(&req) {
                         if q.handles.contains(&h) {
@@ -1300,6 +1332,11 @@ impl<E: Engine> Loop<'_, E> {
         for (req, ticket, op) in ops {
             self.ev_start(i, gen, req, ticket, op);
         }
+        for m in sends {
+            if let Err(e) = self.start_call(from, &m, None) {
+                eprintln!("send: {e}");
+            }
+        }
         self.ev_reap(i);
         self.ev_kick(i);
     }
@@ -1312,6 +1349,14 @@ impl<E: Engine> Loop<'_, E> {
             let _ = waker.wake();
         };
         let binding = |req: &[u8]| serde_json::from_slice::<serde_json::Value>(req).ok().and_then(|v| v["db"].as_str().map(String::from));
+        let proc = self.ev[i].as_ref().map_or(0, |e| e.proc);
+        if let AsyncOp::Call(msg) = &op {
+            let from = proc;
+            if let Err(e) = self.start_call(from, msg, Some(CallTo::Ev(i, gen, ticket))) {
+                reply(DbDone::Answer(json_err(&e)));
+            }
+            return;
+        }
         let Some(pools) = &self.sh.pg else {
             if let AsyncOp::Timer(ms) = op {
                 return self.ev_timers.push(Reverse((Instant::now() + Duration::from_millis(ms), i, gen, ticket)));
@@ -1320,12 +1365,15 @@ impl<E: Engine> Loop<'_, E> {
         };
         match op {
             AsyncOp::Timer(ms) => self.ev_timers.push(Reverse((Instant::now() + Duration::from_millis(ms), i, gen, ticket))),
-            AsyncOp::PgOpen(r) => match binding(&r).filter(|b| pools.has(b)) {
-                Some(b) => pools.lease(&b, Box::new(move |r| reply(DbDone::Pinned(r)))),
+            AsyncOp::Call(_) => unreachable!("handled above"),
+            AsyncOp::PgOpen(r) => match binding(&r).filter(|b| pools.has(b)).map(|b| self.may_lease(proc, &b).map(|()| b)) {
+                Some(Ok(b)) => pools.lease(&b, Box::new(move |r| reply(DbDone::Pinned(r)))),
+                Some(Err(e)) => reply(DbDone::Answer(json_err(&e))),
                 None => reply(DbDone::Answer(json_err("pg_open_async: name a database binding (\"db\")"))),
             },
-            AsyncOp::PgQuery(0, r) => match binding(&r) {
-                Some(b) => pools.query(&b, r, Box::new(move |a| reply(DbDone::Answer(a)))),
+            AsyncOp::PgQuery(0, r) => match binding(&r).map(|b| self.may_lease(proc, &b).map(|()| b)) {
+                Some(Ok(b)) => pools.query(&b, r, Box::new(move |a| reply(DbDone::Answer(a)))),
+                Some(Err(e)) => reply(DbDone::Answer(json_err(&e))),
                 None => reply(DbDone::Answer(json_err("pg_query_async: name a database binding (\"db\"), or use a handle"))),
             },
             AsyncOp::PgQuery(h, r) => {
@@ -1399,9 +1447,14 @@ impl<E: Engine> Loop<'_, E> {
         }
     }
 
-    /// Timers that are due, and requests past their time.
+    /// Timers that are due, calls and requests past their time.
     fn ev_tick(&mut self) {
         let now = Instant::now();
+        let late: Vec<u64> = self.calls.iter().filter(|(_, (_, at))| *at <= now).map(|(&id, _)| id).collect();
+        for id in late {
+            let (to, _) = self.calls.remove(&id).unwrap();
+            self.call_reply(to, json_err("timeout"));
+        }
         while self.ev_timers.peek().is_some_and(|Reverse((at, ..))| *at <= now) {
             let Reverse((_, i, gen, ticket)) = self.ev_timers.pop().unwrap();
             self.ev_done(i, gen, ticket, DbDone::Answer(vec![]));
@@ -1457,6 +1510,17 @@ impl<E: Engine> Loop<'_, E> {
     /// a host call (the interpreter); else on its fiber (compiled).
     fn park(&mut self, t: Task<E>, op: crate::host::DbOp, interp: bool) {
         use crate::host::DbOp;
+        // A call to another process: nothing to do with the database.
+        if let DbOp::Call(msg) = &op {
+            self.next_park += 1;
+            let park = self.next_park;
+            let from = t.cell.proc;
+            self.parked.insert(park, (t, interp));
+            if let Err(e) = self.start_call(from, msg, Some(CallTo::Park(park))) {
+                self.db_done(park, DbDone::Answer(json_err(&e)));
+            }
+            return;
+        }
         let fail = |m: String| json_err(&m);
         let binding = |req: &[u8]| serde_json::from_slice::<serde_json::Value>(req).ok().and_then(|v| v["db"].as_str().map(String::from));
         // May this cell use handle `h`? Its object's, or its request's.
@@ -1473,12 +1537,19 @@ impl<E: Engine> Loop<'_, E> {
             let _ = waker.wake();
         };
         match op {
+            DbOp::Call(_) => unreachable!("handled above"),
             DbOp::Open(req) => {
                 let Some(b) = binding(&req).filter(|b| pools.has(b)) else { return self.db_resume(t, interp, 0, fail("pg_open: name a database binding (\"db\")".into())) };
+                if let Err(e) = self.may_lease(t.cell.proc, &b) {
+                    return self.db_resume(t, interp, 0, fail(e));
+                }
                 pools.lease(&b, Box::new(move |r| reply(DbDone::Pinned(r))));
             }
             DbOp::Query(0, req) => {
                 let Some(b) = binding(&req) else { return self.db_resume(t, interp, 0, fail("pg_query: name a database binding (\"db\"), or use a handle".into())) };
+                if let Err(e) = self.may_lease(t.cell.proc, &b) {
+                    return self.db_resume(t, interp, 0, fail(e));
+                }
                 pools.query(&b, req, Box::new(move |a| reply(DbDone::Answer(a))));
             }
             DbOp::Query(h, req) => {
@@ -1568,6 +1639,12 @@ impl<E: Engine> Loop<'_, E> {
     fn apply_ws(&mut self, name: &str, ws: Vec<WsOut>) -> std::io::Result<()> {
         let me = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node);
         for out in ws {
+            if let WsOut::Message(m) = &out {
+                if let Err(e) = self.start_call(self.app.object_proc(name), m, None) {
+                    eprintln!("send from {name}: {e}");
+                }
+                continue;
+            }
             let id = out.id();
             if let WsOut::Close(..) = out {
                 // Closed by the object: it hears nothing back, and the socket
@@ -1578,6 +1655,7 @@ impl<E: Engine> Loop<'_, E> {
                 WsOut::Send(_, m) => (1, m.into_bytes()),
                 WsOut::Binary(_, b) => (2, b),
                 WsOut::Close(_, code) => (8, code.to_be_bytes().to_vec()),
+                WsOut::Message(_) => unreachable!("sent above"),
             };
             if Self::sock_node(id) != me {
                 if let Some(f) = &self.sh.fleet {
@@ -1756,6 +1834,13 @@ impl<E: Engine> Loop<'_, E> {
         let Some(name) = obj else {
             return Some((match answer {
                 Ok(a) => {
+                    for out in ws {
+                        if let WsOut::Message(m) = out {
+                            if let Err(e) = self.start_call(cell.proc, &m, None) {
+                                eprintln!("send: {e}");
+                            }
+                        }
+                    }
                     self.pools[cell.proc].push(cell);
                     split_answer(&a)
                 }
@@ -2117,33 +2202,108 @@ impl<E: Engine> Loop<'_, E> {
             }
             Req::NewId => self.queue_reply(who, (200, format!("{{\"id\":\"{}\"}}", uuid_v7()))),
             Req::NotFound => self.queue_reply(who, (404, "{\"error\":\"no route\"}".into())),
-            Req::Cell(p, cell_req) if self.ev_mode[p] => self.ev_request(Origin::Local(who), p, cell_req)?,
-            Req::Cell(p, cell_req) => {
-                let mut cell = match self.pools[p].pop() {
-                    Some(cell) => cell,
-                    None => fresh(self.eng, self.app, p, &self.sh.cfg.environ)?,
-                };
-                if let Err(trap) = crate::start(&mut cell.vm, &cell_req, &mut cell.st) {
-                    eprintln!("cell trapped starting a request: {trap}");
-                    self.queue_reply(who, (500, String::new()));
-                    return Ok(());
-                }
-                self.tasks.push_back(Task { origin: Origin::Local(who), cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: None });
-            }
-            Req::Object(name, cell_req) => {
-                let o = owner(&name, self.sh.cfg.threads);
-                if o == self.me {
-                    self.submit(Origin::Local(who), name, cell_req);
-                } else {
-                    // Another loop owns it: hand the request over.
-                    self.sh.stats.forwarded.fetch_add(1, Relaxed);
-                    let (tx, waker) = &self.sh.peers[o];
-                    let _ = tx.send(Msg::Run { origin: Origin::Remote(self.me, who), obj: name, req: cell_req });
-                    waker.wake()?;
-                }
-            }
+            Req::Cell(p, cell_req) => self.run_cell(Origin::Local(who), p, cell_req)?,
+            Req::Object(name, cell_req) => self.run_obj(Origin::Local(who), name, cell_req)?,
         }
         Ok(())
+    }
+
+    /// A request for a worker process, on this loop.
+    fn run_cell(&mut self, origin: Origin, p: usize, req: String) -> std::io::Result<()> {
+        if self.ev_mode[p] {
+            return self.ev_request(origin, p, req);
+        }
+        let mut cell = match self.pools[p].pop() {
+            Some(cell) => cell,
+            None => fresh(self.eng, self.app, p, &self.sh.cfg.environ)?,
+        };
+        if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
+            eprintln!("cell trapped starting a request: {trap}");
+            return self.deliver(origin, (500, String::new()));
+        }
+        self.tasks.push_back(Task { origin, cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: None });
+        Ok(())
+    }
+
+    /// A request for an object, on the loop that owns it.
+    fn run_obj(&mut self, origin: Origin, name: String, req: String) -> std::io::Result<()> {
+        let o = owner(&name, self.sh.cfg.threads);
+        if o == self.me {
+            self.submit(origin, name, req);
+            return Ok(());
+        }
+        // Another loop owns it: hand the request over.
+        self.sh.stats.forwarded.fetch_add(1, Relaxed);
+        let origin = match origin {
+            Origin::Local(who) => Origin::Remote(self.me, who),
+            o => o,
+        };
+        let (tx, waker) = &self.sh.peers[o];
+        let _ = tx.send(Msg::Run { origin, obj: name, req });
+        waker.wake()
+    }
+
+    /// `call` (with someone to tell) or `send` (`to: None`) from process
+    /// `from`. The manifest's `callers` decide; `Err` says why not. A call
+    /// always ends in exactly one answer: the target's, or a timeout.
+    fn start_call(&mut self, from: usize, msg: &[u8], to: Option<CallTo>) -> Result<(), String> {
+        let v: serde_json::Value = serde_json::from_slice(msg).map_err(|_| "want JSON: {\"to\", \"method\", \"path\", \"body\"}".to_string())?;
+        let target = v["to"].as_str().ok_or("name the process: \"to\"")?;
+        let caller = &self.app.procs[from].name;
+        let t = self.app.proc_named(target).filter(|t| self.app.procs[*t].callers.contains(&from)).ok_or_else(|| format!("denied: {caller} may not call {target}"))?;
+        let proc = &self.app.procs[t];
+        let method = v["method"].as_str().unwrap_or("POST");
+        if !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].contains(&method) {
+            return Err(format!("method {method:?}"));
+        }
+        let path = v["path"].as_str().unwrap_or("/");
+        if !path.starts_with('/') || path.contains(char::is_whitespace) {
+            return Err("path: want /..., with no spaces".into());
+        }
+        let body = v["body"].as_str().unwrap_or("");
+        let line = |kind: &str| if body.is_empty() { format!("{kind} {method} {path}") } else { format!("{kind} {method} {path} {body}") };
+        let timeout = v["timeout_ms"].as_u64().map_or(proc.timeout, |ms| Duration::from_millis(ms).min(proc.timeout));
+        let origin = match to {
+            Some(to) => {
+                self.next_call += 1;
+                self.calls.insert(self.next_call, (to, Instant::now() + timeout));
+                Origin::Call(self.me, self.next_call)
+            }
+            None => Origin::Discard,
+        };
+        let r = if proc.durable {
+            let id = v["id"].as_str().filter(|id| !id.is_empty() && !id.contains('/')).ok_or(format!("{target} is durable: name the object, \"id\""))?;
+            let name = format!("{target}/{id}");
+            if name.len() > MAX_NAME {
+                return Err("id: too long".into());
+            }
+            self.run_obj(origin, name, line("do"))
+        } else {
+            self.run_cell(origin, t, line("api"))
+        };
+        r.map_err(|e| e.to_string())
+    }
+
+    /// May process `proc` lease from pool `pool`? Its `owners` decide (with
+    /// no manifest, anyone may).
+    fn may_lease(&self, proc: usize, pool: &str) -> Result<(), String> {
+        if self.app.router.legacy || self.app.procs[proc].owns.iter().any(|p| p == pool) {
+            return Ok(());
+        }
+        Err(format!("denied: {} isn't an owner of pool {pool}", self.app.procs[proc].name))
+    }
+
+    /// A `call` is answered: tell whoever waits (once; a late answer is dropped).
+    fn call_done(&mut self, id: u64, (status, body): (u16, String)) {
+        let Some((to, _)) = self.calls.remove(&id) else { return };
+        self.call_reply(to, serde_json::json!({ "status": status, "body": body }).to_string().into_bytes());
+    }
+
+    fn call_reply(&mut self, to: CallTo, payload: Vec<u8>) {
+        match to {
+            CallTo::Ev(inst, gen, ticket) => self.ev_done(inst, gen, ticket, DbDone::Answer(payload)),
+            CallTo::Park(park) => self.db_done(park, DbDone::Answer(payload)),
+        }
     }
 
     /// Run a request on an object this loop owns, now or after the ones ahead of it.

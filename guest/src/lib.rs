@@ -192,6 +192,43 @@ pub mod api {
 /// The host wraps each request in a transaction and commits it before the
 /// answer leaves. If this cell crashes, the host rolls the request back and
 /// starts a fresh cell, and the state is loaded again from storage.
+/// Other processes, through the host: `call` waits for the answer, `send`
+/// goes out only if this request succeeds.
+pub mod procs {
+    #[cfg(target_arch = "wasm32")]
+    #[link(wasm_import_module = "combd")]
+    extern "C" {
+        fn call(ptr: *const u8, len: u32) -> u32;
+        fn send(ptr: *const u8, len: u32) -> u32;
+        fn pg_read(ptr: *mut u8, cap: u32) -> u32;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    unsafe fn call(_: *const u8, _: u32) -> u32 {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    unsafe fn send(_: *const u8, _: u32) -> u32 {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    unsafe fn pg_read(_: *mut u8, _: u32) -> u32 {
+        0
+    }
+
+    /// `{"status", "body"}` or `{"error"}`.
+    pub fn call_json(msg: &str) -> String {
+        let n = unsafe { call(msg.as_ptr(), msg.len() as u32) } as usize;
+        let mut buf = vec![0u8; n];
+        let got = unsafe { pg_read(buf.as_mut_ptr(), n as u32) } as usize;
+        buf.truncate(got);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    pub fn send_json(msg: &str) -> bool {
+        unsafe { send(msg.as_ptr(), msg.len() as u32) == 1 }
+    }
+}
+
 /// Postgres through the host: a binding name, never a socket or a password.
 pub mod pg {
     use serde_json::json;
@@ -479,6 +516,12 @@ pub mod room {
                     format!("200 {}", json!({ "closed": h != 0 && super::pg::close(h) }))
                 }
                 ("POST", "/pg/crash") => panic!("crash while holding a session"),
+                ("POST", "/call") => format!("200 {}", super::procs::call_json(body)),
+                ("POST", "/send") => format!("{} {{}}", if super::procs::send_json(body) { 202 } else { 507 }),
+                ("POST", "/send-crash") => {
+                    super::procs::send_json(body);
+                    panic!("crash after a send: it must never go out")
+                }
                 ("GET", "/ws-stats") => format!("200 {}", json!({ "joins": kv("joins"), "closes": kv("closes"), "sockets": sockets().len() })),
                 // Write, then crash: the host must roll the write back.
                 ("POST", "/crash") => {

@@ -281,7 +281,7 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
     for k in app.keys().filter(|k| *k != "name") {
         errs.push(format!("app.{k}: unknown key"));
     }
-    let mut specs = |side: Side, sect: &str, errs: &mut Vec<String>| -> BTreeMap<String, Spec> {
+    let specs = |side: Side, sect: &str, errs: &mut Vec<String>| -> BTreeMap<String, Spec> {
         let mut out = BTreeMap::new();
         for (k, v) in table(sect, errs) {
             match spec(side, &k, &v) {
@@ -813,7 +813,7 @@ impl Manifest {
                 None => {}
             }
         }
-        let mut fill = |at: &str, kind: &str, got: &BTreeMap<String, Json>, errs: &mut Vec<String>| -> BTreeMap<String, Json> {
+        let fill = |at: &str, kind: &str, got: &BTreeMap<String, Json>, errs: &mut Vec<String>| -> BTreeMap<String, Json> {
             let schema = settings_of(kind);
             let mut out = BTreeMap::new();
             for (k, want) in &schema {

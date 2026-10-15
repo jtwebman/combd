@@ -85,7 +85,7 @@ impl<P> App<P> {
                 owns: r.pools.iter().filter(|(_, pool)| pool.owners.contains(name)).map(|(n, _)| n.clone()).collect(),
             });
         }
-        let mut routes: Vec<Target> = user
+        let routes: Vec<Target> = user
             .iter()
             .enumerate()
             .flat_map(|(i, (name, p))| p.routes.iter().map(move |r| Target { route: r.clone(), proc: i, name: (*name).clone(), durable: p.settings["durable"].as_bool() == Some(true) }))

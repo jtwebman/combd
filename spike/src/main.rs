@@ -1890,6 +1890,7 @@ secrets:
   PG_URL: { secret: pg-url, type: url }
 processes:
   api: { kind: api, routes: ["/*"] }
+  other: { kind: api, routes: ["other.test/*"] }
   pg-conn: { kind: "combd:postgres", url: $PG_URL, connection: { retries: 0 } }
 pools:
   main: { member: pg-conn, owners: [api], max: $PG_MAX, wait_ms: 2000 }
@@ -1897,18 +1898,21 @@ pools:
         std::fs::create_dir(app.0.join("modules")).unwrap();
         std::fs::copy(GUEST_EV, manifest::module_path(&app.0, "api")).unwrap();
         std::fs::write(app.0.join("combd.dev.toml"), format!("[vars]\nREGION = \"us-east\"\n[secrets]\npg-url = {pg_url:?}\n")).unwrap();
-        let Ok(Some((_, pg, environ))) = http::app_settings(&app.0) else { panic!("the manifest should load") };
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, pg, environ) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
         let p = &pg.as_ref().unwrap().pools[0];
         assert_eq!((p.name.as_str(), p.max, p.wait_ms, p.retries), ("main", 4, 2000, 0));
         let dir = store::tempdir::Dir::new();
-        let wasm = std::fs::read(GUEST_EV).unwrap();
-        let (port, _, _) = server_for(interp::Interp { max_pages: 16384 }, http::Config { pg, environ: Arc::new(environ), ..cfg(&dir.0, 1) }, wasm);
+        let (port, _, _) = server_app(eng, http::Config { pg, environ: Arc::new(environ), ..cfg(&dir.0, 1) }, move |_| a);
         assert_eq!(http(port, "GET", "/env/REGION", ""), (200, "{\"value\":\"us-east\"}".into()));
         assert_eq!(http(port, "GET", "/env/PG_MAX", ""), (200, "{\"value\":\"4\"}".into()));
         assert_eq!(http(port, "GET", "/env/PG_URL", "").1, serde_json::json!({ "value": pg_url }).to_string(), "secrets are env vars too");
         assert_eq!(http(port, "GET", "/env/MY_FLAG", "").0, 404, "an unset optional isn't set");
         if std::env::var("COMBD_PG_TEST").is_ok() {
             assert!(http(port, "POST", "/pg/q", "{\"q\":\"SELECT 41 + 1\"}").1.contains("[[42]]"));
+            // Only the pool's owners may use it.
+            let (_, body) = http_to(port, "other.test", "POST", "/pg/q", "{\"q\":\"SELECT 1\"}");
+            assert!(body.contains("denied: other isn't an owner of pool main"), "{body}");
         }
         // A mistake in the environment: nothing starts.
         std::fs::write(app.0.join("combd.dev.toml"), "[vars]\nREGION = \"Not Valid\"\n").unwrap();
@@ -1971,6 +1975,87 @@ routes = ["/room/:id/*"]
         for path in ["/nope", "/do/r1/count", "/room", "/hello/extra"] {
             assert_eq!(http(port, "GET", path, "").0, 404, "{path}");
         }
+    }
+
+    /// `call` and `send` between processes: only where `callers` allows,
+    /// always one answer (the target's, a timeout, or a crash's 500), and a
+    /// request's sends go out only if it succeeds (an object's: once committed).
+    fn processes_call_and_send<E: Engine + Sync + Send + 'static>(eng: E)
+    where
+        E::Program: Sync + Send,
+    {
+        let app = store::tempdir::Dir::new();
+        std::fs::write(app.0.join("combd.toml"), r#"
+[app]
+name = "shop"
+[processes.front]
+kind = "ev"
+routes = ["/call", "/send"]
+[processes.sleeper]
+kind = "ev"
+callers = ["front"]
+[processes.worker]
+kind = "classic"
+callers = ["front", "room"]
+[processes.room]
+kind = "classic"
+durable = true
+routes = ["/room/:id/*"]
+callers = ["front", "room"]
+[processes.admin]
+kind = "classic"
+routes = ["/admin/*"]
+"#).unwrap();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::copy(GUEST_EV, manifest::module_path(&app.0, "ev")).unwrap();
+        std::fs::copy(GUEST, manifest::module_path(&app.0, "classic")).unwrap();
+        let (a, pg, environ) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = server_app(eng, http::Config { pg, environ: Arc::new(environ), ..cfg(&dir.0, 2) }, move |_| a);
+        let call = |msg: serde_json::Value| -> serde_json::Value {
+            let (code, body) = http(port, "POST", "/call", &msg.to_string());
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str(&body).unwrap_or_else(|_| panic!("{body}"))
+        };
+        let count = |id: &str| http(port, "GET", &format!("/room/{id}/count"), "").1;
+        // A worker, and an object.
+        let r = call(serde_json::json!({ "to": "worker", "method": "GET", "path": "/api/users/42" }));
+        assert_eq!(r["status"], 200, "{r}");
+        let r = call(serde_json::json!({ "to": "room", "id": "r1", "path": "/incr" }));
+        assert_eq!((r["status"].clone(), r["body"].clone()), (200.into(), "{\"count\":1}".into()), "{r}");
+        assert_eq!(count("r1"), "{\"count\":1}");
+        // Only where `callers` allows.
+        assert_eq!(call(serde_json::json!({ "to": "admin", "path": "/admin/x" }))["error"], "denied: front may not call admin");
+        assert_eq!(call(serde_json::json!({ "to": "nobody" }))["error"], "denied: front may not call nobody");
+        assert!(call(serde_json::json!({ "to": "room", "path": "/count" }))["error"].as_str().unwrap().contains("name the object"));
+        // Always one answer: a timeout, or a crash's 500.
+        let t = Instant::now();
+        assert_eq!(call(serde_json::json!({ "to": "sleeper", "method": "GET", "path": "/sleep/3000", "timeout_ms": 200 }))["error"], "timeout");
+        assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
+        assert_eq!(call(serde_json::json!({ "to": "sleeper", "method": "GET", "path": "/crash/0" }))["status"], 500);
+        // Fire and forget.
+        assert_eq!(http(port, "POST", "/send", &serde_json::json!({ "to": "room", "id": "r2", "path": "/incr" }).to_string()).0, 202);
+        assert!(eventually(2000, || count("r2") == "{\"count\":1}"));
+        // An object calls, waiting (parked); and sends, after its commit.
+        let (code, body) = http(port, "POST", "/room/r3/call", &serde_json::json!({ "to": "worker", "method": "GET", "path": "/api/users/7" }).to_string());
+        assert!(code == 200 && body.contains("\"status\":200"), "{code} {body}");
+        assert_eq!(http(port, "POST", "/room/r4/send", &serde_json::json!({ "to": "room", "id": "r5", "path": "/incr" }).to_string()).0, 202);
+        assert!(eventually(2000, || count("r5") == "{\"count\":1}"));
+        // A request that crashes never sends.
+        assert_eq!(http(port, "POST", "/room/r6/send-crash", &serde_json::json!({ "to": "room", "id": "r7", "path": "/incr" }).to_string()).0, 500);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(count("r7"), "{\"count\":0}");
+    }
+
+    #[test]
+    fn processes_call_and_send_on_the_interpreter() {
+        processes_call_and_send(interp::Interp { max_pages: 16384 });
+    }
+
+    #[cfg(feature = "aot-guard")]
+    #[test]
+    fn processes_call_and_send_on_aot() {
+        processes_call_and_send(aot::Aot);
     }
 
     #[test]

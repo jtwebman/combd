@@ -1398,6 +1398,30 @@ an object, and its request sees the path after the route's `*`. Anything
 no route matches is a 404, the old fixed `/do/` routes included. With no
 manifest, `serve` works as before.
 
+**Processes call each other, only where the manifest says.** `call` waits
+for an answer: a classic cell parks (no CPU) and gets it from `pg_read`; an
+event cell uses `call_async` and gets it in `on_event`. `send` (and
+`send_async`) is fire and forget. Both take `{"to", "id"?, "method"?,
+"path"?, "body"?, "timeout_ms"?}`; `id` names the object when the target is
+durable. The target sees an ordinary request. The host checks `callers`
+(it knows which process is calling, so a cell can't pretend to be another)
+and answers a call exactly once: `{"status", "body"}` (a crashed target is
+a 500), or `{"error"}` for a denial or a timeout (the caller's loop keeps a
+deadline per call, at most the target's `timeout_ms`; a late answer is
+dropped). A request's `send`s go out only if it succeeds, and an object's
+only once its writes are on disk: the same output gate as its WebSocket
+sends. Pools check `owners` the same way, on every lease and pooled query.
+
+**Test `processes_call_and_send_*`:** calls to a worker and to an object;
+a denial for a process not in `callers` (and an unknown one); a timeout
+(200 ms against a 3 s sleep) and a crash's 500; `send` from an event cell;
+a parked `call` from an object; `send` after an object's commit; and a
+request that sends, then crashes: its message never arrives. The manifest
+test checks that a process not in a pool's `owners` is denied. The
+host-API fuzzer covers `call`, `send`, `call_async`, `send_async`, and
+`environ_get` (20,000 seeds, clean; two `sql` calls ran slow under a load
+average near 10, and were fine when run again alone).
+
 Object names were allowed up to 256 bytes, but they're hex-encoded into
 file names, which most file systems cap at 255 bytes: names over 124 bytes
 could never open. The cap is 120 now.

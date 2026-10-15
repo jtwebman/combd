@@ -59,6 +59,8 @@ pub enum EvAction {
     Async { req: u64, ticket: u64, op: AsyncOp },
     /// Done with a Postgres handle of request `req`.
     PgClose(u64, u64),
+    /// `send` to another process: fire and forget.
+    Send(Vec<u8>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +68,8 @@ pub enum AsyncOp {
     PgOpen(Vec<u8>),
     PgQuery(u64, Vec<u8>),
     Timer(u64),
+    /// `call` another process (`DbOp::Call`'s JSON).
+    Call(Vec<u8>),
 }
 
 /// What one callback may ask for, so a loop in a cell can't flood the host.
@@ -74,6 +78,10 @@ const MAX_EV_OUT: usize = 10_000;
 /// A Postgres call. The cell waits (paused, no CPU) while the host does it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DbOp {
+    /// Call another process: `{"to", "id"?, "method"?, "path"?, "body"?,
+    /// "timeout_ms"?}`. The result is the answer's length, for `pg_read`:
+    /// `{"status", "body"}`, or `{"error"}` (denied, timeout).
+    Call(Vec<u8>),
     /// Pin a connection: `{"db": binding}`. The result is a handle (0: no;
     /// why is in `pg_read`).
     Open(Vec<u8>),
@@ -86,22 +94,27 @@ pub enum DbOp {
 
 /// A WebSocket action a cell asked for.
 #[derive(Clone, Debug, PartialEq)]
+/// What a request sends out, once it has succeeded (for an object: once
+/// its writes are on disk): WebSocket messages, and messages to processes.
 pub enum WsOut {
     Send(u64, String),
     Binary(u64, Vec<u8>),
     Close(u64, u16),
+    /// `send` to another process (its JSON).
+    Message(Vec<u8>),
 }
 
 impl WsOut {
     pub fn id(&self) -> u64 {
         match self {
             WsOut::Send(id, _) | WsOut::Binary(id, _) | WsOut::Close(id, _) => *id,
+            WsOut::Message(_) => 0,
         }
     }
     fn len(&self) -> usize {
         match self {
             WsOut::Send(_, m) => m.len(),
-            WsOut::Binary(_, b) => b.len(),
+            WsOut::Binary(_, b) | WsOut::Message(b) => b.len(),
             WsOut::Close(..) => 0,
         }
     }
@@ -263,9 +276,22 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
         // Postgres (`pg.rs`): `pg_open(ptr, len)`, `pg_query(handle, ptr,
         // len)`, `pg_close(handle)` wait for the host; `pg_read(ptr)` copies
         // the last answer out.
-        ("combd", name @ ("pg_open" | "pg_query" | "pg_close")) => {
+        // Processes: `call(ptr, len)` waits for the answer (its length is
+        // the result; `pg_read` copies it); `send(ptr, len)` queues a message
+        // that goes out only if this request succeeds (1: queued, 0: too much).
+        ("combd", "send") => {
+            let len = arg(1)? as usize;
+            let queued: usize = st.ws_out.iter().map(WsOut::len).sum();
+            if len > 1 << 20 || queued + len > MAX_WS_OUT {
+                0
+            } else {
+                st.ws_out.push(WsOut::Message(mem.read(arg(0)? as u32, len as u32).ok_or("send: bad pointer")?));
+                1
+            }
+        }
+        ("combd", name @ ("pg_open" | "pg_query" | "pg_close" | "call")) => {
             if !st.can_park {
-                return Err(format!("{name}: this engine can't wait on a database yet"));
+                return Err(format!("{name}: this engine can't wait on the host yet"));
             }
             let req = |p: u64, l: u64| -> Result<Vec<u8>, String> {
                 if l > 1 << 20 {
@@ -276,6 +302,7 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
             st.pending = Some(match name {
                 "pg_open" => DbOp::Open(req(arg(0)?, arg(1)?)?),
                 "pg_query" => DbOp::Query(arg(0)?, req(arg(1)?, arg(2)?)?),
+                "call" => DbOp::Call(req(arg(0)?, arg(1)?)?),
                 _ => DbOp::Close(arg(0)?),
             });
             0 // the real result comes when the host is done
@@ -294,7 +321,7 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
         // may go on after it (waitUntil). Anything that waits returns a
         // ticket at once, and `on_event(ticket, len)` comes back with its
         // data, read by `ev_read(ptr, cap)`. A ticket of 0: unknown request.
-        ("combd", name @ ("respond" | "pg_open_async" | "pg_query_async" | "pg_close_async" | "timer_async")) => {
+        ("combd", name @ ("respond" | "pg_open_async" | "pg_query_async" | "pg_close_async" | "timer_async" | "call_async" | "send_async")) => {
             let req = arg(0)?;
             if !st.ev_reqs.contains(&req) {
                 0
@@ -307,7 +334,7 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
                     }
                     mem.read(p as u32, l as u32).ok_or_else(|| format!("{name}: bad pointer"))
                 };
-                let mut ticket = |op: AsyncOp, st: &mut HostState| {
+                let ticket = |op: AsyncOp, st: &mut HostState| {
                     st.next_ticket += 1;
                     st.ev_out.push(EvAction::Async { req, ticket: st.next_ticket, op });
                     st.next_ticket
@@ -320,6 +347,11 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
                     }
                     "pg_open_async" => ticket(AsyncOp::PgOpen(read(arg(1)?, arg(2)?, 1 << 20)?), st),
                     "pg_query_async" => ticket(AsyncOp::PgQuery(arg(1)?, read(arg(2)?, arg(3)?, 1 << 20)?), st),
+                    "call_async" => ticket(AsyncOp::Call(read(arg(1)?, arg(2)?, 1 << 20)?), st),
+                    "send_async" => {
+                        st.ev_out.push(EvAction::Send(read(arg(1)?, arg(2)?, 1 << 20)?));
+                        1
+                    }
                     "pg_close_async" => {
                         st.ev_out.push(EvAction::PgClose(req, arg(1)?));
                         1
