@@ -59,7 +59,7 @@ use crate::store::{self, AlarmIndex, Db};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -270,6 +270,10 @@ enum Msg {
     PeerReply { id: u64, res: Option<own::PeerRes> },
     /// A WebSocket handshake for an object you own: take the connection.
     Adopt { s: TcpStream, rbuf: Vec<u8>, name: String, path: String, key: String },
+    /// Fleet mode: another node's object sends on a socket we hold.
+    WsPush { name: String, sock: u64, op: u8, payload: Vec<u8> },
+    /// Fleet mode: a push of ours couldn't reach the socket's node.
+    WsLost { name: String, sock: u64 },
 }
 
 /// Fleet mode: a request the decision core knows about.
@@ -279,8 +283,10 @@ struct FReq {
     cell_req: String,
     hops: u8,
     act: Act,
-    /// The answer, held until the core says it's proven.
+    /// The answer, held until the core says it's proven, and the WebSocket
+    /// sends that wait with it.
     resp: Option<(u16, String)>,
+    ws: Vec<WsOut>,
 }
 
 struct Conn {
@@ -345,6 +351,10 @@ struct Task<E: Engine> {
     cell: Cell<E>,
     /// The Durable Object it runs in, if any.
     obj: Option<String>,
+    /// A WebSocket handshake (it joins the object's list if the answer is
+    /// 101), and gone sockets this request takes off the list.
+    ws_open: Option<u64>,
+    ws_drop: Vec<u64>,
 }
 
 /// A Durable Object in memory.
@@ -370,6 +380,8 @@ struct Object<E: Engine> {
     index_at: Option<i64>,
     index_busy: bool,
     seal_wait: Option<(Act, Vec<u8>)>,
+    /// Its WebSocket list (`_combd_sockets`), read once it's needed.
+    socks: Option<BTreeSet<u64>>,
 }
 
 impl<E: Engine> Object<E> {
@@ -388,6 +400,7 @@ impl<E: Engine> Object<E> {
             index_at: None,
             index_busy: false,
             seal_wait: None,
+            socks: None,
         }
     }
 }
@@ -551,8 +564,15 @@ where
                     alarm_fire: HashMap::new(),
                     last_scan: Instant::now(),
                     last_tick: Instant::now(),
-                    sockets: HashMap::new(),
+                    local_socks: HashMap::new(),
                     next_sock: 0,
+                    boot: {
+                        let mut b = [0u8; 8];
+                        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
+                        u64::from_le_bytes(b) ^ now_ms() as u64
+                    },
+                    ws_gone: HashMap::new(),
+                    ws_lost: Default::default(),
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l)) {
                     eprintln!("event loop stopped: {e}");
@@ -600,10 +620,17 @@ struct Loop<'a, E: Engine> {
     alarm_fire: HashMap<String, (i64, u32, i64)>,
     last_scan: Instant,
     last_tick: Instant,
-    /// Each object's WebSockets on this loop: socket id -> connection. They
-    /// stay while the object is out of memory.
-    sockets: HashMap<String, BTreeMap<u64, Who>>,
+    /// WebSocket connections this loop holds: socket id -> connection. They
+    /// stay while their object is out of memory, or runs on another node.
+    local_socks: HashMap<u64, Who>,
     next_sock: u64,
+    /// Random bits for socket ids, so a restart never reuses one.
+    boot: u64,
+    /// Sockets that are gone, per object, until a committed request has
+    /// taken them off the object's list (`_combd_sockets`).
+    ws_gone: HashMap<String, BTreeSet<u64>>,
+    /// Lost sockets we've told their object about already.
+    ws_lost: std::collections::HashSet<u64>,
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
@@ -863,6 +890,8 @@ impl<E: Engine> Loop<'_, E> {
                     let id = self.add_conn(s, rbuf)?;
                     self.upgrade(id, name, path, key);
                 }
+                Msg::WsPush { name, sock, op, payload } => self.ws_local(&name, sock, op, &payload)?,
+                Msg::WsLost { name, sock } => self.socket_lost(&name, sock),
                 Msg::Reply { who, reply } => self.deliver(Origin::Local(who), reply)?,
                 Msg::Synced { obj, gen, ok } => self.synced(&obj, gen, ok)?,
                 Msg::Checkpointed { obj } => {
@@ -944,12 +973,11 @@ impl<E: Engine> Loop<'_, E> {
                     return self.ws_read(who.0);
                 }
                 // Refused: answer it as plain HTTP, and close.
-                let name = w.obj.clone();
                 w.gone = true;
                 let _ = write!(c.wbuf, "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", reply.0, reply.1.len());
                 c.wbuf.extend_from_slice(reply.1.as_bytes());
                 c.close_after = true;
-                self.unregister(&name, sock);
+                self.local_socks.remove(&sock);
                 self.settle(who.0)
             }
         }
@@ -965,50 +993,99 @@ impl<E: Engine> Loop<'_, E> {
         }
     }
 
-    /// Do what a cell asked of its object's sockets.
-    fn apply_ws(&mut self, name: &str, ws: Vec<WsOut>) -> std::io::Result<()> {
-        let mut touched = vec![];
-        for out in ws {
-            let (id, frame, close) = match &out {
-                WsOut::Send(id, m) => (*id, crate::ws::text(m), None),
-                WsOut::Close(id, code) => (*id, crate::ws::close(*code), Some(*code)),
-            };
-            let Some(&who) = self.sockets.get(name).and_then(|m| m.get(&id)) else { continue };
-            let Some(c) = self.conn(who) else { continue };
-            let Some(w) = c.ws.as_mut().filter(|w| w.open && !w.gone) else { continue };
-            if c.wbuf.len() - c.wpos + frame.len() > MAX_WS_WRITE {
-                // It reads too slowly to keep up: let it go.
-                w.gone = true;
-                c.close_after = true;
-                c.wbuf.truncate(c.wpos);
-                self.drop_socket(who, crate::ws::TOO_SLOW);
-            } else {
-                c.wbuf.extend_from_slice(&frame);
-                if close.is_some() {
-                    // The object closed it: no event back to the object.
-                    w.gone = true;
-                    c.close_after = true;
-                    self.unregister(name, id);
-                }
-            }
-            touched.push(who.0);
+    /// A request committed: its handshake joined the socket list, and the
+    /// gone sockets it took off are done with.
+    fn sockets_committed(&mut self, name: &str, joined: Option<u64>, dropped: &[u64]) {
+        let Some(socks) = self.objects.get_mut(name).and_then(|o| o.socks.as_mut()) else { return };
+        socks.extend(joined);
+        for id in dropped {
+            socks.remove(id);
         }
-        touched.dedup();
-        for id in touched {
-            self.settle(id)?;
+        let socks = socks.clone();
+        if let Some(g) = self.ws_gone.get_mut(name) {
+            g.retain(|id| socks.contains(id));
+            if g.is_empty() {
+                self.ws_gone.remove(name);
+            }
+        }
+    }
+
+    /// The node a socket's connection is on: its id says.
+    fn sock_node(sock: u64) -> u32 {
+        (sock >> 52) as u32
+    }
+
+    /// Do what a cell asked of its object's sockets: here, or on the node
+    /// that holds the connection (fleet mode).
+    fn apply_ws(&mut self, name: &str, ws: Vec<WsOut>) -> std::io::Result<()> {
+        let me = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node);
+        for out in ws {
+            let id = out.id();
+            if let WsOut::Close(..) = out {
+                // Closed by the object: it hears nothing back, and the socket
+                // leaves its list with the next request.
+                self.ws_gone.entry(name.to_string()).or_default().insert(id);
+            }
+            let (op, payload) = match out {
+                WsOut::Send(_, m) => (1, m.into_bytes()),
+                WsOut::Binary(_, b) => (2, b),
+                WsOut::Close(_, code) => (8, code.to_be_bytes().to_vec()),
+            };
+            if Self::sock_node(id) != me {
+                if let Some(f) = &self.sh.fleet {
+                    let node = Self::sock_node(id);
+                    f.wire.push(node, Frame::WsPush { name: name.to_string(), sock: id, op, payload });
+                }
+                continue;
+            }
+            self.ws_local(name, id, op, &payload)?;
         }
         Ok(())
     }
 
-    /// Forget a socket (it closed, or never opened).
-    fn unregister(&mut self, name: &str, sock: u64) {
-        if let Some(m) = self.sockets.get_mut(name) {
-            if m.remove(&sock).is_some() {
-                self.sh.stats.sockets_open.fetch_sub(1, Relaxed);
+    /// Send on a socket whose connection is on this loop. One that isn't here
+    /// any more (it closed, or this node restarted) is lost: its object hears.
+    fn ws_local(&mut self, name: &str, id: u64, op: u8, payload: &[u8]) -> std::io::Result<()> {
+        let live = self.local_socks.get(&id).copied().filter(|&who| self.conn(who).and_then(|c| c.ws.as_ref()).is_some_and(|w| w.open && !w.gone));
+        let Some(who) = live else {
+            if op != 8 {
+                self.socket_lost(name, id);
             }
-            if m.is_empty() {
-                self.sockets.remove(name);
+            return Ok(());
+        };
+        let frame = crate::ws::encode(op, payload);
+        let c = self.conn(who).unwrap();
+        let w = c.ws.as_mut().unwrap();
+        if c.wbuf.len() - c.wpos + frame.len() > MAX_WS_WRITE {
+            // It reads too slowly to keep up: let it go.
+            w.gone = true;
+            c.close_after = true;
+            c.wbuf.truncate(c.wpos);
+            self.drop_socket(who, crate::ws::TOO_SLOW);
+        } else {
+            c.wbuf.extend_from_slice(&frame);
+            if op == 8 {
+                w.gone = true;
+                c.close_after = true;
+                self.forget(id, true);
             }
+        }
+        self.settle(who.0)
+    }
+
+    /// A socket in an object's list is gone without a close: tell the
+    /// object once (1006), wherever it runs.
+    fn socket_lost(&mut self, name: &str, id: u64) {
+        if self.ws_gone.get(name).is_some_and(|g| g.contains(&id)) || !self.ws_lost.insert(id) {
+            return;
+        }
+        self.submit(Origin::Socket((usize::MAX, 0), id, false), name.to_string(), format!("do WSCLOSE /{id} 1006"));
+    }
+
+    /// This loop no longer holds a socket's connection.
+    fn forget(&mut self, id: u64, was_open: bool) {
+        if self.local_socks.remove(&id).is_some() && was_open {
+            self.sh.stats.sockets_open.fetch_sub(1, Relaxed);
         }
     }
 
@@ -1016,15 +1093,11 @@ impl<E: Engine> Loop<'_, E> {
     /// the rules): forget it, and tell its object, waking it if it sleeps.
     fn drop_socket(&mut self, who: Who, code: u16) {
         let Some(w) = self.conn(who).and_then(|c| c.ws.as_mut()) else { return };
-        let (name, id, open) = (w.obj.clone(), w.id, w.open);
+        let (name, id, open, held) = (w.obj.clone(), w.id, w.open, !w.gone);
         w.gone = true;
-        if self.sockets.get(&name).is_some_and(|m| m.contains_key(&id)) {
-            if open {
-                self.unregister(&name, id);
-            } else if let Some(m) = self.sockets.get_mut(&name) {
-                m.remove(&id); // never opened: never counted
-            }
-            if open {
+        if self.local_socks.contains_key(&id) {
+            self.forget(id, open);
+            if open && held {
                 self.submit(Origin::Socket(who, id, false), name, format!("do WSCLOSE /{id} {code}"));
             }
         }
@@ -1043,21 +1116,21 @@ impl<E: Engine> Loop<'_, E> {
             }
             match w.dec.next(&mut c.rbuf) {
                 Ok(None) => break,
-                Ok(Some(Event::Text(t))) => {
+                Ok(Some(ev @ (Event::Text(_) | Event::Binary(_)))) => {
                     w.inflight += 1;
                     let (name, sock) = (w.obj.clone(), w.id);
                     self.sh.stats.ws_messages.fetch_add(1, Relaxed);
-                    self.submit(Origin::Socket(who, sock, false), name, format!("do WSMSG /{sock} {t}"));
+                    // A binary message rides in the event as base64; the host
+                    // turns it back into bytes just before the cell runs.
+                    let req = match ev {
+                        Event::Text(t) => format!("do WSMSG /{sock} {t}"),
+                        Event::Binary(b) => format!("do WSBIN /{sock} {}", crate::ws::base64(&b)),
+                        _ => unreachable!(),
+                    };
+                    self.submit(Origin::Socket(who, sock, false), name, req);
                 }
                 Ok(Some(Event::Ping(p))) => c.wbuf.extend_from_slice(&crate::ws::pong(&p)),
                 Ok(Some(Event::Pong)) => {}
-                Ok(Some(Event::Binary(_))) => {
-                    // ponytail: text only, for now. Binary needs a byte-safe cell event.
-                    c.wbuf.extend_from_slice(&crate::ws::close(crate::ws::UNSUPPORTED));
-                    c.close_after = true;
-                    self.drop_socket(who, crate::ws::UNSUPPORTED);
-                    break;
-                }
                 Ok(Some(Event::Close(code))) => {
                     // Echo the close (RFC 6455), then tell the object.
                     let echo = if code == 1005 || !(1000..5000).contains(&code) { 1000 } else { code };
@@ -1077,16 +1150,20 @@ impl<E: Engine> Loop<'_, E> {
         self.settle(id)
     }
 
-    /// A handshake for an object this loop owns: register the socket, and ask
-    /// the object (`do WSOPEN <path> <id>`; 101 accepts).
+    /// A handshake for an object whose requests this loop handles: hold the
+    /// connection, and ask the object (`do WSOPEN <path> <id>`; 101 accepts).
+    /// In fleet mode the object may run on another node; its events go there
+    /// like any request, and the connection stays here.
     fn upgrade(&mut self, id: usize, name: String, path: String, key: String) {
         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return };
         let who = (id, c.gen);
         self.next_sock += 1;
-        let sock = self.next_sock;
+        // Unique across the fleet and across restarts: node, boot, loop, count.
+        let node = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node) as u64;
+        let sock = (node & 0x7ff) << 52 | (self.boot & 0xffff) << 36 | (self.me as u64 & 0xff) << 28 | (self.next_sock & 0xfff_ffff);
         c.busy = true; // no more HTTP on this connection
         c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: Default::default(), open: false, gone: false, inflight: 0 });
-        self.sockets.entry(name.clone()).or_default().insert(sock, who);
+        self.local_socks.insert(sock, who);
         self.submit(Origin::Socket(who, sock, true), name, format!("do WSOPEN {path} {sock}"));
     }
 
@@ -1110,7 +1187,7 @@ impl<E: Engine> Loop<'_, E> {
     /// operation, and the guard-page AOT tier doesn't promise it's exact
     /// at a trap either (LLVM may drop a store around a load that faults).
     fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> Option<((u16, String), Vec<WsOut>)> {
-        let Task { mut cell, obj, origin } = t;
+        let Task { mut cell, obj, origin, ws_open, ws_drop } = t;
         // WebSocket sends go out only if the request succeeds, and only
         // after its writes are on disk (with the answer).
         let ws = if answer.is_ok() { std::mem::take(&mut cell.host().ws_out) } else { vec![] };
@@ -1129,7 +1206,7 @@ impl<E: Engine> Loop<'_, E> {
             }, vec![]));
         };
         if let Origin::Fleet(req) = origin {
-            return self.fleet_finish(name, req, cell, answer).map(|r| (r, vec![]));
+            return self.fleet_finish(name, req, cell, answer, ws, ws_open, ws_drop).map(|r| (r, vec![]));
         }
         let o = self.objects.get_mut(&name).expect("object of a running task");
         o.busy = false;
@@ -1138,9 +1215,15 @@ impl<E: Engine> Loop<'_, E> {
         let mut ok = false;
         let mut new_alarm = None;
         let mut wrote = false;
+        let mut joined = None;
         let reply = {
             let db = o.db.lock().unwrap();
             match answer {
+                Ok(a) if ws_accepted(&a, ws_open).is_some_and(|id| db.update_sockets(Some(id), &[]).is_err()) => {
+                    eprintln!("object {name:?}: socket list: can't add");
+                    db.rollback();
+                    (500, "{\"error\":\"storage\"}".into())
+                }
                 Ok(a) => {
                     let alarm = if dirty { db.alarm() } else { None };
                     // A new alarm goes in the index before the commit, so it can't be lost.
@@ -1155,6 +1238,7 @@ impl<E: Engine> Loop<'_, E> {
                             ok = true;
                             wrote = w;
                             new_alarm = alarm;
+                            joined = ws_accepted(&a, ws_open);
                             split_answer(&a)
                         }
                         Err(e) => {
@@ -1172,6 +1256,9 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }
         };
+        if ok {
+            self.sockets_committed(&name, joined, &ws_drop);
+        }
         if ok && dirty {
             match new_alarm {
                 Some(at) => self.alarms.push(Reverse((at, name.clone()))),
@@ -1418,14 +1505,6 @@ impl<E: Engine> Loop<'_, E> {
         c.busy = true;
         match req {
             Req::Upgrade(name, path, key) => {
-                if self.core.is_some() {
-                    // ponytail: fleet mode needs sockets that cross nodes.
-                    self.queue_reply(who, (501, "{\"error\":\"WebSockets aren't in fleet mode yet\"}".into()));
-                    if let Some(c) = self.conn(who) {
-                        c.close_after = true;
-                    }
-                    return Ok(());
-                }
                 let o = owner(&name, self.sh.cfg.threads);
                 if o == self.me {
                     self.upgrade(id, name, path, key);
@@ -1476,7 +1555,7 @@ impl<E: Engine> Loop<'_, E> {
                     self.queue_reply(who, (500, String::new()));
                     return Ok(());
                 }
-                self.tasks.push_back(Task { origin: Origin::Local(who), cell, obj: None });
+                self.tasks.push_back(Task { origin: Origin::Local(who), cell, obj: None, ws_open: None, ws_drop: vec![] });
             }
             Req::Object(name, cell_req) => {
                 let o = owner(&name, self.sh.cfg.threads);
@@ -1532,19 +1611,26 @@ impl<E: Engine> Loop<'_, E> {
 
     /// Begin one request on an object: its warm cell (or a fresh one), inside
     /// a transaction. `Ok(false)`: nothing to run (a stale alarm).
-    fn run_object(&mut self, name: &str, origin: Origin, req: String) -> Result<bool, (u16, String)> {
+    fn run_object(&mut self, name: &str, origin: Origin, mut req: String) -> Result<bool, (u16, String)> {
         let (eng, prog) = (self.eng, self.prog);
-        // The sockets this request may use: the open ones, and, for a
-        // handshake, its own (sends to it go out after the 101).
-        let me = match origin {
-            Origin::Socket(_, sock, true) => Some(sock),
-            _ => None,
-        };
-        let ids: Vec<u64> = self
-            .sockets
-            .get(name)
-            .map(|m| m.iter().filter(|(&id, &who)| Some(id) == me || self.conns.get(who.0).and_then(Option::as_ref).filter(|c| c.gen == who.1).and_then(|c| c.ws.as_ref()).is_some_and(|w| w.open && !w.gone)).map(|(&id, _)| id).collect())
-            .unwrap_or_default();
+        // WebSocket events say what they are in their text, the same here
+        // and when forwarded from the node that holds the connection.
+        let sock_of = |s: &str| s.trim_start_matches('/').parse::<u64>().ok();
+        let mut ws_open = None;
+        let mut ws_in = vec![];
+        if let Some(rest) = req.strip_prefix("do WSOPEN ") {
+            ws_open = rest.rsplit(' ').next().and_then(sock_of);
+        } else if let Some(rest) = req.strip_prefix("do WSCLOSE ") {
+            if let Some(id) = rest.split(' ').next().and_then(sock_of) {
+                self.ws_gone.entry(name.to_string()).or_default().insert(id);
+            }
+        } else if let Some(rest) = req.strip_prefix("do WSBIN ") {
+            // Bytes for `ws_msg`; the cell sees their length.
+            let (sock, b64) = rest.split_once(' ').unwrap_or((rest, ""));
+            ws_in = crate::ws::unbase64(b64).unwrap_or_default();
+            req = format!("do WSBIN {sock} {}", ws_in.len());
+        }
+        let gone: BTreeSet<u64> = self.ws_gone.get(name).cloned().unwrap_or_default();
         let o = self.objects.get_mut(name).unwrap();
         o.last_used = Instant::now();
         {
@@ -1580,6 +1666,23 @@ impl<E: Engine> Loop<'_, E> {
                     }
                 }
             }
+            if o.socks.is_none() {
+                o.socks = Some(db.sockets().into_iter().collect());
+            }
+        }
+        // Gone sockets leave the list in this request's transaction; the
+        // rest are the ones it may use (and, for a handshake, its own: sends
+        // to it go out after the 101).
+        let socks = o.socks.as_ref().unwrap();
+        let ws_drop: Vec<u64> = gone.iter().copied().filter(|id| socks.contains(id)).collect();
+        let ids: Vec<u64> = socks.iter().copied().filter(|id| !gone.contains(id)).chain(ws_open).collect();
+        if !ws_drop.is_empty() {
+            let db = o.db.lock().unwrap();
+            if let Err(e) = db.update_sockets(None, &ws_drop) {
+                eprintln!("object {name:?}: socket list: {e}");
+                db.rollback();
+                return Err((500, "{\"error\":\"storage\"}".into()));
+            }
         }
         let mut cell = match o.cell.take() {
             Some(c) => c,
@@ -1596,13 +1699,14 @@ impl<E: Engine> Loop<'_, E> {
         };
         cell.host().ws_ids = ids;
         cell.host().ws_out.clear();
+        cell.host().ws_in = ws_in;
         if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
             eprintln!("object {name:?} trapped starting a request: {trap}");
             o.db.lock().unwrap().rollback();
             return Err((500, String::new()));
         }
         o.busy = true;
-        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()) });
+        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open, ws_drop });
         Ok(true)
     }
 }
@@ -1633,7 +1737,7 @@ impl<E: Engine> Loop<'_, E> {
         let req = self.next_req;
         let obj = own::obj_id(&name);
         self.names.insert(obj, name.clone());
-        self.freqs.insert(req, FReq { origin, name, cell_req, hops, act: 0, resp: None });
+        self.freqs.insert(req, FReq { origin, name, cell_req, hops, act: 0, resp: None, ws: vec![] });
         self.core_on(own::Event::Request { obj, req });
     }
 
@@ -1646,6 +1750,9 @@ impl<E: Engine> Loop<'_, E> {
             Effect::Call { op, call } => self.job(Job::Call { op, call, back: self.me }),
             Effect::Answer { req, ans } => {
                 let Some(fr) = self.freqs.remove(&req) else { return };
+                if matches!(ans, own::Answer::Done { .. }) && !fr.ws.is_empty() {
+                    let _ = self.apply_ws(&fr.name, fr.ws.clone());
+                }
                 let reply = match ans {
                     own::Answer::Done { .. } => fr.resp.unwrap_or((500, "{\"error\":\"no answer\"}".into())),
                     own::Answer::Failed => (503, "{\"error\":\"retry\"}".into()),
@@ -1746,16 +1853,23 @@ impl<E: Engine> Loop<'_, E> {
 
     /// A request the core ran is done: commit locally (no fsync: the bucket
     /// is what makes it durable), hold the answer, and tell the core.
-    fn fleet_finish(&mut self, name: String, req: own::ReqId, cell: Cell<E>, answer: Result<String, String>) -> Option<(u16, String)> {
+    #[allow(clippy::too_many_arguments)]
+    fn fleet_finish(&mut self, name: String, req: own::ReqId, cell: Cell<E>, answer: Result<String, String>, ws: Vec<WsOut>, ws_open: Option<u64>, ws_drop: Vec<u64>) -> Option<(u16, String)> {
         let Some(o) = self.objects.get_mut(&name) else { return None };
         o.busy = false;
         o.last_used = Instant::now();
+        let mut committed = None;
         let (reply, changed) = {
             let db = o.db.lock().unwrap();
             match answer {
+                Ok(a) if ws_accepted(&a, ws_open).is_some_and(|id| db.update_sockets(Some(id), &[]).is_err()) => {
+                    db.rollback();
+                    ((500, "{\"error\":\"storage\"}".into()), false)
+                }
                 Ok(a) => match db.commit() {
                     Ok(w) => {
                         o.cell = Some(cell);
+                        committed = Some(ws_accepted(&a, ws_open));
                         (split_answer(&a), w)
                     }
                     Err(e) => {
@@ -1771,8 +1885,16 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }
         };
+        if let Some(joined) = committed {
+            self.sockets_committed(&name, joined, &ws_drop);
+        }
+        // The sends wait with the answer, for the core to say it's proven.
+        let ok = committed.is_some();
         let act = self.freqs.get_mut(&req).map(|fr| {
             fr.resp = Some(reply);
+            if ok {
+                fr.ws = ws;
+            }
             fr.act
         });
         self.reconcile(&name);
@@ -1920,6 +2042,21 @@ impl wire::Sink for LoopSink {
         let _ = tx.send(Msg::PeerReply { id, res });
         let _ = waker.wake();
     }
+    fn ws_push(&self, name: String, sock: u64, op: u8, payload: Vec<u8>) {
+        let (tx, waker) = &self.loops[owner(&name, self.threads)];
+        let _ = tx.send(Msg::WsPush { name, sock, op, payload });
+        let _ = waker.wake();
+    }
+    fn ws_lost(&self, name: String, sock: u64) {
+        let (tx, waker) = &self.loops[owner(&name, self.threads)];
+        let _ = tx.send(Msg::WsLost { name, sock });
+        let _ = waker.wake();
+    }
+}
+
+/// The socket a handshake's answer accepts, if it's a 101.
+fn ws_accepted(answer: &str, ws_open: Option<u64>) -> Option<u64> {
+    ws_open.filter(|_| split_answer(answer).0 == 101)
 }
 
 fn split_answer(a: &str) -> (u16, String) {

@@ -29,13 +29,31 @@ pub struct HostState {
     /// asked to send or close (the host does it after the output gate).
     pub ws_ids: Vec<u64>,
     pub ws_out: Vec<WsOut>,
+    /// The binary message this event carries (`ws_msg` copies it out).
+    pub ws_in: Vec<u8>,
 }
 
 /// A WebSocket action a cell asked for.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WsOut {
     Send(u64, String),
+    Binary(u64, Vec<u8>),
     Close(u64, u16),
+}
+
+impl WsOut {
+    pub fn id(&self) -> u64 {
+        match self {
+            WsOut::Send(id, _) | WsOut::Binary(id, _) | WsOut::Close(id, _) => *id,
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            WsOut::Send(_, m) => m.len(),
+            WsOut::Binary(_, b) => b.len(),
+            WsOut::Close(..) => 0,
+        }
+    }
 }
 
 /// What one request may queue to send, in all. A broadcast loop copies its
@@ -139,22 +157,37 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
         // are. 0 is OK; 1: no such socket; 2: too big, or not UTF-8.
         // (No early `return Ok(..)` here: the result must go through the
         // check at the end, which matches the import's declared type.)
-        ("combd", "ws_send") => {
+        // `ws_send_binary` is the same, for bytes; `ws_msg(ptr)` copies this
+        // event's binary message (its length is in the event) into the cell.
+        ("combd", name @ ("ws_send" | "ws_send_binary")) => {
             let (id, len) = (arg(0)?, arg(2)? as u32);
-            let queued: usize = st.ws_out.iter().map(|o| if let WsOut::Send(_, m) = o { m.len() } else { 0 }).sum();
+            let queued: usize = st.ws_out.iter().map(WsOut::len).sum();
             if !st.ws_ids.contains(&id) {
                 1
             } else if len as usize > crate::ws::MAX_MESSAGE || queued + len as usize > MAX_WS_OUT {
                 2
             } else {
-                match String::from_utf8(mem.read(arg(1)? as u32, len).ok_or("ws_send: bad pointer")?) {
-                    Ok(m) => {
-                        st.ws_out.push(WsOut::Send(id, m));
-                        0
+                let bytes = mem.read(arg(1)? as u32, len).ok_or("ws_send: bad pointer")?;
+                if name == "ws_send_binary" {
+                    st.ws_out.push(WsOut::Binary(id, bytes));
+                    0
+                } else {
+                    match String::from_utf8(bytes) {
+                        Ok(m) => {
+                            st.ws_out.push(WsOut::Send(id, m));
+                            0
+                        }
+                        Err(_) => 2,
                     }
-                    Err(_) => 2,
                 }
             }
+        }
+        ("combd", "ws_msg") => {
+            let msg = std::mem::take(&mut st.ws_in);
+            if !mem.write(arg(0)? as u32, &msg) {
+                return Err("ws_msg: bad pointer".into());
+            }
+            0
         }
         ("combd", "ws_close") => {
             let id = arg(0)?;

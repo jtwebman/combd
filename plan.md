@@ -1018,7 +1018,9 @@ What changes as the fleet grows:
    [spike/RESULTS.md](spike/RESULTS.md).
 4. **WebSockets** with hibernation. **Done 2026-10-14** on one node: the
    host holds the sockets, idle objects leave memory, a message wakes them.
-   Next: binary messages, fleet mode, and numbers. See
+   Then binary messages and fleet mode: connections stay on the node they
+   reached, events go to the owner, and the socket list lives in the
+   object's storage, so it survives a takeover. Next: numbers. See
    [spike/RESULTS.md](spike/RESULTS.md).
 5. **Bring your own database.** Host-owned pools, Postgres first.
 6. **Fast fleet writes (D3).** Done early, as part of step 3 (see "What

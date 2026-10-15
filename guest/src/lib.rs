@@ -218,6 +218,8 @@ pub mod room {
             pub fn ws_send(id: u64, ptr: *const u8, len: u32) -> u32;
             pub fn ws_list(ptr: *mut u64, cap: u32) -> u32;
             pub fn ws_close(id: u64, code: u32) -> u32;
+            pub fn ws_send_binary(id: u64, ptr: *const u8, len: u32) -> u32;
+            pub fn ws_msg(ptr: *mut u8) -> u32;
         }
     }
 
@@ -238,6 +240,12 @@ pub mod room {
         }
         pub unsafe fn ws_close(_: u64, _: u32) -> u32 {
             1
+        }
+        pub unsafe fn ws_send_binary(_: u64, _: *const u8, _: u32) -> u32 {
+            1
+        }
+        pub unsafe fn ws_msg(_: *mut u8) -> u32 {
+            0
         }
     }
 
@@ -349,6 +357,18 @@ pub mod room {
                         room.msgs.pop_front();
                     }
                     broadcast(&json!({ "from": from.trim_start_matches('/'), "text": body }).to_string());
+                    "200 {}".into()
+                }
+                // A binary message: its bytes (from `ws_msg`), sent back to
+                // everyone as binary, after "from:".
+                ("WSBIN", from) => {
+                    let mut msg = vec![0u8; body.trim().parse().unwrap_or(0)];
+                    unsafe { host::ws_msg(msg.as_mut_ptr()) };
+                    let mut out = format!("{}:", from.trim_start_matches('/')).into_bytes();
+                    out.extend_from_slice(&msg);
+                    for id in sockets() {
+                        unsafe { host::ws_send_binary(id, out.as_ptr(), out.len() as u32) };
+                    }
                     "200 {}".into()
                 }
                 ("WSCLOSE", _) => {

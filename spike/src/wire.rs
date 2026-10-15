@@ -102,11 +102,17 @@ pub trait Sink: Send + 'static {
     fn peer(&self, conn: usize, id: u64, call: PeerCall);
     /// The answer to a peer call loop `back` made (`None`: lost).
     fn peer_reply(&self, back: usize, id: u64, res: Option<PeerRes>);
+    /// A node asks us to send on one of our WebSockets.
+    fn ws_push(&self, name: String, sock: u64, op: u8, payload: Vec<u8>);
+    /// A push of ours couldn't reach its node: the socket is as good as gone.
+    fn ws_lost(&self, name: String, sock: u64);
 }
 
 enum Cmd {
     Send { node: Node, frame: Frame, back: usize },
     Reply { conn: usize, frame: Frame },
+    /// One way: no answer is waited for.
+    Push { node: Node, frame: Frame },
 }
 
 /// The handle the event loops use.
@@ -120,6 +126,12 @@ impl Wire {
     /// Forward a request to `node`; its reply goes to loop `back`.
     pub fn send(&self, node: Node, frame: Frame, back: usize) {
         let _ = self.cmds.send(Cmd::Send { node, frame, back });
+        let _ = self.waker.wake();
+    }
+
+    /// Send a one-way frame (a `WsPush`) to `node`.
+    pub fn push(&self, node: Node, frame: Frame) {
+        let _ = self.cmds.send(Cmd::Push { node, frame });
         let _ = self.waker.wake();
     }
 
@@ -227,6 +239,17 @@ impl<S: Sink> Hub<S> {
     fn command(&mut self, c: Cmd) {
         match c {
             Cmd::Reply { conn, frame } => self.queue(conn, &frame.encode()),
+            Cmd::Push { node, frame } => {
+                let conn = match self.links.get(&node) {
+                    Some(&c) => Some(c),
+                    None => self.connect(node),
+                };
+                match (conn, frame) {
+                    (Some(c), f) => self.queue(c, &f.encode()),
+                    (None, Frame::WsPush { name, sock, .. }) => self.sink.ws_lost(name, sock),
+                    (None, _) => {}
+                }
+            }
             Cmd::Send { node, frame, back } => {
                 let (id, peer) = (frame.id(), matches!(frame, Frame::Peer { .. }));
                 let conn = match self.links.get(&node) {
@@ -380,6 +403,7 @@ impl<S: Sink> Hub<S> {
                     }
                 }
                 Ok(Frame::Peer { id: fid, call }) if c.node.is_none() => self.sink.peer(id, fid, call),
+                Ok(Frame::WsPush { name, sock, op, payload }) if c.node.is_none() => self.sink.ws_push(name, sock, op, payload),
                 Ok(Frame::PeerReply { id: fid, res }) if c.node.is_some() => {
                     if let Some((back, _)) = c.waiting.remove(&fid) {
                         self.sink.peer_reply(back, fid, Some(res));
@@ -441,6 +465,8 @@ mod tests {
                 w.reply(conn, Frame::PeerReply { id, res: PeerRes::Have(id) });
             }
         }
+        fn ws_push(&self, _: String, _: u64, _: u8, _: Vec<u8>) {}
+        fn ws_lost(&self, _: String, _: u64) {}
         fn peer_reply(&self, _back: usize, id: u64, res: Option<PeerRes>) {
             let status = match res {
                 Some(PeerRes::Have(n)) if n == id => 200,

@@ -100,6 +100,8 @@ reads, and 5.7x on writes spread over 1,000 objects.
 **WebSockets that sleep.** An object can hold many WebSockets, like a chat
 room. When it goes quiet it leaves memory, and its sockets stay open; the
 next message wakes it with its state intact. Pings never wake it at all.
+Text and binary both work, across a fleet too: a client can reach any node,
+and the room's sockets survive its owner going down.
 
 **Durable Objects across a fleet.** Several combd nodes share one S3 bucket,
 which decides who owns each object. Writes are confirmed by two peer nodes,

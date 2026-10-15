@@ -102,12 +102,16 @@ pub enum Frame {
     /// A call to this node's peer store, and its answer.
     Peer { id: u64, call: PeerCall },
     PeerReply { id: u64, res: PeerRes },
+    /// One way, no answer: send this on a WebSocket whose connection is on
+    /// your node (op: 1 text, 2 binary, 8 close with a 2-byte code).
+    WsPush { name: String, sock: u64, op: u8, payload: Vec<u8> },
 }
 
 impl Frame {
     pub fn id(&self) -> u64 {
         match self {
             Frame::Forward { id, .. } | Frame::Reply { id, .. } | Frame::Peer { id, .. } | Frame::PeerReply { id, .. } => *id,
+            Frame::WsPush { .. } => 0,
         }
     }
 }
@@ -245,6 +249,14 @@ impl Frame {
                 b.extend_from_slice(&id.to_le_bytes());
                 encode_res(res, &mut b);
             }
+            Frame::WsPush { name, sock, op, payload } => {
+                b.push(5);
+                b.extend_from_slice(&sock.to_le_bytes());
+                b.push(*op);
+                b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                b.extend_from_slice(name.as_bytes());
+                b.extend_from_slice(payload);
+            }
         }
         let n = (b.len() - 4) as u32;
         b[..4].copy_from_slice(&n.to_le_bytes());
@@ -288,6 +300,13 @@ impl Frame {
                     Some(res) if r.0.is_empty() => Ok(Frame::PeerReply { id, res }),
                     _ => Err(bad("bad peer reply")),
                 }
+            }
+            5 => {
+                // `id` holds the socket id here.
+                let mut r = Rd(&b[9..]);
+                let (op, l) = (r.u8().ok_or_else(|| bad("short frame"))?, r.take(2).map(|x| u16::from_le_bytes([x[0], x[1]]) as usize).ok_or_else(|| bad("short frame"))?);
+                let name = text(r.take(l).ok_or_else(|| bad("short frame"))?)?;
+                Ok(Frame::WsPush { name, sock: id, op, payload: r.0.to_vec() })
             }
             _ => Err(bad("unknown frame kind")),
         }
@@ -457,12 +476,13 @@ mod tests {
         let ents = |rng: &mut crate::sim::Rng| (0..rng.below(4)).map(|_| vec![rng.next() as u8; rng.below(40) as usize]).collect::<Vec<_>>();
         let mut store = PeerStore::default();
         for i in 0..100_000u64 {
-            let f = match rng.below(5) {
+            let f = match rng.below(6) {
                 0 => Frame::Forward { id: rng.next(), name: "room".into(), req: "do GET /".into() },
                 1 => Frame::Reply { id: rng.next(), status: 200, body: "{}".into() },
                 2 => Frame::Peer { id: 1, call: PeerCall::Append { obj: rng.below(4) as u128, epoch: rng.below(5) as u32, from: rng.below(8), ents: ents(&mut rng), trunc: rng.below(8) } },
                 3 => Frame::Peer { id: 2, call: PeerCall::Fence { obj: rng.below(4) as u128, epoch: rng.below(5) as u32 } },
-                _ => Frame::PeerReply { id: 3, res: PeerRes::Tails { born: 1, tails: vec![Tail { epoch: 1, from: 2, ents: ents(&mut rng) }] } },
+                4 => Frame::PeerReply { id: 3, res: PeerRes::Tails { born: 1, tails: vec![Tail { epoch: 1, from: 2, ents: ents(&mut rng) }] } },
+                _ => Frame::WsPush { name: "room".into(), sock: rng.next(), op: 1, payload: ents(&mut rng).concat() },
             };
             let mut b = f.encode();
             for _ in 0..1 + rng.below(3) {
@@ -558,6 +578,7 @@ mod tests {
             Frame::Peer { id: 2, call: PeerCall::Fence { obj: 5, epoch: 4 } },
             Frame::PeerReply { id: 3, res: PeerRes::Have(12) },
             Frame::PeerReply { id: 4, res: PeerRes::Refused },
+            Frame::WsPush { name: "room".into(), sock: 77, op: 2, payload: vec![0, 255, 7] },
             Frame::PeerReply { id: 5, res: PeerRes::Tails { born: 4, tails: vec![Tail { epoch: 2, from: 7, ents: vec![vec![3; 5]] }] } },
         ] {
             let b = f.encode();

@@ -1396,6 +1396,19 @@ mod tests {
             self.0.read_exact(&mut p).unwrap();
             (h[0] & 0x0f, p)
         }
+        /// The next frame, or `None` if none comes in `ms`.
+        fn recv_within(&mut self, ms: u64) -> Option<(u8, Vec<u8>)> {
+            use std::io::Read;
+            self.0.set_read_timeout(Some(Duration::from_millis(ms))).unwrap();
+            let mut h = [0u8; 1];
+            let r = self.0.peek(&mut h);
+            self.0.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = Read::by_ref(&mut self.0);
+            match r {
+                Ok(n) if n > 0 => Some(self.recv()),
+                _ => None,
+            }
+        }
         fn recv_text(&mut self) -> String {
             let (op, p) = self.recv();
             assert_eq!(op, 1, "wanted text, got opcode {op}: {p:?}");
@@ -1431,6 +1444,15 @@ mod tests {
         a.text("hello");
         assert!(a.recv_text().contains("\"text\":\"hello\""));
         assert!(b.recv_text().contains("\"text\":\"hello\""));
+        // Binary, every byte value, both ways.
+        let bytes: Vec<u8> = (0..=255u8).chain([0, 0, 255]).collect();
+        a.send(2, &bytes);
+        for c in [&mut a, &mut b] {
+            let (op, got) = c.recv();
+            assert_eq!(op, 2);
+            let colon = got.iter().position(|&x| x == b':').unwrap();
+            assert_eq!(&got[colon + 1..], &bytes[..]);
+        }
         // The host answers pings itself.
         a.send(9, b"are you there");
         assert_eq!(a.recv(), (10, b"are you there".to_vec()));
@@ -1477,6 +1499,72 @@ mod tests {
         use std::io::Write;
         c.0.write_all(&[0x81, 0x02, b'h', b'i']).unwrap();
         assert_eq!(c.recv(), (8, 1002u16.to_be_bytes().to_vec()));
+    }
+
+    /// WebSockets in fleet mode: each connection stays on the node it
+    /// reached, its events go to the object's owner like any request, and
+    /// the socket list lives in the object's storage, so it survives a
+    /// takeover. Two nodes; the owner stops; the other takes over and still
+    /// reaches its socket.
+    #[test]
+    fn fleet_websockets_cross_nodes_and_survive_a_takeover() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 2).unwrap();
+        let bucket = format!("combd-test-{}-{}", std::process::id(), Instant::now().elapsed().as_nanos() % 100_000);
+        let wbase = 26000 + (std::process::id() % 1000) as u16 * 2;
+        let peers: HashMap<own::Node, String> = (0..2).map(|n| (n, format!("127.0.0.1:{}", wbase + n as u16))).collect();
+        let node = |n: own::Node| {
+            let fc = fleet::FleetCfg {
+                node: n,
+                lease_ms: 1000,
+                replicas: 0,
+                s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
+                peers: peers.clone(),
+                wire_port: wbase + n as u16,
+                wire_certs: Some(dir.0.join("certs")),
+                insecure: false,
+            };
+            let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
+            do_server(interp::Interp { max_pages: 16384 }, c)
+        };
+        let (a, stop_a, ta) = node(0);
+        let (b, _, _) = node(1);
+        for p in [a, b] {
+            stat(p, "fences");
+        }
+        // Node 0 takes the room; node 1's handshake goes there.
+        let mut x = Ws::open(a, "/do/fws/ws").unwrap();
+        let mut y = Ws::open(b, "/do/fws/ws").unwrap();
+        y.text("from node 1");
+        assert!(x.recv_text().contains("from node 1"));
+        assert!(y.recv_text().contains("from node 1"));
+        x.send(2, &[0, 1, 255]);
+        for c in [&mut x, &mut y] {
+            let (op, got) = c.recv();
+            assert_eq!(op, 2);
+            assert!(got.ends_with(&[0, 1, 255]));
+        }
+        // The owner stops. Node 1 takes the room over after the lease, with
+        // its socket list, and still reaches y.
+        stop_a.store(true, std::sync::atomic::Ordering::Relaxed);
+        ta.join().unwrap();
+        let mut back = false;
+        for i in 0..20 {
+            y.text(&format!("after {i}"));
+            if let Some((1, m)) = y.recv_within(3000) {
+                if String::from_utf8_lossy(&m).contains("after") {
+                    back = true;
+                    break;
+                }
+            }
+        }
+        assert!(back, "node 1 never took the room over");
+        assert!(stat(b, "fences") + stat(b, "objects_opened") >= 1);
+        assert!(http(b, "GET", "/do/fws/msgs", "").1.contains("from node 1"), "the room's state came along");
     }
 
     /// Objects by id: `/do/new` hands one out, `/do/id/<uuid>` reaches it.

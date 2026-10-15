@@ -23,7 +23,6 @@ pub enum Event {
 pub const PROTOCOL: u16 = 1002;
 pub const BAD_DATA: u16 = 1007;
 pub const TOO_BIG: u16 = 1009;
-pub const UNSUPPORTED: u16 = 1003;
 /// We closed it: it read too slowly (policy violation).
 pub const TOO_SLOW: u16 = 1008;
 
@@ -142,10 +141,6 @@ pub fn encode(op: u8, payload: &[u8]) -> Vec<u8> {
     b
 }
 
-pub fn text(s: &str) -> Vec<u8> {
-    encode(0x1, s.as_bytes())
-}
-
 pub fn close(code: u16) -> Vec<u8> {
     encode(0x8, &code.to_be_bytes())
 }
@@ -200,7 +195,7 @@ fn sha1(msg: &[u8]) -> [u8; 20] {
     out
 }
 
-fn base64(b: &[u8]) -> String {
+pub fn base64(b: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::new();
     for c in b.chunks(3) {
@@ -210,6 +205,37 @@ fn base64(b: &[u8]) -> String {
         }
     }
     s
+}
+
+/// The other way. `None` on anything that isn't base64 we made.
+pub fn unbase64(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let b = s.as_bytes();
+    if b.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 4 * 3);
+    for c in b.chunks(4) {
+        let pad = c.iter().rev().take_while(|&&x| x == b'=').count();
+        let mut n = 0u32;
+        for &x in &c[..4 - pad] {
+            n = n << 6 | val(x)? as u32;
+        }
+        n <<= 6 * pad as u32;
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    Some(out)
+}
+
+pub fn binary(b: &[u8]) -> Vec<u8> {
+    encode(0x2, b)
 }
 
 #[cfg(test)]
@@ -234,6 +260,16 @@ pub mod tests {
         b.extend_from_slice(&mask);
         b.extend(payload.iter().enumerate().map(|(i, x)| x ^ mask[i % 4]));
         b
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        for n in 0..300usize {
+            let b: Vec<u8> = (0..n).map(|i| (i * 7 + n) as u8).collect();
+            assert_eq!(unbase64(&base64(&b)), Some(b));
+        }
+        assert_eq!(unbase64("abc"), None);
+        assert_eq!(unbase64("ab!d"), None);
     }
 
     #[test]

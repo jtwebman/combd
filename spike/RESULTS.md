@@ -1229,10 +1229,33 @@ hears it), a refused handshake (403), a frame that breaks the rules (1002),
 and handshakes handed between loops. The frame decoder takes 20,000 damaged
 inputs without panicking, and the host fuzzer covers the three new imports.
 
-Not yet: binary messages (closed with 1003 for now: a cell event needs a
-byte-safe form), sockets in fleet mode (refused with 501: they'd need frames
-across nodes), per-socket attachments (cells can keep that in SQLite), and
-numbers (idle sockets per GB, wake-up time).
+**Binary messages.** A cell's events are text, so a binary message rides in
+its event as base64 (`do WSBIN /<id> <len>` by the time the cell sees it)
+and the host turns it back into bytes just before the cell runs; the cell
+copies them out with `ws_msg(ptr)`, and sends binary with
+`ws_send_binary`. Riding in the event means it crosses nodes as is.
+
+**Fleet mode.** A WebSocket's TCP connection stays on the node the client
+reached. Its events become ordinary requests to the object, which the fleet
+already routes to the owner (forwarding, takeover, D3). The object's socket
+list moved into its storage (`_combd_sockets`, a host table the cell can't
+touch), written in the request's transaction, so it replicates with the
+object and comes back after a takeover. Socket ids carry their node, a
+random boot number, and their loop, so they're unique across the fleet and
+across restarts. The owner sends to a socket on another node with a one-way
+wire frame (`WsPush`). A socket that turns out to be gone (the node
+restarted, or can't be reached) gets its object a close event (1006), and
+leaves the list with the next committed request. Sends still wait for the
+output gate; in fleet mode, that's the core saying the write is proven.
+
+Test `fleet_websockets_cross_nodes_and_survive_a_takeover`: two nodes, a
+client on each in one room. Node 0 owns the room, so node 1's handshake goes
+there. Text and binary cross both ways. Then node 0 stops; node 1 takes the
+room over after the lease, with its socket list, and its client hears its
+own message again. The single-node test sends all 256 byte values both ways.
+
+Not yet: per-socket attachments (cells can keep that in SQLite), and
+numbers (idle sockets per GB, wake-up time, cross-node message time).
 
 ## Security: memory is always zero
 

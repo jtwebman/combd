@@ -109,6 +109,9 @@ impl Db {
         let page: i64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
         conn.pragma_update(None, "max_page_count", MAX_DB_BYTES / page)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS _combd_alarm (id INTEGER PRIMARY KEY CHECK (id = 1), at INTEGER NOT NULL)")?;
+        // The object's WebSockets, wherever their connections are. Kept here,
+        // in the request's transaction, so they move with the object (D2, D3).
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS _combd_sockets (id INTEGER PRIMARY KEY)")?;
         for (limit, v) in [
             (Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE as i32),
             (Limit::SQLITE_LIMIT_SQL_LENGTH, 1 << 20),
@@ -211,6 +214,33 @@ impl Db {
         };
         self.host.store(false, Relaxed);
         r.map(|_| ())
+    }
+
+    /// The object's WebSocket ids.
+    pub fn sockets(&self) -> Vec<u64> {
+        self.host.store(true, Relaxed);
+        let r = self.conn.prepare_cached("SELECT id FROM _combd_sockets").and_then(|mut s| s.query_map([], |r| r.get::<_, i64>(0)).and_then(|m| m.collect::<Result<Vec<_>, _>>()));
+        self.host.store(false, Relaxed);
+        r.unwrap_or_default().into_iter().map(|i| i as u64).collect()
+    }
+
+    /// Add one socket and drop some, inside the open transaction.
+    pub fn update_sockets(&self, add: Option<u64>, drop: &[u64]) -> rusqlite::Result<()> {
+        self.host.store(true, Relaxed);
+        let r = (|| {
+            if let Some(id) = add {
+                self.conn.execute("INSERT OR IGNORE INTO _combd_sockets (id) VALUES (?)", [id as i64])?;
+                self.wrote.set(true);
+            }
+            for &id in drop {
+                if self.conn.execute("DELETE FROM _combd_sockets WHERE id = ?", [id as i64])? > 0 {
+                    self.wrote.set(true);
+                }
+            }
+            Ok(())
+        })();
+        self.host.store(false, Relaxed);
+        r
     }
 
     /// The host's transaction is open (a cell can't end it).
