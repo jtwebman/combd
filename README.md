@@ -109,6 +109,14 @@ request. A Durable Object can hold one across many messages, with row locks
 and advisory locks, and a crash rolls it back and lets the locks go. A cell
 waiting on the database is paused and costs no CPU.
 
+**Many requests per instance.** A Worker can opt in to being an event
+cell, like a Node process: one instance takes up to 32 requests at once
+(`COMBD_EV_MAX`) and runs them while they wait on timers or Postgres. Thirty
+requests that each wait 400 ms finish in about 400 ms on one instance. It can
+answer and keep working (waitUntil). The price: a crash fails every
+unanswered request on that instance, and work after an answer is best
+effort. Set `COMBD_EV_MAX=1` for strict one-request let-it-crash.
+
 **Durable Objects across a fleet.** Several combd nodes share one S3 bucket,
 which decides who owns each object. Writes are confirmed by two peer nodes,
 so they don't wait on the bucket, and the bucket gets them in batches. Kill

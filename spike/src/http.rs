@@ -54,7 +54,7 @@ use crate::engine::{CellVm, Engine, Outcome};
 use crate::fleet::{DiskPeers, FleetCfg, Frame};
 use crate::wire::{self, Wire};
 use crate::own::{self, Act, Core, Effect};
-use crate::host::{now_ms, HostState, WsOut};
+use crate::host::{now_ms, AsyncOp, EvAction, HostState, WsOut};
 use crate::store::{self, AlarmIndex, Db};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -107,6 +107,8 @@ pub struct Config {
     /// has been idle this long; then the handle closes (rolling back, and
     /// releasing its locks) and the object can leave.
     pub session_idle: Duration,
+    /// Event cells: requests in flight per instance before another one starts.
+    pub ev_max: usize,
 }
 
 impl Config {
@@ -122,6 +124,7 @@ impl Config {
             fleet: FleetCfg::from_env(),
             pg: crate::pg::PgCfg::from_env(),
             session_idle: Duration::from_millis(num("COMBD_PG_SESSION_IDLE_MS", 60_000) as u64),
+            ev_max: num("COMBD_EV_MAX", 32).max(1),
         }
     }
 }
@@ -153,6 +156,9 @@ struct Stats {
     ws_messages: AtomicU64,
     /// Handshakes another loop accepted and handed to the object's loop.
     ws_handoffs: AtomicU64,
+    /// Event cells: instances started, and requests they took.
+    ev_instances: AtomicU64,
+    ev_requests: AtomicU64,
 }
 
 /// Make an object's commits up to `gen` durable, then tell loop `back`.
@@ -252,6 +258,8 @@ enum Origin {
     /// A WebSocket event: its connection, socket id, and whether it's the
     /// handshake (`WSOPEN`, answered with 101 to accept).
     Socket(Who, u64, bool),
+    /// An event cell's callback (on instance N): its answers go by `respond`.
+    Ev(usize),
 }
 
 /// Between loops.
@@ -286,7 +294,43 @@ enum Msg {
     WsLost { name: String, sock: u64 },
     /// A database call a parked cell waits on is done.
     DbDone { park: u64, done: DbDone },
+    /// An event cell's async call is done: (instance, its generation, ticket).
+    EvDone { inst: usize, gen: u64, ticket: u64, done: DbDone },
 }
+
+/// An event cell: one instance serving many requests at once, like a Node
+/// process. It runs one callback at a time; requests interleave only where
+/// the cell waits (an async call), which it chose.
+struct EvInst<E: Engine> {
+    gen: u64,
+    /// `None` while a callback runs.
+    cell: Option<Cell<E>>,
+    reqs: HashMap<u64, EvReq>,
+    /// Async calls out: ticket -> request.
+    tickets: HashMap<u64, u64>,
+    queue: VecDeque<EvCall>,
+    /// The request whose event the running callback handles, if any.
+    running: Option<u64>,
+}
+
+struct EvReq {
+    origin: Origin,
+    responded: bool,
+    /// Async calls started and events not yet handled.
+    open: u32,
+    handles: Vec<u64>,
+    start: Instant,
+}
+
+enum EvCall {
+    Request(u64, String),
+    Event { ticket: u64, req: u64, payload: Vec<u8> },
+}
+
+/// An event cell request gets this long to answer, and this long in all
+/// (work after answering included: waitUntil).
+const EV_ANSWER: Duration = Duration::from_secs(30);
+const EV_TOTAL: Duration = Duration::from_secs(60);
 
 /// What a database call came back with.
 enum DbDone {
@@ -385,6 +429,8 @@ struct Task<E: Engine> {
     ws_drop: Vec<u64>,
     /// Postgres handles a stateless request opened (they close with it).
     pg: Vec<u64>,
+    /// An event cell's callback: its instance.
+    ev: Option<usize>,
 }
 
 /// A Durable Object in memory.
@@ -613,6 +659,11 @@ where
                     parked: HashMap::new(),
                     next_park: 0,
                     pg_handles: HashMap::new(),
+                    ev_mode: false,
+                    ev: vec![],
+                    ev_gen: 0,
+                    next_ev_req: 0,
+                    ev_timers: BinaryHeap::new(),
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l)) {
                     eprintln!("event loop stopped: {e}");
@@ -676,6 +727,13 @@ struct Loop<'a, E: Engine> {
     parked: HashMap<u64, (Task<E>, bool)>,
     next_park: u64,
     pg_handles: HashMap<u64, PgHandle>,
+    /// Event cells: whether this program is one (it exports `on_request`),
+    /// its instances, and their timers (due, instance, generation, ticket).
+    ev_mode: bool,
+    ev: Vec<Option<EvInst<E>>>,
+    ev_gen: u64,
+    next_ev_req: u64,
+    ev_timers: BinaryHeap<Reverse<(Instant, usize, u64, u64)>>,
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
@@ -806,7 +864,9 @@ impl<E: Engine> Loop<'_, E> {
     fn run(&mut self, mut listener: TcpListener) -> std::io::Result<()> {
         let mut events = Events::with_capacity(1024);
         self.poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
-        self.pool.push(fresh(self.eng, self.prog)?);
+        let mut first = fresh(self.eng, self.prog)?;
+        self.ev_mode = first.vm.has_export("on_request");
+        self.pool.push(first);
         // Alarms from before a restart.
         let threads = self.sh.cfg.threads;
         for (name, at) in self.sh.index.lock().unwrap().all().unwrap_or_default() {
@@ -819,6 +879,11 @@ impl<E: Engine> Loop<'_, E> {
             // Never block while requests are waiting to run.
             let timeout = if self.tasks.is_empty() {
                 let next = self.alarms.peek().map(|Reverse((at, _))| Duration::from_millis((at - now_ms()).max(0) as u64));
+                let timer = self.ev_timers.peek().map(|Reverse((at, ..))| at.saturating_duration_since(Instant::now()));
+                let next = match (next, timer) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
                 next.map_or(TICK, |n| n.min(TICK))
             } else {
                 Duration::ZERO
@@ -880,6 +945,7 @@ impl<E: Engine> Loop<'_, E> {
                     self.sweep();
                 }
             }
+            self.ev_tick();
             // One round of the run queue: every request gets one slice.
             for _ in 0..self.tasks.len() {
                 let mut t = self.tasks.pop_front().unwrap();
@@ -902,6 +968,8 @@ impl<E: Engine> Loop<'_, E> {
                         }
                         Err(trap) => Err(trap),
                     },
+                    // An event cell's callback answers by `respond`, not by return.
+                    Outcome::Done(_) if t.ev.is_some() => Ok(String::new()),
                     Outcome::Done(r) => {
                         let a = crate::response(&t.cell.vm, &r);
                         // Cells that export `release` free the answer once we've read it.
@@ -912,6 +980,10 @@ impl<E: Engine> Loop<'_, E> {
                     }
                     Outcome::Trap(trap) => Err(trap),
                 };
+                if t.ev.is_some() {
+                    self.ev_finish(t, answer.is_ok());
+                    continue;
+                }
                 let (origin, name) = (t.origin, t.obj.clone());
                 if let Some((reply, ws)) = self.finish_task(t, answer) {
                     self.release(name.as_deref(), origin, reply, ws)?;
@@ -945,6 +1017,7 @@ impl<E: Engine> Loop<'_, E> {
                 Msg::WsPush { name, sock, op, payload } => self.ws_local(&name, sock, op, &payload)?,
                 Msg::WsLost { name, sock } => self.socket_lost(&name, sock),
                 Msg::DbDone { park, done } => self.db_done(park, done),
+                Msg::EvDone { inst, gen, ticket, done } => self.ev_done(inst, gen, ticket, done),
                 Msg::Reply { who, reply } => self.deliver(Origin::Local(who), reply)?,
                 Msg::Synced { obj, gen, ok } => self.synced(&obj, gen, ok)?,
                 Msg::Checkpointed { obj } => {
@@ -1009,6 +1082,7 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Ok(())
             }
+            Origin::Ev(_) => Ok(()),
             Origin::Socket(who, sock, open) => {
                 let Some(c) = self.conn(who) else { return Ok(()) };
                 let Some(w) = c.ws.as_mut() else { return Ok(()) };
@@ -1043,6 +1117,272 @@ impl<E: Engine> Loop<'_, E> {
         match name {
             Some(n) if !ws.is_empty() => self.apply_ws(n, ws),
             _ => Ok(()),
+        }
+    }
+
+    /// A request for an event cell: the least busy instance with room takes
+    /// it, or a new one starts.
+    fn ev_request(&mut self, origin: Origin, req: String) -> std::io::Result<()> {
+        let cap = self.sh.cfg.ev_max;
+        let pick = self.ev.iter().enumerate().filter_map(|(i, e)| e.as_ref().filter(|e| e.reqs.len() < cap).map(|e| (e.reqs.len(), i))).min().map(|(_, i)| i);
+        let i = match pick {
+            Some(i) => i,
+            None => {
+                self.ev_gen += 1;
+                let inst = EvInst { gen: self.ev_gen, cell: Some(fresh(self.eng, self.prog)?), reqs: HashMap::new(), tickets: HashMap::new(), queue: VecDeque::new(), running: None };
+                self.sh.stats.ev_instances.fetch_add(1, Relaxed);
+                match self.ev.iter().position(Option::is_none) {
+                    Some(i) => {
+                        self.ev[i] = Some(inst);
+                        i
+                    }
+                    None => {
+                        self.ev.push(Some(inst));
+                        self.ev.len() - 1
+                    }
+                }
+            }
+        };
+        self.next_ev_req += 1;
+        let id = self.next_ev_req;
+        self.sh.stats.ev_requests.fetch_add(1, Relaxed);
+        let inst = self.ev[i].as_mut().unwrap();
+        inst.reqs.insert(id, EvReq { origin, responded: false, open: 0, handles: vec![], start: Instant::now() });
+        inst.queue.push_back(EvCall::Request(id, req));
+        self.ev_kick(i);
+        Ok(())
+    }
+
+    /// Start the instance's next callback, if it's free.
+    fn ev_kick(&mut self, i: usize) {
+        let Some(inst) = self.ev.get_mut(i).and_then(Option::as_mut) else { return };
+        if inst.cell.is_none() {
+            return;
+        }
+        let Some(call) = inst.queue.pop_front() else { return };
+        let mut cell = inst.cell.take().unwrap();
+        let ids: Vec<u64> = inst.reqs.keys().copied().collect();
+        let h = cell.host();
+        h.ev_reqs = ids;
+        h.ev_out.clear();
+        let started = match call {
+            EvCall::Request(id, req) => {
+                inst.running = None;
+                (|| -> Result<(), String> {
+                    cell.vm.begin("alloc", &[req.len() as u64])?;
+                    let ptr = crate::finish(&mut cell.vm, u32::MAX, &mut cell.st)?[0] as u32;
+                    if !cell.vm.write(ptr, req.as_bytes()) {
+                        return Err("bad alloc pointer".into());
+                    }
+                    cell.vm.begin("on_request", &[id, ptr as u64, req.len() as u64])
+                })()
+            }
+            EvCall::Event { ticket, req, payload } => {
+                inst.running = Some(req);
+                let n = payload.len() as u64;
+                cell.host().ev_payload = payload;
+                cell.vm.begin("on_event", &[ticket, n])
+            }
+        };
+        let t = Task { origin: Origin::Ev(i), cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: Some(i) };
+        match started {
+            Ok(()) => self.tasks.push_back(t),
+            Err(e) => {
+                eprintln!("event cell: can't start a callback: {e}");
+                self.ev_finish(t, false);
+            }
+        }
+    }
+
+    /// A callback returned: do what it asked, finish requests that are done,
+    /// and start the next callback. A trap takes the instance down.
+    fn ev_finish(&mut self, t: Task<E>, ok: bool) {
+        let i = t.ev.unwrap();
+        // Handles from blocking pg_open last one callback.
+        for h in t.pg {
+            self.pg_close(h);
+        }
+        let mut cell = t.cell;
+        let Some(inst) = self.ev.get_mut(i).and_then(Option::as_mut) else { return };
+        if !ok {
+            return self.ev_crash(i);
+        }
+        let actions = std::mem::take(&mut cell.host().ev_out);
+        inst.cell = Some(cell);
+        if let Some(q) = inst.running.take().and_then(|r| inst.reqs.get_mut(&r)) {
+            q.open = q.open.saturating_sub(1);
+        }
+        let (gen, mut replies, mut ops, mut closes) = (inst.gen, vec![], vec![], vec![]);
+        for a in actions {
+            match a {
+                EvAction::Respond(req, text) => {
+                    if let Some(q) = inst.reqs.get_mut(&req).filter(|q| !q.responded) {
+                        q.responded = true;
+                        replies.push((q.origin, split_answer(&text)));
+                    }
+                }
+                EvAction::Async { req, ticket, op } => {
+                    if let Some(q) = inst.reqs.get_mut(&req) {
+                        q.open += 1;
+                        inst.tickets.insert(ticket, req);
+                        ops.push((req, ticket, op));
+                    }
+                }
+                EvAction::PgClose(req, h) => {
+                    if let Some(q) = inst.reqs.get_mut(&req) {
+                        if q.handles.contains(&h) {
+                            q.handles.retain(|&x| x != h);
+                            closes.push(h);
+                        }
+                    }
+                }
+            }
+        }
+        for (origin, reply) in replies {
+            let _ = self.deliver(origin, reply);
+        }
+        for h in closes {
+            self.pg_close(h);
+        }
+        for (req, ticket, op) in ops {
+            self.ev_start(i, gen, req, ticket, op);
+        }
+        self.ev_reap(i);
+        self.ev_kick(i);
+    }
+
+    /// Start an async call for an event cell's request.
+    fn ev_start(&mut self, i: usize, gen: u64, req: u64, ticket: u64, op: AsyncOp) {
+        let (tx, waker) = self.sh.peers[self.me].clone();
+        let reply = move |done: DbDone| {
+            let _ = tx.send(Msg::EvDone { inst: i, gen, ticket, done });
+            let _ = waker.wake();
+        };
+        let binding = |req: &[u8]| serde_json::from_slice::<serde_json::Value>(req).ok().and_then(|v| v["db"].as_str().map(String::from));
+        let Some(pools) = &self.sh.pg else {
+            if let AsyncOp::Timer(ms) = op {
+                return self.ev_timers.push(Reverse((Instant::now() + Duration::from_millis(ms), i, gen, ticket)));
+            }
+            return reply(DbDone::Answer(json_err("no database bindings are set up")));
+        };
+        match op {
+            AsyncOp::Timer(ms) => self.ev_timers.push(Reverse((Instant::now() + Duration::from_millis(ms), i, gen, ticket))),
+            AsyncOp::PgOpen(r) => match binding(&r).filter(|b| pools.has(b)) {
+                Some(b) => {
+                    let b2 = b.clone();
+                    pools.pin(&b, Box::new(move |r| reply(DbDone::Pinned(b2, r))));
+                }
+                None => reply(DbDone::Answer(json_err("pg_open_async: name a database binding (\"db\")"))),
+            },
+            AsyncOp::PgQuery(0, r) => match binding(&r) {
+                Some(b) => pools.query(&b, r, Box::new(move |a| reply(DbDone::Answer(a)))),
+                None => reply(DbDone::Answer(json_err("pg_query_async: name a database binding (\"db\"), or use a handle"))),
+            },
+            AsyncOp::PgQuery(h, r) => {
+                let owned = self.ev[i].as_ref().and_then(|e| e.reqs.get(&req)).is_some_and(|q| q.handles.contains(&h));
+                match self.pg_handles.get(&h).filter(|_| owned) {
+                    Some(ph) => pools.query_on(&ph.binding, ph.worker, r, Box::new(move |a| reply(DbDone::Answer(a)))),
+                    None => reply(DbDone::Answer(json_err(&format!("pg_query_async: no such handle {h}")))),
+                }
+            }
+        }
+    }
+
+    /// An async call is back: queue its event for the instance.
+    fn ev_done(&mut self, i: usize, gen: u64, ticket: u64, done: DbDone) {
+        let live = self.ev.get(i).and_then(Option::as_ref).is_some_and(|e| e.gen == gen);
+        let req = if live { self.ev[i].as_mut().unwrap().tickets.remove(&ticket) } else { None };
+        let alive_req = req.filter(|r| self.ev[i].as_ref().is_some_and(|e| e.reqs.contains_key(r)));
+        let payload = match done {
+            DbDone::Answer(a) => a,
+            DbDone::Pinned(_, Err(e)) => json_err(&e),
+            DbDone::Pinned(binding, Ok(worker)) => {
+                let Some(r) = alive_req else {
+                    // Its request (or instance) is gone: give it straight back.
+                    if let Some(p) = &self.sh.pg {
+                        p.unpin(&binding, worker);
+                    }
+                    return;
+                };
+                self.next_park += 1;
+                let h = self.next_park << 8 | self.me as u64;
+                self.pg_handles.insert(h, PgHandle { binding, worker, obj: None });
+                self.ev[i].as_mut().unwrap().reqs.get_mut(&r).unwrap().handles.push(h);
+                serde_json::json!({ "handle": h }).to_string().into_bytes()
+            }
+        };
+        let Some(r) = alive_req else { return };
+        self.ev[i].as_mut().unwrap().queue.push_back(EvCall::Event { ticket, req: r, payload });
+        self.ev_kick(i);
+    }
+
+    /// Requests that are answered and have nothing open are done; their
+    /// handles close.
+    fn ev_reap(&mut self, i: usize) {
+        let Some(inst) = self.ev.get_mut(i).and_then(Option::as_mut) else { return };
+        let done: Vec<u64> = inst.reqs.iter().filter(|(_, q)| q.responded && q.open == 0).map(|(&id, _)| id).collect();
+        let mut closes = vec![];
+        for id in done {
+            closes.extend(inst.reqs.remove(&id).unwrap().handles);
+        }
+        for h in closes {
+            self.pg_close(h);
+        }
+        // An idle instance goes, unless it's the first: that one stays warm.
+        // ponytail: drops at once; keep it for `idle` if start-up cost shows.
+        let first = self.ev.iter().position(Option::is_some);
+        let inst = self.ev[i].as_ref().unwrap();
+        if first != Some(i) && inst.reqs.is_empty() && inst.queue.is_empty() && inst.cell.is_some() {
+            self.ev[i] = None;
+        }
+    }
+
+    /// An instance trapped: its unanswered requests fail, its handles close,
+    /// and it's gone (a fresh one starts when needed). Let it crash.
+    fn ev_crash(&mut self, i: usize) {
+        let Some(inst) = self.ev.get_mut(i).and_then(Option::take) else { return };
+        eprintln!("event cell crashed, with {} requests in flight", inst.reqs.len());
+        for q in inst.reqs.into_values() {
+            if !q.responded {
+                let _ = self.deliver(q.origin, (500, "{\"error\":\"the cell crashed\"}".into()));
+            }
+            for h in q.handles {
+                self.pg_close(h);
+            }
+        }
+    }
+
+    /// Timers that are due, and requests past their time.
+    fn ev_tick(&mut self) {
+        let now = Instant::now();
+        while self.ev_timers.peek().is_some_and(|Reverse((at, ..))| *at <= now) {
+            let Reverse((_, i, gen, ticket)) = self.ev_timers.pop().unwrap();
+            self.ev_done(i, gen, ticket, DbDone::Answer(vec![]));
+        }
+        for i in 0..self.ev.len() {
+            let Some(inst) = self.ev[i].as_mut() else { continue };
+            let mut late = vec![];
+            let mut over = vec![];
+            for (&id, q) in inst.reqs.iter_mut() {
+                if !q.responded && q.start.elapsed() > EV_ANSWER {
+                    q.responded = true;
+                    late.push(q.origin);
+                }
+                if q.start.elapsed() > EV_TOTAL {
+                    over.push(id);
+                }
+            }
+            let mut closes = vec![];
+            for id in over {
+                closes.extend(inst.reqs.remove(&id).unwrap().handles);
+                inst.tickets.retain(|_, r| *r != id);
+            }
+            for origin in late {
+                let _ = self.deliver(origin, (504, "{\"error\":\"the cell didn't answer in time\"}".into()));
+            }
+            for h in closes {
+                self.pg_close(h);
+            }
         }
     }
 
@@ -1351,7 +1691,7 @@ impl<E: Engine> Loop<'_, E> {
     /// operation, and the guard-page AOT tier doesn't promise it's exact
     /// at a trap either (LLVM may drop a store around a load that faults).
     fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> Option<((u16, String), Vec<WsOut>)> {
-        let Task { mut cell, obj, origin, ws_open, ws_drop, pg } = t;
+        let Task { mut cell, obj, origin, ws_open, ws_drop, pg, .. } = t;
         // A stateless request's handles end with it; a crash ends an
         // object's (rolling back, releasing its locks).
         for h in pg {
@@ -1706,7 +2046,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -1724,11 +2064,14 @@ impl<E: Engine> Loop<'_, E> {
                     s.tail_entries.load(Relaxed),
                     s.sockets_open.load(Relaxed),
                     s.ws_messages.load(Relaxed),
-                    s.ws_handoffs.load(Relaxed)
+                    s.ws_handoffs.load(Relaxed),
+                    s.ev_instances.load(Relaxed),
+                    s.ev_requests.load(Relaxed)
                 );
                 self.queue_reply(who, (200, body));
             }
             Req::NewId => self.queue_reply(who, (200, format!("{{\"id\":\"{}\"}}", uuid_v7()))),
+            Req::Cell(cell_req) if self.ev_mode => self.ev_request(Origin::Local(who), cell_req)?,
             Req::Cell(cell_req) => {
                 let mut cell = match self.pool.pop() {
                     Some(cell) => cell,
@@ -1739,7 +2082,7 @@ impl<E: Engine> Loop<'_, E> {
                     self.queue_reply(who, (500, String::new()));
                     return Ok(());
                 }
-                self.tasks.push_back(Task { origin: Origin::Local(who), cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![] });
+                self.tasks.push_back(Task { origin: Origin::Local(who), cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: None });
             }
             Req::Object(name, cell_req) => {
                 let o = owner(&name, self.sh.cfg.threads);
@@ -1890,7 +2233,7 @@ impl<E: Engine> Loop<'_, E> {
             return Err((500, String::new()));
         }
         o.busy = true;
-        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open, ws_drop, pg: vec![] });
+        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open, ws_drop, pg: vec![], ev: None });
         Ok(true)
     }
 }

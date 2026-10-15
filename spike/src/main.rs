@@ -1159,11 +1159,18 @@ mod tests {
     where
         E::Program: Sync + Send,
     {
+        server_for(eng, cfg, wasm())
+    }
+
+    fn server_for<E: Engine + Sync + Send + 'static>(eng: E, cfg: http::Config, wasm: Vec<u8>) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>)
+    where
+        E::Program: Sync + Send,
+    {
         static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
         let port = 21000 + (std::process::id() % 2000) as u16 * 10 + PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let stop = cfg.stop.clone();
         let t = std::thread::spawn(move || {
-            let prog = eng.load(&wasm()).unwrap();
+            let prog = eng.load(&wasm).unwrap();
             http::serve_with(&eng, &prog, port, cfg);
         });
         for _ in 0..200 {
@@ -1186,6 +1193,7 @@ mod tests {
             fleet: None,
             pg: None,
             session_idle: Duration::from_secs(60),
+            ev_max: 32,
         }
     }
 
@@ -1697,6 +1705,122 @@ mod tests {
         assert!(eventually(4000, || lock("/do/other/pg/q", "pg_try_advisory_lock", 45) == true), "an idle session must close");
         assert!(eventually(2000, || stat(port, "evictions") > ev));
         q("/api/pg/q", &format!("DROP TABLE {t}"), serde_json::json!([]));
+    }
+
+    const GUEST_EV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../guest-ev/target/wasm32-unknown-unknown/release/combd_guest_ev.wasm");
+
+    /// Many requests at once on one instance (event cells): fetch them all.
+    fn many(port: u16, n: usize, path: &str) -> Vec<(u16, String)> {
+        let path = path.to_string();
+        let hs: Vec<_> = (0..n).map(|_| {
+            let p = path.clone();
+            std::thread::spawn(move || http(port, "GET", &p, ""))
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    }
+
+    /// Event cells: one instance holds many requests that wait on I/O, shares
+    /// state between them, keeps working after it answers, and a crash fails
+    /// only the requests on that instance that weren't answered yet.
+    fn event_cells<E: Engine + Sync + Send + 'static>(eng: E)
+    where
+        E::Program: Sync + Send,
+    {
+        let dir = store::tempdir::Dir::new();
+        let wasm = std::fs::read(GUEST_EV).expect("build guest-ev first: cd guest-ev && cargo build --release --target wasm32-unknown-unknown");
+        let (port, _, _) = server_for(eng, http::Config { ev_max: 8, ..cfg(&dir.0, 1) }, wasm);
+        // 30 requests that each wait 400 ms: about 400 ms in all, on 4 instances (8 each).
+        let t = Instant::now();
+        let got = many(port, 30, "/sleep/400");
+        assert!(got.iter().all(|r| *r == (200, "{\"slept\":400}".into())), "{got:?}");
+        assert!(t.elapsed() < Duration::from_millis(1500), "took {:?}", t.elapsed());
+        assert_eq!(stat(port, "ev_instances"), 4);
+        // The extra instances are gone once idle; the first stays, with its state.
+        for n in 1..=3 {
+            assert_eq!(http(port, "GET", "/hello", ""), (200, format!("{{\"hits\":{n}}}")));
+        }
+        assert_eq!(stat(port, "ev_instances"), 4);
+        // waitUntil: the answer comes first, the work after.
+        let t = Instant::now();
+        assert_eq!(http(port, "GET", "/later/300", "").0, 200);
+        assert!(t.elapsed() < Duration::from_millis(250), "waited for the work: {:?}", t.elapsed());
+        assert_eq!(http(port, "GET", "/later-count", ""), (200, "{\"later\":0}".into()));
+        assert!(eventually(2000, || http(port, "GET", "/later-count", "").1 == "{\"later\":1}"));
+        // A crash: the instance's unanswered requests fail with it.
+        let waiting = std::thread::spawn(move || many(port, 5, "/sleep/600"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(http(port, "GET", "/crash/50", "").0, 500);
+        assert!(waiting.join().unwrap().iter().all(|r| r.0 == 500));
+        // A fresh instance takes the next request, with fresh state.
+        assert_eq!(http(port, "GET", "/hello", ""), (200, "{\"hits\":1}".into()));
+        assert_eq!(http(port, "GET", "/nope", "").0, 404);
+        assert!(stat(port, "ev_requests") >= 30 + 3 + 3 + 6 + 2);
+    }
+
+    /// Event cells and Postgres: transactions on pinned connections interleave
+    /// on one instance, and one that fails rolls back alone.
+    fn event_cells_postgres<E: Engine + Sync + Send + 'static>(eng: E, tag: &str)
+    where
+        E::Program: Sync + Send,
+    {
+        let Ok(url) = std::env::var("COMBD_PG_TEST") else {
+            eprintln!("skipping: set COMBD_PG_TEST to a Postgres URL");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        let wasm = std::fs::read(GUEST_EV).unwrap();
+        let pg = pg::PgCfg { bindings: vec![("main".into(), url)], pool: 12, max_pinned: 10, statement_timeout_ms: 3000 };
+        let (port, _, _) = server_for(eng, http::Config { pg: Some(pg), ..cfg(&dir.0, 1) }, wasm);
+        let t = format!("ev_{tag}_{}", std::process::id());
+        let q = |sql: &str| http(port, "POST", "/pg/q", &serde_json::json!({ "q": sql }).to_string());
+        assert_eq!(q(&format!("CREATE TABLE {t} (k int PRIMARY KEY)")).0, 200);
+        // 10 transactions, each pausing 300 ms halfway: about 300 ms in all.
+        let start = Instant::now();
+        let hs: Vec<_> = (0..10).map(|k| {
+            let body = serde_json::json!([{ "q": format!("INSERT INTO {t} VALUES ($1)"), "p": [k] }, { "q": format!("INSERT INTO {t} VALUES ($1)"), "p": [k + 100] }]).to_string();
+            std::thread::spawn(move || http(port, "POST", "/pg/tx/300", &body))
+        }).collect();
+        for h in hs {
+            let r = h.join().unwrap();
+            assert_eq!(r.0, 200, "{r:?}");
+        }
+        assert!(start.elapsed() < Duration::from_millis(1500), "took {:?}", start.elapsed());
+        assert_eq!(stat(port, "ev_instances"), 1);
+        // A failing second half (a duplicate key) rolls back the first half too.
+        let body = serde_json::json!([{ "q": format!("INSERT INTO {t} VALUES (50)") }, { "q": format!("INSERT INTO {t} VALUES (1)") }]).to_string();
+        assert_eq!(http(port, "POST", "/pg/tx/0", &body).0, 400);
+        let (code, rows) = q(&format!("SELECT count(*)::int AS n, count(*) FILTER (WHERE k = 50)::int AS bad FROM {t}"));
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&rows).unwrap();
+        assert_eq!(v["rows"][0], serde_json::json!([20, 0]), "{v}");
+        // Every pinned connection went back: 10 more fit.
+        assert!(eventually(2000, || many(port, 10, "/hello").iter().all(|r| r.0 == 200)));
+        let body = serde_json::json!([{ "q": "SELECT 1" }, { "q": "SELECT 2" }]).to_string();
+        let hs: Vec<_> = (0..10).map(|_| { let b = body.clone(); std::thread::spawn(move || http(port, "POST", "/pg/tx/50", &b).0) }).collect();
+        assert!(hs.into_iter().all(|h| h.join().unwrap() == 200));
+        assert_eq!(q(&format!("DROP TABLE {t}")).0, 200);
+    }
+
+    #[test]
+    fn event_cells_postgres_on_the_interpreter() {
+        event_cells_postgres(interp::Interp { max_pages: 16384 }, "interp");
+    }
+
+    #[cfg(feature = "aot-guard")]
+    #[test]
+    fn event_cells_postgres_on_aot() {
+        event_cells_postgres(aot::Aot, "aot");
+    }
+
+    #[test]
+    fn event_cells_on_the_interpreter() {
+        event_cells(interp::Interp { max_pages: 16384 });
+    }
+
+    #[cfg(feature = "aot-guard")]
+    #[test]
+    fn event_cells_on_aot() {
+        event_cells(aot::Aot);
     }
 
     #[test]

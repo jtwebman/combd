@@ -1312,6 +1312,40 @@ Not yet: TLS to Postgres, a fleet-wide connection cap (each node has its own
 pool), LISTEN/NOTIFY as events, query caching, read replicas, MySQL, and
 numbers.
 
+## Event cells: many requests per instance
+
+A Worker that exports `on_request` is an event cell (`guest-ev/`), like a
+Node process: one instance serves many requests at once. The host calls
+`on_request(id, ptr, len)` for each new request and `on_event(ticket, len)`
+when something the cell waited on is back (`ev_read` copies its data). The
+async imports return a ticket at once: `timer_async(req, ms)`,
+`pg_open_async(req, ...)`, `pg_query_async(req, handle, ...)`, plus
+`pg_close_async`. `respond(req, answer)` answers; work may go on after it
+(waitUntil). The guest keeps a table of ticket -> what to do next: its own
+small event loop.
+
+The host runs one callback at a time per instance, through the normal
+slices. A new request goes to the least busy instance under the cap
+(`COMBD_EV_MAX`, default 32), or a new one starts. Idle extra instances go
+away; the first stays warm, with its state. A request is done when it has
+answered and has nothing open, and then its Postgres handles close. 30 s to
+answer (504 after), 60 s in all. A trap fails every unanswered request on
+that instance, closes its handles, and the next request gets a fresh one.
+Work after `respond` is best effort: a crash loses it, and nothing retries.
+Works on all three engines; nothing needs to pause mid-call.
+
+**Test `event_cells_on_the_interpreter` / `_on_aot`** (cap 8): 30 requests
+that each wait 400 ms finish in about 400 ms on 4 instances; state is
+shared across requests; waitUntil answers first and counts later; a crash
+fails the 5 requests waiting on its instance and the next request gets
+fresh state. **`event_cells_postgres_*`**, against a real Postgres: 10
+transactions that each pause 300 ms halfway run interleaved on one instance
+in about 300 ms; one that fails halfway rolls back alone; every pinned
+connection goes back.
+
+Not yet: event-mode Durable Objects, cells calling objects, and placed
+Postgres pools (per-node pools don't scale to 1000 nodes; see the plan).
+
 ## Security: memory is always zero
 
 Every byte a new cell can see starts as zero. Its buffer comes from `calloc`,

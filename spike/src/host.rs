@@ -39,7 +39,35 @@ pub struct HostState {
     pub can_park: bool,
     /// How many results the waiting import declared (0 or 1).
     pub pending_results: u32,
+    /// Event cells: the requests this instance may act for, what this
+    /// callback asked for (the loop does it when the callback returns), and
+    /// the data that came with the event being handled.
+    pub ev_reqs: Vec<u64>,
+    pub ev_out: Vec<EvAction>,
+    pub ev_payload: Vec<u8>,
+    pub next_ticket: u64,
 }
+
+/// What an event cell's callback asked for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EvAction {
+    /// Answer request `req` (`"200 {...}"`, as a classic cell returns).
+    Respond(u64, String),
+    /// Start something for request `req`; `on_event(ticket, len)` comes back.
+    Async { req: u64, ticket: u64, op: AsyncOp },
+    /// Done with a Postgres handle of request `req`.
+    PgClose(u64, u64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AsyncOp {
+    PgOpen(Vec<u8>),
+    PgQuery(u64, Vec<u8>),
+    Timer(u64),
+}
+
+/// What one callback may ask for, so a loop in a cell can't flood the host.
+const MAX_EV_OUT: usize = 10_000;
 
 /// A Postgres call. The cell waits (paused, no CPU) while the host does it.
 #[derive(Clone, Debug, PartialEq)]
@@ -256,6 +284,52 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
             let n = out.len().min(arg(1)? as usize);
             if !mem.write(arg(0)? as u32, &out[..n]) {
                 return Err("pg_read: bad pointer".into());
+            }
+            n as u64
+        }
+        // Event cells (one instance, many requests at once, like Node):
+        // `respond(req, ptr, len)` answers a request, now or later, and work
+        // may go on after it (waitUntil). Anything that waits returns a
+        // ticket at once, and `on_event(ticket, len)` comes back with its
+        // data, read by `ev_read(ptr, cap)`. A ticket of 0: unknown request.
+        ("combd", name @ ("respond" | "pg_open_async" | "pg_query_async" | "pg_close_async" | "timer_async")) => {
+            let req = arg(0)?;
+            if !st.ev_reqs.contains(&req) {
+                0
+            } else if st.ev_out.len() >= MAX_EV_OUT {
+                return Err(format!("{name}: too many at once"));
+            } else {
+                let read = |p: u64, l: u64, max: usize| -> Result<Vec<u8>, String> {
+                    if l as usize > max {
+                        return Err(format!("{name}: too large"));
+                    }
+                    mem.read(p as u32, l as u32).ok_or_else(|| format!("{name}: bad pointer"))
+                };
+                let mut ticket = |op: AsyncOp, st: &mut HostState| {
+                    st.next_ticket += 1;
+                    st.ev_out.push(EvAction::Async { req, ticket: st.next_ticket, op });
+                    st.next_ticket
+                };
+                match name {
+                    "respond" => {
+                        let text = String::from_utf8(read(arg(1)?, arg(2)?, crate::store::MAX_RESULT)?).map_err(|_| "respond: not UTF-8")?;
+                        st.ev_out.push(EvAction::Respond(req, text));
+                        1
+                    }
+                    "pg_open_async" => ticket(AsyncOp::PgOpen(read(arg(1)?, arg(2)?, 1 << 20)?), st),
+                    "pg_query_async" => ticket(AsyncOp::PgQuery(arg(1)?, read(arg(2)?, arg(3)?, 1 << 20)?), st),
+                    "pg_close_async" => {
+                        st.ev_out.push(EvAction::PgClose(req, arg(1)?));
+                        1
+                    }
+                    _ => ticket(AsyncOp::Timer(arg(1)?.min(30_000)), st),
+                }
+            }
+        }
+        ("combd", "ev_read") => {
+            let n = st.ev_payload.len().min(arg(1)? as usize);
+            if !mem.write(arg(0)? as u32, &st.ev_payload[..n]) {
+                return Err("ev_read: bad pointer".into());
             }
             n as u64
         }

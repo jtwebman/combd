@@ -9,6 +9,12 @@ fn main() {
     if std::path::Path::new("src/gen_js.rs").exists() {
         println!("cargo:rustc-cfg=has_js");
     }
+    // The event cell (guest-ev), when aot.sh made it.
+    println!("cargo:rustc-check-cfg=cfg(has_ev)");
+    println!("cargo:rerun-if-changed=src/gen_ev.rs");
+    if std::path::Path::new("src/gen_ev.rs").exists() {
+        println!("cargo:rustc-cfg=has_ev");
+    }
     // Fuzz modules, only while `aot-fuzz.sh` runs (`combd-spike fuzz-gen`).
     println!("cargo:rustc-check-cfg=cfg(has_fuzz)");
     println!("cargo:rerun-if-changed=src/gen_fuzz.rs");

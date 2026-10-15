@@ -55,6 +55,10 @@ const IMPORTS: &[(&str, &str, usize)] = &[
     ("combd", "ws_send_binary", 3),
     ("combd", "ws_msg", 1),
     ("combd", "pg_read", 2),
+    ("combd", "respond", 3),
+    ("combd", "pg_query_async", 4),
+    ("combd", "timer_async", 2),
+    ("combd", "ev_read", 2),
     ("env", "abort", 4),
     ("wasi_snapshot_preview1", "fd_write", 4),
     ("wasi_snapshot_preview1", "fd_read", 4),
@@ -173,7 +177,7 @@ fn one(seed: u64, slow: Duration, st: &mut Stats) {
     let ds = dir.display().to_string();
     let db = Arc::new(Mutex::new(Db::open(&dir.join("obj.sqlite")).unwrap()));
     db.lock().unwrap().begin().unwrap();
-    let mut hs = HostState { db: Some(db.clone()), ws_ids: (1..rng.below(5)).collect(), ..HostState::default() };
+    let mut hs = HostState { db: Some(db.clone()), ws_ids: (1..rng.below(5)).collect(), ev_reqs: (1..rng.below(5)).collect(), ev_payload: vec![7; rng.below(100) as usize], ..HostState::default() };
     // Mostly small memories; now and then a big one (a host cost that
     // scales with memory only shows there: this machine copies ~70 GB/s).
     let mem_len = [0u32, 1, 65536, 1 << 20, 1 << 20, 1 << 20, 16 << 20, 64 << 20][rng.below(8) as usize];

@@ -353,6 +353,22 @@ database. So the **host keeps the pools**: a few connections per node per
 database, shared by every instance on that node. A cell never holds a socket.
 It holds a `db` binding.
 
+**Update: per-node pools don't scale to a big fleet.** 1000 nodes with a
+pool of 4 each is 4,000 connections, and Postgres defaults to 100 (each costs
+it 5 to 10 MB). The fix is to place the pools: K pool objects
+(`pg-main-0` .. `pg-main-K-1`) each hold M connections, so the total is
+K x M however many nodes there are. Plain queries go round robin; a
+transaction sticks to the object holding its handle. The cost is one hop,
+about 0.2 ms in one data center, on a query that already takes 0.5 to 1 ms
+(the same idea as Hyperdrive). What it needs, as tools users can build their
+own pools with too:
+1. Cells call Durable Objects (`do_fetch`, async, a ticket like the
+   Postgres calls).
+2. Event-mode objects: an object that exports `on_request` takes many
+   requests at once. Opt-in; plain objects stay one at a time.
+3. Lazy node pools: connections open only when something on the node asks,
+   and close when idle, so nodes with no pool object hold none.
+
 ### How a query flows
 
 1. The cell calls `db.query(sql, params)`, a host import.
@@ -576,6 +592,29 @@ program, and that is where V8's worst security bugs come from. So:
 | crash | Wasm trap |
 | supervisor | the cell host |
 | hibernate | drop the instance, keep SQLite |
+
+### Event cells: many requests per instance (opt-in)
+
+Most Worker requests spend their time waiting on I/O, and one instance per
+request wastes memory. A Worker that exports `on_request(id, ptr, len)` and
+`on_event(ticket, len)` is an **event cell**, like a Node process: one
+instance holds up to `COMBD_EV_MAX` (32) requests at once. It still runs one
+callback at a time; requests interleave only where the cell waits.
+- Anything that waits returns a ticket at once (`timer_async`,
+  `pg_open_async`, `pg_query_async`); `on_event` brings the data back.
+- `respond(id, answer)` answers a request, now or later. Work may go on after
+  it: that's waitUntil. A request is done when it has answered and has
+  nothing open; then its database handles close.
+- **The price of sharing:** a crash fails every unanswered request on that
+  instance, not just one. Work after `respond` is best effort: if the
+  instance crashes, it's lost and nothing retries it. Anything that must
+  happen goes before the answer, or into a Durable Object.
+  `COMBD_EV_MAX=1` brings back strict one-request let-it-crash.
+- Limits: 30 s to answer (then 504), 60 s in all.
+- Durable Objects stay one at a time, so a failure never leaves ordering in
+  doubt. Batching comes next: an object that exports `on_batch` gets up to N
+  queued requests at once (N is its choice: ask for 10 with 2 waiting, get
+  2), for one transaction and one fsync, with an answer for each.
 
 ### Fair scheduling (no cell hogs a core)
 

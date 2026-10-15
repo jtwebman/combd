@@ -203,6 +203,11 @@ impl CellVm for WtVm {
         None // host calls run inline, never as `HostCall`
     }
 
+    fn has_export(&mut self, name: &str) -> bool {
+        let Some(store) = self.store.as_mut() else { return false };
+        self.instance.get_func(&mut *store, name).is_some()
+    }
+
     fn host_out(&self) -> Vec<u8> {
         self.store.as_ref().map_or_else(Vec::new, |s| s.data().out.clone())
     }

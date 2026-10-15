@@ -50,6 +50,10 @@ pub trait CellVm {
     fn host_state(&mut self) -> Option<&mut crate::host::HostState> {
         None
     }
+    /// Whether the module exports `name` (event cells export `on_request`).
+    fn has_export(&mut self, _name: &str) -> bool {
+        false
+    }
     /// A database call this cell is waiting on, for engines that pause
     /// inside a host call (the compiled tier's fibers). The interpreter
     /// leaves it in its `HostState` instead.

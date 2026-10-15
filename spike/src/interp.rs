@@ -1127,6 +1127,10 @@ impl CellVm for Vm {
         self.m.import_names.get(idx as usize)
     }
 
+    fn has_export(&mut self, name: &str) -> bool {
+        self.m.exports.contains_key(name)
+    }
+
     fn snapshot(&self) -> Option<Vm> {
         Some(self.clone())
     }

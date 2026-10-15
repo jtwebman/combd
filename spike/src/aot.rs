@@ -242,6 +242,10 @@ impl CellVm for AotVm {
         None // host calls run inline
     }
 
+    fn has_export(&mut self, name: &str) -> bool {
+        (self.m.export)(name).is_some()
+    }
+
     fn host_out(&self) -> Vec<u8> {
         self.state.as_ref().map_or_else(Vec::new, |(c, _)| c.host.out())
     }
