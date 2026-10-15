@@ -1067,6 +1067,35 @@ What changes as the fleet grows:
     plus 4x its variation), never fixed. Safety never depends on a timeout;
     only availability does.
 
+## The finish lines (set 2026-10-15)
+
+The plan grew fast: a process model, supervisors, user pools, environments
+per pull request, KMS secrets, an ingress router. Each is a good idea, and
+together they're a platform nobody can use yet. So: **no new concepts until
+v0.1 runs.** Two finish lines.
+
+**v0.1: one real app, deployed to a fleet.**
+1. One app and its manifest: routes by domain and path, a Worker process,
+   a Durable Object, and a Postgres pool.
+2. `combd deploy` to a 3-node fleet on one bucket.
+3. Durable Objects with their own storage, WebSockets, and the pool capped
+   across the whole fleet (one manager, members near their callers).
+4. `callers` and `owners` enforced; `call` and `send` between processes.
+5. Secrets set with the CLI, encrypted in the bucket.
+
+Waits until after v0.1: supervisors, user-written pool kinds, `enqueue`,
+per-PR environments, `fetch` beyond what the JS line needs.
+
+**The JS line: Cloudflare Workers as they were at launch (2017-2018).** With
+agents writing most code, the language matters less than strict config,
+clear errors, and a small API, so Rust in Wasm is the main path. JS gets a
+solid baseline, not Node: the `fetch` handler (both forms), `Request`,
+`Response`, `Headers`, `fetch()` out through the egress allowlist, `URL`,
+`URLSearchParams`, `TextEncoder`/`TextDecoder`, `atob`/`btoa`,
+`crypto.getRandomValues` and `crypto.subtle` (digest, HMAC, AES-GCM),
+`console`, timers within a request, and `waitUntil`. Not Node APIs, not
+npm packages that need them, not full streams or Cache.
+
 ## Build order (when we do build)
 
 0. **DONE 2026-10-13. Spike: the engine race.** Results in
