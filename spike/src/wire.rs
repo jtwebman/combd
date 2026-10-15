@@ -69,6 +69,27 @@ pub fn load_tls(dir: &Path, node: Node) -> Result<Tls, String> {
     Ok(Tls { server: Arc::new(server), client: Arc::new(client) })
 }
 
+/// The admin API's TLS: this node's certificate, and no client
+/// certificate (clients show a token instead).
+pub fn admin_tls(dir: &Path, node: Node) -> Result<Arc<rustls::ServerConfig>, String> {
+    let e = |what: &str, x: &dyn std::fmt::Display| format!("{what}: {x}");
+    let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(dir.join(format!("node{node}.pem"))).map_err(|x| e("node cert", &x))?.collect::<Result<_, _>>().map_err(|x| e("node cert", &x))?;
+    let key = PrivateKeyDer::from_pem_file(dir.join(format!("node{node}.key"))).map_err(|x| e("node key", &x))?;
+    let c = rustls::ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions().map_err(|x| e("tls", &x))?.with_no_client_auth().with_single_cert(certs, key).map_err(|x| e("server cert", &x))?;
+    Ok(Arc::new(c))
+}
+
+/// A client for the admin API that trusts the fleet CA in `ca`.
+pub fn admin_client(ca: &Path) -> Result<Arc<rustls::ClientConfig>, String> {
+    let e = |x: &dyn std::fmt::Display| format!("{}: {x}", ca.display());
+    let mut roots = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_file_iter(ca).map_err(|x| e(&x))? {
+        roots.add(c.map_err(|x| e(&x))?).map_err(|x| e(&x))?;
+    }
+    let c = rustls::ClientConfig::builder_with_provider(provider()).with_safe_default_protocol_versions().map_err(|x| e(&x))?.with_root_certificates(roots).with_no_client_auth();
+    Ok(Arc::new(c))
+}
+
 /// A fleet CA and a certificate for each of `nodes` nodes, into `dir`.
 pub fn make_certs(dir: &Path, nodes: u32) -> Result<(), String> {
     let e = |x: rcgen::Error| x.to_string();

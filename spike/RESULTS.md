@@ -1432,6 +1432,62 @@ their process and on disk as `room/r1`, and 404s), `routes_pick_the_most_
 specific`, and the parser fuzzer now runs every mangled request through a
 manifest's routes too.
 
+## Deploys
+
+combd knows nothing about people: only tokens and what each may do. Users,
+orgs, invites, logins, and roles live outside it (your CI and identity
+system, or a hosted dashboard that holds the tokens and calls the same API).
+
+- **The bucket** (`spike/src/deploy.rs`): `apps/<org>/<app>/versions/<hash>`
+  holds a bundle (the manifest and `modules/*.wasm`, nothing else, so the
+  dev env file can't ride along), named by its SHA-256; `current` says
+  which is live and moves only by compare-and-swap; `vars` holds the vars.
+- **A deploy is checked in full before it's live:** the manifest names the
+  app it's deployed as, every module loads, every var resolves, and no
+  domain clashes with the node's other apps. A bad deploy never moves the
+  pointer.
+- **Every node** (`serve-fleet`) loads every app at start, then every 2 s
+  swaps in what changed (a version, or vars), one app at a time: an app
+  that won't load is skipped and tried again, the rest go on.
+- **On a running node** the app table is append-only: the new version's
+  processes are added and the old ones retired, so in-flight work finishes
+  on the old code, new requests get the new, and an object's next request
+  runs the new code on its old storage.
+- **The admin API** (`spike/src/admin.rs`), on its own port: deploy,
+  status, rollback (an earlier version, checked again), take down, set
+  vars (checked against their declared types; the CLI's `"8"` is an int
+  only if the var is). Tokens are stored as SHA-256 hashes and compared in
+  constant time; scopes look like `acme/shop:deploy`, `acme/*:vars`,
+  `*/*:*`. The token is checked on the headers, before any of a body is
+  read. Without TLS it listens on localhost only; beyond it, TLS with the
+  fleet's certificates.
+- **The CLI:** `combd-spike admin-token <scope>...`, `deploy <dir> <org>
+  <url>`, `status`, `rollback`, `remove`, `vars <org>/<app> <url> K=V...`.
+- **A node refuses to start if its id is in use:** it watches its own
+  heartbeat for half a lease, and if it moves, someone else has the id.
+
+**Test `deploys_reach_every_node`** (three D3 nodes that start empty, all
+through node 0's admin API over TLS): v1 reaches every node; counts hold
+across them; no token (401), a token for another app or org (403), and a
+guessed one are refused, and a 60 MB upload with a weak token is refused
+at once, before its body; a var reaches every node, and an undeclared one
+is refused; a bundle whose manifest names another app is refused and the
+pointer stays; v2's new route reaches every node and the object keeps its
+count; rollback to v1 and forward again; a second app on its own domain;
+taking the first down makes it a 404 everywhere while the second serves;
+and a second node 1 can't start. Also `a_deploy_swaps_a_running_app`
+(in-flight work across a swap), and the bundle decoder against 100,000
+mangled bundles.
+
+Found while building it: refusing before reading a body, then closing,
+reset the connection, and the client could miss the answer. The server now
+reads (and drops) up to 1 MB for 2 s after a refusal, never all of it.
+
+Not yet: secrets (next: encrypted in the bucket), the AOT tier for deployed
+modules (it runs only modules built in; deploy nodes run the interpreter),
+pools added by a deploy (they start with the node, until the fleet pool),
+and a push to peers on deploy (they poll every 2 s).
+
 ## Many tenants on one node (shared process)
 
 `combd-spike serve-apps <engine> <root> <port>` serves every app under

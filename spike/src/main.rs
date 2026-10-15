@@ -7,10 +7,12 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
 #[cfg(feature = "aot-lite")]
 mod aot;
 mod aot_gen;
 mod app;
+mod deploy;
 mod engine;
 mod fleet;
 mod host;
@@ -355,6 +357,29 @@ impl<V: CellVm> host::Mem for VmMem<'_, V> {
     }
     fn write(&mut self, ptr: u32, bytes: &[u8]) -> bool {
         self.0.write(ptr, bytes)
+    }
+}
+
+/// Run one admin API call from the command line, print its answer, and exit
+/// non-zero if it failed.
+fn cli(url: &str, f: impl FnOnce(&dyn Fn(&str, &str, &[u8]) -> Result<serde_json::Value, String>) -> Result<serde_json::Value, String>) {
+    let token = std::env::var("COMBD_TOKEN").unwrap_or_default();
+    let tls = std::env::var("COMBD_ADMIN_CA").ok().map(|ca| wire::admin_client(std::path::Path::new(&ca)));
+    let name = std::env::var("COMBD_ADMIN_NAME").unwrap_or_else(|_| "node0.combd".into());
+    let r = (|| {
+        let tls = tls.transpose()?;
+        let call = |method: &str, path: &str, body: &[u8]| -> Result<serde_json::Value, String> {
+            let (status, v) = admin::request(url, tls.as_ref().map(|c| (c, name.as_str())), &token, method, path, body)?;
+            if status == 200 { Ok(v) } else { Err(format!("{status}: {}", v["error"].as_str().unwrap_or("?"))) }
+        };
+        f(&call)
+    })();
+    match r {
+        Ok(v) => println!("{v}"),
+        Err(e) => {
+            eprintln!("combd     {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -811,6 +836,53 @@ fn main_with(args: &[&str]) {
         ["langs", "aot"] => std::process::exit(if langs("aot", &aot::Aot) { 0 } else { 1 }),
         #[cfg(feature = "aot-lite")]
         [test, "aot"] => run(test, "aot", &aot::Aot),
+        // A fleet node serving what's deployed to its bucket (COMBD_S3,
+        // COMBD_NODE, COMBD_PEERS...), with the admin API if COMBD_ADMIN_PORT.
+        ["serve-fleet", engine, port] => {
+            let port = port.parse().unwrap();
+            let cfg = http::Config::from_env();
+            let Some(fc) = cfg.fleet.as_ref() else {
+                eprintln!("combd     serve-fleet needs fleet mode: COMBD_S3, COMBD_NODE, COMBD_PEERS");
+                std::process::exit(1);
+            };
+            let admin = admin::AdminCfg::from_env(fc.wire_certs.as_deref(), fc.node).unwrap_or_else(|e| {
+                eprintln!("combd     {e}");
+                std::process::exit(1);
+            });
+            let r = match engine {
+                "interp" => http::serve_fleet_apps(&interp::Interp { max_pages: 16384 }, port, cfg, admin),
+                _ => Err("serve-fleet runs the interpreter: deployed modules aren't in the AOT build".into()),
+            };
+            if let Err(e) = r {
+                eprintln!("combd     {e}");
+                std::process::exit(1);
+            }
+        }
+        // A new admin token, and its line for COMBD_ADMIN_TOKENS.
+        ["admin-token", ref scopes @ ..] if !scopes.is_empty() => {
+            let (token, line) = admin::new_token(scopes);
+            println!("token (give it to your CI; it's shown once): {token}");
+            println!("line for the tokens file:                   {line}");
+        }
+        // The admin API, from the command line: COMBD_TOKEN, and for https
+        // COMBD_ADMIN_CA (the fleet's ca.pem) and COMBD_ADMIN_NAME (node0.combd).
+        ["deploy", dir, org, url] => cli(url, |call| {
+            let dir = std::path::Path::new(dir);
+            let m = manifest::load(dir)?.ok_or("no manifest in that folder")?;
+            let b = deploy::bundle(dir)?;
+            call("PUT", &format!("/v1/apps/{org}/{}", m.app), &b)
+        }),
+        ["status", app, url] => cli(url, |call| call("GET", &format!("/v1/apps/{app}"), b"")),
+        ["rollback", app, version, url] => cli(url, |call| call("POST", &format!("/v1/apps/{app}/rollback"), serde_json::json!({ "version": version }).to_string().as_bytes())),
+        ["remove", app, url] => cli(url, |call| call("DELETE", &format!("/v1/apps/{app}"), b"")),
+        ["vars", app, url, ref sets @ ..] => cli(url, |call| {
+            let mut m = serde_json::Map::new();
+            for kv in sets.iter() {
+                let (k, v) = kv.split_once('=').ok_or(format!("{kv}: want NAME=value (NAME= to unset)"))?;
+                m.insert(k.into(), if v.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(v.into()) });
+            }
+            call("PUT", &format!("/v1/apps/{app}/vars"), serde_json::Value::Object(m).to_string().as_bytes())
+        }),
         // Every app under `root/<org>/<app>/`, one node, shared process.
         ["serve-apps", engine, root, port] => {
             let (root, port) = (std::path::Path::new(root), port.parse().unwrap());
@@ -2369,6 +2441,127 @@ callers = ["api"]
         // The object keeps its state, on v2's code.
         assert_eq!(http(port, "GET", "/room/r1/count", ""), (200, "{\"count\":3}".into()));
         assert_eq!(http(port, "POST", "/room/r1/incr", ""), (200, "{\"count\":4}".into()));
+    }
+
+    /// Deploys through the bucket, on three nodes that start with nothing:
+    /// a deploy reaches every node, vars and new versions too, a bad deploy
+    /// never moves the pointer, and an app taken down is gone everywhere.
+    #[test]
+    fn deploys_reach_every_node() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 3).unwrap();
+        let bucket = s3::S3 { bucket: test_bucket(), ..base.clone() };
+        let wports = free_ports(3);
+        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
+        // Node 0 has the admin API, over TLS with the fleet's certificates.
+        let (token, line) = admin::new_token(&["acme/*:*"]);
+        let (weak, weak_line) = admin::new_token(&["acme/blog:deploy"]);
+        let admin_port = free_ports(1)[0];
+        let certs = dir.0.join("certs");
+        let nodes: Vec<u16> = (0..3u32)
+            .map(|n| {
+                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false };
+                let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 2) };
+                let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: true, tls: Some(wire::admin_tls(&certs, 0).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}")).unwrap() });
+                let port = free_ports(1)[0];
+                std::thread::spawn(move || http::serve_fleet_apps(&interp::Interp { max_pages: 16384 }, port, c, admin).unwrap());
+                port
+            })
+            .collect();
+        let url = format!("https://127.0.0.1:{admin_port}");
+        let tls = wire::admin_client(&certs.join("ca.pem")).unwrap();
+        assert!(eventually(10_000, || std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok()));
+        let api = |token: &str, method: &str, path: &str, body: &[u8]| admin::request(&url, Some((&tls, "node0.combd")), token, method, path, body).unwrap();
+        for &p in &nodes {
+            assert!(eventually(10_000, || std::net::TcpStream::connect(("127.0.0.1", p)).is_ok()));
+            stat(p, "fences");
+        }
+        // An app folder: version `n`, with `extra` routes on `api`.
+        let src = store::tempdir::Dir::new();
+        let app = |name: &str, domain: &str, routes: &str, vars: &str| {
+            let d = src.0.join(name);
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(d.join("modules")).unwrap();
+            std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
+            std::fs::copy(GUEST, manifest::module_path(&d, "classic")).unwrap();
+            std::fs::write(d.join("combd.toml"), format!("[app]\nname = \"{name}\"\ndomains = [\"{domain}\"]\n[vars]\n{vars}\n[processes.api]\nkind = \"ev\"\nroutes = {routes}\n[processes.room]\nkind = \"classic\"\ndurable = true\nroutes = [\"/room/:id/*\"]\n")).unwrap();
+            deploy::bundle(&d).unwrap()
+        };
+        let deploy = |name: &str, b: &[u8]| -> Result<String, String> {
+            match api(&token, "PUT", &format!("/v1/apps/acme/{name}"), b) {
+                (200, v) => Ok(v["version"].as_str().unwrap().to_string()),
+                (_, v) => Err(v["error"].as_str().unwrap_or("?").to_string()),
+            }
+        };
+        let everywhere = |h: &str, path: &str, want: &str| {
+            for &p in &nodes {
+                assert!(eventually(10_000, || http_to(p, h, "GET", path, "").1 == want), "node {p} {h}{path}: {:?}, want {want}", http_to(p, h, "GET", path, ""));
+            }
+        };
+        // Nothing yet.
+        assert_eq!(http_to(nodes[0], "shop.test", "GET", "/env/V", "").0, 404);
+        // v1 reaches every node.
+        let v1 = deploy("shop", &app("shop", "shop.test", "[\"/env/*\"]", "V = \"one\"")).unwrap_or_else(|e| panic!("{e}"));
+        everywhere("shop.test", "/env/V", "{\"value\":\"one\"}");
+        for (i, &p) in nodes.iter().cycle().take(9).enumerate() {
+            assert_eq!(http_to(p, "shop.test", "POST", "/room/r1/incr", "").1, format!("{{\"count\":{}}}", i + 1));
+        }
+        // Only a token with the right scope, and no body read before that.
+        let shop = deploy::bundle(&src.0.join("shop")).unwrap();
+        assert_eq!(api("", "PUT", "/v1/apps/acme/shop", &shop).0, 401);
+        assert_eq!(api(&weak, "PUT", "/v1/apps/acme/shop", &shop).0, 403, "scoped to acme/blog");
+        assert_eq!(api(&token, "PUT", "/v1/apps/globex/shop", &shop).0, 403, "scoped to acme");
+        assert_eq!(api("combd_guess", "GET", "/v1/apps/acme/shop", b"").0, 403);
+        let t = Instant::now();
+        let refused = {
+            use std::io::{Read, Write};
+            let s = std::net::TcpStream::connect(("127.0.0.1", admin_port)).unwrap();
+            let conn = rustls::ClientConnection::new(tls.clone(), rustls::pki_types::ServerName::try_from("node0.combd").unwrap()).unwrap();
+            let mut t = rustls::StreamOwned::new(conn, s);
+            write!(t, "PUT /v1/apps/acme/shop HTTP/1.1\r\nauthorization: Bearer {weak}\r\ncontent-length: 60000000\r\n\r\n").unwrap();
+            let mut out = vec![];
+            let _ = t.read_to_end(&mut out);
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        assert!(refused.starts_with("HTTP/1.1 403") && t.elapsed() < Duration::from_secs(5), "refused before the 60 MB body: {refused:?} in {:?}", t.elapsed());
+        assert_eq!(api(&token, "GET", "/v1/apps/acme/shop", b"").1["version"], v1.as_str());
+        // A var set through the API reaches every node, checked against its type.
+        assert_eq!(api(&token, "PUT", "/v1/apps/acme/shop/vars", br#"{"V": "changed"}"#).0, 200);
+        everywhere("shop.test", "/env/V", "{\"value\":\"changed\"}");
+        assert!(api(&token, "PUT", "/v1/apps/acme/shop/vars", br#"{"NOPE": "x"}"#).1["error"].as_str().unwrap().contains("not declared"));
+        // A bad deploy (its manifest names another app, or a module is
+        // missing) is refused, and the pointer stays.
+        assert!(deploy("shop", &app("other", "shop.test", "[\"/env/*\"]", "V = \"x\"")).unwrap_err().contains("its manifest says it's \"other\""));
+        assert_eq!(deploy::current(&bucket, "acme", "shop").unwrap().unwrap().0, v1);
+        // v2: a new route; the object keeps its state.
+        let v2 = deploy("shop", &app("shop", "shop.test", "[\"/env/*\", \"/hello\"]", "V = \"two\"")).unwrap();
+        assert_ne!(v1, v2);
+        everywhere("shop.test", "/hello", "{\"hits\":1}");
+        everywhere("shop.test", "/room/r1/count", "{\"count\":9}");
+        // Rollback to v1: /hello is gone again everywhere.
+        assert_eq!(api(&token, "POST", "/v1/apps/acme/shop/rollback", serde_json::json!({ "version": v1 }).to_string().as_bytes()).0, 200);
+        for &p in &nodes {
+            assert!(eventually(10_000, || http_to(p, "shop.test", "GET", "/hello", "").0 == 404), "node {p}");
+        }
+        assert_eq!(api(&token, "POST", "/v1/apps/acme/shop/rollback", serde_json::json!({ "version": v2 }).to_string().as_bytes()).0, 200);
+        // A second app, on its own domain.
+        deploy("blog", &app("blog", "blog.test", "[\"/env/*\"]", "V = \"blog\"")).unwrap();
+        everywhere("blog.test", "/env/V", "{\"value\":\"blog\"}");
+        everywhere("shop.test", "/env/V", "{\"value\":\"changed\"}");
+        // A second node 1 would fight the first over everything it owns:
+        // it must see the id is taken, and not start.
+        assert!(http::node_id_free(&bucket, 1, 1000).unwrap_err().contains("node id 1 is already in use"));
+        assert!(http::node_id_free(&bucket, 7, 1000).is_ok(), "a new id is free");
+        // Taken down: gone everywhere; the other app stays.
+        assert_eq!(api(&token, "DELETE", "/v1/apps/acme/shop", b"").0, 200);
+        for &p in &nodes {
+            assert!(eventually(10_000, || http_to(p, "shop.test", "GET", "/env/V", "").0 == 404), "node {p} still serves it");
+        }
+        everywhere("blog.test", "/env/V", "{\"value\":\"blog\"}");
     }
 
     #[test]

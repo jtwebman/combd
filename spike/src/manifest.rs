@@ -795,6 +795,28 @@ fn check_settings(at: &str, schema: &BTreeMap<String, Spec>, got: &BTreeMap<Stri
 }
 
 impl Manifest {
+    /// A value for var `name`, checked against its type. Text (as a CLI
+    /// sends it) is read as that type: `"8"` for an int is 8, `"lots"` is an
+    /// error. A secret, or a name that isn't a var, is refused.
+    pub fn var_value(&self, name: &str, v: Json) -> Result<Json, String> {
+        if self.secrets.contains_key(name) {
+            return Err(format!("{name} is a secret: set it as one"));
+        }
+        let s = self.vars.get(name).ok_or(format!("{name}: not declared in [vars]"))?;
+        let v = match (&s.ty, v) {
+            (Ty::Int, Json::String(t)) => t.trim().parse::<i64>().map(Json::from).map_err(|_| format!("{name}: want int, got {t:?}"))?,
+            (Ty::Float, Json::String(t)) => t.trim().parse::<f64>().ok().and_then(|f| serde_json::Number::from_f64(f).map(Json::Number)).ok_or(format!("{name}: want float, got {t:?}"))?,
+            (Ty::Bool, Json::String(t)) => match t.as_str() {
+                "true" => Json::Bool(true),
+                "false" => Json::Bool(false),
+                _ => return Err(format!("{name}: want true or false, got {t:?}")),
+            },
+            (_, v) => v,
+        };
+        check_value(s, &v).map_err(|e| format!("{name}: {e}"))?;
+        Ok(v)
+    }
+
     /// Resolve for one environment: its values checked against their types,
     /// every required one set, and every setting checked again with real
     /// values (a var's limits may be wider than its setting's).

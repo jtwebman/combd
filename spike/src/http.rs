@@ -623,6 +623,197 @@ where
     }
 }
 
+/// A node serving the apps deployed to its fleet's bucket: it loads them
+/// all, then every `SYNC` swaps in whatever changed. Deploys come in through
+/// `deploy_bundle` (the admin API), on any node.
+pub fn serve_fleet_apps<E>(eng: &E, port: u16, cfg: Config, admin: Option<crate::admin::AdminCfg>) -> Result<(), String>
+where
+    E: Engine + Sync,
+    E::Program: Sync + Send,
+{
+    let s3 = cfg.fleet.as_ref().ok_or("fleet mode needs a bucket (COMBD_S3)")?.s3.clone();
+    // The storage test first (it makes the bucket too): never serve on one
+    // that can't do compare-and-swap.
+    s3.check().map_err(|e| format!("the bucket at {} failed the storage test: {e}", s3.host))?;
+    let cache = cfg.data.join("apps");
+    let mut known = crate::deploy::Known::new();
+    let first = sync_apps(eng, &s3, &cache, &mut known, &App::empty())?;
+    let live = Live::new(first.unwrap_or_else(App::empty));
+    let mut cfg = cfg;
+    cfg.pg = pg_of(&live.now());
+    let scratch = cfg.data.join("scratch");
+    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+    std::thread::scope(|sc| {
+        let (live, stop) = (&live, cfg.stop.clone());
+        if let Some(admin) = admin {
+            let (s3, stop) = (&s3, cfg.stop.clone());
+            let scratch = scratch.clone();
+            sc.spawn(move || {
+                let api = NodeApi { eng, live, s3, scratch };
+                if let Err(e) = crate::admin::serve(admin, &api, &stop) {
+                    eprintln!("combd     the admin API stopped: {e}");
+                }
+            });
+        }
+        let s3 = s3.clone();
+        sc.spawn(move || {
+            while !stop.load(Relaxed) {
+                std::thread::sleep(SYNC);
+                match sync_apps(eng, &s3, &cache, &mut known, &live.now()) {
+                    Ok(Some(next)) => live.swap(next),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("combd     deploys: {e} (still serving what's loaded)"),
+                }
+            }
+        });
+        serve_live(eng, live, port, cfg);
+    });
+    Ok(())
+}
+
+/// The admin API's work on a node of a fleet.
+struct NodeApi<'a, E: Engine> {
+    eng: &'a E,
+    live: &'a Live<E::Program>,
+    s3: &'a crate::s3::S3,
+    scratch: std::path::PathBuf,
+}
+
+impl<E: Engine + Sync> crate::admin::Api for NodeApi<'_, E>
+where
+    E::Program: Sync + Send,
+{
+    fn deploy(&self, org: &str, app: &str, bundle: &[u8]) -> Result<String, String> {
+        deploy_bundle(self.eng, self.live, self.s3, &self.scratch, org, app, bundle)
+    }
+
+    fn current(&self, org: &str, app: &str) -> Result<Option<String>, String> {
+        Ok(crate::deploy::current(self.s3, org, app)?.map(|(v, _)| v))
+    }
+
+    /// An earlier version, checked again (vars may have changed since).
+    fn rollback(&self, org: &str, app: &str, version: &str) -> Result<(), String> {
+        let b = crate::deploy::get_version(self.s3, org, app, version)?;
+        deploy_bundle(self.eng, self.live, self.s3, &self.scratch, org, app, &b).map(|_| ())
+    }
+
+    fn remove(&self, org: &str, app: &str) -> Result<(), String> {
+        crate::deploy::remove(self.s3, org, app)
+    }
+
+    /// Set (or, with `null`, unset) vars. With a version live, each is
+    /// checked against its declared type, so a bad value never reaches it.
+    fn set_vars(&self, org: &str, app: &str, set: std::collections::BTreeMap<String, serde_json::Value>) -> Result<(), String> {
+        let manifest = match crate::deploy::current(self.s3, org, app)? {
+            Some((v, _)) => {
+                let dir = self.scratch.join(format!("vars-{org}-{app}-{v}"));
+                crate::deploy::unpack(&crate::deploy::get_version(self.s3, org, app, &v)?, &dir)?;
+                let m = crate::manifest::load(&dir);
+                let _ = std::fs::remove_dir_all(&dir);
+                m?
+            }
+            None => None,
+        };
+        let (mut env, _) = crate::deploy::env(self.s3, org, app)?;
+        for (k, v) in set {
+            if v.is_null() {
+                env.vars.remove(&k);
+                continue;
+            }
+            let v = match &manifest {
+                Some(m) => m.var_value(&k, v)?,
+                None => v,
+            };
+            env.vars.insert(k, v);
+        }
+        crate::deploy::put_vars(self.s3, org, app, &env.vars)
+    }
+}
+
+/// How often a node looks for deploys.
+const SYNC: Duration = Duration::from_secs(2);
+
+/// What changed in the bucket since `known`, as a new app (`None`: nothing).
+fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, known: &mut crate::deploy::Known, now: &App<E::Program>) -> Result<Option<App<E::Program>>, String> {
+    let (changes, gone) = crate::deploy::sync(s3, cache, known)?;
+    if changes.is_empty() && gone.is_empty() {
+        return Ok(None);
+    }
+    // Take down what's gone, then each change on its own: one app that
+    // won't load is skipped (and tried again next time), not the rest.
+    let mut next = now.with_apps(&[], &gone, |w| eng.load(w).map_err(|e| e.to_string()))?;
+    for g in &gone {
+        known.remove(g);
+    }
+    let (mut errs, mut applied) = (vec![], !gone.is_empty());
+    for c in &changes {
+        let one = load_one(&c.dir, &c.env).and_then(|(m, r)| {
+            if m.app != c.app {
+                return Err(format!("its manifest says it's {:?}", m.app));
+            }
+            let a = crate::app::AppDir { org: &c.org, dir: &c.dir, resolved: &r, app: &m.app, domains: &m.domains };
+            next.with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string()))
+        });
+        match one {
+            Ok(n) => {
+                next = n;
+                applied = true;
+                known.insert((c.org.clone(), c.app.clone()), (c.version.clone(), c.vars_etag.clone()));
+            }
+            Err(e) => errs.push(format!("{}/{}: {e}", c.org, c.app)),
+        }
+    }
+    if !errs.is_empty() {
+        eprintln!("combd     deploys skipped for now: {}", errs.join("; "));
+    }
+    if !applied {
+        return Ok(None);
+    }
+    Ok(Some(next))
+}
+
+/// An app's manifest in `dir`, resolved with `env`.
+fn load_one(dir: &std::path::Path, env: &crate::manifest::EnvValues) -> Result<(crate::manifest::Manifest, crate::manifest::Resolved), String> {
+    let m = crate::manifest::load(dir)?.ok_or("no manifest")?;
+    let r = m.resolve(env)?;
+    Ok((m, r))
+}
+
+/// The Postgres pools of every live app (named `<org>/<app>/<pool>`).
+fn pg_of<P>(_app: &App<P>) -> Option<crate::pg::PgCfg> {
+    // ponytail: pools start with the node; a deploy that adds a pool needs
+    // a restart until the fleet-wide pool lands (it starts pools on demand).
+    None
+}
+
+/// Deploy `bundle` as `<org>/<app>`: everything is checked first, against
+/// what this node serves (so a domain another app has is refused), then the
+/// version goes up and the live pointer moves. Every node picks it up.
+pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, s3: &crate::s3::S3, scratch: &std::path::Path, org: &str, app: &str, bundle: &[u8]) -> Result<String, String> {
+    let ident = |s: &str| !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    if !ident(org) || !ident(app) {
+        return Err("org and app: lowercase letters, digits, - and _".into());
+    }
+    let v = crate::deploy::version_of(bundle);
+    let dir = scratch.join(format!("{org}-{app}-{v}"));
+    crate::deploy::unpack(bundle, &dir)?;
+    let checked = (|| {
+        let (env, _) = crate::deploy::env(s3, org, app)?;
+        let (m, r) = load_one(&dir, &env)?;
+        if m.app != app {
+            return Err(format!("its manifest says it's {:?}, not {app:?}", m.app));
+        }
+        let a = crate::app::AppDir { org, dir: &dir, resolved: &r, app: &m.app, domains: &m.domains };
+        live.now().with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string())).map(|_| ())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    checked.map_err(|e| format!("{org}/{app}: {e}"))?;
+    crate::deploy::put_version(s3, org, app, bundle)?;
+    let was = crate::deploy::current(s3, org, app)?;
+    crate::deploy::set_current(s3, org, app, &v, was.as_ref().map(|(_, e)| e.as_str()))?;
+    Ok(v)
+}
+
 /// Deploy the app in `dir` (org `org`) onto a running node: checked and
 /// loaded in full first, so a bad version never goes live and the old one
 /// keeps serving.
@@ -904,6 +1095,19 @@ struct Loop<'a, E: Engine> {
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
+/// Never two nodes with one id: they'd fight over everything it owns. A
+/// live node renews its heartbeat every third of a lease, so if this id's
+/// moves while we watch for half a lease, someone else is using it.
+pub fn node_id_free(s3: &crate::s3::S3, node: own::Node, lease_ms: u64) -> Result<(), String> {
+    let beat = || s3.get(&own::lease_key(node)).ok().flatten().map(|(_, etag)| etag);
+    let before = beat();
+    std::thread::sleep(Duration::from_millis(lease_ms / 2));
+    if before.is_some() && beat() != before {
+        return Err(format!("node id {node} is already in use by a running node: give this one another COMBD_NODE"));
+    }
+    Ok(())
+}
+
 fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize, data: &std::path::Path) -> FleetShared {
     // The startup storage test: never serve on a bucket that can't do CAS.
     if let Err(e) = fc.s3.check() {
@@ -911,6 +1115,10 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
         std::process::exit(1);
     }
     println!("combd     node {} in a fleet, bucket {} passed the storage test", fc.node, fc.s3.host);
+    if let Err(e) = node_id_free(&fc.s3, fc.node, fc.lease_ms) {
+        eprintln!("combd     {e}");
+        std::process::exit(1);
+    }
     let (tx, rx) = channel::<Job>();
     let rx = Arc::new(Mutex::new(rx));
     for _ in 0..BUCKET_THREADS {
