@@ -8,6 +8,14 @@
 //! app's routes match only its own domains, and no two apps share one. The
 //! org is the tenant, and comes from who deployed (here, the folder an app is
 //! in), never from the app's own manifest.
+//!
+//! A deploy makes a new `App` from the old one, append-only: the new
+//! version's processes are added, the old version's are marked `retired`,
+//! and nothing moves. So a cell from the old version still points at a real
+//! process: it finishes what it's doing on the old code, and is dropped
+//! instead of going back to a pool. New requests route only to live
+//! processes. ponytail: retired processes and their programs stay until the
+//! node restarts; collect them once nothing uses them, if deploys get frequent.
 
 use crate::manifest::{Resolved, Route, Seg};
 use std::collections::HashMap;
@@ -15,8 +23,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct Proc {
     pub name: String,
+    /// An older version's: it runs out what it has, and takes nothing new.
+    pub retired: bool,
     /// Its app (`App::tenants`).
     pub tenant: usize,
     /// Index into `App::progs`.
@@ -31,6 +42,7 @@ pub struct Proc {
 }
 
 /// One app of one org.
+#[derive(Clone)]
 pub struct Tenant {
     pub org: String,
     pub app: String,
@@ -47,10 +59,15 @@ impl Tenant {
 }
 
 pub struct App<P> {
-    pub progs: Vec<P>,
+    pub progs: Vec<Arc<P>>,
     pub procs: Vec<Proc>,
     pub tenants: Vec<Tenant>,
     pub router: Router,
+    /// Programs by the hash of their bytes: the same module loads once,
+    /// across apps and versions.
+    by_hash: HashMap<[u8; 32], usize>,
+    /// Apps taken down: (`tenants` index); their processes are retired.
+    gone: Vec<usize>,
 }
 
 /// Where a request goes. Non-generic, so the (fuzzed) parser can use it.
@@ -91,35 +108,77 @@ pub struct AppDir<'a> {
 impl<P> App<P> {
     /// One program, the old routes.
     pub fn single(prog: P, max_concurrent: usize) -> App<P> {
-        let proc = Proc { name: "main".into(), tenant: 0, prog: 0, durable: false, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
+        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
         let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default() };
-        App { progs: vec![prog], procs: vec![proc], tenants: vec![tenant], router: Router::legacy() }
+        App { progs: vec![Arc::new(prog)], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
+    }
+
+    /// No apps yet.
+    pub fn empty() -> App<P> {
+        App { progs: vec![], procs: vec![], tenants: vec![], router: Router::new(vec![], vec![]), by_hash: HashMap::new(), gone: vec![] }
     }
 
     /// Every app, from its resolved manifest: each module loaded once (the
     /// same bytes in two apps are one program), each process with its
     /// settings and rights, all scoped to its app.
     pub fn from_apps(apps: &[AppDir], load: impl Fn(&[u8]) -> Result<P, String>) -> Result<App<P>, String> {
-        let mut progs = vec![];
-        let mut by_hash: HashMap<[u8; 32], usize> = HashMap::new();
-        let (mut procs, mut tenants, mut targets) = (vec![], vec![], vec![]);
-        let mut owner_of: HashMap<String, String> = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
         for a in apps {
-            let t = tenants.len();
-            let key = format!("{}/{}", a.org, a.app);
-            if tenants.iter().any(|x: &Tenant| x.key() == key) {
-                return Err(format!("{key}: two apps with the same name in one org"));
+            if !seen.insert((a.org, a.app)) {
+                return Err(format!("{}/{}: two apps with the same name in one org", a.org, a.app));
             }
-            for d in a.domains {
-                if let Some(other) = owner_of.insert(d.clone(), key.clone()) {
-                    return Err(format!("{key}: domain {d} is already {other}'s"));
+        }
+        App::empty().with_apps(apps, &[], load)
+    }
+
+    /// A new `App`: this one, with `apps` deployed (new, or new versions of
+    /// apps it has) and the apps in `remove` taken down. Append-only: see the
+    /// module's notes.
+    pub fn with_apps(&self, apps: &[AppDir], remove: &[(String, String)], load: impl Fn(&[u8]) -> Result<P, String>) -> Result<App<P>, String> {
+        let mut progs = self.progs.clone();
+        let mut by_hash = self.by_hash.clone();
+        let mut procs = self.procs.clone();
+        let mut tenants = self.tenants.clone();
+        let mut gone = self.gone.clone();
+        let find = |tenants: &[Tenant], org: &str, app: &str| tenants.iter().position(|x| x.org == org && x.app == app);
+        let changed: Vec<usize> = apps.iter().filter_map(|a| find(&tenants, a.org, a.app)).chain(remove.iter().filter_map(|(o, a)| find(&tenants, o, a))).collect();
+        for p in procs.iter_mut().filter(|p| changed.contains(&p.tenant)) {
+            p.retired = true;
+        }
+        for (o, a) in remove {
+            if let Some(t) = find(&tenants, o, a) {
+                gone.push(t);
+            }
+        }
+        for a in apps {
+            let environ = Arc::new(a.resolved.environ.iter().map(|(k, v)| format!("{k}={v}").into_bytes()).collect());
+            let tenant = Tenant { org: a.org.into(), app: a.app.into(), domains: a.domains.to_vec(), environ };
+            match find(&tenants, a.org, a.app) {
+                Some(t) => {
+                    tenants[t] = tenant;
+                    gone.retain(|&g| g != t);
+                }
+                None => tenants.push(tenant),
+            }
+        }
+        // Domains: each app's own, no two the same, and an app with none
+        // only when it's alone.
+        let live: Vec<usize> = (0..tenants.len()).filter(|t| !gone.contains(t)).collect();
+        let mut owner_of: HashMap<&str, String> = HashMap::new();
+        for &t in &live {
+            let x = &tenants[t];
+            for d in &x.domains {
+                if let Some(other) = owner_of.insert(d, x.key()) {
+                    return Err(format!("{}: domain {d} is already {other}'s", x.key()));
                 }
             }
-            if apps.len() > 1 && a.domains.is_empty() {
-                return Err(format!("{key}: with more than one app, each one names its domains ([app] domains)"));
+            if live.len() > 1 && x.domains.is_empty() {
+                return Err(format!("{}: with more than one app, each one names its domains ([app] domains)", x.key()));
             }
-            let environ = a.resolved.environ.iter().map(|(k, v)| format!("{k}={v}").into_bytes()).collect();
-            tenants.push(Tenant { org: a.org.into(), app: a.app.into(), domains: a.domains.to_vec(), environ: Arc::new(environ) });
+        }
+        for a in apps {
+            let t = find(&tenants, a.org, a.app).unwrap();
+            let key = tenants[t].key();
             let user: Vec<(&String, &crate::manifest::Process)> = a.resolved.processes.iter().filter(|(_, p)| !p.kind.starts_with("combd:")).collect();
             let first = procs.len();
             let index = |n: &str| user.iter().position(|(name, _)| *name == n).map(|i| first + i);
@@ -133,16 +192,16 @@ impl<P> App<P> {
                 let prog = match by_hash.get(&hash) {
                     Some(&i) => i,
                     None => {
-                        progs.push(load(&wasm).map_err(|e| format!("{key}: modules/{}.wasm: {e}", p.kind))?);
+                        progs.push(Arc::new(load(&wasm).map_err(|e| format!("{key}: modules/{}.wasm: {e}", p.kind))?));
                         by_hash.insert(hash, progs.len() - 1);
                         progs.len() - 1
                     }
                 };
                 let n = |k: &str| p.settings[k].as_u64().unwrap_or(0);
                 let durable = p.settings["durable"].as_bool() == Some(true);
-                let i = procs.len();
                 procs.push(Proc {
                     name: (*name).clone(),
+                    retired: false,
                     tenant: t,
                     prog,
                     durable,
@@ -157,17 +216,27 @@ impl<P> App<P> {
                             return Err(format!("{key}: route {} is on {h}, which isn't one of its domains", r.text));
                         }
                     }
-                    targets.push(Target { route: r.clone(), proc: i, tenant: t, name: format!("{key}/{name}"), durable });
                 }
             }
         }
-        let domains = tenants.iter().map(|t| t.domains.clone()).collect();
-        Ok(App { progs, procs, tenants, router: Router::new(targets, domains) })
+        // Routes: every live process's, from its manifest.
+        let mut targets = vec![];
+        for (t, a) in apps.iter().map(|a| (find(&tenants, a.org, a.app).unwrap(), a)) {
+            for (name, p) in a.resolved.processes.iter().filter(|(_, p)| !p.kind.starts_with("combd:")) {
+                let i = procs.iter().position(|x| x.tenant == t && !x.retired && &x.name == name).unwrap();
+                let durable = procs[i].durable;
+                targets.extend(p.routes.iter().map(|r| Target { route: r.clone(), proc: i, tenant: t, name: format!("{}/{name}", tenants[t].key()), durable }));
+            }
+        }
+        // ...and those of apps this deploy didn't touch.
+        targets.extend(self.router.routes.iter().filter(|x| !procs[x.proc].retired && !gone.contains(&x.tenant)).map(|x| Target { route: x.route.clone(), proc: x.proc, tenant: x.tenant, name: x.name.clone(), durable: x.durable }));
+        let domains = tenants.iter().enumerate().map(|(t, x)| if gone.contains(&t) { vec![] } else { x.domains.clone() }).collect();
+        Ok(App { progs, procs, tenants, router: Router::new(targets, domains), by_hash, gone })
     }
 
     /// Process `name` of app `tenant`: a call or a lease never leaves its app.
     pub fn proc_in(&self, tenant: usize, name: &str) -> Option<usize> {
-        self.procs.iter().position(|p| p.tenant == tenant && p.name == name)
+        self.procs.iter().position(|p| p.tenant == tenant && !p.retired && p.name == name)
     }
 
     /// The process an object belongs to: `<org>/<app>/<process>/<id>`, or 0
@@ -178,7 +247,7 @@ impl<P> App<P> {
         }
         let mut parts = obj.splitn(4, '/');
         let (Some(org), Some(app), Some(proc)) = (parts.next(), parts.next(), parts.next()) else { return 0 };
-        let tenant = self.tenants.iter().position(|t| t.org == org && t.app == app);
+        let tenant = self.tenants.iter().enumerate().position(|(i, t)| t.org == org && t.app == app && !self.gone.contains(&i));
         tenant.and_then(|t| self.proc_in(t, proc)).unwrap_or(0)
     }
 

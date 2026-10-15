@@ -567,11 +567,11 @@ fn owner(name: &str, threads: usize) -> usize {
 pub fn serve<E>(eng: &E, prog: E::Program, port: u16)
 where
     E: Engine + Sync,
-    E::Program: Sync,
+    E::Program: Sync + Send,
 {
     let cfg = Config::from_env();
     let app = App::single(prog, cfg.ev_max);
-    serve_with(eng, &app, port, cfg)
+    serve_with(eng, app, port, cfg)
 }
 
 /// The app in `dir`: its manifest, resolved for the local `dev` environment,
@@ -579,7 +579,7 @@ where
 pub fn serve_app<E>(eng: &E, dir: &std::path::Path, port: u16)
 where
     E: Engine + Sync,
-    E::Program: Sync,
+    E::Program: Sync + Send,
 {
     serve_apps_in(eng, &[("local".into(), dir.to_path_buf())], port)
 }
@@ -589,7 +589,7 @@ where
 pub fn serve_apps<E>(eng: &E, root: &std::path::Path, port: u16)
 where
     E: Engine + Sync,
-    E::Program: Sync,
+    E::Program: Sync + Send,
 {
     let mut apps = vec![];
     let dirs = |d: &std::path::Path| -> Vec<std::path::PathBuf> {
@@ -608,12 +608,12 @@ where
 fn serve_apps_in<E>(eng: &E, apps: &[(String, std::path::PathBuf)], port: u16)
 where
     E: Engine + Sync,
-    E::Program: Sync,
+    E::Program: Sync + Send,
 {
     match load_apps(eng, apps) {
         Ok((app, pg)) => {
             let cfg = Config { pg, ..Config::from_env() };
-            serve_with(eng, &app, port, cfg)
+            serve_with(eng, app, port, cfg)
         }
         Err(e) => {
             // Any mistake in any app, and nothing starts.
@@ -621,6 +621,19 @@ where
             std::process::exit(1);
         }
     }
+}
+
+/// Deploy the app in `dir` (org `org`) onto a running node: checked and
+/// loaded in full first, so a bad version never goes live and the old one
+/// keeps serving.
+pub fn deploy_dir<E: Engine>(eng: &E, live: &Live<E::Program>, org: &str, dir: &std::path::Path) -> Result<(), String> {
+    let at = format!("{org}/{}", dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    let m = crate::manifest::load(dir).map_err(|e| format!("{at}: {e}"))?.ok_or(format!("{at}: no manifest"))?;
+    let r = m.resolve(&crate::manifest::load_dev(dir).map_err(|e| format!("{at}: {e}"))?).map_err(|e| format!("{at}: {e}"))?;
+    let a = crate::app::AppDir { org, dir, resolved: &r, app: &m.app, domains: &m.domains };
+    let next = live.now().with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string()))?;
+    live.swap(next);
+    Ok(())
 }
 
 /// One app in `dir` (org `local`), ready to serve.
@@ -645,11 +658,43 @@ pub fn load_apps<E: Engine>(eng: &E, apps: &[(String, std::path::PathBuf)]) -> R
     Ok((app, (!pools.is_empty()).then_some(crate::pg::PgCfg { pools })))
 }
 
-pub fn serve_with<E>(eng: &E, app: &App<E::Program>, port: u16, mut cfg: Config)
+/// What a node serves right now. A deploy `swap`s in a new `App` (made with
+/// `App::with_apps`); each loop picks it up between rounds (within a tick).
+pub struct Live<P> {
+    app: Mutex<Arc<App<P>>>,
+    gen: AtomicU64,
+}
+
+impl<P> Live<P> {
+    pub fn new(app: App<P>) -> Live<P> {
+        Live { app: Mutex::new(Arc::new(app)), gen: AtomicU64::new(0) }
+    }
+
+    pub fn now(&self) -> Arc<App<P>> {
+        self.app.lock().unwrap().clone()
+    }
+
+    pub fn swap(&self, app: App<P>) {
+        *self.app.lock().unwrap() = Arc::new(app);
+        self.gen.fetch_add(1, Relaxed);
+    }
+}
+
+/// Serve `app`, fixed: nothing swaps it.
+pub fn serve_with<E>(eng: &E, app: App<E::Program>, port: u16, cfg: Config)
 where
     E: Engine + Sync,
-    E::Program: Sync,
+    E::Program: Sync + Send,
 {
+    serve_live(eng, &Live::new(app), port, cfg)
+}
+
+pub fn serve_live<E>(eng: &E, live: &Live<E::Program>, port: u16, mut cfg: Config)
+where
+    E: Engine + Sync,
+    E::Program: Sync + Send,
+{
+    let app = live.now();
     std::fs::create_dir_all(&cfg.data).expect("create the data directory");
     let index = Mutex::new(AlarmIndex::open(&cfg.data).expect("open the alarm index"));
     let listener = std::net::TcpListener::bind(("0.0.0.0", port)).expect("bind");
@@ -721,10 +766,13 @@ where
     std::thread::scope(|sc| {
         for (me, (poll, inbox)) in polls.into_iter().zip(inboxes).enumerate() {
             let l = listener.try_clone().expect("clone listener");
+            let app = app.clone();
             sc.spawn(move || {
                 let mut lp = Loop {
                     eng,
-                    app,
+                    app: app.clone(),
+                    live,
+                    app_gen: live.gen.load(Relaxed),
                     sh,
                     me,
                     inbox,
@@ -787,7 +835,10 @@ where
 /// Everything one event loop owns.
 struct Loop<'a, E: Engine> {
     eng: &'a E,
-    app: &'a App<E::Program>,
+    /// The app as of the last round; `live` has the newest.
+    app: Arc<App<E::Program>>,
+    live: &'a Live<E::Program>,
+    app_gen: u64,
     sh: &'a Shared,
     me: usize,
     inbox: Receiver<Msg>,
@@ -980,11 +1031,7 @@ impl<E: Engine> Loop<'_, E> {
     fn run(&mut self, mut listener: TcpListener) -> std::io::Result<()> {
         let mut events = Events::with_capacity(1024);
         self.poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
-        for p in 0..self.app.procs.len() {
-            let mut first = fresh(self.eng, self.app, p, &self.environ_for(p))?;
-            self.ev_mode[p] = first.vm.has_export("on_request");
-            self.pools[p].push(first);
-        }
+        self.warm(0)?;
         // Alarms from before a restart.
         let threads = self.sh.cfg.threads;
         for (name, at) in self.sh.index.lock().unwrap().all().unwrap_or_default() {
@@ -994,6 +1041,7 @@ impl<E: Engine> Loop<'_, E> {
         }
         let mut touched: Vec<usize> = vec![];
         while !self.sh.cfg.stop.load(Relaxed) {
+            self.pick_up_app()?;
             // Never block while requests are waiting to run.
             let timeout = if self.tasks.is_empty() {
                 let next = self.alarms.peek().map(|Reverse((at, _))| Duration::from_millis((at - now_ms()).max(0) as u64));
@@ -1070,11 +1118,12 @@ impl<E: Engine> Loop<'_, E> {
             // gets all it needs; what it leaves goes unspent this round, and
             // the round is shorter (the poll comes sooner).
             let share = self.round_share();
+            let app = self.app.clone();
             let mut used: HashMap<&str, usize> = HashMap::new();
             for _ in 0..self.tasks.len() {
                 let mut t = self.tasks.pop_front().unwrap();
                 if let Some(share) = share {
-                    let org = self.app.tenants[self.app.procs[t.cell.proc].tenant].org.as_str();
+                    let org = app.tenants[app.procs[t.cell.proc].tenant].org.as_str();
                     let n = used.entry(org).or_default();
                     if *n >= share {
                         self.tasks.push_back(t);
@@ -1272,7 +1321,7 @@ impl<E: Engine> Loop<'_, E> {
             Some(i) => i,
             None => {
                 self.ev_gen += 1;
-                let inst = EvInst { gen: self.ev_gen, proc, cell: Some(fresh(self.eng, self.app, proc, &self.environ_for(proc))?), reqs: HashMap::new(), tickets: HashMap::new(), queue: VecDeque::new(), running: None };
+                let inst = EvInst { gen: self.ev_gen, proc, cell: Some(fresh(self.eng, &self.app, proc, &self.environ_for(proc))?), reqs: HashMap::new(), tickets: HashMap::new(), queue: VecDeque::new(), running: None };
                 self.sh.stats.ev_instances.fetch_add(1, Relaxed);
                 match self.ev.iter().position(Option::is_none) {
                     Some(i) => {
@@ -1487,7 +1536,8 @@ impl<E: Engine> Loop<'_, E> {
         // ponytail: drops at once; keep it for `idle` if start-up cost shows.
         let inst = self.ev[i].as_ref().unwrap();
         let first = self.ev.iter().position(|e| e.as_ref().is_some_and(|e| e.proc == inst.proc));
-        if first != Some(i) && inst.reqs.is_empty() && inst.queue.is_empty() && inst.cell.is_some() {
+        let retired = self.app.procs[inst.proc].retired;
+        if (first != Some(i) || retired) && inst.reqs.is_empty() && inst.queue.is_empty() && inst.cell.is_some() {
             self.ev[i] = None;
         }
     }
@@ -1902,7 +1952,9 @@ impl<E: Engine> Loop<'_, E> {
                             }
                         }
                     }
-                    self.pools[cell.proc].push(cell);
+                    if !self.app.procs[cell.proc].retired {
+                        self.pools[cell.proc].push(cell);
+                    }
                     split_answer(&a)
                 }
                 Err(trap) => {
@@ -2276,7 +2328,7 @@ impl<E: Engine> Loop<'_, E> {
         }
         let mut cell = match self.pools[p].pop() {
             Some(cell) => cell,
-            None => fresh(self.eng, self.app, p, &self.environ_for(p))?,
+            None => fresh(self.eng, &self.app, p, &self.environ_for(p))?,
         };
         if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
             eprintln!("cell trapped starting a request: {trap}");
@@ -2312,7 +2364,10 @@ impl<E: Engine> Loop<'_, E> {
         let target = v["to"].as_str().ok_or("name the process: \"to\"")?;
         let caller = &self.app.procs[from].name;
         let tenant = self.app.procs[from].tenant;
-        let t = self.app.proc_in(tenant, target).filter(|t| !self.app.router.legacy && self.app.procs[*t].callers.contains(&from)).ok_or_else(|| format!("denied: {caller} may not call {target}"))?;
+        // By name: a caller still on an older version (a deploy just came)
+        // is the same process as far as `callers` goes.
+        let allowed = |t: &usize| !self.app.router.legacy && self.app.procs[*t].callers.iter().any(|&c| self.app.procs[c].name == *caller);
+        let t = self.app.proc_in(tenant, target).filter(allowed).ok_or_else(|| format!("denied: {caller} may not call {target}"))?;
         let proc = &self.app.procs[t];
         let method = v["method"].as_str().unwrap_or("POST");
         if !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].contains(&method) {
@@ -2344,6 +2399,47 @@ impl<E: Engine> Loop<'_, E> {
             self.run_cell(origin, t, line("api"))
         };
         r.map_err(|e: std::io::Error| e.to_string())
+    }
+
+    /// A deploy swapped in a new app: take it. Processes it retired keep
+    /// what's running and get nothing new; their warm cells go, and an
+    /// object's old cell gives way to a fresh one (its storage stays).
+    fn pick_up_app(&mut self) -> std::io::Result<()> {
+        let gen = self.live.gen.load(Relaxed);
+        if gen == self.app_gen {
+            return Ok(());
+        }
+        self.app_gen = gen;
+        let from = self.app.procs.len();
+        self.app = self.live.now();
+        let app = self.app.clone();
+        for (p, pool) in self.pools.iter_mut().enumerate() {
+            if app.procs[p].retired {
+                pool.clear();
+            }
+        }
+        for o in self.objects.values_mut() {
+            if !o.busy && o.cell.as_ref().is_some_and(|c| app.procs[c.proc].retired) {
+                o.cell = None;
+            }
+        }
+        self.warm(from)
+    }
+
+    /// New processes (from `from` on): a warm cell each, and whether it's an
+    /// event cell.
+    fn warm(&mut self, from: usize) -> std::io::Result<()> {
+        self.pools.resize_with(self.app.procs.len(), Vec::new);
+        self.ev_mode.resize(self.app.procs.len(), false);
+        for p in from..self.app.procs.len() {
+            if self.app.procs[p].retired {
+                continue;
+            }
+            let mut first = fresh(self.eng, &self.app, p, &self.environ_for(p))?;
+            self.ev_mode[p] = first.vm.has_export("on_request");
+            self.pools[p].push(first);
+        }
+        Ok(())
     }
 
     /// Each org's slices this round (`None`: one org, no limit).
@@ -2430,7 +2526,7 @@ impl<E: Engine> Loop<'_, E> {
     /// Begin one request on an object: its warm cell (or a fresh one), inside
     /// a transaction. `Ok(false)`: nothing to run (a stale alarm).
     fn run_object(&mut self, name: &str, origin: Origin, mut req: String) -> Result<bool, (u16, String)> {
-        let (eng, app) = (self.eng, self.app);
+        let (eng, app) = (self.eng, self.app.clone());
         let proc = app.object_proc(name);
         let environ = self.environ_for(proc);
         // WebSocket events say what they are in their text, the same here
@@ -2505,8 +2601,9 @@ impl<E: Engine> Loop<'_, E> {
             }
         }
         let mut cell = match o.cell.take() {
-            Some(c) => c,
-            None => match fresh(eng, app, proc, &environ) {
+            // A cell of the old code (a deploy came since) gives way.
+            Some(c) if !app.procs[c.proc].retired => c,
+            _ => match fresh(eng, &app, proc, &environ) {
                 Ok(mut c) => {
                     c.host().db = Some(o.db.clone());
                     c

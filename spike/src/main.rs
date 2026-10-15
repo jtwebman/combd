@@ -1201,7 +1201,7 @@ mod tests {
         let stop = cfg.stop.clone();
         let t = std::thread::spawn(move || {
             let app = make(&eng);
-            http::serve_with(&eng, &app, port, cfg);
+            http::serve_with(&eng, app, port, cfg);
         });
         for _ in 0..200 {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -2323,6 +2323,52 @@ callers = ["api"]
             assert_eq!(ok(n1, &h, "GET", "/room/r1/count", ""), format!("{{\"count\":{}}}", 3 * (i + 1) + 1));
             assert_eq!(ok(n2, &h, "GET", "/room/sent/count", ""), "{\"count\":3}");
         }
+    }
+
+    /// A deploy onto a running node: in-flight work finishes on the old
+    /// version, new requests get the new one, an object keeps its state and
+    /// runs the new code, and a bad version never goes live.
+    #[test]
+    fn a_deploy_swaps_a_running_app() {
+        let root = store::tempdir::Dir::new();
+        let v = |n: u32, api_kind: &str, api_routes: &str| {
+            let d = root.0.join(format!("v{n}")).join("shop");
+            std::fs::create_dir_all(d.join("modules")).unwrap();
+            std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
+            std::fs::copy(GUEST, manifest::module_path(&d, "classic")).unwrap();
+            std::fs::write(d.join("combd.toml"), format!("[app]\nname = \"shop\"\n[vars]\nVERSION = \"{n}\"\n[processes.api]\nkind = \"{api_kind}\"\nroutes = {api_routes}\n[processes.edge]\nkind = \"ev\"\nroutes = [\"/env/*\", \"/sleep/*\"]\n[processes.room]\nkind = \"classic\"\ndurable = true\nroutes = [\"/room/:id/*\"]\n")).unwrap();
+            d
+        };
+        let (v1, v2) = (v(1, "ev", "[\"/hello\"]"), v(2, "classic", "[\"/api/*\"]"));
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, _) = http::load_app(&eng, &v1).unwrap_or_else(|e| panic!("{e}"));
+        let live = Arc::new(http::Live::new(a));
+        let dir = store::tempdir::Dir::new();
+        let port = free_ports(1)[0];
+        let (l2, c) = (live.clone(), cfg(&dir.0, 1));
+        std::thread::spawn(move || http::serve_live(&interp::Interp { max_pages: 16384 }, &l2, port, c));
+        assert!(eventually(2000, || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()));
+        assert_eq!(http(port, "GET", "/env/VERSION", ""), (200, "{\"value\":\"1\"}".into()));
+        assert_eq!(http(port, "GET", "/hello", "").0, 200);
+        for n in 1..=3 {
+            assert_eq!(http(port, "POST", "/room/r1/incr", ""), (200, format!("{{\"count\":{n}}}")));
+        }
+        // A slow request on v1, in flight across the deploy.
+        let slow = std::thread::spawn(move || http(port, "GET", "/sleep/600", ""));
+        std::thread::sleep(Duration::from_millis(100));
+        // A bad version: refused, and v1 keeps serving.
+        let bad = v(3, "missing", "[\"/x\"]");
+        assert!(http::deploy_dir(&eng, &live, "local", &bad).unwrap_err().contains("no module modules/missing.wasm"));
+        assert_eq!(http(port, "GET", "/hello", "").0, 200);
+        // v2: `api` is another module on other routes, and VERSION is 2.
+        http::deploy_dir(&eng, &live, "local", &v2).unwrap_or_else(|e| panic!("{e}"));
+        assert!(eventually(1000, || http(port, "GET", "/env/VERSION", "").1 == "{\"value\":\"2\"}"));
+        assert_eq!(http(port, "GET", "/hello", "").0, 404, "v1's route is gone");
+        assert_eq!(http(port, "GET", "/api/users/7", "").0, 200, "v2's route is there");
+        assert_eq!(slow.join().unwrap(), (200, "{\"slept\":600}".into()), "in flight across the deploy, it finished");
+        // The object keeps its state, on v2's code.
+        assert_eq!(http(port, "GET", "/room/r1/count", ""), (200, "{\"count\":3}".into()));
+        assert_eq!(http(port, "POST", "/room/r1/incr", ""), (200, "{\"count\":4}".into()));
     }
 
     #[test]
