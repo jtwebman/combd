@@ -1139,10 +1139,21 @@ So, designed with the user:
   (sharded, with SQLite each) or Postgres. A small capped app KV (flags,
   config) may come later.
 
-Spec: `spec/Catalog.tla` (1.6 million states, four known-bad versions
-caught, one of them the first deploy design). Next: snapshots and trimming
-in the spec, then the simulator, then the code (deploys, vars, and secrets
-move onto it), then real nodes with kill and split tests.
+Spec: `spec/Catalog.tla` (14.6 million states with snapshots and trimming;
+six known-bad versions caught, one of them the first deploy design, and
+one the trap that trimming sets: a deleted slot is empty again). Next: the
+simulator, then the code (deploys, vars, and secrets move onto it), then
+real nodes with kill and split tests.
+
+**The data path's cost, found while pricing this:** D3 uploads a busy
+object's writes as fast as the bucket answers (one upload in flight at a
+time, 20 to 30 a second), about $10 to $13 a day per object busy all day on
+S3. The peers already hold every write before it's acknowledged, so
+uploads can wait: per object every 10 s or 1 MB (about $0.04 a day per busy
+object), or one combined upload per node every 5 to 30 s (cost by node, not
+object). The longer the wait, the longer the newest writes live only on
+the two peers. Comes right after the catalog, with the replication spec's
+timing checked again.
 
 ## Build order (when we do build)
 

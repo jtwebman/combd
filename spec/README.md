@@ -11,9 +11,18 @@ every node; pushes may be lost, repeated, or come in any order, and a node
 applies entry n+1 only after n, fetching gaps from the bucket. A node may
 crash and keep its copy (disk) or lose it (memory).
 
-Three invariants: no acknowledged change is lost, every node's copy is the
-start of the log, and no two apps ever hold one domain (in the log or any
-copy). 1.6 million states, no errors. Four known-bad versions must fail:
+The log is trimmed: a node writes a snapshot (the state at slot k, from its
+copy), and only then are slots up to k deleted. A deleted slot is empty
+again, so a slow writer whose check used an old head could write it, and
+"only if empty" would let it, into a place no reader will ever look. So
+after a write, the writer reads the snapshot: if it covers the slot, the
+write didn't count, and it checks again. A node too far behind loads the
+snapshot.
+
+Four invariants: no acknowledged change is lost, every node's copy is the
+start of the log, no two apps ever hold one domain (in the log or any
+copy), and every node can still catch up. 14.6 million states, no errors.
+Six known-bad versions must fail:
 
 | Bug | Caught by |
 |---|---|
@@ -21,6 +30,8 @@ copy). 1.6 million states, no errors. Four known-bad versions must fail:
 | write a slot without "only if empty" | NoLostAckedChange |
 | apply pushes in any order | CopyIsPrefix |
 | check against this node's copy, but write at the head | OneAppPerDomain |
+| acknowledge a write without checking the snapshot | NoLostAckedChange |
+| trim slots the snapshot doesn't cover yet | CanCatchUp |
 
 The last is the first deploy design: each app's own pointer, checked
 against the deploying node's view. Two deploys on two nodes could both
@@ -29,8 +40,7 @@ claim a domain. TLC shows it; the log fixes it.
 Leases, heartbeats, and leaders aren't in it: they're for liveness. The
 ownership spec below already lets any process claim at any time, because
 its safety never rested on leases, so moving node heartbeats from the
-bucket to the wire changes no proof. Not modeled yet: snapshots and
-trimming the log (a node too far behind loads a snapshot instead).
+bucket to the wire changes no proof.
 
 `Ownership.tla` is the D2 protocol for who owns a Durable Object, with the
 bucket as the only coordinator: a compare-and-swap ownership record, a new
