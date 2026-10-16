@@ -305,8 +305,10 @@ JS compute is **1.9x faster**; Rust compute and the JS API 8% to 17%; Rust
 API requests are about the same (except POST, 12%). Every time the hot loop
 grew, the Rust compute rows paid a few percent back in register allocation
 and layout, so it holds only what real workloads run. One cost: a cell paused
-mid-call is about 23 KB bigger (density, 10,000 cells: 118 to 141 KB per
-cell), since its stack no longer shares pages with other small allocations.
+mid-call is bigger, since its stack no longer shares pages with other small
+allocations: about 7 KB on Linux x86 with 4 KB pages (the arena's images,
+3,000 cells: 74.0 to 81.1 KB per cell), 23 KB on macOS with 16 KB pages
+(10,000 cells: 118 to 141 KB). An idle cell is the same.
 The spec suite (30,497 checks), the differential fuzzer, and a new test of
 each fused op at its edges (`fused_ops_match_wasmtime`) all agree with
 Wasmtime. The gap is now 4x to 10x. The rest is dispatch: each op is a
