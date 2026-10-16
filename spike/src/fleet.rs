@@ -98,13 +98,37 @@ pub fn run_call(s3: &S3, call: &Call) -> Res {
 
 /// Every entry of a restore, in order: each segment holds several.
 pub fn fetch(s3: &S3, segs: &[String]) -> Result<Vec<Vec<u8>>, String> {
-    let mut out = vec![];
-    for k in segs {
+    // Many GETs at once (the client keeps that many connections): an
+    // object's segments pile up, one per upload, and one at a time from a
+    // node an ocean from the bucket was a minute (200 segments, 300 ms each).
+    const AT_ONCE: usize = 16;
+    let get = |k: &String| -> Result<Vec<Vec<u8>>, String> {
         match s3.get(k) {
-            Ok(Some((b, _))) => out.extend(crate::own::unframe(&b).ok_or_else(|| format!("segment {k} is garbled"))?),
-            Ok(None) => return Err(format!("segment {k} is missing")),
-            Err(e) => return Err(format!("segment {k}: {e}")),
+            Ok(Some((b, _))) => crate::own::unframe(&b).ok_or_else(|| format!("segment {k} is garbled")),
+            Ok(None) => Err(format!("segment {k} is missing")),
+            Err(e) => Err(format!("segment {k}: {e}")),
         }
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let got: Vec<std::sync::Mutex<Option<Result<Vec<Vec<u8>>, String>>>> = segs.iter().map(|_| Default::default()).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..AT_ONCE.min(segs.len()) {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(k) = segs.get(i) else { break };
+                let r = get(k);
+                let stop = r.is_err();
+                *got[i].lock().unwrap() = Some(r);
+                if stop {
+                    // No point fetching the rest.
+                    next.store(segs.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    let mut out = vec![];
+    for (k, g) in segs.iter().zip(got) {
+        out.extend(g.into_inner().unwrap().unwrap_or_else(|| Err(format!("segment {k}: not fetched")))?);
     }
     Ok(out)
 }

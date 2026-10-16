@@ -2905,6 +2905,29 @@ callers = ["api"]
         assert_eq!(http(port, "GET", "/api/stats", "").0, 200);
     }
 
+    /// A restore's segments come back in order, many at once, and a missing
+    /// one fails it.
+    #[test]
+    fn segments_fetch_in_order() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let s3 = s3::S3 { bucket: test_bucket(), ..base };
+        s3.make_bucket().unwrap();
+        let keys: Vec<String> = (0..40).map(|i| format!("obj/test/s{i:04}")).collect();
+        for (i, k) in keys.iter().enumerate() {
+            let ents = vec![vec![i as u8], vec![i as u8, 0xff]];
+            s3.put(k, &own::frame(&ents), &s3::Cond::Any).unwrap().unwrap();
+        }
+        let got = fleet::fetch(&s3, &keys).unwrap();
+        let want: Vec<Vec<u8>> = (0..40u8).flat_map(|i| [vec![i], vec![i, 0xff]]).collect();
+        assert_eq!(got, want);
+        let mut gap = keys.clone();
+        gap.insert(17, "obj/test/missing".into());
+        assert!(fleet::fetch(&s3, &gap).unwrap_err().contains("missing"));
+    }
+
     /// A match in play on a fleet (two peers per object) answers its
     /// messages under the read lease: the game writes nothing, so a ping
     /// mustn't wait for a round to the peers (an ocean away, in the arena).
