@@ -10,6 +10,11 @@ docker pull -q "$IMAGE" >/dev/null 2>&1 || exit 0
 NEW=$(docker image inspect -f '{{.Id}}' "$IMAGE")
 CUR=$(docker inspect -f '{{.Image}}' combd 2>/dev/null)
 if [ "$NEW" = "$CUR" ]; then rm -f $SEEN; exit 0; fi
+# The same combd inside (only the game changed, and that came as a deploy):
+# no restart.
+src() { docker image inspect -f '{{ index .Config.Labels "combd.source" }}' "$1" 2>/dev/null; }
+NEWSRC=$(src "$NEW"); CURSRC=$(src "$CUR")
+if [ -n "$NEWSRC" ] && [ "$NEWSRC" = "$CURSRC" ]; then rm -f $SEEN; exit 0; fi
 [ "$(cut -d' ' -f1 $SEEN 2>/dev/null)" = "$NEW" ] || echo "$NEW $(date +%s)" > $SEEN
 WAITED=$(( $(date +%s) - $(cut -d' ' -f2 $SEEN) ))
 [ $WAITED -ge $(( ${N:-0} * 120 )) ] || exit 0

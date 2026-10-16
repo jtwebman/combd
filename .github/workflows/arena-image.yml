@@ -18,6 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Hash combd's own sources
+        id: src
+        run: echo "hash=$(git rev-parse HEAD:spike HEAD:guest | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -28,7 +31,9 @@ jobs:
           context: .
           file: examples/arena/Dockerfile
           push: true
-          build-args: ARENA_VERSION=${{ github.sha }}
+          build-args: |
+            ARENA_VERSION=${{ github.sha }}
+            COMBD_SOURCE=${{ steps.src.outputs.hash }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/combd-arena:latest
             ghcr.io/${{ github.repository_owner }}/combd-arena:${{ github.sha }}
