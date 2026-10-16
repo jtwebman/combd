@@ -30,7 +30,7 @@
   </div>
   <aside>
     <label>Name <input id="name" maxlength="24" autocomplete="off"></label>
-    <p><button id="play" disabled>Find a match</button></p>
+    <p><button id="play" disabled>Find a match</button> <button id="bot" disabled>Play a bot</button></p>
     <h2>Nodes (your round trips)</h2>
     <table id="nodes"></table>
     <h2>Your record</h2>
@@ -68,8 +68,9 @@ async function measure() {
   const min = Math.min(...Object.values(state.rtt));
   $("nodes").innerHTML = Object.entries(nodes).map(([id, url]) =>
     `<tr><td class="${state.rtt[id] === min ? "best" : ""}">node ${id}</td><td class="r">${state.rtt[id] ?? "-"} ms</td></tr>`).join("");
-  say("Ready. Find a match: you'll be paired with someone close to you.");
+  say("Ready. Find a match: you'll be paired with someone close to you. No one around? Play a bot.");
   $("play").disabled = false;
+  $("bot").disabled = false;
 }
 
 async function api(path, body) {
@@ -83,7 +84,7 @@ async function record() {
   const s = await api("/api/stats");
   const esc = (t) => String(t).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
   $("recent").innerHTML = (s.recent || []).slice(0, 8).map(m =>
-    `<tr><td>${esc(m.players.join(" vs "))}</td><td class="r">node ${m.node}, ${m.worst_rtt} ms</td><td class="r"><a href="?watch=${encodeURIComponent(m.match)}&node=${m.node}">watch</a></td></tr>`).join("") || `<tr><td class="dim">none yet</td></tr>`;
+    `<tr><td>${esc(m.players.join(" vs "))}</td><td class="r">node ${m.node}, ${m.worst_rtt} ms</td><td class="r">${m.over ? "over" : `<a href="?watch=${encodeURIComponent(m.match)}&node=${m.node}">watch</a>`}</td></tr>`).join("") || `<tr><td class="dim">none yet</td></tr>`;
 }
 
 $("play").onclick = async () => {
@@ -98,6 +99,15 @@ $("play").onclick = async () => {
     if (p.error) { say(p.error); $("play").disabled = false; return; }
     say(`Waiting for an opponent (${p.queue} in the queue)...`);
   }
+};
+
+// A bot, now: the match plays it itself, on the node nearest you.
+$("bot").onclick = async () => {
+  $("play").disabled = $("bot").disabled = true;
+  say("Starting a match with a bot on the node nearest you...");
+  const j = await api("/api/bot", { player: name.value, rtt: state.rtt });
+  if (!j.match) { say("Couldn't start it: " + (j.error || "?")); $("play").disabled = $("bot").disabled = false; return; }
+  connect(j);
 };
 
 // Straight to the match's node: that's the one picked for both players.
@@ -119,7 +129,7 @@ function connect(m) {
     }
   };
   ws.onclose = () => {
-    if (state.phase === "over" || state.match !== m) { $("play").disabled = false; return; }
+    if (state.phase === "over" || state.match !== m) { $("play").disabled = $("bot").disabled = false; return; }
     // Dropped mid-match: the game pauses for us. Come back.
     say("Connection lost: reconnecting (the match is paused for you)...");
     setTimeout(() => state.match === m && connect(m), 1000);

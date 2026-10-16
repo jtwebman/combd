@@ -11,43 +11,26 @@
 //! ```sh
 //! cargo run --release -- http://localhost:8080 8 mix     # 8 bots, all four kinds
 //! cargo run --release -- https://arena.combd.dev 4 mix   # over HTTPS and WSS
+//! ARENA_VS_BOT=1 cargo run --release -- https://arena.combd.dev 1 chaser  # vs the match's own bot
 //! cargo run --release -- http://localhost:8080 2 chaser 60   # for 60 s
 //! ```
 //! A bot plays one match after another, so a human who joins meets one.
+//!
+//! They play like people, not machines: a bot fires only once it has seen
+//! the other player for a reaction time (`ARENA_BOT_REACT_MS`, 300), aims
+//! where it saw them that long ago, and misses by up to `ARENA_BOT_AIM`
+//! radians (0.15, about 9 degrees) either way.
 //!
 //! `ARENA_SPREAD=40` pretends the bots live around the world: bot i's home is
 //! node i % nodes, and every node away from home adds 40 ms to what it
 //! measured, so matches land on different nodes even when every bot runs on
 //! one laptop.
 
-use arena_game::game::{blocked, sees, R, SPAWNS, WALLS};
+use arena_game::bot::{Brain, Rng, Strategy};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Strategy {
-    Chaser,
-    Sniper,
-    Camper,
-    Random,
-}
-
-/// splitmix64, for wandering.
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-    fn f(&mut self) -> f64 {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64
-    }
-}
 
 fn hostport(url: &str) -> &str {
     url.split_once("://").map_or(url, |(_, r)| r).trim_end_matches('/')
@@ -210,71 +193,6 @@ impl Ws {
     }
 }
 
-/// Where to go next, toward (tx, ty): straight if that's free, else the
-/// nearest angle off it that is.
-fn steer(x: f64, y: f64, tx: f64, ty: f64) -> (f64, f64) {
-    let base = (ty - y).atan2(tx - x);
-    for off in [0.0, 0.5, -0.5, 1.0, -1.0, 1.6, -1.6, 2.4, -2.4] {
-        let a = base + off;
-        let (mx, my) = (a.cos(), a.sin());
-        if !blocked(x + mx * (R + 6.0), y + my * (R + 6.0)) {
-            return (mx, my);
-        }
-    }
-    (0.0, 0.0)
-}
-
-/// A spot behind the nearest wall, out of sight of (ex, ey), if there's one.
-fn cover(x: f64, y: f64, ex: f64, ey: f64) -> (f64, f64) {
-    let mut best = (x, y, f64::MAX);
-    for &(wx, wy, ww, wh) in WALLS.iter() {
-        for (cx, cy) in [(wx - R - 8.0, wy + wh / 2.0), (wx + ww + R + 8.0, wy + wh / 2.0), (wx + ww / 2.0, wy - R - 8.0), (wx + ww / 2.0, wy + wh + R + 8.0)] {
-            if blocked(cx, cy) || sees(cx, cy, ex, ey) {
-                continue;
-            }
-            let d = (cx - x).hypot(cy - y);
-            if d < best.2 {
-                best = (cx, cy, d);
-            }
-        }
-    }
-    (best.0, best.1)
-}
-
-/// One input, from what this bot knows.
-fn think(s: Strategy, rng: &mut Rng, me: &Value, them: Option<(f64, f64)>, last: Option<(f64, f64)>, side: usize, t: u64) -> Value {
-    let (x, y) = (me["x"].as_f64().unwrap_or(0.0), me["y"].as_f64().unwrap_or(0.0));
-    // With nothing seen yet: the other spawn.
-    let (ex, ey) = them.or(last).unwrap_or(SPAWNS[1 - side]);
-    let aim = (ey - y).atan2(ex - x);
-    let seen = them.is_some();
-    let d = (ex - x).hypot(ey - y);
-    let ((mx, my), fire) = match s {
-        Strategy::Chaser => (if d > 60.0 { steer(x, y, ex, ey) } else { (0.0, 0.0) }, seen),
-        Strategy::Sniper => {
-            let (cx, cy) = if d < 350.0 { (x - (ex - x), y - (ey - y)) } else if d > 450.0 { (ex, ey) } else {
-                // Strafe: across the line to them, switching every 2 s.
-                let side_step = if (t / 2000) % 2 == 0 { 1.0 } else { -1.0 };
-                (x - (ey - y) * side_step, y + (ex - x) * side_step)
-            };
-            (steer(x, y, cx, cy), seen && d < 600.0)
-        }
-        Strategy::Camper => {
-            // In cover most of the time; every 4 s, a step toward them to peek.
-            let peek = (t / 1000) % 4 == 3;
-            let (cx, cy) = if peek { (ex, ey) } else { cover(x, y, ex, ey) };
-            let m = if (cx - x).hypot(cy - y) < 6.0 { (0.0, 0.0) } else { steer(x, y, cx, cy) };
-            (m, seen)
-        }
-        Strategy::Random => {
-            let a = rng.f() * std::f64::consts::TAU;
-            ((a.cos(), a.sin()), rng.f() < 0.3)
-        }
-    };
-    let aim = if s == Strategy::Random && !seen { rng.f() * std::f64::consts::TAU } else { aim };
-    json!({ "t": "in", "mx": mx, "my": my, "aim": aim, "fire": fire })
-}
-
 /// Our round trip to each node: the best of three pings.
 fn measure(url: &str) -> (Value, Value) {
     let nodes = json_of(http(url, "GET", "/_combd/nodes", ""));
@@ -327,9 +245,14 @@ fn play(url: &str, name: &str, s: Strategy, rng: &mut Rng, home: usize, timing: 
     if let Some(ms) = std::env::var("ARENA_SPREAD").ok().and_then(|v| v.parse().ok()) {
         spread(&mut rtt, home, ms);
     }
-    let j = json_of(http(url, "POST", "/api/join", &json!({ "player": name, "rtt": rtt }).to_string()));
-    let ticket = j["ticket"].as_str().ok_or(format!("join: {j}"))?.to_string();
-    let m = loop {
+    // `ARENA_VS_BOT=1`: play the match's own bot (the page's "Play a bot").
+    let vs_bot = std::env::var("ARENA_VS_BOT").is_ok_and(|v| v == "1");
+    let j = json_of(http(url, "POST", if vs_bot { "/api/bot" } else { "/api/join" }, &json!({ "player": name, "rtt": rtt }).to_string()));
+    let ticket = j["ticket"].as_str().unwrap_or_default().to_string();
+    if !vs_bot && ticket.is_empty() {
+        return Err(format!("join: {j}"));
+    }
+    let m = if vs_bot { j.get("match").map(|_| j.clone()).ok_or(format!("bot: {j}"))? } else { loop {
         std::thread::sleep(Duration::from_millis(300));
         let p = json_of(http(url, "POST", "/api/poll", &json!({ "ticket": ticket }).to_string()));
         if p["match"].is_string() {
@@ -339,15 +262,16 @@ fn play(url: &str, name: &str, s: Strategy, rng: &mut Rng, home: usize, timing: 
             // Nobody to play for a minute: the queue let us go. Join again.
             return Ok(Some(false)).and(Err("lonely".into()));
         }
-    };
+    } };
     let node_url = urls[m["node"].to_string().trim_matches('"')].as_str().unwrap_or(url).to_string();
     let path = format!("/match/{}/ws", m["match"].as_str().unwrap());
     let mut ws = Ws::open(&node_url, &path)?;
     ws.send(&json!({ "t": "hello", "token": m["token"] }).to_string()).map_err(|e| e.to_string())?;
     let side = m["side"].as_u64().unwrap_or(0) as usize;
-    let mut last_seen = None;
     let start = Instant::now();
     let mut last_ping: Option<Instant> = None;
+    let env_num = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let mut brain = Brain::new(s, rng.next(), env_num("ARENA_BOT_REACT_MS", 300.0) as u64, env_num("ARENA_BOT_AIM", 0.15));
     loop {
         // Once a second: a round trip to the match's node, and then tell it
         // (the other player and spectators see it).
@@ -376,15 +300,10 @@ fn play(url: &str, name: &str, s: Strategy, rng: &mut Rng, home: usize, timing: 
                         timing.stale += n("your_stale");
                         return Ok(v["winner"].as_bool());
                     }
-                    let me = v["you"].clone();
-                    if let (Some(x), Some(y)) = (v["them"]["x"].as_f64(), v["them"]["y"].as_f64()) {
-                        last_seen = Some((x, y));
-                    }
                     // An answer to every state, as a player at the keys would
                     // (states come 20 times a second).
+                    let input = brain.input(&v, side, start.elapsed().as_millis() as u64);
                     if v["phase"] == "play" {
-                        let them = v["them"].as_object().map(|_| last_seen.unwrap());
-                        let input = think(s, rng, &me, them, last_seen, side, start.elapsed().as_millis() as u64);
                         ws.send(&input.to_string()).map_err(|e| e.to_string())?;
                     }
                 }

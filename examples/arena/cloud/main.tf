@@ -169,7 +169,13 @@ resource "digitalocean_droplet" "node" {
     tls_cert = "${acme_certificate.arena.certificate_pem}${acme_certificate.arena.issuer_pem}"
     tls_key  = acme_certificate.arena.private_key_pem
     host     = local.host
+    update   = file("${path.module}/combd-update.sh")
   })
+  # Running nodes keep what they started with: a change here is for new
+  # droplets (the image itself rolls out through combd-update).
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
 resource "digitalocean_project_resources" "arena" {
@@ -177,8 +183,8 @@ resource "digitalocean_project_resources" "arena" {
   resources = [for d in digitalocean_droplet.node : d.urn]
 }
 
-# HTTP and HTTPS for everyone; the wire only between the nodes; SSH and the admin API
-# only from you.
+# HTTP, HTTPS, and the admin API for everyone; the wire only between the
+# nodes; SSH only from you.
 resource "digitalocean_firewall" "arena" {
   name        = "combd-arena"
   droplet_ids = [for d in digitalocean_droplet.node : d.id]
@@ -197,10 +203,12 @@ resource "digitalocean_firewall" "arena" {
     port_range         = "7100"
     source_droplet_ids = [for d in digitalocean_droplet.node : d.id]
   }
+  # The admin API (TLS, a token checked before any body is read), for
+  # deploys from CI too.
   inbound_rule {
     protocol         = "tcp"
     port_range       = "9443"
-    source_addresses = [var.admin_cidr]
+    source_addresses = ["0.0.0.0/0", "::/0"]
   }
   inbound_rule {
     protocol         = "tcp"

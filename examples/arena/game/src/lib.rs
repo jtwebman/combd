@@ -11,6 +11,7 @@
 //!   `send` when it ends.
 
 pub mod game;
+pub mod bot;
 
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -185,6 +186,8 @@ fn lobby(method: &str, path: &str, body: &str) -> String {
         ("GET", "/") => format!("200\ncontent-type: text/html; charset=utf-8\ncache-control: no-store\n\n{INDEX}"),
         ("POST", "/api/join") => mm("/join", body),
         ("POST", "/api/poll") => mm("/poll", body),
+        // No one around: play one of our bots, which the match plays itself.
+        ("POST", "/api/bot") => mm("/bot", body),
         ("GET", "/api/stats") => {
             let r = call(&json!({ "to": "matchmaker", "id": "global", "method": "GET", "path": "/stats" }));
             format!("{} {}", r["status"].as_u64().unwrap_or(503), r["body"].as_str().unwrap_or("{}"))
@@ -267,7 +270,7 @@ fn pair_all(mm: &mut Mm, now: u64) {
         let id = format!("m{}{}", now, mm.matches);
         let tokens = [token(), token()];
         // Start the match on the node best for both.
-        let r = call(&json!({ "to": "match", "id": id, "node": node, "path": "/create", "body": json!({ "players": [a.player, b.player], "tokens": tokens }).to_string() }));
+        let r = call(&json!({ "to": "match", "id": id, "node": node, "path": "/create", "body": json!({ "id": id, "players": [a.player, b.player], "tokens": tokens }).to_string() }));
         if r["status"].as_u64() != Some(200) {
             // Couldn't start it: they wait on, and the next tick tries again.
             mm.queue.push(a);
@@ -327,6 +330,32 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                 tick_every(0);
                 ok(json!({}))
             }
+            // Play a bot now: the match plays it, on the node nearest you.
+            ("POST", "/bot") => {
+                let Some(player) = v["player"].as_str().filter(|p| !p.is_empty() && p.len() <= 32 && !p.starts_with("bot-")) else { return err(400, "want {\"player\": name, \"rtt\": {node: ms}}") };
+                let rtt: BTreeMap<u64, u64> = v["rtt"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect()).unwrap_or_default();
+                let Some((&node, &ms)) = rtt.iter().min_by_key(|(_, &ms)| ms) else { return err(400, "measure the nodes first: rtt") };
+                let strategy = v["strategy"].as_str().and_then(bot::Strategy::from_name).unwrap_or(bot::Strategy::ALL[(now % 4) as usize]);
+                let bot_name = format!("bot-{}", strategy.name());
+                mm.queue.retain(|w| w.player != player);
+                mm.matches += 1;
+                let id = format!("m{}{}", now, mm.matches);
+                let tok = token();
+                let r = call(&json!({ "to": "match", "id": id, "node": node, "path": "/create", "body": json!({ "id": id, "players": [player, bot_name], "tokens": [tok, ""], "bot": strategy.name() }).to_string() }));
+                if r["status"].as_u64() != Some(200) {
+                    return err(503, "couldn't start the match: try again");
+                }
+                let row = json!({ "match": id, "node": node, "players": [player, bot_name], "worst_rtt": ms, "at": now, "bot": true });
+                sql("INSERT INTO recent (row) VALUES (?)", &[json!(row.to_string())]);
+                sql("DELETE FROM recent WHERE id <= (SELECT MAX(id) - 20 FROM recent)", &[]);
+                sql("INSERT INTO kv (k, v) VALUES ('matches', 1) ON CONFLICT (k) DO UPDATE SET v = v + 1", &[]);
+                ok(json!({ "match": id, "node": node, "token": tok, "side": 0, "rtt": ms }))
+            }
+            // A match is over: no more watching it (there's no replay).
+            ("POST", "/ended") => {
+                sql("UPDATE recent SET row = json_set(row, '$.over', json('true')) WHERE json_extract(row, '$.match') = ?", &[v["match"].clone()]);
+                ok(json!({}))
+            }
             ("GET", "/stats") => {
                 let matches = sql("SELECT v FROM kv WHERE k = 'matches'", &[]).first().and_then(|r| r[0].as_i64()).unwrap_or(0);
                 let recent: Vec<Value> = sql("SELECT row FROM recent ORDER BY id DESC LIMIT 20", &[]).iter().filter_map(|r| serde_json::from_str(r[0].as_str()?).ok()).collect();
@@ -351,6 +380,9 @@ enum Phase {
 }
 
 struct Match {
+    id: String,
+    /// Side 1 is our bot, which the match plays itself.
+    bot: Option<bot::Brain>,
     players: [String; 2],
     tokens: [String; 2],
     socks: [Option<u64>; 2],
@@ -409,6 +441,11 @@ fn spectate_delay_ms() -> u64 {
     env("SPECTATE_DELAY_MS").and_then(|v| v.parse().ok()).unwrap_or(10_000)
 }
 
+/// A side is here: its player's socket is open, or it's our bot.
+fn here(m: &Match, side: usize) -> bool {
+    m.socks[side].is_some() || (side == 1 && m.bot.is_some())
+}
+
 /// What a spectator sees of a tick: everything.
 fn frame(m: &Match, now: u64) -> String {
     let mut v = m.game.view_all();
@@ -460,11 +497,18 @@ fn state_msg(m: &Match, side: usize, now: u64) -> String {
     v.to_string()
 }
 
+/// Tell the matchmaker this match is over (its list stops offering it to
+/// watch).
+fn ended(m: &Match) {
+    send(&json!({ "to": "matchmaker", "id": "global", "path": "/ended", "body": json!({ "match": m.id }).to_string() }));
+}
+
 /// The end: a winner, or (`None`) a draw.
 fn finish(m: &mut Match, winner: Option<usize>, now: u64) {
     m.game.winner = winner;
     m.phase = Phase::Over;
     m.over_at = now;
+    ended(m);
     let who = winner.map_or("draw".to_string(), |w| m.players[w].clone());
     sql("INSERT OR REPLACE INTO meta (k, v) VALUES ('winner', ?)", &[json!(who)]);
     for side in 0..2 {
@@ -489,7 +533,11 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
             if s("players", 0) == s("players", 1) {
                 return err(400, "a player can't play themselves");
             }
-            *cell = Some(Match { players: [s("players", 0), s("players", 1)], tokens: [s("tokens", 0), s("tokens", 1)], socks: [None, None], game: game::Game::new(), phase: Phase::Waiting, created: now, played: 0, last_step: now, ticks: 0, over_at: 0, timing: Timing::default(), ping: [None, None], spectators: vec![], frames: Default::default() });
+            let bot = v["bot"].as_str().and_then(bot::Strategy::from_name).map(|st| bot::Brain::new(st, now ^ 0x9e37_79b9, 300, 0.15));
+            *cell = Some(Match { id: v["id"].as_str().unwrap_or("").to_string(), bot, players: [s("players", 0), s("players", 1)], tokens: [s("tokens", 0), s("tokens", 1)], socks: [None, None], game: game::Game::new(), phase: Phase::Waiting, created: now, played: 0, last_step: now, ticks: 0, over_at: 0, timing: Timing::default(), ping: [None, None], spectators: vec![], frames: Default::default() });
+            if let Some(m) = cell.as_mut().filter(|m| m.bot.is_some()) {
+                m.ping[1] = Some(0);
+            }
             // Slowly until both players are here: a match nobody joins costs little.
             tick_every(1000);
             return ok(json!({ "ok": true }));
@@ -521,7 +569,7 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                         let hello = json!({ "t": "hello", "side": side, "players": m.players, "map": game::walls() });
                         ws_send(sock, &hello.to_string());
                         match m.phase {
-                            Phase::Waiting if m.socks.iter().all(Option::is_some) => {
+                            Phase::Waiting if (0..2).all(|i| here(m, i)) => {
                                 m.phase = Phase::Play;
                                 m.last_step = now;
                                 tick_every(50);
@@ -564,7 +612,7 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                                     m.phase = Phase::Paused { who: side, until: now + pause_ms() };
                                     m.game.players[side].input = game::Input::default();
                                 }
-                                ("resume", Phase::Paused { who, .. }) if who == side && m.socks.iter().all(Option::is_some) => {
+                                ("resume", Phase::Paused { who, .. }) if who == side && (0..2).all(|i| here(m, i)) => {
                                     m.phase = Phase::Play;
                                     m.last_step = now;
                                 }
@@ -606,6 +654,7 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                     Phase::Waiting if now.saturating_sub(m.created) > START_WAIT_MS => {
                         m.phase = Phase::Over;
                         m.over_at = now;
+                        ended(m);
                     }
                     Phase::Play => {
                         let t = &mut m.timing;
@@ -619,6 +668,13 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                         for side in 0..2 {
                             t.stale[side] += !t.fresh[side] as u64;
                             t.fresh[side] = false;
+                        }
+                        // Our bot: its move, from only what its side is shown.
+                        if let Some(b) = m.bot.as_mut() {
+                            let v = b.input(&m.game.view(1), 1, now);
+                            let f = |k: &str| v[k].as_f64().unwrap_or(0.0);
+                            m.game.players[1].input = game::Input { mx: f("mx"), my: f("my"), aim: f("aim"), fire: v["fire"].as_bool().unwrap_or(false) };
+                            m.timing.fresh[1] = true;
                         }
                         let dt = (now.saturating_sub(m.last_step) as f64 / 1000.0).clamp(0.0, 0.2);
                         m.played += now.saturating_sub(m.last_step);

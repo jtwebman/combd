@@ -13,10 +13,10 @@ pub const W: f64 = 960.0;
 pub const H: f64 = 640.0;
 pub const R: f64 = 14.0;
 pub const SPEED: f64 = 220.0;
-pub const BULLET_SPEED: f64 = 700.0;
+pub const BULLET_SPEED: f64 = 550.0;
 pub const BULLET_LIFE_MS: u64 = 1200;
-pub const FIRE_MS: u64 = 350;
-pub const HP: u32 = 3;
+pub const FIRE_MS: u64 = 450;
+pub const HP: u32 = 4;
 pub const RESPAWN_MS: u64 = 1500;
 pub const KILLS_TO_WIN: u32 = 3;
 

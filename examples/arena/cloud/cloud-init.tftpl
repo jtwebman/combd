@@ -41,6 +41,17 @@ write_files:
     permissions: "0600"
     encoding: b64
     content: ${base64encode(env)}
+  # New images roll out by themselves, one node at a time (combd-update).
+  - path: /usr/local/bin/combd-update
+    permissions: "0755"
+    encoding: b64
+    content: ${base64encode(update)}
+  - path: /etc/combd/update
+    content: |
+      COMBD_IMAGE=${image}
+  - path: /etc/cron.d/combd-update
+    content: |
+      * * * * * root /usr/local/bin/combd-update
 runcmd:
   # A little swap: 1 GB is tight for combd, Docker, and the OS together.
   - fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab

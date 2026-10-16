@@ -1,6 +1,9 @@
-# The arena's image (combd and the game module), for the cloud demo: built
-# on linux/amd64 and pushed to ghcr.io/<owner>/combd-arena. Make the package
-# public once (GitHub, Packages, combd-arena, settings) so droplets can pull it.
+# The arena, built and rolled out: the image (combd and the game module)
+# built on linux/amd64 and pushed to ghcr.io/<owner>/combd-arena (public, so
+# droplets can pull it), then the game deployed through the admin API.
+# The nodes move to the new image by themselves (cloud/combd-update.sh), one
+# at a time. Neither cuts off a game in play: each waits for live matches to
+# end, up to a limit.
 name: arena image
 on:
   push:
@@ -28,3 +31,37 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/combd-arena:latest
             ghcr.io/${{ github.repository_owner }}/combd-arena:${{ github.sha }}
+  deploy:
+    needs: image
+    runs-on: ubuntu-latest
+    concurrency: arena-deploy
+    steps:
+      - name: Wait for live matches to end (up to 10 minutes)
+        run: |
+          for i in $(seq 1 60); do
+            live=$(curl -s -m 10 https://arena.combd.dev/api/stats | python3 -c "
+          import sys, json, time
+          r = json.load(sys.stdin).get('recent', [])
+          print(sum(1 for m in r if not m.get('over') and m['at'] > time.time() * 1000 - 600000))" || echo 0)
+            [ "$live" = "0" ] && exit 0
+            echo "$live live match(es): waiting"
+            sleep 10
+          done
+          echo "still live after 10 minutes: deploying anyway"
+      - name: Deploy the game (through any node that answers)
+        env:
+          COMBD_TOKEN: ${{ secrets.ARENA_DEPLOY_TOKEN }}
+          CA: ${{ secrets.ARENA_ADMIN_CA }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/combd-arena:${{ github.sha }}
+        run: |
+          printf '%s\n' "$CA" > ca.pem
+          for try in 1 2 3 4 5 6; do
+            for n in 0 1 2; do
+              if docker run --rm -v "$PWD/ca.pem:/ca.pem:ro" -e COMBD_TOKEN -e COMBD_ADMIN_CA=/ca.pem -e COMBD_ADMIN_NAME=node$n.combd \
+                "$IMAGE" ./target/release/combd-spike deploy ../examples/arena/app acme "https://n$n.arena.combd.dev:9443"; then
+                exit 0
+              fi
+            done
+            sleep 20
+          done
+          exit 1
