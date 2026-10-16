@@ -35,6 +35,11 @@ pub struct FleetCfg {
     /// The wire's certificates, or `None` with `insecure` for plain TCP.
     pub wire_certs: Option<std::path::PathBuf>,
     pub insecure: bool,
+    /// How long an object's uploads may wait while its peers hold the
+    /// writes (`COMBD_UPLOAD_MS`, default 10 s), or until this many bytes
+    /// build up (`COMBD_UPLOAD_BYTES`, default 1 MB, at most 16 MB).
+    pub upload_ms: u64,
+    pub upload_bytes: usize,
 }
 
 impl FleetCfg {
@@ -54,7 +59,13 @@ impl FleetCfg {
         let replicas = std::env::var("COMBD_REPLICAS").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
         let wire_certs = std::env::var("COMBD_WIRE_CERTS").ok().map(Into::into);
         let insecure = std::env::var("COMBD_WIRE_INSECURE").as_deref() == Ok("1");
-        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure })
+        let upload_ms = std::env::var("COMBD_UPLOAD_MS").ok().and_then(|p| p.parse().ok()).unwrap_or(10_000);
+        if upload_ms > 300_000 {
+            eprintln!("combd     warning: COMBD_UPLOAD_MS is {upload_ms}: an object's newest writes live only on its peers for up to {} minutes", upload_ms / 60_000);
+        }
+        // Under the wire's frame limit: a takeover gets the rest in one reply.
+        let upload_bytes = std::env::var("COMBD_UPLOAD_BYTES").ok().and_then(|p| p.parse().ok()).unwrap_or(1 << 20).min(16 << 20);
+        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure, upload_ms, upload_bytes })
     }
 }
 
@@ -224,7 +235,8 @@ fn decode_res(r: &mut Rd) -> Option<PeerRes> {
     })
 }
 
-// ponytail: a fence's tails must fit too; they're small while uploads keep up.
+// A fence's tails must fit too: uploads start by COMBD_UPLOAD_BYTES (at
+// most 16 MB), well under this.
 pub const MAX_FRAME: usize = 64 << 20;
 
 impl Frame {
@@ -346,9 +358,14 @@ pub struct DiskPeers {
     path: PathBuf,
     file: std::fs::File,
     size: u64,
+    /// The size right after the last compaction: what the store holds.
+    base: u64,
     dirty: bool,
 }
 
+/// Compact past this, or past twice what the last compaction left (so a
+/// store that holds a lot, with uploads waiting, doesn't compact on every
+/// sync).
 const COMPACT: u64 = 64 << 20;
 
 fn record(c: &PeerCall) -> Vec<u8> {
@@ -396,7 +413,7 @@ impl DiskPeers {
         let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
         file.set_len(at as u64)?;
         file.sync_all()?;
-        Ok(DiskPeers { store, path, file, size: at as u64, dirty: false })
+        Ok(DiskPeers { store, path, file, size: at as u64, base: 0, dirty: false })
     }
 
     /// Apply a call; it's durable after the next `sync`. A wiped store first
@@ -425,7 +442,7 @@ impl DiskPeers {
         if std::mem::take(&mut self.dirty) {
             self.file.sync_data()?;
         }
-        if self.size > COMPACT {
+        if self.size > COMPACT.max(2 * self.base) {
             self.compact()?;
         }
         Ok(())
@@ -447,6 +464,7 @@ impl DiskPeers {
         }
         self.file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
         self.size = b.len() as u64;
+        self.base = self.size;
         Ok(())
     }
 }

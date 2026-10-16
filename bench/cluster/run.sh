@@ -35,7 +35,7 @@ node() { # n
     docker rm -f node$1 >/dev/null 2>&1 || true
     docker run -d --name node$1 --network $NET --cpus=1 -v combd-certs:/certs:ro -e COMBD_WIRE_CERTS=/certs -v combd-data$1:/data \
         -e COMBD_NODE=$1 -e COMBD_PEERS=$PEERS -e COMBD_THREADS=1 -e COMBD_DATA=/data -e COMBD_LEASE_MS=${LEASE_MS:-3000} \
-        -e COMBD_REPLICAS=${REPLICAS:-0} \
+        -e COMBD_REPLICAS=${REPLICAS:-0} -e COMBD_UPLOAD_MS=${UPLOAD_MS:-10000} \
         -e COMBD_S3=http://s3:9000 -e COMBD_S3_KEY=combd -e COMBD_S3_SECRET=combd-secret-key \
         $IMG ./target/release/combd-spike serve ${ENGINE:-aot} rust 8080 >/dev/null
 }

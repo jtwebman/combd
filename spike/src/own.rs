@@ -18,7 +18,11 @@
 //! With no peers (`replicas` 0) only the second way exists, which is D2. With
 //! peers, the first is the fast path and the second keeps writes going (at
 //! bucket speed) while a peer is down. Entries are uploaded in the background
-//! either way, and peers drop what the bucket has.
+//! either way, and peers drop what the bucket has. With every peer up,
+//! uploads wait (`uploads`: for a while, or until enough has built up), so a
+//! busy object makes one bucket write every few seconds, not one per write;
+//! until then its newest writes live on its peers only. With no peers, or
+//! one down, the bucket is how writes get acknowledged, so they go at once.
 //!
 //! Bucket keys, per object `o`:
 //! - `own/o`: the ownership record `{node, epoch, sealed, peers}`, changed
@@ -254,6 +258,9 @@ pub struct Bugs {
     /// taken over). Safety holds anyway; the simulator's liveness check must
     /// catch it.
     pub assume_alive: bool,
+    /// Liveness: uploads wait even with a peer down, so writes (which need
+    /// the bucket then) wait for the timer.
+    pub wait_when_down: bool,
 }
 
 /// A node's peer store: the entries it keeps for other nodes' objects. The
@@ -484,6 +491,12 @@ struct Serve {
     /// Entries `uploaded + 1 ..= made`.
     ents: VecDeque<Vec<u8>>,
     uploading: bool,
+    /// The bytes in `ents`, and when the oldest not yet in an upload was
+    /// made: uploads wait for one or the other to get big enough.
+    bytes: usize,
+    since: Option<u64>,
+    /// Upload now, without waiting (the object is being let go).
+    flush: bool,
     /// D3: an upload was lost. Wait for a tick, then send the very same one
     /// again (up to this entry): it may have landed, and two segments must
     /// never overlap.
@@ -553,6 +566,8 @@ pub struct CoreStats {
     pub bucket_acks: u64,
     pub fences: u64,
     pub tail_entries: u64,
+    /// Segments sent to the bucket (retries too).
+    pub uploads: u64,
 }
 
 pub struct Core {
@@ -562,6 +577,10 @@ pub struct Core {
     /// Every node, and how many peers each object gets (0: D2).
     fleet: Vec<Node>,
     replicas: usize,
+    /// D3 uploads wait up to this long, or until this many bytes (0 ms: no
+    /// wait).
+    upload_ms: u64,
+    upload_bytes: usize,
     next_op: OpId,
     next_act: Act,
     ops: HashMap<OpId, Wait>,
@@ -593,6 +612,8 @@ impl Core {
             lease_ms,
             fleet: vec![],
             replicas: 0,
+            upload_ms: 0,
+            upload_bytes: 1 << 20,
             next_op: 0,
             next_act: 0,
             ops: HashMap::new(),
@@ -614,6 +635,13 @@ impl Core {
     pub fn replicate(mut self, fleet: Vec<Node>, replicas: usize) -> Core {
         self.fleet = fleet;
         self.replicas = replicas;
+        self
+    }
+
+    /// D3: let uploads wait up to `ms`, or until `bytes` have built up.
+    pub fn uploads(mut self, ms: u64, bytes: usize) -> Core {
+        self.upload_ms = ms;
+        self.upload_bytes = bytes;
         self
     }
 
@@ -714,6 +742,8 @@ impl Core {
                 if let Some(s) = self.serving(obj, act) {
                     let reqs = s.sealing.take().unwrap_or_default();
                     s.made += 1;
+                    s.bytes += changes.len();
+                    s.since.get_or_insert(now);
                     s.ents.push_back(changes);
                     s.round += 1;
                     s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs });
@@ -724,6 +754,15 @@ impl Core {
             Event::Restored { obj, act, ok } => self.restored(obj, act, ok),
             Event::Release { obj } => {
                 let seal_early = self.bugs.seal_early;
+                let st = self.st(obj);
+                // Only uploads left: send them now, and it goes next time.
+                if let Phase::Serving(s) = &mut st.phase {
+                    if s.uploaded < s.made && !s.flush {
+                        s.flush = true;
+                        self.kick(obj);
+                        return std::mem::take(&mut self.out);
+                    }
+                }
                 let st = self.st(obj);
                 let idle = matches!(&st.phase, Phase::Serving(s) if s.idle(seal_early));
                 if idle && st.waiting.is_empty() {
@@ -766,6 +805,9 @@ impl Core {
             uploaded: 0,
             ents: VecDeque::new(),
             uploading: false,
+            bytes: 0,
+            since: None,
+            flush: false,
             upload_wait: false,
             retry_upto: None,
             round: 0,
@@ -834,6 +876,7 @@ impl Core {
     /// Start whatever calls are due: peer appends, an upload, a proof.
     fn kick(&mut self, o: Obj) {
         let (trunc_early, skip_proof) = (self.bugs.trunc_early, self.bugs.skip_proof);
+        let (now, upload_ms, upload_bytes, wait_when_down) = (self.now, self.upload_ms, self.upload_bytes, self.bugs.wait_when_down);
         let Phase::Serving(s) = &mut self.st(o).phase else { return };
         let e = s.epoch;
         let mut peer_calls = vec![];
@@ -861,8 +904,20 @@ impl Core {
             peer_calls.push((Wait::Append(o, e, i, s.round), p.node, PeerCall::Append { obj: o, epoch: e, from, ents, trunc }));
         }
         let mut calls = vec![];
-        if !s.uploading && !s.upload_wait && s.uploaded < s.made {
+        // Uploads wait only while every peer is up: otherwise the bucket is
+        // how writes are acknowledged. A retry must go as it went.
+        let due = s.retry_upto.is_some()
+            || s.flush
+            || s.peers.is_empty()
+            || (!wait_when_down && s.peers.iter().any(|p| p.down))
+            || s.bytes >= upload_bytes
+            || s.since.is_some_and(|t| now.saturating_sub(t) >= upload_ms);
+        if due && !s.uploading && !s.upload_wait && s.uploaded < s.made {
             s.uploading = true;
+            s.flush = false;
+            if s.retry_upto.is_none() {
+                s.since = None;
+            }
             let upto = s.retry_upto.unwrap_or(s.made);
             let seg = Val::Seg(frame(s.ents.iter().take((upto - s.uploaded) as usize)));
             let retry = s.retry_upto.is_some();
@@ -884,6 +939,7 @@ impl Core {
             self.peer(w, node, c);
         }
         for (w, c) in calls {
+            self.stats.uploads += matches!(w, Wait::Upload(..)) as u64;
             self.call(w, c);
         }
         self.settle(o);
@@ -1092,7 +1148,7 @@ impl Core {
                 let Some(s) = self.serving_in(o, e) else { return };
                 s.uploading = false;
                 s.retry_upto = None;
-                s.ents.drain(..(upto - s.uploaded) as usize);
+                s.bytes -= s.ents.drain(..(upto - s.uploaded) as usize).map(|e| e.len()).sum::<usize>();
                 s.uploaded = upto;
                 self.kick(o);
             }

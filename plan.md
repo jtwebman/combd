@@ -1148,8 +1148,10 @@ vars are on it, a deploy reaches every node in about 25 ms, and two
 racing deploys can't share a domain. Heartbeats are over the wire now (no
 per-node bucket writes), with a liveness check and a lost node in the
 simulator. Secrets are on it too, sealed (a data key per app under a
-master key file; write-only API; opened only in a node's memory). Next:
-upload batching. ponytail: heartbeats go all to all; a leader or gossip
+master key file; write-only API; opened only in a node's memory). Uploads
+are batched (10 s or 1 MB while every peer is up: 12 to 56x fewer bucket
+writes on the Docker cluster). Next: the fleet-wide Postgres pool.
+ponytail: heartbeats go all to all; a leader or gossip
 if fleets get very large.
 
 **The data path's cost, found while pricing this:** D3 uploads a busy
@@ -1158,7 +1160,8 @@ time, 20 to 30 a second), about $10 to $13 a day per object busy all day on
 S3. The peers already hold every write before it's acknowledged, so
 uploads can wait: per object every 10 s or 1 MB (about $0.04 a day per busy
 object), or one combined upload per node every 5 to 30 s (cost by node, not
-object). The longer the wait, the longer the newest writes live only on
+object). **Done 2026-10-15** (per object; see RESULTS.md, "Upload
+batching"). The longer the wait, the longer the newest writes live only on
 the two peers. Comes right after the catalog, with the replication spec's
 timing checked again. **The node's operator decides:** `COMBD_UPLOAD_MS`
 (default 10 s; no cap, but a warning in the logs above 5 minutes; 0 is

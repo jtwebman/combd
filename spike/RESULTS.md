@@ -1520,6 +1520,81 @@ Not yet: node heartbeats over the wire (they still renew in the bucket;
 that's the ownership core, next), secrets, and two vars changes at once on
 two nodes (the later one wins whole).
 
+## Upload batching
+
+An object's writes are acknowledged once its peers have them; the bucket
+upload was only ever background work, but it went as fast as the bucket
+answered (one in flight per object, 20 to 30 a second, about $11 a day for
+an object busy all day on S3). Now, while every peer is up, uploads wait:
+up to `COMBD_UPLOAD_MS` (default 10 s; a warning in the log above 5
+minutes) or until `COMBD_UPLOAD_BYTES` build up (default 1 MB, at most
+16 MB, under the wire's frame limit so a takeover's tails fit one reply).
+They still go at once when the bucket is how writes get acknowledged (no
+peers, or a peer down), on a retry (it must be the same upload), and when
+an idle object is being let go. The cost: an object's newest writes live
+only on its two peers for up to that long. Losing both peers' disks in
+that window loses them, as before, just over a longer window.
+
+The spec (`spec/Replication.tla`) already lets an upload happen at any
+time, so this changes no proof: waiting is one of the orders it checked.
+
+**Simulator:** each seed picks a wait (none, 300 ms, 2 s, or 5 s with a
+40-byte cap), so every test runs them all. A new known-bad version,
+`wait_when_down` (uploads wait even with a peer down), loses no safety but
+makes writes crawl; the liveness probe now has a clock (a write must get in
+within ten leases after the faults stop; the worst seen is about 4 s, the
+bad version takes 32 s) and catches it. 56,000 seeds across D2 and D3
+with splits, lost disks, and a lost node: every invariant held. The
+simulator also had a hole: it allowed one wiped disk per run *and* a node
+lost for good, which is two lost disks. An object whose two peers were
+exactly those rightly stopped (its acknowledged writes were gone from
+everywhere), and the probe called it a bug. Now a run with a lost node
+wipes no other disk.
+
+**Two real-node bugs it found,** both older than batching and both
+invisible while tails were tiny:
+- **The wire dropped any frame over 64 KB.** rustls caps what waits to be
+  sent at 64 KB by default, so a bigger frame failed the write and dropped
+  the connection. A takeover's fence reply, now carrying seconds of
+  writes, never arrived, and the takeover retried forever. Now uncapped,
+  as plain TCP mode already was (frames are capped instead), and the mTLS
+  test sends 1 MB each way.
+- **The peer store compacted on every sync** once what it holds passed
+  64 MB (with uploads waiting, 50 to 80 MB here). Each group commit then
+  rewrote and fsynced the whole store: a run with a lost disk fell to 157
+  writes/s with a p99 of 1 s. Now it compacts past twice what the last
+  compaction left.
+
+**Real nodes** (`bench/cluster`, three Docker nodes, 32 clients, 50
+objects, 15 s each; `UPLOAD_MS` sets the wait). Every run kept
+`acknowledged <= count <= acknowledged + failed` for every object, both
+ways:
+
+| run | no wait: writes/s, p99 | 10 s: writes/s, p99 |
+|---|---|---|
+| steady | 2,932, 33 ms | 2,190, 36 ms |
+| SIGKILL a node | 1,690, 68 ms | 1,699, 96 ms |
+| freeze a node 4 s | 1,423, 53 ms | 1,870, 55 ms |
+| SIGKILL, lose its disk | 1,411, 77 ms | 1,660, 87 ms |
+| steady (split run) | 2,224, 45 ms | 3,063, 24 ms |
+| cut from the bucket | 1,683, 54 ms | 1,367, 133 ms |
+| cut from the wire | 1,195, 72 ms | 1,444, 115 ms |
+| cut from both | 689, 160 ms | 538, 213 ms |
+| **bucket uploads, kill runs** | **45,935** | **3,766** (12x fewer) |
+| **bucket uploads, split runs** | **44,957** | **796** (56x fewer) |
+
+Throughput moves within the noise of a shared laptop (it swings 30% run to
+run); p99 is higher during a fault (a takeover now has seconds of writes to
+fetch from a peer, not a few). A 1 s wait measured as well as no wait in
+every case, with 9x fewer uploads.
+
+**What it costs now:** entries are whole 4 KB pages, so a write-heavy
+object fills 1 MB in a few seconds: one upload every ~2.5 s at 50 writes/s,
+about $0.17 a day on S3 or R2 (was about $11). A light object uploads every
+10 s: about $0.04 a day. Raising `COMBD_UPLOAD_BYTES` cuts the heavy case
+further, at the price of more memory: an owner holds up to that much per
+busy object, and each peer the same.
+
 ## Secrets, sealed in the catalog
 
 Secrets live in the catalog, sealed (`spike/src/secrets.rs`). Each app

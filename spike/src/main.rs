@@ -753,6 +753,7 @@ fn main_with(args: &[&str]) {
                 Some("trust_wiped") => bugs.trust_wiped = true,
                 Some("wipe_forgets_fence") => bugs.wipe_forgets_fence = true,
                 Some("assume_alive") => bugs.assume_alive = true,
+                Some("wait_when_down") => bugs.wait_when_down = true,
                 _ => {}
             }
             let replicas = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -765,8 +766,10 @@ fn main_with(args: &[&str]) {
             let only = more.contains(&"only-splits");
             let splits = only || more.contains(&"splits");
             let wipes = more.contains(&"wipes");
+            // `uploads=MS`: every seed waits this long (and 1 MB); else by seed.
+            let uploads = more.iter().find_map(|a| a.strip_prefix("uploads=")?.parse().ok()).map(|ms| (ms, 1 << 20));
             let (stats, bad) = sim::run_with(seeds, &|| {
-                let mut s = sim::Settings { replicas, bugs, splits, wipes, loss, ..Default::default() };
+                let mut s = sim::Settings { replicas, bugs, splits, wipes, loss, uploads, ..Default::default() };
                 if only {
                     (s.lost, s.crash, s.freeze) = (0.0, 0.0, 0.0);
                 }
@@ -1458,6 +1461,8 @@ mod tests {
                 wire_port: wports[n as usize],
                 wire_certs: Some(dir.0.join("certs")),
                 insecure: false,
+                upload_ms: 0,
+                upload_bytes: 1 << 20,
             };
             let c = http::Config { idle: Duration::from_millis(idle_ms), fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
             do_server(interp::Interp { max_pages: 16384 }, c)
@@ -1515,6 +1520,8 @@ mod tests {
                 wire_port: wports[n as usize],
                 wire_certs: Some(dir.0.join("certs")),
                 insecure: false,
+                upload_ms: 60_000,
+                upload_bytes: 1 << 20,
             };
             let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 2) };
             do_server(interp::Interp { max_pages: 16384 }, c)
@@ -1535,18 +1542,24 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            panic!("{method} {path} never answered 200");
+            panic!("{method} {path} never answered 200: {:?} stats {}", http(port, method, path, ""), http(port, "GET", "/_combd/stats", "").1);
         };
         for i in 1..=30 {
             assert_eq!(ok(a, "POST", "/do/p1/incr"), format!("{{\"count\":{i}}}"));
         }
         assert!(stat(a, "peer_acks") >= 25, "writes should be acknowledged by peers: {}", http(a, "GET", "/_combd/stats", "").1);
+        // Uploads wait (60 s here) while every peer is up: the bucket has
+        // none of these writes yet, only the peers do.
+        eprintln!("uploads for 30 writes: {}", stat(a, "uploads"));
+        assert!(stat(a, "uploads") <= 2, "{}", http(a, "GET", "/_combd/stats", "").1);
         // The owner stops (its peer store keeps running: it's the same
-        // process). Another node takes over after the lease and has it all.
+        // process). Another node takes over after the lease and has it all,
+        // from the peers.
         stop_a.store(true, std::sync::atomic::Ordering::Relaxed);
         ta.join().unwrap();
         assert_eq!(ok(b, "GET", "/do/p1/count"), "{\"count\":30}");
         assert!(stat(b, "fences") >= 1, "the takeover should fence: {}", http(b, "GET", "/_combd/stats", "").1);
+        assert!(stat(b, "tail_entries") >= 25, "the writes came from the peers: {}", http(b, "GET", "/_combd/stats", "").1);
         assert_eq!(ok(b, "POST", "/do/p1/incr"), "{\"count\":31}");
     }
 
@@ -1738,6 +1751,8 @@ mod tests {
                 wire_port: wports[n as usize],
                 wire_certs: Some(dir.0.join("certs")),
                 insecure: false,
+                upload_ms: 0,
+                upload_bytes: 1 << 20,
             };
             let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
             do_server(interp::Interp { max_pages: 16384 }, c)
@@ -2367,6 +2382,8 @@ callers = ["api"]
                 wire_port: wports[n as usize],
                 wire_certs: Some(dir.0.join("certs")),
                 insecure: false,
+                upload_ms: 0,
+                upload_bytes: 1 << 20,
             };
             let eng = interp::Interp { max_pages: 16384 };
             let (a, pg) = http::load_apps(&eng, &dirs).unwrap_or_else(|e| panic!("{e}"));
@@ -2521,7 +2538,7 @@ callers = ["api"]
         secrets::new_master(&master).unwrap();
         let nodes: Vec<u16> = (0..3u32)
             .map(|n| {
-                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false };
+                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20 };
                 let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), ..cfg(&dir.0.join(format!("d{n}")), 2) };
                 // Nodes 0 and 1 take deploys (to race them against each other).
                 let admin = (n < 2).then(|| admin::AdminCfg { port: admin_ports[n as usize], public: true, tls: Some(wire::admin_tls(&certs, n).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}")).unwrap() });
@@ -2673,7 +2690,7 @@ callers = ["api"]
         // A second node 1 would fight the first over everything it owns:
         // its peers have been hearing the first one's heartbeats, so it must
         // see the id is taken (after waiting three leases), and not start.
-        let twin = fleet::FleetCfg { node: 1, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: 0, wire_certs: Some(certs.clone()), insecure: false };
+        let twin = fleet::FleetCfg { node: 1, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: 0, wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20 };
         let t = Instant::now();
         assert!(http::node_id_free(&twin, 12345).unwrap_err().contains("node id 1 is already in use"));
         assert!(t.elapsed() >= Duration::from_secs(3), "it waits for a just-restarted node to go quiet first: {:?}", t.elapsed());

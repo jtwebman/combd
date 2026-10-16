@@ -167,6 +167,7 @@ struct Stats {
     bucket_acks: AtomicU64,
     fences: AtomicU64,
     tail_entries: AtomicU64,
+    uploads: AtomicU64,
     /// WebSockets open, and messages in from them.
     sockets_open: AtomicU64,
     ws_messages: AtomicU64,
@@ -1050,7 +1051,7 @@ where
                         let mut fleet: Vec<own::Node> = f.cfg.peers.keys().copied().chain([f.cfg.node]).collect();
                         fleet.sort();
                         fleet.dedup();
-                        Core::with_lease(f.cfg.node, own::Bugs::default(), f.cfg.lease_ms).replicate(fleet, f.cfg.replicas)
+                        Core::with_lease(f.cfg.node, own::Bugs::default(), f.cfg.lease_ms).replicate(fleet, f.cfg.replicas).uploads(f.cfg.upload_ms, f.cfg.upload_bytes)
                     }),
                     freqs: HashMap::new(),
                     next_req: 0,
@@ -2678,7 +2679,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -2694,6 +2695,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.bucket_acks.load(Relaxed),
                     s.fences.load(Relaxed),
                     s.tail_entries.load(Relaxed),
+                    s.uploads.load(Relaxed),
                     s.sockets_open.load(Relaxed),
                     s.ws_messages.load(Relaxed),
                     s.ws_handoffs.load(Relaxed),
@@ -3069,6 +3071,7 @@ impl<E: Engine> Loop<'_, E> {
         st.bucket_acks.fetch_add(now.bucket_acks - was.bucket_acks, Relaxed);
         st.fences.fetch_add(now.fences - was.fences, Relaxed);
         st.tail_entries.fetch_add(now.tail_entries - was.tail_entries, Relaxed);
+        st.uploads.fetch_add(now.uploads - was.uploads, Relaxed);
         for e in effects {
             self.effect(e);
         }

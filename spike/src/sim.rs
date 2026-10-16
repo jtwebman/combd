@@ -81,12 +81,15 @@ pub struct Settings {
     pub wipes: bool,
     /// One node dies for good, partway through.
     pub loss: bool,
+    /// How long D3 uploads may wait, and how many bytes may build up first
+    /// (`None`: picked by the seed, from no wait to 5 s).
+    pub uploads: Option<(u64, usize)>,
     pub bugs: Bugs,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, bugs: Bugs::default() }
+        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, uploads: None, bugs: Bugs::default() }
     }
 }
 
@@ -105,6 +108,9 @@ pub struct Stats {
     pub bucket_acks: u64,
     pub fences: u64,
     pub tail_entries: u64,
+    pub uploads: u64,
+    /// The longest a probe took to get a write in, from when they start.
+    pub probe_ms: u64,
     pub splits: u64,
     pub wipes: u64,
     /// The longest time any object went without an acknowledged write, in ms
@@ -237,7 +243,8 @@ fn decode_seg(b: &[u8]) -> Option<Vec<W>> {
 }
 
 impl Sim {
-    pub fn new(seed: u64, s: Settings) -> Sim {
+    pub fn new(seed: u64, mut s: Settings) -> Sim {
+        s.uploads.get_or_insert([(0, 1 << 20), (300, 1 << 20), (2000, 1 << 20), (5000, 40)][(seed % 4) as usize]);
         let mut sim = Sim {
             rng: Rng::new(seed),
             s,
@@ -291,7 +298,10 @@ impl Sim {
         let off = self.rng.below(1_000_000);
         self.procs.push(Proc {
             node,
-            core: Core::new(node, self.s.bugs).replicate((0..self.s.nodes).collect(), self.s.replicas),
+            core: {
+                let (ms, bytes) = self.s.uploads.unwrap();
+                Core::new(node, self.s.bugs).replicate((0..self.s.nodes).collect(), self.s.replicas).uploads(ms, bytes)
+            },
             alive: true,
             frozen: false,
             held: vec![],
@@ -342,6 +352,10 @@ impl Sim {
         // Liveness: every object took a write once the faults stopped.
         if let Some((o, _)) = self.probes.iter().find(|(_, done)| !**done) {
             return Err(format!("object {o} never took a write after the faults stopped (lost node: {:?})", self.gone));
+        }
+        // And soon: the worst seen is about 4 s (a takeover, then a write).
+        if self.stats.probe_ms > 10 * crate::own::LEASE_MS {
+            return Err(format!("a write took {} ms to get in after the faults stopped (lost node: {:?})", self.stats.probe_ms, self.gone));
         }
         Ok(())
     }
@@ -513,8 +527,10 @@ impl Sim {
             self.stats.crashes += 1;
             self.procs[p].alive = false;
             // Now and then the disk goes with it (once per run: two lost
-            // disks at once really can lose writes).
-            if self.s.wipes && self.stats.wipes == 0 && self.rng.chance(0.3) {
+            // disks at once really can lose writes, and a node lost for good
+            // is one: with both, an object whose two peers were those two
+            // rightly stops rather than lose acknowledged writes).
+            if self.s.wipes && !self.s.loss && self.stats.wipes == 0 && self.rng.chance(0.3) {
                 self.stats.wipes += 1;
                 let mut st = PeerStore::wiped();
                 st.forgets_fence = self.s.bugs.wipe_forgets_fence;
@@ -671,8 +687,8 @@ impl Sim {
     fn client_answer(&mut self, req: ReqId, ans: Answer, p: usize) -> Result<(), String> {
         let saw = self.procs[p].saw.remove(&req);
         let Some(pd) = self.pending.remove(&req) else { return Ok(()) }; // timed out already
-        if pd.client >= PROBE && matches!(ans, Answer::Done { .. }) {
-            self.probes.insert(pd.obj, true);
+        if pd.client >= PROBE && matches!(ans, Answer::Done { .. }) && !self.probes.insert(pd.obj, true).unwrap_or(false) {
+            self.stats.probe_ms = self.stats.probe_ms.max(self.now - (self.s.duration + 2000));
         }
         match ans {
             Answer::Done { epoch } => {
@@ -797,6 +813,7 @@ pub fn run_with(seeds: std::ops::Range<u64>, settings: &dyn Fn() -> Settings) ->
             total.bucket_acks += p.core.stats.bucket_acks;
             total.fences += p.core.stats.fences;
             total.tail_entries += p.core.stats.tail_entries;
+            total.uploads += p.core.stats.uploads;
         }
         let s = &sim.stats;
         total.writes_acked += s.writes_acked;
@@ -810,6 +827,7 @@ pub fn run_with(seeds: std::ops::Range<u64>, settings: &dyn Fn() -> Settings) ->
         total.splits += s.splits;
         total.wipes += s.wipes;
         total.max_gap = total.max_gap.max(s.max_gap);
+        total.probe_ms = total.probe_ms.max(s.probe_ms);
         if let Err(e) = r {
             return (total, Some((seed, e)));
         }
@@ -874,7 +892,7 @@ mod tests {
     /// its objects taken over, so every object takes a write once the
     /// faults stop. With the known-bad version that hears everyone forever,
     /// safety still holds (it never rested on liveness), and the probe
-    /// catches it.
+    /// catches it, as it does uploads that wait while a peer is down.
     #[test]
     fn a_lost_node_is_taken_over() {
         for replicas in [0, 2] {
@@ -886,6 +904,11 @@ mod tests {
             let (_, bad) = run_with(0..100, &|| Settings { replicas, bugs: alive, ..Settings::default() });
             assert!(bad.is_none(), "with nobody lost, it's only liveness: safety must hold: {bad:?}");
         }
+        // Uploads that wait with a peer down: writes need the bucket then,
+        // so they crawl (one per upload timer). Caught by the probe's clock.
+        let wait = Bugs { wait_when_down: true, ..Bugs::default() };
+        let (_, bad) = run_with(0..300, &|| Settings { replicas: 2, loss: true, bugs: wait, ..Settings::default() });
+        assert!(bad.is_some_and(|(_, why)| why.contains("ms to get in")), "wait_when_down wasn't caught");
     }
 
     /// Each known-bad version must be caught, or the oracle is blind.

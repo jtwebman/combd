@@ -239,7 +239,13 @@ impl<S: Sink> Hub<S> {
         }
     }
 
-    fn add(&mut self, mut sock: TcpStream, tls: Option<rustls::Connection>, node: Option<Node>) -> Option<usize> {
+    fn add(&mut self, mut sock: TcpStream, mut tls: Option<rustls::Connection>, node: Option<Node>) -> Option<usize> {
+        // No cap on what waits to be sent, as in plain mode: rustls's
+        // default (64 KB) made any bigger frame (a fence's tails, a large
+        // append) fail and drop the connection. Frames are capped instead.
+        if let Some(t) = &mut tls {
+            t.set_buffer_limit(None);
+        }
         let id = self.next;
         self.next += 1;
         self.poll.registry().register(&mut sock, Token(id), Interest::READABLE).ok()?;
@@ -524,6 +530,10 @@ mod tests {
         let (_b, _rb) = hub(base + 1, &peers, Some(load_tls(&dir.0.join("fleet"), 1).unwrap()));
         a.send(1, Frame::Forward { id: 7, name: "room".into(), req: "do GET /count".into() }, 0);
         assert_eq!(ra.recv_timeout(Duration::from_secs(5)).unwrap(), (7, (200, "room:do GET /count".into())));
+        // Big frames both ways (rustls's default 64 KB send cap broke them).
+        let big = "x".repeat(1 << 20);
+        a.send(1, Frame::Forward { id: 12, name: "room".into(), req: big.clone() }, 0);
+        assert_eq!(ra.recv_timeout(Duration::from_secs(5)).unwrap(), (12, (200, format!("room:{big}"))));
         a.send(1, Frame::Peer { id: 10, call: PeerCall::Fence { obj: 1, epoch: 2 } }, 0);
         assert_eq!(ra.recv_timeout(Duration::from_secs(5)).unwrap(), (10, (200, "peer".into())));
 
