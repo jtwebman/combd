@@ -948,7 +948,7 @@ impl Core {
     /// Turn what has run into an entry (a seal), or, for reads only, into a
     /// wait for the next confirmation.
     fn flush(&mut self, o: Obj) {
-        let (now, trust) = (self.now, self.lease_trust_ms);
+        let (now, trust, ack_one) = (self.now, self.lease_trust_ms, self.bugs.ack_one);
         let Phase::Serving(s) = &mut self.st(o).phase else { return };
         if s.sealing.is_some() || s.batch.is_empty() {
             return;
@@ -964,15 +964,26 @@ impl Core {
             s.sealing = Some(reqs);
             let act = s.act;
             self.out.push(Effect::Seal { obj: o, act });
-        } else if s.pends.is_empty() && now < lease {
+        } else if now < lease && {
+            // Every entry made so far is acknowledged, as a write's answer
+            // needs: then nothing a read saw can be lost.
+            let has = |p: &PeerSt| p.have >= s.made;
+            s.uploaded >= s.made || if ack_one { s.peers.iter().any(has) } else { s.peers.iter().all(has) }
+        } {
             // Reads under the lease, with every earlier write acknowledged:
             // done now, no round. Past half the lease, a round renews it.
+            // Whatever still waits for a round (reads that came while the
+            // lease had lapsed) is proven now too, and goes first, so
+            // answers keep their order. Waiting on them instead would never
+            // end where a round takes longer than the gap between requests
+            // (an object's beat is 50 ms; a round to another continent, 200).
             let epoch = s.epoch;
             if lease - now < trust / 2 {
                 s.round += 1;
             }
-            self.stats.lease_reads += reqs.len() as u64;
-            for r in reqs {
+            let waiting: Vec<ReqId> = s.pends.drain(..).flat_map(|p| p.reqs).collect();
+            self.stats.lease_reads += (waiting.len() + reqs.len()) as u64;
+            for r in waiting.into_iter().chain(reqs) {
                 self.answer(r, Answer::Done { epoch });
             }
             self.kick(o);

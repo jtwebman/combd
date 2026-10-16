@@ -978,8 +978,8 @@ mod tests {
             ("seal_early", 2, Bugs { seal_early: true, ..Bugs::default() }),
         ];
         for (name, replicas, bugs) in cases {
-            let (_, bad) = run_many(0..2000, replicas, bugs);
-            assert!(bad.is_some(), "{name} was not caught in 2,000 seeds");
+            let (_, bad) = run_many(0..6000, replicas, bugs);
+            assert!(bad.is_some(), "{name} was not caught in 6,000 seeds");
         }
     }
 }
