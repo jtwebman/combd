@@ -33,7 +33,7 @@ fail MCCatalog CatAckBeforeWrite CatBlindSlot CatApplyAnyOrder CatUncoveredCheck
 pass MCOwnership MCOwnership
 fail MCOwnership BugSkipProof BugLoadBeforeCas BugNoManifest BugReuseEpoch
 pass MCReplication MCReplication
-fail MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest RepAckNoProof RepLateManifest
+fail MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest RepAckNoProof RepLateManifest RepLeaseNoPromise RepLeaseOvertrust
 # With a peer's disk lost once (the slow one: about 20 minutes).
 pass MCReplication RepWipe
 fail MCReplication RepTrustWiped RepWipeForgetsFence

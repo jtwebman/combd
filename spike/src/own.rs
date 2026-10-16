@@ -173,6 +173,9 @@ pub enum PeerRes {
     /// Every tail, and `born`: 0, or for a store that lost its disk, the
     /// epoch it relearned. It speaks only for epochs after that.
     Tails { born: u32, tails: Vec<Tail> },
+    /// Not yet: this store promised the object's owner it wouldn't be fenced
+    /// for this many more ms (a read lease, see `PeerStore::handle_at`).
+    Wait(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -265,6 +268,11 @@ pub struct Bugs {
     /// Liveness: uploads wait even with a peer down, so writes (which need
     /// the bucket then) wait for the timer.
     pub wait_when_down: bool,
+    /// Read lease: peers let a newer owner fence them while they've promised
+    /// the old one not to.
+    pub lease_no_promise: bool,
+    /// Read lease: the owner trusts its lease longer than peers promised.
+    pub lease_overtrust: bool,
 }
 
 /// A node's peer store: the entries it keeps for other nodes' objects. The
@@ -283,6 +291,17 @@ pub struct PeerStore {
     pub wiped: bool,
     /// The bug switch `wipe_forgets_fence`, for tests only.
     pub forgets_fence: bool,
+    /// Read leases: after acknowledging an owner's append, a store promises
+    /// that owner's epoch this long (its own clock) before a newer one may
+    /// fence it, and as long after it starts (it can't remember what it
+    /// promised before). 0: no promises.
+    pub promise_ms: u64,
+    /// Promises made, per object: (epoch, until). In memory only: a
+    /// restart is covered by `started`.
+    held: HashMap<Obj, (u32, u64)>,
+    started: Option<u64>,
+    /// The bug switch `lease_no_promise`, for tests only.
+    pub ignores_promise: bool,
 }
 
 #[derive(Default)]
@@ -297,6 +316,37 @@ impl PeerStore {
     /// A store that lost its disk.
     pub fn wiped() -> PeerStore {
         PeerStore { wiped: true, ..PeerStore::default() }
+    }
+
+    /// The store's process started (again) at `now`: what it promised before
+    /// is forgotten, so it holds off every fence for a lease.
+    pub fn started(&mut self, now: u64) {
+        self.held.clear();
+        self.started = Some(now);
+    }
+
+    /// A call at `now` (this store's clock), keeping its promises: a fence
+    /// for a newer epoch than one it promised is told to wait.
+    pub fn handle_at(&mut self, call: PeerCall, now: u64) -> PeerRes {
+        if self.promise_ms > 0 && !self.ignores_promise {
+            let started = *self.started.get_or_insert(now);
+            if let PeerCall::Fence { obj, epoch } = &call {
+                let held = self.held.get(obj).filter(|h| *epoch > h.0).map_or(0, |h| h.1);
+                let until = held.max(started + self.promise_ms);
+                if now < until {
+                    return PeerRes::Wait(until - now);
+                }
+            }
+        }
+        let append = match &call {
+            PeerCall::Append { obj, epoch, .. } => Some((*obj, *epoch)),
+            _ => None,
+        };
+        let res = self.handle(call);
+        if let (Some((obj, epoch)), PeerRes::Have(_), true) = (append, &res, self.promise_ms > 0) {
+            self.held.insert(obj, (epoch, now + self.promise_ms));
+        }
+        res
     }
 
     /// Does a wiped store need to relearn this object first (`Learn`, with
@@ -421,7 +471,7 @@ enum Wait {
     /// Only with `Bugs::load_before_cas`: the history, read before the CAS.
     EarlyList(Obj, Option<String>, u32),
     EarlyManifest(Obj, Option<String>, u32, Vec<String>),
-    Fence(Obj, u32),
+    Fence(Obj, u32, Node),
     List(Obj, u32),
     /// Reading the manifest of an earlier epoch q: its uploads, how many
     /// entries they hold, and q.
@@ -431,7 +481,8 @@ enum Wait {
     /// Serving: an upload up to entry N (a retry?), a peer append (peer
     /// index, round), a proof (round, entries uploaded).
     Upload(Obj, u32, u64, bool),
-    Append(Obj, u32, usize, u64),
+    /// Peer `usize`, round, and when it was sent (our clock).
+    Append(Obj, u32, usize, u64, u64),
     Prove(Obj, u32, u64, u64),
     /// Marking the record sealed; nothing waits on it.
     SealRec,
@@ -441,7 +492,7 @@ impl Wait {
     fn obj(&self) -> Option<Obj> {
         use Wait::*;
         match self {
-            ReadRec(o) | Cas(o, _) | ReadBack(o, _) | EarlyList(o, ..) | EarlyManifest(o, ..) | Fence(o, _)
+            ReadRec(o) | Cas(o, _) | ReadBack(o, _) | EarlyList(o, ..) | EarlyManifest(o, ..) | Fence(o, ..)
             | List(o, _) | PrevManifest(o, ..) | TailSeg(o, ..) | Manifest(o, _) | Upload(o, ..) | Append(o, ..) | Prove(o, ..) => {
                 Some(*o)
             }
@@ -469,6 +520,9 @@ struct PeerSt {
     /// allows one retry.
     down: bool,
     retry: bool,
+    /// When (our clock) the last call it acknowledged was sent: its promise
+    /// runs from after that (see `Core::read_lease`).
+    acked_at: Option<u64>,
 }
 
 /// Requests waiting to be acknowledged: they need entries up to `need`, and
@@ -544,6 +598,8 @@ struct FenceSt {
     /// None of those could speak for the epoch we need: wait for the rest,
     /// then list again.
     waiting: bool,
+    /// Peers that said "not yet" (a lease they promised): ask again then.
+    again: Vec<(Node, u64)>,
 }
 
 struct ObjSt {
@@ -572,6 +628,8 @@ pub struct CoreStats {
     pub tail_entries: u64,
     /// Segments sent to the bucket (retries too).
     pub uploads: u64,
+    /// Reads answered under the read lease, with no round.
+    pub lease_reads: u64,
 }
 
 pub struct Core {
@@ -585,6 +643,9 @@ pub struct Core {
     /// wait).
     upload_ms: u64,
     upload_bytes: usize,
+    /// Read leases: how long after a round all peers acknowledged a read may
+    /// be answered without another (0: every read waits for a round).
+    lease_trust_ms: u64,
     next_op: OpId,
     next_act: Act,
     ops: HashMap<OpId, Wait>,
@@ -618,6 +679,7 @@ impl Core {
             replicas: 0,
             upload_ms: 0,
             upload_bytes: 1 << 20,
+            lease_trust_ms: 0,
             next_op: 0,
             next_act: 0,
             ops: HashMap::new(),
@@ -639,6 +701,15 @@ impl Core {
     pub fn replicate(mut self, fleet: Vec<Node>, replicas: usize) -> Core {
         self.fleet = fleet;
         self.replicas = replicas;
+        self
+    }
+
+    /// D3: read leases, with peers that promise `promise_ms` (their
+    /// `PeerStore::promise_ms`). The owner trusts three quarters of it,
+    /// counted from when it sent the round: room for clocks that run apart
+    /// by up to a fifth.
+    pub fn read_lease(mut self, promise_ms: u64) -> Core {
+        self.lease_trust_ms = if self.bugs.lease_overtrust { promise_ms * 3 / 2 } else { promise_ms * 3 / 4 };
         self
     }
 
@@ -711,6 +782,18 @@ impl Core {
                 self.heard.insert(node, now);
             }
             Event::Tick => {
+                // Fences told to wait (a lease the peer promised): again, once due.
+                let mut again = vec![];
+                for (&o, st) in self.objs.iter_mut() {
+                    if let Some(f) = st.fence.as_mut() {
+                        let (due, wait): (Vec<_>, Vec<_>) = f.again.drain(..).partition(|x| x.1 <= now);
+                        f.again = wait;
+                        again.extend(due.into_iter().map(|(n, _)| (o, f.epoch, n)));
+                    }
+                }
+                for (o, e, n) in again {
+                    self.peer(Wait::Fence(o, e, n), n, PeerCall::Fence { obj: o, epoch: e });
+                }
                 let live: Vec<Obj> = self.objs.iter().filter(|(_, st)| matches!(st.phase, Phase::Serving(_))).map(|(&o, _)| o).collect();
                 let lease_ms = self.lease_ms;
                 for o in live {
@@ -804,7 +887,7 @@ impl Core {
         if !ok {
             return self.drop_obj(o);
         }
-        let peers = st.peers.iter().map(|&node| PeerSt { node, have: 0, round: 0, busy: false, down: false, retry: false }).collect();
+        let peers = st.peers.iter().map(|&node| PeerSt { node, have: 0, round: 0, busy: false, down: false, retry: false, acked_at: None }).collect();
         st.phase = Phase::Serving(Serve {
             epoch: st.epoch,
             act,
@@ -865,16 +948,34 @@ impl Core {
     /// Turn what has run into an entry (a seal), or, for reads only, into a
     /// wait for the next confirmation.
     fn flush(&mut self, o: Obj) {
-        let now = self.now;
+        let (now, trust) = (self.now, self.lease_trust_ms);
         let Phase::Serving(s) = &mut self.st(o).phase else { return };
         if s.sealing.is_some() || s.batch.is_empty() {
             return;
         }
         let reqs = std::mem::take(&mut s.batch);
+        // The read lease: every peer acknowledged a call sent at `from` or
+        // later, so none can be fenced before `from` + their promise.
+        let lease = match s.peers.iter().map(|p| if p.down { None } else { p.acked_at }).collect::<Option<Vec<u64>>>() {
+            Some(at) if trust > 0 && !at.is_empty() => at.into_iter().min().unwrap() + trust,
+            _ => 0,
+        };
         if std::mem::take(&mut s.dirty) {
             s.sealing = Some(reqs);
             let act = s.act;
             self.out.push(Effect::Seal { obj: o, act });
+        } else if s.pends.is_empty() && now < lease {
+            // Reads under the lease, with every earlier write acknowledged:
+            // done now, no round. Past half the lease, a round renews it.
+            let epoch = s.epoch;
+            if lease - now < trust / 2 {
+                s.round += 1;
+            }
+            self.stats.lease_reads += reqs.len() as u64;
+            for r in reqs {
+                self.answer(r, Answer::Done { epoch });
+            }
+            self.kick(o);
         } else {
             s.round += 1;
             s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs });
@@ -910,7 +1011,7 @@ impl Core {
                 .collect();
             let trunc = if trunc_early { s.made } else { s.uploaded };
             p.busy = true;
-            peer_calls.push((Wait::Append(o, e, i, s.round), p.node, PeerCall::Append { obj: o, epoch: e, from, ents, trunc }));
+            peer_calls.push((Wait::Append(o, e, i, s.round, now), p.node, PeerCall::Append { obj: o, epoch: e, from, ents, trunc }));
         }
         let mut calls = vec![];
         // Uploads wait only while every peer is up: otherwise the bucket is
@@ -1076,9 +1177,16 @@ impl Core {
             }
 
             // ---- 2. fence, then load, then write the manifest, then restore ----
-            (Wait::Fence(o, e), res) => {
+            (Wait::Fence(o, e, n), res) => {
+                let now = self.now;
                 let st = self.st(o);
                 let Some(f) = st.fence.as_mut().filter(|f| f.epoch == e) else { return };
+                // It promised the old owner a lease: ask again once it's out
+                // (on a tick), the call still counted as out.
+                if let Res::Peer(PeerRes::Wait(ms)) = res {
+                    f.again.push((n, now + ms));
+                    return;
+                }
                 f.out -= 1;
                 if let Res::Peer(PeerRes::Tails { born, tails }) = res {
                     f.replies.push((born, tails));
@@ -1161,7 +1269,7 @@ impl Core {
                 s.uploaded = upto;
                 self.kick(o);
             }
-            (Wait::Append(o, e, i, round), res) => {
+            (Wait::Append(o, e, i, round, sent), res) => {
                 let Some(s) = self.serving_in(o, e) else { return };
                 let p = &mut s.peers[i];
                 p.busy = false;
@@ -1171,6 +1279,7 @@ impl Core {
                         p.have = n;
                         p.round = p.round.max(round);
                         p.down = false;
+                        p.acked_at = Some(p.acked_at.map_or(sent, |a| a.max(sent)));
                     }
                     // Fenced: a newer owner has it.
                     Res::Peer(PeerRes::Refused) => return self.drop_obj(o),
@@ -1261,9 +1370,9 @@ impl Core {
             return self.call(Wait::List(o, e), Call::List(obj_prefix(o)));
         }
         let peers = prev.unwrap().peers;
-        self.st(o).fence = Some(FenceSt { epoch: e, out: peers.len(), replies: vec![], listed: 0, waiting: false });
+        self.st(o).fence = Some(FenceSt { epoch: e, out: peers.len(), replies: vec![], listed: 0, waiting: false, again: vec![] });
         for n in peers {
-            self.peer(Wait::Fence(o, e), n, PeerCall::Fence { obj: o, epoch: e });
+            self.peer(Wait::Fence(o, e, n), n, PeerCall::Fence { obj: o, epoch: e });
         }
     }
 

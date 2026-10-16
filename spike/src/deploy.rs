@@ -232,19 +232,7 @@ mod tests {
         let good = encode(&[("combd.toml".into(), b"[app]".to_vec()), ("modules/api.wasm".into(), vec![0, 97, 115, 109])]).unwrap();
         let mut rng = crate::sim::Rng::new(7);
         for _ in 0..100_000 {
-            let mut b = good.clone();
-            for _ in 0..1 + rng.below(4) {
-                if b.is_empty() {
-                    b.push(0);
-                }
-                let at = rng.below(b.len() as u64) as usize;
-                match rng.below(4) {
-                    0 => b[at] ^= 1 << rng.below(8),
-                    1 => b.truncate(at),
-                    2 => b.insert(at, rng.next() as u8),
-                    _ => b.splice(at..at, [0xff, 0xff, 0xff, 0x7f]).for_each(drop),
-                }
-            }
+            let b = crate::sim::mangle(&mut rng, &good);
             if let Ok(files) = std::panic::catch_unwind(|| decode(&b)).expect("the decoder panicked") {
                 for (n, _) in files {
                     assert!(n == "combd.toml" || n == "combd.yaml" || n == "combd.json" || (n.starts_with("modules/") && n.ends_with(".wasm") && !n.contains("..")), "{n:?}");

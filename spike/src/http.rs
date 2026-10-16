@@ -1061,7 +1061,7 @@ where
                         let mut fleet: Vec<own::Node> = f.cfg.peers.keys().copied().chain([f.cfg.node]).collect();
                         fleet.sort();
                         fleet.dedup();
-                        Core::with_lease(f.cfg.node, own::Bugs::default(), f.cfg.lease_ms).replicate(fleet, f.cfg.replicas).uploads(f.cfg.upload_ms, f.cfg.upload_bytes)
+                        Core::with_lease(f.cfg.node, own::Bugs::default(), f.cfg.lease_ms).replicate(fleet, f.cfg.replicas).uploads(f.cfg.upload_ms, f.cfg.upload_bytes).read_lease(if f.cfg.read_lease { f.cfg.lease_ms / 2 } else { 0 })
                     }),
                     freqs: HashMap::new(),
                     next_req: 0,
@@ -1321,10 +1321,12 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
         eprintln!("combd     can't write this node's lease: {e}");
         std::process::exit(1);
     }
-    let disk = DiskPeers::open(&data.join("peers"), ran_before).unwrap_or_else(|e| {
+    let mut disk = DiskPeers::open(&data.join("peers"), ran_before).unwrap_or_else(|e| {
         eprintln!("combd     can't open the peer store: {e}");
         std::process::exit(1);
     });
+    // Read leases: half a lease, so a takeover waits at most that much more.
+    disk.promise(fc.lease_ms / 2);
     let (ptx, prx) = channel();
     let heard: Arc<Mutex<HashMap<own::Node, (u64, Instant)>>> = Arc::default();
     let wire_cell: Arc<std::sync::OnceLock<Wire>> = Arc::default();

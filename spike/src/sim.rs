@@ -36,6 +36,25 @@
 use crate::own::*;
 use std::collections::{BTreeMap, HashMap};
 
+/// Fuzzing: `good`, damaged 1 to 4 ways at random (a bit flipped, cut
+/// short, a byte added, a huge length pasted in).
+pub fn mangle(rng: &mut Rng, good: &[u8]) -> Vec<u8> {
+    let mut b = good.to_vec();
+    for _ in 0..1 + rng.below(4) {
+        if b.is_empty() {
+            b.push(0);
+        }
+        let at = rng.below(b.len() as u64) as usize;
+        match rng.below(4) {
+            0 => b[at] ^= 1 << rng.below(8),
+            1 => b.truncate(at),
+            2 => b.insert(at, rng.next() as u8),
+            _ => b.splice(at..at, [0xff, 0xff, 0xff, 0x7f]).for_each(drop),
+        }
+    }
+    b
+}
+
 /// A write, as the simulator's clients make them.
 pub type W = u64;
 
@@ -81,6 +100,8 @@ pub struct Settings {
     pub wipes: bool,
     /// One node dies for good, partway through.
     pub loss: bool,
+    /// Read leases (`Core::read_lease`, `PeerStore::promise_ms`).
+    pub lease: bool,
     /// How long D3 uploads may wait, and how many bytes may build up first
     /// (`None`: picked by the seed, from no wait to 5 s).
     pub uploads: Option<(u64, usize)>,
@@ -89,7 +110,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, uploads: None, bugs: Bugs::default() }
+        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, lease: true, uploads: None, bugs: Bugs::default() }
     }
 }
 
@@ -109,6 +130,7 @@ pub struct Stats {
     pub fences: u64,
     pub tail_entries: u64,
     pub uploads: u64,
+    pub lease_reads: u64,
     /// The longest a probe took to get a write in, from when they start.
     pub probe_ms: u64,
     pub splits: u64,
@@ -145,8 +167,8 @@ type End = Option<Node>;
 
 /// A peer store answers a call; a wiped one first relearns the object from
 /// the bucket, as a real one does.
-fn store_call(stores: &mut HashMap<Node, PeerStore>, bucket: &BTreeMap<String, (Val, u64)>, node: Node, call: PeerCall) -> PeerRes {
-    let st = stores.entry(node).or_default();
+fn store_call(stores: &mut HashMap<Node, PeerStore>, bucket: &BTreeMap<String, (Val, u64)>, node: Node, call: PeerCall, now: u64) -> PeerRes {
+    let st = stores.get_mut(&node).expect("every node's store is made at its spawn");
     if let Some(obj) = st.must_learn(&call) {
         let epoch = match bucket.get(&own_key(obj)) {
             Some((Val::Rec(r), _)) => r.epoch,
@@ -154,8 +176,11 @@ fn store_call(stores: &mut HashMap<Node, PeerStore>, bucket: &BTreeMap<String, (
         };
         st.handle(PeerCall::Learn { obj, epoch });
     }
-    st.handle(call)
+    st.handle_at(call, now)
 }
+
+/// Read leases in the simulator: peers promise half a lease.
+const PROMISE_MS: u64 = LEASE_MS / 2;
 
 /// What a process holds for one object it serves: its data.
 #[derive(Default)]
@@ -300,7 +325,8 @@ impl Sim {
             node,
             core: {
                 let (ms, bytes) = self.s.uploads.unwrap();
-                Core::new(node, self.s.bugs).replicate((0..self.s.nodes).collect(), self.s.replicas).uploads(ms, bytes)
+                let c = Core::new(node, self.s.bugs).replicate((0..self.s.nodes).collect(), self.s.replicas).uploads(ms, bytes);
+                if self.s.lease { c.read_lease(PROMISE_MS) } else { c }
             },
             alive: true,
             frozen: false,
@@ -312,6 +338,15 @@ impl Sim {
         });
         let p = self.procs.len() - 1;
         self.current.insert(node, p);
+        // Its peer store (kept across restarts, like a disk), told it started
+        // again: it forgets its promises, so it holds off fences a lease.
+        let (lease, ignores, now) = (self.s.lease, self.s.bugs.lease_no_promise, self.clock(p));
+        let st = self.stores.entry(node).or_default();
+        if lease {
+            st.promise_ms = PROMISE_MS;
+            st.ignores_promise = ignores;
+        }
+        st.started(now);
         self.at(0, Msg::Tick(p));
     }
 
@@ -436,10 +471,12 @@ impl Sim {
                 if !up || self.cut(Some(from), Some(node)) {
                     self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
                 } else if self.cut(Some(node), Some(from)) {
-                    store_call(&mut self.stores, &self.bucket, node, call);
+                    let now = self.clock(self.current[&node]);
+                    store_call(&mut self.stores, &self.bucket, node, call, now);
                     self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
                 } else if !lose_reply {
-                    let res = Res::Peer(store_call(&mut self.stores, &self.bucket, node, call));
+                    let now = self.clock(self.current[&node]);
+                    let res = Res::Peer(store_call(&mut self.stores, &self.bucket, node, call, now));
                     let d = self.peer_latency();
                     self.at(d, Msg::Proc(p, Event::Reply { op, res }));
                 }
@@ -814,6 +851,7 @@ pub fn run_with(seeds: std::ops::Range<u64>, settings: &dyn Fn() -> Settings) ->
             total.fences += p.core.stats.fences;
             total.tail_entries += p.core.stats.tail_entries;
             total.uploads += p.core.stats.uploads;
+            total.lease_reads += p.core.stats.lease_reads;
         }
         let s = &sim.stats;
         total.writes_acked += s.writes_acked;
@@ -909,6 +947,21 @@ mod tests {
         let wait = Bugs { wait_when_down: true, ..Bugs::default() };
         let (_, bad) = run_with(0..300, &|| Settings { replicas: 2, loss: true, bugs: wait, ..Settings::default() });
         assert!(bad.is_some_and(|(_, why)| why.contains("ms to get in")), "wait_when_down wasn't caught");
+    }
+
+    /// Read leases: reads answered with no round are still never stale,
+    /// through splits and lost disks, and the lease is really used. The two
+    /// ways to get it wrong (peers that break their promise, an owner that
+    /// trusts past it) are caught as stale reads.
+    #[test]
+    fn read_leases_hold_and_their_bugs_are_caught() {
+        let (s, bad) = run_with(0..300, &|| Settings { replicas: 2, splits: true, wipes: true, ..Settings::default() });
+        assert!(bad.is_none(), "{bad:?}");
+        assert!(s.lease_reads > s.reads_done / 4, "the lease should answer many reads: {s:?}");
+        for (name, bugs) in [("lease_no_promise", Bugs { lease_no_promise: true, ..Bugs::default() }), ("lease_overtrust", Bugs { lease_overtrust: true, ..Bugs::default() })] {
+            let (_, bad) = run_with(0..2000, &|| Settings { replicas: 2, splits: true, bugs, ..Settings::default() });
+            assert!(bad.as_ref().is_some_and(|(_, why)| why.contains("missed write")), "{name} wasn't caught: {bad:?}");
+        }
     }
 
     /// Each known-bad version must be caught, or the oracle is blind.

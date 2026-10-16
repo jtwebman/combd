@@ -420,3 +420,25 @@ fn hex(b: &[u8]) -> String {
 fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Entries and snapshots come from the bucket and other nodes: damaged
+    /// at random, the decoders must never panic.
+    #[test]
+    fn mangled_entries_and_snapshots_never_panic() {
+        let e = Entry { id: 7, app: "acme/shop".into(), value: br#"{"version":"v1","domains":["a.test"]}"#.to_vec() };
+        let mut st = State::default();
+        st.apply(&e);
+        st.apply(&Entry { id: 8, app: "acme/shop#vars".into(), value: b"{}".to_vec() });
+        let (good_e, good_s) = (encode(&e), encode_snap(&st));
+        assert_eq!(decode(&good_e).map(|d| d.app), Some(e.app.clone()));
+        let mut rng = crate::sim::Rng::new(13);
+        for _ in 0..100_000 {
+            let (a, b) = (crate::sim::mangle(&mut rng, &good_e), crate::sim::mangle(&mut rng, &good_s));
+            std::panic::catch_unwind(|| (decode(&a), decode_snap(&b))).expect("a catalog decoder panicked");
+        }
+    }
+}

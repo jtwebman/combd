@@ -770,6 +770,8 @@ fn main_with(args: &[&str]) {
                 Some("wipe_forgets_fence") => bugs.wipe_forgets_fence = true,
                 Some("assume_alive") => bugs.assume_alive = true,
                 Some("wait_when_down") => bugs.wait_when_down = true,
+                Some("lease_no_promise") => bugs.lease_no_promise = true,
+                Some("lease_overtrust") => bugs.lease_overtrust = true,
                 _ => {}
             }
             let replicas = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -1479,6 +1481,7 @@ mod tests {
                 insecure: false,
                 upload_ms: 0,
                 upload_bytes: 1 << 20,
+                read_lease: true,
             };
             let c = http::Config { idle: Duration::from_millis(idle_ms), fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
             do_server(interp::Interp { max_pages: 16384 }, c)
@@ -1538,6 +1541,7 @@ mod tests {
                 insecure: false,
                 upload_ms: 60_000,
                 upload_bytes: 1 << 20,
+                read_lease: true,
             };
             let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 2) };
             do_server(interp::Interp { max_pages: 16384 }, c)
@@ -1769,6 +1773,7 @@ mod tests {
                 insecure: false,
                 upload_ms: 0,
                 upload_bytes: 1 << 20,
+                read_lease: true,
             };
             let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
             do_server(interp::Interp { max_pages: 16384 }, c)
@@ -2414,6 +2419,7 @@ callers = ["api"]
                 insecure: false,
                 upload_ms: 0,
                 upload_bytes: 1 << 20,
+                read_lease: true,
             };
             let eng = interp::Interp { max_pages: 16384 };
             let (a, pg) = http::load_apps(&eng, &dirs).unwrap_or_else(|e| panic!("{e}"));
@@ -2568,7 +2574,7 @@ callers = ["api"]
         secrets::new_master(&master).unwrap();
         let nodes: Vec<u16> = (0..3u32)
             .map(|n| {
-                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20 };
+                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true };
                 let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), ..cfg(&dir.0.join(format!("d{n}")), 2) };
                 // Nodes 0 and 1 take deploys (to race them against each other).
                 let admin = (n < 2).then(|| admin::AdminCfg { port: admin_ports[n as usize], public: true, tls: Some(wire::admin_tls(&certs, n).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}")).unwrap() });
@@ -2720,7 +2726,7 @@ callers = ["api"]
         // A second node 1 would fight the first over everything it owns:
         // its peers have been hearing the first one's heartbeats, so it must
         // see the id is taken (after waiting three leases), and not start.
-        let twin = fleet::FleetCfg { node: 1, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: 0, wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20 };
+        let twin = fleet::FleetCfg { node: 1, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: 0, wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true };
         let t = Instant::now();
         assert!(http::node_id_free(&twin, 12345).unwrap_err().contains("node id 1 is already in use"));
         assert!(t.elapsed() >= Duration::from_secs(3), "it waits for a just-restarted node to go quiet first: {:?}", t.elapsed());
@@ -2859,7 +2865,7 @@ callers = ["api"]
         let stops: Vec<Arc<AtomicBool>> = (0..3).map(|_| Arc::default()).collect();
         let nodes: Vec<u16> = (0..3u32)
             .map(|n| {
-                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20 };
+                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true };
                 let c = http::Config { fleet: Some(fc), stop: stops[n as usize].clone(), ..cfg(&dir.0.join(format!("d{n}")), 2) };
                 let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: false, tls: None, tokens: admin::parse_tokens(&line).unwrap() });
                 let port = free_ports(1)[0];

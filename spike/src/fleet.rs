@@ -40,6 +40,11 @@ pub struct FleetCfg {
     /// build up (`COMBD_UPLOAD_BYTES`, default 1 MB, at most 16 MB).
     pub upload_ms: u64,
     pub upload_bytes: usize,
+    /// Read leases (`COMBD_READ_LEASE=1`): owners answer reads with no round
+    /// while their peers' promises hold. Peers always promise; turn this on
+    /// only once every node runs a version that does (an older peer would
+    /// promise nothing).
+    pub read_lease: bool,
 }
 
 impl FleetCfg {
@@ -65,7 +70,8 @@ impl FleetCfg {
         }
         // Under the wire's frame limit: a takeover gets the rest in one reply.
         let upload_bytes = std::env::var("COMBD_UPLOAD_BYTES").ok().and_then(|p| p.parse().ok()).unwrap_or(1 << 20).min(16 << 20);
-        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure, upload_ms, upload_bytes })
+        let read_lease = std::env::var("COMBD_READ_LEASE").as_deref() == Ok("1");
+        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure, upload_ms, upload_bytes, read_lease })
     }
 }
 
@@ -207,6 +213,10 @@ fn encode_res(res: &PeerRes, b: &mut Vec<u8>) {
             b.extend_from_slice(&n.to_le_bytes());
         }
         PeerRes::Refused => b.push(2),
+        PeerRes::Wait(ms) => {
+            b.push(4);
+            b.extend_from_slice(&ms.to_le_bytes());
+        }
         PeerRes::Tails { born, tails: ts } => {
             b.push(3);
             b.extend_from_slice(&born.to_le_bytes());
@@ -224,6 +234,7 @@ fn decode_res(r: &mut Rd) -> Option<PeerRes> {
     Some(match r.u8()? {
         1 => PeerRes::Have(r.u64()?),
         2 => PeerRes::Refused,
+        4 => PeerRes::Wait(r.u64()?),
         3 => {
             let born = r.u32()?;
             let n = r.u32()?;
@@ -306,8 +317,13 @@ impl Frame {
         if !(9..=MAX_FRAME).contains(&n) {
             return Err(bad("bad frame length"));
         }
-        let mut b = vec![0u8; n];
-        r.read_exact(&mut b)?;
+        // Only as much memory as really arrives: a length alone can't make
+        // us allocate 64 MB.
+        let mut b = Vec::new();
+        r.take(n as u64).read_to_end(&mut b)?;
+        if b.len() < n {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short frame"));
+        }
         let id = u64::from_le_bytes(b[1..9].try_into().unwrap());
         let text = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| bad("frame text isn't UTF-8"));
         match b[0] {
@@ -368,6 +384,8 @@ pub struct DiskPeers {
     size: u64,
     /// The size right after the last compaction: what the store holds.
     base: u64,
+    /// This process's start, for the store's clock.
+    t0: std::time::Instant,
     dirty: bool,
 }
 
@@ -421,7 +439,7 @@ impl DiskPeers {
         let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
         file.set_len(at as u64)?;
         file.sync_all()?;
-        Ok(DiskPeers { store, path, file, size: at as u64, base: 0, dirty: false })
+        Ok(DiskPeers { store, path, file, size: at as u64, base: 0, dirty: false, t0: std::time::Instant::now() })
     }
 
     /// Apply a call; it's durable after the next `sync`. A wiped store first
@@ -435,10 +453,20 @@ impl DiskPeers {
         self.apply(c).map(Some)
     }
 
+    /// Read leases: promise owners `ms` (see `PeerStore::promise_ms`),
+    /// counted from now for this process (a restart forgets its promises,
+    /// so it holds off every fence that long first).
+    pub fn promise(&mut self, ms: u64) {
+        self.store.promise_ms = ms;
+        self.t0 = std::time::Instant::now();
+        self.store.started(0);
+    }
+
     fn apply(&mut self, c: PeerCall) -> std::io::Result<PeerRes> {
         let rec = record(&c);
-        let res = self.store.handle(c);
-        if res != PeerRes::Refused {
+        let res = self.store.handle_at(c, self.t0.elapsed().as_millis() as u64);
+        // Refused, or "not yet" (a promise kept): nothing changed.
+        if !matches!(res, PeerRes::Refused | PeerRes::Wait(_)) {
             self.file.write_all(&rec)?;
             self.size += rec.len() as u64;
             self.dirty = true;
@@ -618,6 +646,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Frames come from other nodes: damaged at random, the reader must
+    /// never panic.
+    #[test]
+    fn mangled_frames_never_panic() {
+        let frames = [
+            Frame::Forward { id: 7, name: "acme/app/room/1".into(), req: "do POST /incr {\"a\":1}".into() },
+            Frame::Reply { id: 9, status: 200, body: "{\"ok\":true}".into() },
+            Frame::Peer { id: 3, call: PeerCall::Append { obj: 5, epoch: 2, from: 1, ents: vec![vec![1, 2, 3], vec![4; 40]], trunc: 0 } },
+            Frame::Peer { id: 4, call: PeerCall::Fence { obj: 5, epoch: 3 } },
+            Frame::PeerReply { id: 3, res: PeerRes::Tails { born: 1, tails: vec![Tail { epoch: 2, from: 0, ents: vec![vec![9; 12]] }] } },
+            Frame::PeerReply { id: 4, res: PeerRes::Wait(1500) },
+            Frame::WsPush { name: "acme/app/room/1".into(), sock: 77, op: 1, payload: b"hello".to_vec() },
+            Frame::Catalog { seq: 12, entry: b"entry".to_vec() },
+            Frame::Heartbeat { node: 2, boot: 99 },
+            Frame::Pool { body: b"{\"pool\":\"a/b/c\",\"epoch\":1,\"from\":0,\"t\":\"free\",\"member\":3}".to_vec() },
+        ];
+        let mut rng = crate::sim::Rng::new(11);
+        for i in 0..100_000 {
+            let b = crate::sim::mangle(&mut rng, &frames[i % frames.len()].encode());
+            let _ = std::panic::catch_unwind(|| Frame::read(&mut &b[..])).expect("the frame reader panicked");
+        }
+    }
+
     #[test]
     fn frames_round_trip_and_reject_garbage() {
         for f in [
@@ -631,6 +682,7 @@ mod tests {
             Frame::Catalog { seq: 42, entry: b"{\"id\":1}".to_vec() },
             Frame::Heartbeat { node: 7, boot: u64::MAX },
             Frame::Pool { body: b"{}".to_vec() },
+            Frame::PeerReply { id: 9, res: PeerRes::Wait(1500) },
             Frame::PeerReply { id: 5, res: PeerRes::Tails { born: 4, tails: vec![Tail { epoch: 2, from: 7, ents: vec![vec![3; 5]] }] } },
         ] {
             let b = f.encode();
