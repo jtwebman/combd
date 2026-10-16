@@ -25,7 +25,8 @@ routes = ["/", "/api/*"]
 [processes.matchmaker]
 kind = "game"
 durable = true
-callers = ["lobby", "match"]
+# Itself too: it notes a new match after answering, as a message to itself.
+callers = ["lobby", "match", "matchmaker"]
 
 # One object per match: the game, 20 ticks a second, over WebSockets.
 [processes.match]

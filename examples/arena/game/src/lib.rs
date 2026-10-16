@@ -266,6 +266,13 @@ fn match_id(mm: &mut Mm, node: u64, now: u64) -> String {
     id
 }
 
+/// Note a new match in the recent list and the count: as a message to the
+/// matchmaker itself, so the answer that started it doesn't wait for the
+/// write to reach the replicas.
+fn record(row: &Value) {
+    send(&json!({ "to": "matchmaker", "id": "global", "path": "/record", "body": row.to_string() }));
+}
+
 /// Node ids a client may name (in its round trips): more can't be real.
 const MAX_NODES: u64 = 16;
 
@@ -331,9 +338,7 @@ fn pair_all(mm: &mut Mm, now: u64) {
             return;
         }
         let row = json!({ "match": id, "node": node, "players": [a.player, b.player], "worst_rtt": score, "at": now });
-        sql("INSERT INTO recent (row) VALUES (?)", &[json!(row.to_string())]);
-        sql("DELETE FROM recent WHERE id <= (SELECT MAX(id) - 20 FROM recent)", &[]);
-        sql("INSERT INTO kv (k, v) VALUES ('matches', 1) ON CONFLICT (k) DO UPDATE SET v = v + 1", &[]);
+        record(&row);
         mm.ready.insert(a.ticket.clone(), Assigned { m: id.clone(), node, token: tokens[0].clone(), side: 0, rtt: a.rtt.get(&node).copied(), at: now });
         mm.ready.insert(b.ticket.clone(), Assigned { m: id, node, token: tokens[1].clone(), side: 1, rtt: b.rtt.get(&node).copied(), at: now });
     }
@@ -424,10 +429,14 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                     return err(503, &format!("couldn't start the match ({} {}): try again", r["status"], r["body"].as_str().unwrap_or("")));
                 }
                 let row = json!({ "match": id, "node": node, "players": [player, bot_name], "worst_rtt": ms, "at": now, "bot": true });
-                sql("INSERT INTO recent (row) VALUES (?)", &[json!(row.to_string())]);
+                record(&row);
+                ok(json!({ "match": id, "node": node, "token": tok, "side": 0, "rtt": ms }))
+            }
+            ("POST", "/record") => {
+                sql("INSERT INTO recent (row) VALUES (?)", &[json!(body)]);
                 sql("DELETE FROM recent WHERE id <= (SELECT MAX(id) - 20 FROM recent)", &[]);
                 sql("INSERT INTO kv (k, v) VALUES ('matches', 1) ON CONFLICT (k) DO UPDATE SET v = v + 1", &[]);
-                ok(json!({ "match": id, "node": node, "token": tok, "side": 0, "rtt": ms }))
+                ok(json!({}))
             }
             // A match is over: no more watching it (there's no replay).
             ("POST", "/ended") => {
