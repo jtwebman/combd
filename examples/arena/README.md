@@ -120,3 +120,8 @@ node in front of combd.
    Account: Load Balancing: Monitors and Pools Edit), then `cloud/up.sh`.
 5. `cloud/deploy.sh` deploys again after a change; `cloud/down.sh` takes it
    all down (about $18 a month while it's up, plus the load balancer).
+6. After that, a push to `main` rolls out by itself: CI says a new version
+   is coming (no new matches), waits for live ones to end, and deploys the
+   game; a change to combd itself also moves each node to the new image
+   (about 40 MB), one at a time, while Caddy holds requests until it's back
+   (a few seconds). A change to docs alone does nothing.
