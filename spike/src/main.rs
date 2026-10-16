@@ -1036,6 +1036,115 @@ mod tests {
         assert_eq!(answers(&interp::Interp { max_pages: 16384 }), answers(&wt::Wt::new(WT_FUEL, None)));
     }
 
+    /// The interpreter's fused ops, each at its edges (an address that wraps,
+    /// a shift past 31, a trap halfway through a move, NaN), against Wasmtime.
+    /// Random modules rarely make these exact patterns; compiled code always does.
+    #[test]
+    fn fused_ops_match_wasmtime() {
+        let wasm = wat::parse_str(
+            r#"(module
+              (memory (export "memory") 1)
+              (global $sp (mut i32) (i32.const 4096))
+              (func (export "load_add") (param i32) (result i32) (i32.load (i32.add (local.get 0) (i32.const -8))))
+              (func (export "load_add64") (param i32) (result i64) (i64.load (i32.add (local.get 0) (i32.const 8))))
+              (func (export "add_shl") (param i32 i32) (result i32) (i32.add (local.get 0) (i32.shl (local.get 1) (i32.const 35))))
+              (func (export "shl_add") (param i32 i32) (result i32) (i32.add (i32.shl (local.get 1) (i32.const 2)) (local.get 0)))
+              (func (export "move64") (param i32 i32) (i64.store offset=8 (local.get 0) (i64.load offset=16 (local.get 1))))
+              (func (export "move32") (param i32 i32) (i32.store (local.get 0) (i32.load (local.get 1))))
+              (func (export "move8") (param i32 i32) (i32.store8 (local.get 0) (i32.load8_u (local.get 1))))
+              (func (export "move_far") (param i32 i32) (i64.store offset=70000 (local.get 0) (i64.load (local.get 1))))
+              (func (export "peek") (param i32) (result i64) (i64.load (local.get 0)))
+              (func (export "poke") (param i32 i64) (i64.store (local.get 0) (local.get 1)))
+              (func (export "rsub") (param i32) (result i32) (i32.sub (i32.const 5) (local.get 0)))
+              (func (export "frame") (param i32) (result i32) (local i32)
+                (global.set $sp (local.tee 1 (i32.sub (global.get $sp) (i32.const 16))))
+                (i32.store (local.get 1) (local.get 0))
+                (local.set 0 (i32.add (i32.load (local.get 1)) (global.get $sp)))
+                (global.set $sp (i32.add (local.get 1) (i32.const 16)))
+                (local.get 0))
+              (func (export "sp") (result i32) (global.get $sp))
+              (func (export "flt") (param f64 f64) (result i32) (block (br_if 0 (f64.lt (local.get 0) (local.get 1))) (return (i32.const 0))) (i32.const 1))
+              (func (export "fge") (param f64 f64) (result i32) (block (br_if 0 (f64.ge (local.get 0) (local.get 1))) (return (i32.const 0))) (i32.const 1))
+              (func (export "fmath") (param f64 f64) (result f64) (f64.div (f64.mul (f64.add (local.get 0) (local.get 1)) (f64.sub (local.get 0) (local.get 1))) (local.get 1)))
+              (func (export "count") (param i32) (result i32) (local i32)
+                (block (loop (br_if 1 (i32.ge_u (local.get 1) (local.get 0))) (local.set 1 (i32.add (local.get 1) (i32.const 1))) (br 0)))
+                (local.get 1))
+              (func (export "table") (param i32) (result i32)
+                (block (result i32) (block (result i32) (i32.const 7) (local.get 0) (br_table 0 1 0)) (i32.const 100) (i32.add)))
+              (func $deep (param i32) (result i32) (local i32 i32 i32 i32 i32 i32 i32 i32 i32)
+                (if (result i32) (i32.eqz (local.get 0)) (then (local.get 9)) (else (i32.add (call $deep (i32.sub (local.get 0) (i32.const 1))) (i32.const 1)))))
+              (func (export "deep") (param i32) (result i32) (call $deep (local.get 0)))
+            )"#,
+        )
+        .unwrap();
+        let f = |x: f64| x.to_bits();
+        let calls: Vec<(&str, Vec<u64>)> = vec![
+            ("poke", vec![0, 0x1122334455667788]),
+            ("poke", vec![16, 0x99aabbccddeeff00]),
+            ("load_add", vec![8]),
+            ("load_add", vec![4]),
+            ("load_add", vec![0x10004]),
+            ("load_add64", vec![0]),
+            ("load_add64", vec![0xffff_fff8]),
+            ("load_add64", vec![65528]),
+            ("add_shl", vec![1, 3]),
+            ("add_shl", vec![0xffff_ffff, 0x8000_0001]),
+            ("shl_add", vec![10, 0x4000_0001]),
+            ("move64", vec![100, 0]),
+            ("peek", vec![108]),
+            ("move64", vec![65530, 0]),
+            ("move64", vec![200, 65520]),
+            ("peek", vec![208]),
+            ("move32", vec![300, 16]),
+            ("peek", vec![300]),
+            ("move8", vec![400, 17]),
+            ("peek", vec![400]),
+            ("move_far", vec![8, 0]),
+            ("move_far", vec![0, 0]),
+            ("rsub", vec![7]),
+            ("rsub", vec![0x8000_0000]),
+            ("frame", vec![9]),
+            ("sp", vec![]),
+            ("flt", vec![f(1.0), f(2.0)]),
+            ("flt", vec![f(f64::NAN), f(2.0)]),
+            ("fge", vec![f(f64::NAN), f(2.0)]),
+            ("fge", vec![f(2.0), f(2.0)]),
+            ("fmath", vec![f(3.5), f(-0.25)]),
+            ("count", vec![0]),
+            ("count", vec![1000]),
+            ("table", vec![0]),
+            ("table", vec![1]),
+            ("table", vec![9]),
+            ("deep", vec![3]),
+            ("deep", vec![500]),
+        ];
+        fn transcript<E: Engine>(eng: &E, wasm: &[u8], calls: &[(&str, Vec<u64>)]) -> Vec<String> {
+            let prog = eng.load(wasm).unwrap();
+            let mut vm = eng.spawn(&prog).unwrap();
+            calls
+                .iter()
+                .map(|(name, args)| {
+                    vm.begin(name, args).unwrap();
+                    loop {
+                        match vm.run(1_000) {
+                            Outcome::Yield => continue,
+                            Outcome::Done(r) => break format!("{name}{args:x?} = {r:x?}"),
+                            Outcome::Trap(_) => break format!("{name}{args:x?} traps"),
+                            Outcome::HostCall { .. } => panic!("no imports here"),
+                        }
+                    }
+                })
+                .collect()
+        }
+        let ours = transcript(&interp::Interp { max_pages: 16384 }, &wasm, &calls);
+        assert_eq!(ours, transcript(&wt::Wt::new(WT_FUEL, None), &wasm, &calls));
+        // And the edges land where they should: an address add wraps (it
+        // doesn't trap), a move that traps on its load writes nothing.
+        for want in ["load_add[4] traps", "load_add64[fffffff8] = [1122334455667788]", "move64[fffa, 0] traps", "move64[c8, fff0] traps", "peek[d0] = [0]", "move_far[0, 0] traps", "add_shl[1, 3] = [19]"] {
+            assert!(ours.iter().any(|l| l == want), "{want}: {ours:#?}");
+        }
+    }
+
     #[cfg(feature = "aot-lite")]
     #[test]
     fn aot_matches_interp() {
