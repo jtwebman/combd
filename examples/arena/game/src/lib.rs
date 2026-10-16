@@ -252,7 +252,9 @@ struct Mm {
 }
 
 /// A spare older than this isn't used (it expires itself at twice that).
-const SPARE_MS: u64 = 300_000;
+/// Long: a spare costs one beat every 30 s, and a page warms its nodes when
+/// it loads, so its player's first click should still find one.
+const SPARE_MS: u64 = 1_800_000;
 
 /// A match's id on `node`: its warm spare if there's a fresh one (then a
 /// new spare is made, in the background), or a new id.
