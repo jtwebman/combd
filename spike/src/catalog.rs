@@ -381,6 +381,11 @@ impl Catalog {
         self.call(Wait::Gate(n), Call::Get(SNAP_KEY.into()));
     }
 
+    /// The snapshot's slot, as last read.
+    pub fn snap_at(&self) -> Seq {
+        self.snap.0
+    }
+
     /// Writes in flight or waiting.
     pub fn busy(&self) -> bool {
         self.writing.is_some() || !self.queue.is_empty() || self.catching

@@ -1432,6 +1432,38 @@ their process and on disk as `room/r1`, and 404s), `routes_pick_the_most_
 specific`, and the parser fuzzer now runs every mangled request through a
 manifest's routes too.
 
+## The catalog in the nodes: deploys and vars
+
+Every fleet node runs the catalog (`spike/src/catnode.rs`): a thread around
+the tested core that does its bucket calls through a small storage trait
+(`spike/src/kv.rs`: get, put always / if absent / if the etag matches,
+delete, list; the bucket is the first backend), pushes each new entry to
+the other nodes over the wire (a new one-way frame, `Catalog`), keeps its
+copy on local disk for a fast restart, and snapshots and trims the log
+every 100 entries. It looks at the bucket every 30 s in case a push was
+missed.
+
+Deploys and vars live in it now, not in per-app pointers: `<org>/<app>` is
+`{"version", "domains"}` (empty when taken down) and `<org>/<app>#vars` the
+vars. The domain check runs in the catalog's write, against the log's
+head, so the bug TLC found in the first design (two deploys on two nodes
+both claiming one domain) is gone. A node swaps in what changed the moment
+its copy moves: no polling. Bundles stay in the bucket, by hash.
+
+**Tests:** `deploys_reach_every_node` (all of it through the admin API, now
+on two nodes): a deploy reaches all three nodes about 25 ms after it's
+acknowledged (it was up to 2 s, polling); two deploys at once, through two
+nodes, both claiming `race.test`: exactly one wins, the other hears the
+domain is taken, and every node serves the winner (3 runs out of 3).
+`the_catalog_snapshots_trims_and_catches_up` (a real bucket): 250 changes
+snapshot and trim the log, a duplicate domain is refused, and a new node
+with no copy at all catches up to the identical state. The whole test run
+got faster too (no 2 s polls): about 9 s.
+
+Not yet: node heartbeats over the wire (they still renew in the bucket;
+that's the ownership core, next), secrets, and two vars changes at once on
+two nodes (the later one wins whole).
+
 ## The catalog: core and simulator
 
 `spike/src/catalog.rs` is the catalog's decision core (no I/O), and

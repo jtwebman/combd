@@ -105,13 +105,16 @@ pub enum Frame {
     /// One way, no answer: send this on a WebSocket whose connection is on
     /// your node (op: 1 text, 2 binary, 8 close with a 2-byte code).
     WsPush { name: String, sock: u64, op: u8, payload: Vec<u8> },
+    /// One way: the catalog's entry at slot `seq` (`catalog.rs`), pushed to
+    /// every node after its write.
+    Catalog { seq: u64, entry: Vec<u8> },
 }
 
 impl Frame {
     pub fn id(&self) -> u64 {
         match self {
             Frame::Forward { id, .. } | Frame::Reply { id, .. } | Frame::Peer { id, .. } | Frame::PeerReply { id, .. } => *id,
-            Frame::WsPush { .. } => 0,
+            Frame::WsPush { .. } | Frame::Catalog { .. } => 0,
         }
     }
 }
@@ -249,6 +252,11 @@ impl Frame {
                 b.extend_from_slice(&id.to_le_bytes());
                 encode_res(res, &mut b);
             }
+            Frame::Catalog { seq, entry } => {
+                b.push(6);
+                b.extend_from_slice(&seq.to_le_bytes());
+                b.extend_from_slice(entry);
+            }
             Frame::WsPush { name, sock, op, payload } => {
                 b.push(5);
                 b.extend_from_slice(&sock.to_le_bytes());
@@ -308,6 +316,8 @@ impl Frame {
                 let name = text(r.take(l).ok_or_else(|| bad("short frame"))?)?;
                 Ok(Frame::WsPush { name, sock: id, op, payload: r.0.to_vec() })
             }
+            // `id` holds the slot here.
+            6 => Ok(Frame::Catalog { seq: id, entry: b[9..].to_vec() }),
             _ => Err(bad("unknown frame kind")),
         }
     }
@@ -579,6 +589,7 @@ mod tests {
             Frame::PeerReply { id: 3, res: PeerRes::Have(12) },
             Frame::PeerReply { id: 4, res: PeerRes::Refused },
             Frame::WsPush { name: "room".into(), sock: 77, op: 2, payload: vec![0, 255, 7] },
+            Frame::Catalog { seq: 42, entry: b"{\"id\":1}".to_vec() },
             Frame::PeerReply { id: 5, res: PeerRes::Tails { born: 4, tails: vec![Tail { epoch: 2, from: 7, ents: vec![vec![3; 5]] }] } },
         ] {
             let b = f.encode();

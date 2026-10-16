@@ -1141,9 +1141,13 @@ So, designed with the user:
 
 Spec: `spec/Catalog.tla` (14.6 million states with snapshots and trimming;
 six known-bad versions caught, one of them the first deploy design, and
-one the trap that trimming sets: a deleted slot is empty again). Next: the
-simulator, then the code (deploys, vars, and secrets move onto it), then
-real nodes with kill and split tests.
+one the trap that trimming sets: a deleted slot is empty again). The
+simulator found a seventh (a reader meeting a trimmed slot); the spec has
+it now (58.2 million states). **In the nodes (2026-10-15):** deploys and
+vars are on it, a deploy reaches every node in about 25 ms, and two
+racing deploys can't share a domain. Next: node heartbeats over the wire
+(the ownership core and its simulator), secrets on the catalog, then kill
+and split tests on real nodes.
 
 **The data path's cost, found while pricing this:** D3 uploads a busy
 object's writes as fast as the bucket answers (one upload in flight at a

@@ -13,6 +13,7 @@ mod aot;
 mod aot_gen;
 mod app;
 mod catalog;
+mod catnode;
 mod catsim;
 mod deploy;
 mod engine;
@@ -34,6 +35,7 @@ mod fuzz;
 mod fuzz_host;
 mod http;
 mod interp;
+mod kv;
 #[cfg(feature = "wasmtime")]
 mod wt;
 
@@ -1353,6 +1355,7 @@ mod tests {
             ev_max: 32,
             environ: Arc::default(),
             public: Default::default(),
+            catalog: None,
         }
     }
 
@@ -2489,13 +2492,15 @@ callers = ["api"]
         // Node 0 has the admin API, over TLS with the fleet's certificates.
         let (token, line) = admin::new_token(&["acme/*:*"]);
         let (weak, weak_line) = admin::new_token(&["acme/blog:deploy"]);
-        let admin_port = free_ports(1)[0];
+        let admin_ports = free_ports(2);
+        let admin_port = admin_ports[0];
         let certs = dir.0.join("certs");
         let nodes: Vec<u16> = (0..3u32)
             .map(|n| {
                 let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false };
                 let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 2) };
-                let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: true, tls: Some(wire::admin_tls(&certs, 0).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}")).unwrap() });
+                // Nodes 0 and 1 take deploys (to race them against each other).
+                let admin = (n < 2).then(|| admin::AdminCfg { port: admin_ports[n as usize], public: true, tls: Some(wire::admin_tls(&certs, n).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}")).unwrap() });
                 let port = free_ports(1)[0];
                 std::thread::spawn(move || http::serve_fleet_apps(&interp::Interp { max_pages: 16384 }, port, c, admin).unwrap());
                 port
@@ -2533,9 +2538,12 @@ callers = ["api"]
         };
         // Nothing yet.
         assert_eq!(http_to(nodes[0], "shop.test", "GET", "/env/V", "").0, 404);
-        // v1 reaches every node.
+        // v1 reaches every node: pushed, not polled.
         let v1 = deploy("shop", &app("shop", "shop.test", "[\"/env/*\"]", "V = \"one\"")).unwrap_or_else(|e| panic!("{e}"));
+        let t = Instant::now();
         everywhere("shop.test", "/env/V", "{\"value\":\"one\"}");
+        eprintln!("a deploy reached all three nodes {:?} after it was acknowledged", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
         for (i, &p) in nodes.iter().cycle().take(9).enumerate() {
             assert_eq!(http_to(p, "shop.test", "POST", "/room/r1/incr", "").1, format!("{{\"count\":{}}}", i + 1));
         }
@@ -2565,7 +2573,7 @@ callers = ["api"]
         // A bad deploy (its manifest names another app, or a module is
         // missing) is refused, and the pointer stays.
         assert!(deploy("shop", &app("other", "shop.test", "[\"/env/*\"]", "V = \"x\"")).unwrap_err().contains("its manifest says it's \"other\""));
-        assert_eq!(deploy::current(&bucket, "acme", "shop").unwrap().unwrap().0, v1);
+        assert_eq!(api(&token, "GET", "/v1/apps/acme/shop", b"").1["version"], v1.as_str());
         // v2: a new route; the object keeps its state.
         let v2 = deploy("shop", &app("shop", "shop.test", "[\"/env/*\", \"/hello\"]", "V = \"two\"")).unwrap();
         assert_ne!(v1, v2);
@@ -2594,6 +2602,20 @@ callers = ["api"]
                 assert!(eventually(10_000, || http_to(p, "data.test", "POST", "/pg/q", "{\"q\":\"SELECT 41 + 1\"}").1.contains("[[42]]")), "node {p}: {:?}", http_to(p, "data.test", "POST", "/pg/q", "{\"q\":\"SELECT 41 + 1\"}"));
             }
         }
+        // Two deploys at once, through two nodes, both claiming one domain:
+        // the catalog's log gives them one order, and the second is checked
+        // against the first. Exactly one wins, and every node agrees.
+        let (bx, by) = (app("racex", "race.test", "[\"/env/*\"]", "V = \"x\""), app("racey", "race.test", "[\"/env/*\"]", "V = \"y\""));
+        let url1 = format!("https://127.0.0.1:{}", admin_ports[1]);
+        let (tls1, token1) = (tls.clone(), token.clone());
+        let other = std::thread::spawn(move || admin::request(&url1, Some((&tls1, "node1.combd")), &token1, "PUT", "/v1/apps/acme/racey", &by).unwrap());
+        let mine = api(&token, "PUT", "/v1/apps/acme/racex", &bx);
+        let theirs = other.join().unwrap();
+        assert_eq!([mine.0, theirs.0].iter().filter(|&&c| c == 200).count(), 1, "exactly one wins: {mine:?} {theirs:?}");
+        let loser = if mine.0 == 200 { &theirs } else { &mine };
+        assert!(loser.1["error"].as_str().unwrap().contains("domain race.test is already"), "{loser:?}");
+        let want = if mine.0 == 200 { "{\"value\":\"x\"}" } else { "{\"value\":\"y\"}" };
+        everywhere("race.test", "/env/V", want);
         // A second node 1 would fight the first over everything it owns:
         // it must see the id is taken, and not start.
         assert!(http::node_id_free(&bucket, 1, 1000).unwrap_err().contains("node id 1 is already in use"));
@@ -2690,10 +2712,43 @@ callers = ["api"]
         drop(b);
         let over = until(&mut a, 5000, &|v| v["phase"] == "over");
         assert_eq!(over["winner"], true, "{over}");
-        assert!(eventually(3000, || http(port, "GET", "/api/player/alice", "").1 == "{\"losses\":0,\"wins\":1}"), "{:?}", http(port, "GET", "/api/player/alice", ""));
-        assert!(eventually(3000, || http(port, "GET", "/api/player/bob", "").1 == "{\"losses\":1,\"wins\":0}"));
+        assert!(eventually(3000, || http(port, "GET", "/api/player/alice", "").1 == "{\"draws\":0,\"losses\":0,\"wins\":1}"), "{:?}", http(port, "GET", "/api/player/alice", ""));
+        assert!(eventually(3000, || http(port, "GET", "/api/player/bob", "").1 == "{\"draws\":0,\"losses\":1,\"wins\":0}"));
         let stats: serde_json::Value = serde_json::from_str(&http(port, "GET", "/api/stats", "").1).unwrap();
         assert_eq!(stats["matches"], 1, "{stats}");
+    }
+
+    /// The catalog on a real bucket: 250 changes snapshot and trim the log,
+    /// and a node starting with no copy at all catches up to the same state
+    /// (from the snapshot, then the slots after it).
+    #[test]
+    fn the_catalog_snapshots_trims_and_catches_up() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test the catalog against a real bucket");
+            return;
+        };
+        let bucket = s3::S3 { bucket: test_bucket(), ..base };
+        bucket.make_bucket().unwrap();
+        let dir = store::tempdir::Dir::new();
+        let store: Arc<dyn kv::Store> = Arc::new(bucket.clone());
+        let a = catnode::CatNode::start(store.clone(), dir.0.join("a.snap"), vec![]);
+        assert!(a.ready(Duration::from_secs(10)));
+        for i in 0..250 {
+            a.submit(&format!("acme/app{}", i % 7), format!("{{\"version\":\"v{i}\",\"domains\":[\"d{}\"]}}", i % 7).into_bytes()).unwrap();
+        }
+        // Two apps on one domain: refused.
+        assert!(a.submit("acme/other", b"{\"version\":\"v\",\"domains\":[\"d3\"]}".to_vec()).unwrap_err().contains("domain d3 is already acme/app3's"));
+        let (sa, _) = a.now();
+        assert_eq!(sa.at, 250);
+        // The snapshot and the trim run in the background: wait for them.
+        assert!(eventually(10_000, || bucket.list("catalog/log/").unwrap().len() < 200), "the log was never trimmed: {} slots", bucket.list("catalog/log/").unwrap().len());
+        assert!(bucket.get(catalog::SNAP_KEY).unwrap().is_some());
+        // A new node, nothing on its disk.
+        let b = catnode::CatNode::start(store, dir.0.join("b.snap"), vec![]);
+        assert!(b.ready(Duration::from_secs(10)));
+        assert_eq!(b.now().0, sa, "the new node has exactly the same catalog");
+        // And its copy is on its disk now, for a fast restart.
+        assert!(dir.0.join("b.snap").exists());
     }
 
     #[test]

@@ -1,15 +1,13 @@
-//! Deploys through the bucket. An app's versions, its live pointer, and its
-//! vars live under `apps/<org>/<app>/`:
-//! - `versions/<hash>`: a bundle (the manifest and its modules), named by
-//!   the SHA-256 of its bytes, so uploading the same one twice is free;
-//! - `current`: `{"version": "<hash>"}`, which version is live. It only
-//!   moves (compare-and-swap) after the version passed every check;
-//! - `vars`: the app's var values, as JSON. (Secrets come next, encrypted.)
-//!
-//! Every node lists the `current` pointers every couple of seconds and swaps
-//! in whatever changed (`sync`). A node that can't load a version keeps
-//! serving the one it has.
+//! Deploys. An app's versions are bundles in the bucket,
+//! `apps/<org>/<app>/versions/<hash>` (the manifest and its modules, named
+//! by the SHA-256 of its bytes, so uploading the same one twice is free).
+//! Which version is live, and the app's vars, are in the catalog
+//! (`catalog.rs`, `catnode.rs`): `<org>/<app>` is `{"version", "domains"}`
+//! (empty when taken down), and `<org>/<app>#vars` the vars. A node swaps
+//! in whatever changed whenever its copy of the catalog moves. A node that
+//! can't load a version keeps serving the one it has.
 
+use crate::catalog::State;
 use crate::manifest::EnvValues;
 use crate::s3::{Cond, S3};
 use serde_json::Value as Json;
@@ -119,13 +117,6 @@ fn key(org: &str, app: &str, what: &str) -> String {
     format!("apps/{org}/{app}/{what}")
 }
 
-/// The live version of an app, and the pointer's etag (for a CAS).
-pub fn current(s3: &S3, org: &str, app: &str) -> Result<Option<(String, String)>, String> {
-    let Some((b, etag)) = s3.get(&key(org, app, "current")).map_err(|e| e.to_string())? else { return Ok(None) };
-    let v: Json = serde_json::from_slice(&b).map_err(|_| "a bad current pointer".to_string())?;
-    Ok(v["version"].as_str().map(|s| (s.to_string(), etag)))
-}
-
 pub fn put_version(s3: &S3, org: &str, app: &str, bundle: &[u8]) -> Result<String, String> {
     let v = version_of(bundle);
     s3.put(&key(org, app, &format!("versions/{v}")), bundle, &Cond::Any).map_err(|e| e.to_string())?.map_err(|()| "upload refused".to_string())?;
@@ -140,55 +131,24 @@ pub fn get_version(s3: &S3, org: &str, app: &str, v: &str) -> Result<Vec<u8>, St
     Ok(b)
 }
 
-/// Make `v` live, if the pointer is still at `was` (its etag; `None`: no
-/// version yet). `Err` if someone else moved it first: look again.
-pub fn set_current(s3: &S3, org: &str, app: &str, v: &str, was: Option<&str>) -> Result<(), String> {
-    let cond = match was {
-        Some(e) => Cond::IfMatch(e.into()),
-        None => Cond::IfAbsent,
-    };
-    let body = serde_json::json!({ "version": v }).to_string();
-    s3.put(&key(org, app, "current"), body.as_bytes(), &cond).map_err(|e| e.to_string())?.map_err(|()| "another deploy moved the pointer first: try again".to_string())?;
-    Ok(())
+/// The catalog entry that makes `version` live, on these domains.
+pub fn live_value(version: &str, domains: &[String]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "version": version, "domains": domains })).unwrap()
 }
 
-/// Take an app down: no version is live.
-pub fn remove(s3: &S3, org: &str, app: &str) -> Result<(), String> {
-    s3.delete(&key(org, app, "current")).map_err(|e| e.to_string())
+/// An app's live version, by the catalog.
+pub fn live(state: &State, org: &str, app: &str) -> Option<String> {
+    let v: Json = serde_json::from_slice(state.apps.get(&format!("{org}/{app}"))?).ok()?;
+    v["version"].as_str().map(String::from)
 }
 
-/// An app's env values, and their etag.
-pub fn env(s3: &S3, org: &str, app: &str) -> Result<(EnvValues, String), String> {
-    match s3.get(&key(org, app, "vars")).map_err(|e| e.to_string())? {
-        None => Ok((EnvValues::default(), String::new())),
-        Some((b, etag)) => {
-            let vars: BTreeMap<String, Json> = serde_json::from_slice(&b).map_err(|_| "bad vars".to_string())?;
-            Ok((EnvValues { vars, secrets: BTreeMap::new() }, etag))
-        }
-    }
+/// An app's vars, by the catalog.
+pub fn vars(state: &State, org: &str, app: &str) -> BTreeMap<String, Json> {
+    state.apps.get(&format!("{org}/{app}#vars")).and_then(|b| serde_json::from_slice(b).ok()).unwrap_or_default()
 }
 
-pub fn put_vars(s3: &S3, org: &str, app: &str, vars: &BTreeMap<String, Json>) -> Result<(), String> {
-    let body = serde_json::to_vec(vars).unwrap();
-    s3.put(&key(org, app, "vars"), &body, &Cond::Any).map_err(|e| e.to_string())?.map_err(|()| "refused".to_string())?;
-    Ok(())
-}
-
-/// Every app with a live version: (org, app).
-pub fn apps(s3: &S3) -> Result<Vec<(String, String)>, String> {
-    let keys = s3.list("apps/").map_err(|e| e.to_string())?;
-    Ok(keys
-        .iter()
-        .filter_map(|k| {
-            let rest = k.strip_prefix("apps/")?.strip_suffix("/current")?;
-            let (org, app) = rest.split_once('/')?;
-            (!app.contains('/')).then(|| (org.to_string(), app.to_string()))
-        })
-        .collect())
-}
-
-/// What a node has loaded, per app: (version, vars etag).
-pub type Known = BTreeMap<(String, String), (String, String)>;
+/// What a node has loaded, per app: (version, the vars as stored).
+pub type Known = BTreeMap<(String, String), (String, Vec<u8>)>;
 
 /// One app to (re)load: its folder (unpacked in `cache`) and env values.
 pub struct Change {
@@ -197,28 +157,31 @@ pub struct Change {
     pub dir: PathBuf,
     pub env: EnvValues,
     pub version: String,
-    pub vars_etag: String,
+    pub vars_raw: Vec<u8>,
 }
 
-/// Compare the bucket with what's `known`: the apps that are new or changed
-/// (their version or their vars), and the ones taken down.
-pub fn sync(s3: &S3, cache: &Path, known: &Known) -> Result<(Vec<Change>, Vec<(String, String)>), String> {
-    let live = apps(s3)?;
-    let mut changes = vec![];
-    for (org, app) in &live {
-        let Some((v, _)) = current(s3, org, app)? else { continue };
-        let (env, etag) = env(s3, org, app)?;
-        if known.get(&(org.clone(), app.clone())) == Some(&(v.clone(), etag.clone())) {
+/// Compare the catalog with what's `known`: the apps that are new or
+/// changed (their version or their vars), and the ones taken down.
+pub fn changes(state: &State, s3: &S3, cache: &Path, known: &Known) -> Result<(Vec<Change>, Vec<(String, String)>), String> {
+    let mut live_apps = vec![];
+    let mut out = vec![];
+    for k in state.apps.keys().filter(|k| !k.contains('#')) {
+        let Some((org, app)) = k.split_once('/') else { continue };
+        let Some(v) = live(state, org, app) else { continue };
+        live_apps.push((org.to_string(), app.to_string()));
+        let raw = state.apps.get(&format!("{k}#vars")).cloned().unwrap_or_default();
+        if known.get(&(org.to_string(), app.to_string())) == Some(&(v.clone(), raw.clone())) {
             continue;
         }
         let dir = cache.join(org).join(app).join(&v);
         if !dir.join("modules").is_dir() {
             unpack(&get_version(s3, org, app, &v)?, &dir)?;
         }
-        changes.push(Change { org: org.clone(), app: app.clone(), dir, env, version: v, vars_etag: etag });
+        let env = EnvValues { vars: vars(state, org, app), secrets: BTreeMap::new() };
+        out.push(Change { org: org.into(), app: app.into(), dir, env, version: v, vars_raw: raw });
     }
-    let gone = known.keys().filter(|k| !live.contains(k)).cloned().collect();
-    Ok((changes, gone))
+    let gone = known.keys().filter(|k| !live_apps.contains(k)).cloned().collect();
+    Ok((out, gone))
 }
 
 #[cfg(test)]
