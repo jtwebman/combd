@@ -74,11 +74,22 @@ jobs:
             sleep 20
           done
           exit 1
-      - name: New matches again (also if the deploy failed)
+      - name: New matches again, once the new version is live (also if the deploy failed)
         if: always()
         env:
           KEY: ${{ secrets.ARENA_DRAIN_KEY }}
+          SHA: ${{ github.sha }}
         run: |
+          # The nodes load a deploy a few seconds after it's acknowledged: end
+          # the drain on the new version (the old one may read it as "on").
           body=$(python3 -c 'import json, os; print(json.dumps({"key": os.environ.get("KEY", ""), "on": False}))')
-          for i in 1 2 3 4 5; do curl -sf -m 15 -X POST https://arena.combd.dev/api/drain -d "$body" && exit 0; sleep 10; done
+          for i in $(seq 1 30); do
+            v=$(curl -s -m 10 https://arena.combd.dev/api/stats | python3 -c 'import sys, json; print(json.load(sys.stdin).get("version", ""))' || true)
+            if [ "$v" = "$SHA" ] || [ $i -eq 30 ]; then
+              r=$(curl -s -m 15 -X POST https://arena.combd.dev/api/drain -d "$body" || true)
+              echo "version $v: $r"
+              case "$r" in *'"draining":false'*) exit 0;; esac
+            fi
+            sleep 5
+          done
           echo "couldn't end the drain"; exit 1
