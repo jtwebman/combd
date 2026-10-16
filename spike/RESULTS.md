@@ -2133,12 +2133,19 @@ cells.
    counting `Kept` as a promise (`lease_trusts_kept`) is caught. The spec
    needs no change: peers renewing less is a subset of what it checks, and
    it already models an owner's lease as needing every peer's promise.
-0b. ~~**Compact an object's segments.**~~ Done for restores: an owner
-   that restored from 16 segments or more writes an image (`obj/o/e<E>/i`,
-   the object as one entry), and the next owner starts from it. The arena's
-   matchmaker went from a 201-key manifest to 2 keys. Still to do: delete the
-   segments an image replaced (the bucket keeps them, and a claim still lists
-   them), and image a long-lived object mid-epoch, not only at a restore.
+0b. ~~**Compact an object's segments.**~~ Done. An owner that restored
+   from 16 segments or more (or listed 64 keys or more) writes an image
+   (`obj/o/e<E>/i`, the object as one entry); the next owner starts from
+   it. Once the image is written and a round proves it still owns the
+   object, the owner deletes every older epoch's key. On the arena: the
+   matchmaker's manifest went from 201 keys to 2, its keys in the bucket
+   from over 300 to 3, and the bucket from 1,141 object keys to 612 (node 0
+   deleted 537). Simulator: 100,000 seeds hold every invariant with 3.4
+   million deletes; deleting with no proof (`gc_unproven`), deleting our own
+   uploads, and deleting with no image are each caught. It found a bucket
+   client bug on the way: every DELETE timed out (a 204 read "to the end"
+   on a kept connection). Left: image a long-lived object mid-epoch, not
+   only at a restore.
 1. ~~Run the official Wasm spec test suite against the interpreter.~~ Done:
    30,497 checks pass, plus differential fuzzing against Wasmtime.
 2. ~~Register-based interpreter, toward the 5x target.~~ Done (rounds 2 and
