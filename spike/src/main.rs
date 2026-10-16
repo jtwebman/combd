@@ -688,6 +688,22 @@ fn main_with(args: &[&str]) {
             std::process::exit(if ok { 0 } else { 1 });
         }
         // Certificates for a fleet's wire: a CA and one per node.
+        // The startup storage test, on its own: is this bucket safe to run a
+        // fleet on? (COMBD_S3, COMBD_S3_BUCKET, COMBD_S3_KEY, COMBD_S3_SECRET.)
+        ["bucket-check"] => {
+            let Some(b) = s3::S3::from_env() else {
+                eprintln!("combd     set COMBD_S3 (and COMBD_S3_BUCKET, COMBD_S3_KEY, COMBD_S3_SECRET, COMBD_S3_REGION)");
+                std::process::exit(1);
+            };
+            let t = Instant::now();
+            match b.check() {
+                Ok(()) => println!("combd     {}/{} passed the storage test in {:.1} s: conditional writes hold, under a race too", b.host, b.bucket, t.elapsed().as_secs_f64()),
+                Err(e) => {
+                    eprintln!("combd     {}/{} failed the storage test: {e}", b.host, b.bucket);
+                    std::process::exit(1);
+                }
+            }
+        }
         ["wire-certs", dir, nodes] => match wire::make_certs(std::path::Path::new(dir), nodes.parse().unwrap()) {
             Ok(()) => println!("wire     a CA and {nodes} node certificates in {dir}"),
             Err(e) => {
