@@ -1694,6 +1694,16 @@ without the acknowledged-entries check.
 | late ticks | 1.0% | **0.0%** |
 | reads under the lease, node 0 | 4 of 132 | **558 of 532** (beats too), 14 rounds |
 
+**And a slow restore.** After the Singapore node restarted, the arena's
+matchmaker (its home is there) didn't answer for about a minute: forwards
+to it timed out ("owner didn't answer") and `/api/stats` failed through
+every node. Its restore read 201 segments (one per upload, over 99 epochs)
+one GET at a time, about 300 ms each from Singapore to R2 in Europe. They
+go 16 at a time now. Across the next rollout, 437 of 438 calls to
+`/api/stats` answered (the one that didn't was the moment the node went
+down), and no forward timed out. A forward that times out now logs the
+object and the node, and `/_combd/stats` counts `fence_waits`.
+
 ## Postgres through combd: how fast
 
 `pg_bench` (not run by default: `cargo test --release -- --ignored pg_bench
@@ -2122,6 +2132,11 @@ cells.
    `combd-spike sim 113..114 none 2 beats far`, 15 s). Fix: a peer with a
    newer fence waiting stops promising the old epoch, and says so in its
    answer (or the old owner over-trusts its lease); spec it in TLA+ first.
+0b. **Compact an object's segments.** Each upload is a segment, kept
+   forever, and a restore reads them all: the arena's matchmaker had 201
+   over 99 epochs, a minute to restore from Singapore one GET at a time.
+   Restores fetch 16 at a time now; a snapshot that replaces the old
+   segments would bound it.
 1. ~~Run the official Wasm spec test suite against the interpreter.~~ Done:
    30,497 checks pass, plus differential fuzzing against Wasmtime.
 2. ~~Register-based interpreter, toward the 5x target.~~ Done (rounds 2 and
