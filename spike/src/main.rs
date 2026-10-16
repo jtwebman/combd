@@ -2932,6 +2932,9 @@ callers = ["api"]
             assert_eq!(code, 200, "{path}: {b}");
             serde_json::from_str(&b).unwrap()
         };
+        // A page warms a match on its nodes first (node ids past any real
+        // fleet, and junk, are ignored); this match then starts on it.
+        post("/api/warm", serde_json::json!({ "rtt": { "0": 5, "99": 1, "x": 3 } }));
         let ta = post("/api/join", serde_json::json!({ "player": "alice", "rtt": { "0": 5 } }))["ticket"].as_str().unwrap().to_string();
         let tb = post("/api/join", serde_json::json!({ "player": "bob", "rtt": { "0": 7 } }))["ticket"].as_str().unwrap().to_string();
         let (ma, mb) = (post("/api/poll", serde_json::json!({ "ticket": ta })), post("/api/poll", serde_json::json!({ "ticket": tb })));

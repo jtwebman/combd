@@ -97,6 +97,8 @@ async function measure() {
     }
     if (best < Infinity) state.rtt[id] = Math.round(best);
   }
+  // Have a match ready on the nearest nodes before anyone clicks.
+  if (Object.keys(state.rtt).length) api("/api/warm", { rtt: state.rtt }).catch(() => {});
   const min = Math.min(...Object.values(state.rtt));
   $("nodes").innerHTML = Object.entries(nodes).map(([id, url]) =>
     `<tr><td class="${state.rtt[id] === min ? "best" : ""}">node ${id}</td><td class="r">${state.rtt[id] ?? "-"} ms</td></tr>`).join("");

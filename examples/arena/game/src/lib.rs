@@ -203,6 +203,7 @@ fn lobby(method: &str, path: &str, body: &str) -> String {
         ("POST", "/api/poll") => mm("/poll", body),
         // No one around: play one of our bots, which the match plays itself.
         ("POST", "/api/bot") => mm("/bot", body),
+        ("POST", "/api/warm") => mm("/warm", body),
         ("GET", "/api/stats") => {
             let r = call(&json!({ "to": "matchmaker", "id": "global", "method": "GET", "path": "/stats" }));
             format!("{} {}", r["status"].as_u64().unwrap_or(503), r["body"].as_str().unwrap_or("{}"))
@@ -265,9 +266,12 @@ fn match_id(mm: &mut Mm, node: u64, now: u64) -> String {
     id
 }
 
+/// Node ids a client may name (in its round trips): more can't be real.
+const MAX_NODES: u64 = 16;
+
 /// Make sure `node` has a warm spare: a fire-and-forget start, there.
 fn warm(mm: &mut Mm, node: u64, now: u64) {
-    if mm.spares.get(&node).is_some_and(|s| now < s.1 + SPARE_MS) {
+    if node >= MAX_NODES || mm.spares.get(&node).is_some_and(|s| now < s.1 + SPARE_MS) {
         return;
     }
     mm.matches += 1;
@@ -353,7 +357,7 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
             ("POST", "/join" | "/bot") if mm.draining => err(503, DRAINING),
             ("POST", "/join") => {
                 let Some(player) = v["player"].as_str().filter(|p| !p.is_empty() && p.len() <= 32) else { return err(400, "want {\"player\": name, \"rtt\": {node: ms}}") };
-                let rtt: BTreeMap<u64, u64> = v["rtt"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect()).unwrap_or_default();
+                let rtt: BTreeMap<u64, u64> = v["rtt"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).filter(|(k, _)| *k < MAX_NODES).collect()).unwrap_or_default();
                 if rtt.is_empty() {
                     return err(400, "measure the nodes first: rtt");
                 }
@@ -369,6 +373,18 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                 mm.queue.push(Waiting { ticket: ticket.clone(), player: player.into(), rtt, since: now });
                 pair_all(&mut mm, now);
                 ok(json!({ "ticket": ticket }))
+            }
+            // A page just measured the nodes: warm a spare on each, so its
+            // first match (a bot, most likely) starts at once. Free when
+            // they're warm already.
+            ("POST", "/warm") => {
+                if !mm.draining {
+                    let nodes: Vec<u64> = v["rtt"].as_object().map(|o| o.keys().filter_map(|k| k.parse().ok()).collect()).unwrap_or_default();
+                    for n in nodes {
+                        warm(&mut mm, n, now);
+                    }
+                }
+                ok(json!({}))
             }
             ("POST", "/poll") => {
                 // Pair on every poll (players poll twice a second while they
@@ -396,7 +412,7 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
             }
             ("POST", "/bot") => {
                 let Some(player) = v["player"].as_str().filter(|p| !p.is_empty() && p.len() <= 32 && !p.starts_with("bot-")) else { return err(400, "want {\"player\": name, \"rtt\": {node: ms}}") };
-                let rtt: BTreeMap<u64, u64> = v["rtt"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect()).unwrap_or_default();
+                let rtt: BTreeMap<u64, u64> = v["rtt"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).filter(|(k, _)| *k < MAX_NODES).collect()).unwrap_or_default();
                 let Some((&node, &ms)) = rtt.iter().min_by_key(|(_, &ms)| ms) else { return err(400, "measure the nodes first: rtt") };
                 let strategy = v["strategy"].as_str().and_then(bot::Strategy::from_name).unwrap_or(bot::Strategy::ALL[(now % 4) as usize]);
                 let bot_name = format!("bot-{}", strategy.name());
