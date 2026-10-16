@@ -3,9 +3,7 @@
 //! with SigV4, over HTTP/1.1, or HTTPS for a bucket like S3 or R2
 //! (`COMBD_S3=https://...`, checked against Mozilla's root certificates).
 //!
-//! ponytail: one connection per call (a TLS handshake each time). Fine
-//! while bucket calls are rare (claims, catalog writes, batched uploads); a
-//! keep-alive pool when a far bucket makes them slow.
+//! Connections are kept between calls (a few, idle up to 10 s).
 //!
 //! `check` is the startup storage test: before a node serves, it proves the
 //! bucket really honors conditional writes, including when 16 writers race.
@@ -24,6 +22,8 @@ pub struct S3 {
     pub host: String,
     /// HTTPS.
     pub tls: bool,
+    /// Connections kept open, shared by every copy of this client.
+    pub(crate) pool: std::sync::Arc<std::sync::Mutex<Vec<Conn>>>,
     pub bucket: String,
     pub key: String,
     pub secret: String,
@@ -32,6 +32,18 @@ pub struct S3 {
 
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
+
+/// A connection kept for the next call (a TCP and TLS handshake saved: two
+/// round trips, a third of a far bucket's call), and since when it's idle.
+pub(crate) struct Conn {
+    s: Box<dyn ReadWrite + Send>,
+    idle: std::time::Instant,
+}
+
+/// Kept no longer than this idle (servers close idle connections), and no
+/// more than this many.
+const KEEP_IDLE: Duration = Duration::from_secs(10);
+const MAX_POOLED: usize = 16;
 
 /// HTTPS: Mozilla's root certificates, made once.
 fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
@@ -107,6 +119,7 @@ impl S3 {
     pub fn from_env() -> Option<S3> {
         let url = std::env::var("COMBD_S3").ok()?;
         Some(S3 {
+            pool: Default::default(),
             tls: url.starts_with("https://"),
             host: url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string(),
             bucket: std::env::var("COMBD_S3_BUCKET").unwrap_or_else(|_| "combd".into()),
@@ -144,6 +157,40 @@ impl S3 {
         let sig = hex(&hmac(&k, &to_sign));
         let auth = format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={sig}", self.key);
 
+        let target = if qs.is_empty() { uri } else { format!("{uri}?{qs}") };
+        let mut req = format!("{method} {target} HTTP/1.1\r\nauthorization: {auth}\r\ncontent-length: {}\r\nconnection: keep-alive\r\n", body.len());
+        for (k, v) in &hs {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        // A kept connection the server has since closed fails before any
+        // answer: try a fresh one, unless this is a conditional write (it
+        // may have landed: then it's lost, as the cores expect, never
+        // "the condition failed" for our own write).
+        let conditional = extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("if-match") || k.eq_ignore_ascii_case("if-none-match"));
+        if let Some(c) = self.pooled() {
+            match self.exchange(c, &req, body, method == "HEAD") {
+                Ok(r) => return Ok(r),
+                Err((e, answered)) if answered || conditional => return Err(e),
+                Err(_) => {}
+            }
+        }
+        let c = self.connect()?;
+        self.exchange(c, &req, body, method == "HEAD").map_err(|(e, _)| e)
+    }
+
+    /// A kept connection, if one is fresh enough (servers close idle ones).
+    fn pooled(&self) -> Option<Conn> {
+        let mut pool = self.pool.lock().unwrap();
+        while let Some(c) = pool.pop() {
+            if c.idle.elapsed() < KEEP_IDLE {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    fn connect(&self) -> Io<Conn> {
         // Timeouts well under a lease: a cut link must show up as a lost
         // call quickly, not hold a bucket thread for long.
         use std::net::ToSocketAddrs;
@@ -163,29 +210,35 @@ impl S3 {
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         s.set_write_timeout(Some(Duration::from_secs(5)))?;
         s.set_nodelay(true)?;
-        let mut s: Box<dyn ReadWrite> = if self.tls {
+        let s: Box<dyn ReadWrite + Send> = if self.tls {
             let name = rustls::pki_types::ServerName::try_from(self.host.split(':').next().unwrap_or_default().to_string()).map_err(std::io::Error::other)?;
             Box::new(rustls::StreamOwned::new(rustls::ClientConnection::new(tls_config(), name).map_err(std::io::Error::other)?, s))
         } else {
             Box::new(s)
         };
-        let target = if qs.is_empty() { uri } else { format!("{uri}?{qs}") };
-        let mut req = format!("{method} {target} HTTP/1.1\r\nauthorization: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n", body.len());
-        for (k, v) in &hs {
-            req.push_str(&format!("{k}: {v}\r\n"));
-        }
-        req.push_str("\r\n");
-        s.write_all(req.as_bytes())?;
-        s.write_all(body)?;
-        s.flush()?;
+        Ok(Conn { s, idle: std::time::Instant::now() })
+    }
+
+    /// One request and its answer on `c`, which goes back in the pool if the
+    /// answer was read in full and the server keeps it open. The error says
+    /// whether any of an answer came.
+    fn exchange(&self, c: Conn, req: &str, body: &[u8], head: bool) -> Result<Resp, (std::io::Error, bool)> {
+        let mut s = c.s;
+        let no = |e: std::io::Error| (e, false);
+        s.write_all(req.as_bytes()).map_err(no)?;
+        s.write_all(body).map_err(no)?;
+        s.flush().map_err(no)?;
         let mut r = BufReader::new(s);
         let mut line = String::new();
-        r.read_line(&mut line)?;
-        let status = line.split(' ').nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| std::io::Error::other(format!("bad status line {line:?}")))?;
-        let (mut etag, mut len, mut chunked) = (None, None, false);
+        if r.read_line(&mut line).map_err(no)? == 0 {
+            return Err(no(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed before an answer")));
+        }
+        let yes = |e: std::io::Error| (e, true);
+        let status = line.split(' ').nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| yes(std::io::Error::other(format!("bad status line {line:?}"))))?;
+        let (mut etag, mut len, mut chunked, mut keep) = (None, None, false, true);
         loop {
             line.clear();
-            r.read_line(&mut line)?;
+            r.read_line(&mut line).map_err(yes)?;
             let l = line.trim_end();
             if l.is_empty() {
                 break;
@@ -195,32 +248,47 @@ impl S3 {
                 "etag" => etag = Some(v.trim().to_string()),
                 "content-length" => len = v.trim().parse().ok(),
                 "transfer-encoding" => chunked = v.to_ascii_lowercase().contains("chunked"),
+                "connection" => keep = !v.to_ascii_lowercase().contains("close"),
                 _ => {}
             }
         }
         let mut body = vec![];
-        if method == "HEAD" {
+        if head {
         } else if chunked {
             loop {
                 line.clear();
-                r.read_line(&mut line)?;
+                r.read_line(&mut line).map_err(yes)?;
                 let n = usize::from_str_radix(line.trim().split(';').next().unwrap_or("0"), 16).unwrap_or(0);
                 if n == 0 {
+                    // The trailer, to its blank line.
+                    loop {
+                        line.clear();
+                        if r.read_line(&mut line).map_err(yes)? == 0 || line.trim_end().is_empty() {
+                            break;
+                        }
+                    }
                     break;
                 }
                 let mut chunk = vec![0; n + 2];
-                r.read_exact(&mut chunk)?;
+                r.read_exact(&mut chunk).map_err(yes)?;
                 body.extend_from_slice(&chunk[..n]);
             }
         } else if let Some(n) = len {
             body.resize(n, 0);
-            r.read_exact(&mut body)?;
+            r.read_exact(&mut body).map_err(yes)?;
         } else {
             // To the end: a TLS server that closes without saying so is the end too.
+            keep = false;
             if let Err(e) = r.read_to_end(&mut body) {
                 if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                    return Err(e);
+                    return Err(yes(e));
                 }
+            }
+        }
+        if keep && r.buffer().is_empty() {
+            let mut pool = self.pool.lock().unwrap();
+            if pool.len() < MAX_POOLED {
+                pool.push(Conn { s: r.into_inner(), idle: std::time::Instant::now() });
             }
         }
         Ok(Resp { status, etag, body })
@@ -365,13 +433,33 @@ fn unxml(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// How much keeping connections saves, against a real bucket:
+    /// `COMBD_S3=... cargo test --release -- --ignored bucket_round_trips --nocapture`.
+    #[test]
+    #[ignore]
+    fn bucket_round_trips() {
+        let Some(b) = S3::from_env() else { return };
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            let _ = b.get("_combd/latency-probe");
+        }
+        let kept = t.elapsed() / 20;
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            let fresh = S3 { pool: Default::default(), ..b.clone() };
+            let _ = fresh.get("_combd/latency-probe");
+        }
+        let fresh = t.elapsed() / 20;
+        eprintln!("a GET to {}: {kept:?} on a kept connection, {fresh:?} on a fresh one", b.host);
+    }
+
     /// HTTPS for real: AWS refuses made-up keys, but only after the TLS
     /// handshake and its certificate check. Needs the internet:
     /// `cargo test --release -- --ignored over_https`.
     #[test]
     #[ignore]
     fn a_bucket_over_https() {
-        let b = S3 { host: "s3.amazonaws.com".into(), tls: true, bucket: "combd-tls-check-does-not-exist".into(), key: "AKIAEXAMPLE".into(), secret: "nope".into(), region: "us-east-1".into() };
+        let b = S3 { pool: Default::default(), host: "s3.amazonaws.com".into(), tls: true, bucket: "combd-tls-check-does-not-exist".into(), key: "AKIAEXAMPLE".into(), secret: "nope".into(), region: "us-east-1".into() };
         let e = b.get("k").err().map(|e| e.to_string()).unwrap_or_default();
         assert!(e.contains("HTTP 403") || e.contains("HTTP 404") || e.contains("HTTP 301"), "a refusal over TLS, not a TLS failure: {e}");
     }

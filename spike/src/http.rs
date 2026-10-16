@@ -254,8 +254,11 @@ const ALARM_SCAN: Duration = Duration::from_secs(1);
 /// A forwarded request with no reply in time gets a 503 (the peer may be
 /// frozen), so the client can retry. "In time" is measured per peer, as TCP
 /// does it: smoothed round trip + 4x its variation, within these bounds, so a
-/// peer across the world gets more time than one in the same rack.
-const FORWARD_MIN: Duration = Duration::from_secs(1);
+/// peer across the world gets more time than one in the same rack. The
+/// floor leaves room for the owner's own work: a fresh object's start is a
+/// few bucket calls first, and a bucket can be an ocean away. (A dead owner
+/// is found by its silence, not by this.)
+const FORWARD_MIN: Duration = Duration::from_secs(5);
 const FORWARD_MAX: Duration = Duration::from_secs(30);
 const FORWARD_FIRST: Duration = Duration::from_secs(5);
 

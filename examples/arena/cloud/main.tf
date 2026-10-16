@@ -159,6 +159,9 @@ resource "digitalocean_droplet" "node" {
       "COMBD_ADMIN_PORT=9443",
       "COMBD_ADMIN_TOKENS=/etc/combd/tokens",
       "COMBD_MASTER_KEY_FILE=/etc/combd/master.key",
+      # Every node keeps its peers' promises (the version this fleet started
+      # on does), so owners may answer reads under a lease.
+      "COMBD_READ_LEASE=1",
       "",
     ])
     ca       = file("${local.secrets}/certs/ca.pem")

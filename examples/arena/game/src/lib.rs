@@ -373,7 +373,7 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                 let tok = token();
                 let r = call(&json!({ "to": "match", "id": id, "node": node, "path": "/create", "body": json!({ "id": id, "players": [player, bot_name], "tokens": [tok, ""], "bot": strategy.name() }).to_string() }));
                 if r["status"].as_u64() != Some(200) {
-                    return err(503, "couldn't start the match: try again");
+                    return err(503, &format!("couldn't start the match ({} {}): try again", r["status"], r["body"].as_str().unwrap_or("")));
                 }
                 let row = json!({ "match": id, "node": node, "players": [player, bot_name], "worst_rtt": ms, "at": now, "bot": true });
                 sql("INSERT INTO recent (row) VALUES (?)", &[json!(row.to_string())]);
