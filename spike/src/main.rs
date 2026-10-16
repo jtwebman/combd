@@ -772,6 +772,7 @@ fn main_with(args: &[&str]) {
                 Some("wait_when_down") => bugs.wait_when_down = true,
                 Some("lease_no_promise") => bugs.lease_no_promise = true,
                 Some("lease_overtrust") => bugs.lease_overtrust = true,
+                Some("lease_trusts_kept") => bugs.lease_trusts_kept = true,
                 _ => {}
             }
             let replicas = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
