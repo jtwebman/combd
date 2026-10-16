@@ -74,3 +74,11 @@ jobs:
             sleep 20
           done
           exit 1
+      - name: New matches again (also if the deploy failed)
+        if: always()
+        env:
+          KEY: ${{ secrets.ARENA_DRAIN_KEY }}
+        run: |
+          body=$(python3 -c 'import json, os; print(json.dumps({"key": os.environ.get("KEY", ""), "on": False}))')
+          for i in 1 2 3 4 5; do curl -sf -m 15 -X POST https://arena.combd.dev/api/drain -d "$body" && exit 0; sleep 10; done
+          echo "couldn't end the drain"; exit 1

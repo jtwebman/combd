@@ -189,11 +189,13 @@ fn lobby(method: &str, path: &str, body: &str) -> String {
     };
     match (method, path) {
         ("GET", "/") => format!("200\ncontent-type: text/html; charset=utf-8\ncache-control: no-store\n\n{}", INDEX.replace("{{VERSION}}", VERSION)),
-        // A new version is coming (CI, with the drain key): no new matches.
+        // A new version is coming (CI, with the drain key): no new matches;
+        // `"on": false` once it's here (a deploy that changed only combd
+        // reloads nothing, so it must be said).
         ("POST", "/api/drain") => {
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             match env("DRAIN_KEY") {
-                Some(k) if !k.is_empty() && v["key"].as_str() == Some(k.as_str()) => mm("/drain", "{}"),
+                Some(k) if !k.is_empty() && v["key"].as_str() == Some(k.as_str()) => mm("/drain", &json!({ "on": v["on"].as_bool().unwrap_or(true) }).to_string()),
                 _ => err(403, "no"),
             }
         }
@@ -356,8 +358,8 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
             // A new version is coming: start no new matches (the deploy reloads
             // this, and that ends it).
             ("POST", "/drain") => {
-                mm.draining = true;
-                ok(json!({ "draining": true }))
+                mm.draining = v["on"].as_bool().unwrap_or(true);
+                ok(json!({ "draining": mm.draining }))
             }
             ("POST", "/bot") => {
                 let Some(player) = v["player"].as_str().filter(|p| !p.is_empty() && p.len() <= 32 && !p.starts_with("bot-")) else { return err(400, "want {\"player\": name, \"rtt\": {node: ms}}") };
