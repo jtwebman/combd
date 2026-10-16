@@ -2744,6 +2744,55 @@ callers = ["api"]
     /// a match ticking 20 times a second over WebSockets, sight blocked by
     /// walls, a pause and a resume, a drop and a reconnect, a drop for good
     /// (the other player wins), and both players' records.
+    /// A deploy in the middle of a game doesn't end it: the match (open
+    /// sockets, a beat) finishes on the version it started on, while new
+    /// requests get the new one.
+    #[test]
+    fn a_deploy_never_ends_a_game_in_play() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::copy(format!("{ARENA}/combd.toml"), app.0.join("combd.toml")).unwrap();
+        std::fs::copy(format!("{ARENA}/modules/game.wasm"), app.0.join("modules/game.wasm")).expect("build the arena first: examples/arena/build.sh");
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, _) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let live = Arc::new(http::Live::new(a));
+        let dir = store::tempdir::Dir::new();
+        let port = free_ports(1)[0];
+        let (l2, c) = (live.clone(), cfg(&dir.0, 2));
+        std::thread::spawn(move || http::serve_live(&interp::Interp { max_pages: 16384 }, &l2, port, c));
+        assert!(eventually(2000, || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()));
+        // A match against the match's own bot.
+        let (code, b) = http(port, "POST", "/api/bot", &serde_json::json!({ "player": "alice", "rtt": { "0": 5 } }).to_string());
+        assert_eq!(code, 200, "{b}");
+        let m: serde_json::Value = serde_json::from_str(&b).unwrap();
+        let mut ws = Ws::open(port, &format!("/match/{}/ws", m["match"].as_str().unwrap())).unwrap();
+        ws.text(&serde_json::json!({ "t": "hello", "token": m["token"] }).to_string());
+        // The last state seen within `ms`, and that it kept coming.
+        let mut states = |ms: u64| -> serde_json::Value {
+            let (t, mut last) = (Instant::now(), serde_json::Value::Null);
+            while t.elapsed() < Duration::from_millis(ms) {
+                if let Some((1, b)) = ws.recv_within(300) {
+                    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                    if v["t"] == "st" {
+                        last = v;
+                    }
+                }
+            }
+            last
+        };
+        let before = states(4500);
+        assert_eq!(before["phase"], "play", "{before}");
+        // A new version, deployed mid-game (a var changed: new processes).
+        std::fs::write(app.0.join("combd.dev.toml"), "[vars]\nMATCH_MS = 170000\n").unwrap();
+        http::deploy_dir(&eng, &live, "local", &app.0).unwrap();
+        // Well after the deploy is in (a second), it still goes on.
+        let mid = states(1000);
+        let after = states(1500);
+        assert!(after["k"].as_u64() > mid["k"].as_u64() && mid["k"].as_u64() > before["k"].as_u64() && after["phase"] == "play", "the match went on, on its old version: {before} then {mid} then {after}");
+        // New requests: the new version.
+        assert_eq!(http(port, "GET", "/api/stats", "").0, 200);
+    }
+
     #[test]
     fn arena_plays_a_match() {
         let app = store::tempdir::Dir::new();

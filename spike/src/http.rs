@@ -2558,6 +2558,7 @@ impl<E: Engine> Loop<'_, E> {
     /// recently used ones past the limit.
     fn sweep(&mut self) {
         self.last_sweep = Instant::now();
+        self.retire_cells();
         let idle = self.sh.cfg.idle;
         // Database handles keep an object here until they've been idle for
         // their pool's `session_idle_ms`; then they close, and it can leave.
@@ -2843,12 +2844,24 @@ impl<E: Engine> Loop<'_, E> {
                 pool.clear();
             }
         }
-        for o in self.objects.values_mut() {
-            if !o.busy && o.cell.as_ref().is_some_and(|c| app.procs[c.proc].retired) {
+        self.retire_cells();
+        self.warm(from)
+    }
+
+    /// Objects still on an older version's code move to the new one (their
+    /// cell goes; the next request starts one) once they're not in the
+    /// middle of something: no request running, no open sockets, no beat.
+    /// So a deploy never ends a game in play. ponytail: an object that keeps
+    /// sockets open forever stays on its old version until they close.
+    fn retire_cells(&mut self) {
+        let (app, ticks) = (&self.app, &self.ticks);
+        for (name, o) in self.objects.iter_mut() {
+            let old = o.cell.as_ref().is_some_and(|c| app.procs[c.proc].retired);
+            let mid = o.busy || ticks.contains_key(name) || o.socks.as_ref().is_some_and(|s| !s.is_empty());
+            if old && !mid {
                 o.cell = None;
             }
         }
-        self.warm(from)
     }
 
     /// New processes (from `from` on): a warm cell each, and whether it's an
@@ -2964,6 +2977,7 @@ impl<E: Engine> Loop<'_, E> {
     /// a transaction. `Ok(false)`: nothing to run (a stale alarm).
     fn run_object(&mut self, name: &str, origin: Origin, mut req: String) -> Result<bool, (u16, String)> {
         let (eng, app) = (self.eng, self.app.clone());
+        let ticking = self.ticks.contains_key(name);
         let proc = app.object_proc(name);
         let environ = self.environ_for(proc);
         // WebSocket events say what they are in their text, the same here
@@ -3038,8 +3052,10 @@ impl<E: Engine> Loop<'_, E> {
             }
         }
         let mut cell = match o.cell.take() {
-            // A cell of the old code (a deploy came since) gives way.
-            Some(c) if !app.procs[c.proc].retired => c,
+            // A cell of the old code (a deploy came since) gives way, but not
+            // in the middle of something (open sockets, a beat: a game in
+            // play): it finishes on the version it started on.
+            Some(c) if !app.procs[c.proc].retired || ticking || !ids.is_empty() => c,
             _ => match fresh(eng, &app, proc, &environ) {
                 Ok(mut c) => {
                     c.host().db = Some(o.db.clone());
@@ -3323,6 +3339,7 @@ impl<E: Engine> Loop<'_, E> {
     /// Eviction: hand objects that have been idle too long back to the core.
     fn fleet_sweep(&mut self) {
         self.last_sweep = Instant::now();
+        self.retire_cells();
         let idle = self.sh.cfg.idle;
         let gone: Vec<String> = self
             .objects
