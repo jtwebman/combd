@@ -17,6 +17,7 @@
   button:disabled { opacity: .5; cursor: default; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; } td { padding: 2px 4px; } td.r { text-align: right; color: var(--dim); }
   .best { color: var(--you); font-weight: 600; } .dim { color: var(--dim); font-size: 13px; }
+  a { color: var(--you); } .late { color: var(--shot); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -25,7 +26,7 @@
     <h1>Arena</h1>
     <div class="dim" id="status">Measuring the nodes...</div>
     <canvas id="c" width="960" height="640" aria-label="the arena"></canvas>
-    <div class="dim">Move: WASD or the arrow keys. Aim: the mouse. Shoot: click. Pause: P (the other player wins if you don't come back in time). You only see the other player when no wall is in the way.</div>
+    <div class="dim" id="help">Move: WASD or the arrow keys. Aim: the mouse. Shoot: click. Pause: P (the other player wins if you don't come back in time). You only see the other player when no wall is in the way.</div>
   </div>
   <aside>
     <label>Name <input id="name" maxlength="24" autocomplete="off"></label>
@@ -36,13 +37,14 @@
     <div id="record" class="dim">-</div>
     <h2>Recent matches</h2>
     <table id="recent"></table>
+    <div class="dim">Watch: the whole map, a little behind live.</div>
   </aside>
 </main>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
 const canvas = $("c"), ctx = canvas.getContext("2d");
-const state = { nodes: {}, rtt: {}, map: null, side: 0, last: null, lastSeen: null, phase: "idle", players: [], ws: null, match: null, keys: {}, aim: 0, fire: false };
+const state = { nodes: {}, rtt: {}, map: null, side: 0, last: null, lastSeen: null, phase: "idle", players: [], ws: null, match: null, keys: {}, aim: 0, fire: false, watching: false, sp: null, delay: 0, myPing: null };
 const name = $("name");
 name.value = localStorage.getItem("arena-name") || ("player" + Math.floor(Math.random() * 10000));
 name.onchange = () => localStorage.setItem("arena-name", name.value);
@@ -79,8 +81,9 @@ async function record() {
   const r = await api("/api/player/" + encodeURIComponent(name.value));
   $("record").textContent = `${r.wins || 0} wins, ${r.losses || 0} losses, ${r.draws || 0} draws`;
   const s = await api("/api/stats");
+  const esc = (t) => String(t).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
   $("recent").innerHTML = (s.recent || []).slice(0, 8).map(m =>
-    `<tr><td>${m.players.join(" vs ")}</td><td class="r">node ${m.node}, ${m.worst_rtt} ms</td></tr>`).join("") || `<tr><td class="dim">none yet</td></tr>`;
+    `<tr><td>${esc(m.players.join(" vs "))}</td><td class="r">node ${m.node}, ${m.worst_rtt} ms</td><td class="r"><a href="?watch=${encodeURIComponent(m.match)}&node=${m.node}">watch</a></td></tr>`).join("") || `<tr><td class="dim">none yet</td></tr>`;
 }
 
 $("play").onclick = async () => {
@@ -107,6 +110,7 @@ function connect(m) {
   ws.onopen = () => ws.send(JSON.stringify({ t: "hello", token: m.token }));
   ws.onmessage = (e) => {
     const v = JSON.parse(e.data);
+    if (v.t === "pong") return pong(v);
     if (v.t === "hello") { state.map = v.map; state.side = v.side; state.players = v.players; }
     if (v.t === "st") {
       state.last = v; state.phase = v.phase;
@@ -120,6 +124,34 @@ function connect(m) {
     say("Connection lost: reconnecting (the match is paused for you)...");
     setTimeout(() => state.match === m && connect(m), 1000);
   };
+}
+
+// Our round trip to the match's node, once a second; a player reports it,
+// so the other player and spectators see it too.
+setInterval(() => {
+  if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ t: "ping", c: performance.now() }));
+}, 1000);
+function pong(v) {
+  state.myPing = Math.round(performance.now() - v.c);
+  if (!state.watching && state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ t: "rtt", ms: state.myPing }));
+}
+
+// Watch a match: everything, but late (so it can't be used to see through walls).
+function watch(id, node) {
+  state.watching = true;
+  $("play").disabled = true;
+  $("help").innerHTML = 'Spectating: you see the whole map, both players and every bullet. So it runs behind live: nobody can use it to see through walls in their own match. <a href="/">Play instead</a>';
+  const url = (state.nodes[node] || location.origin).replace(/^http/, "ws") + `/match/${encodeURIComponent(id)}/ws`;
+  const ws = new WebSocket(url);
+  state.ws = ws;
+  ws.onopen = () => ws.send(JSON.stringify({ t: "watch" }));
+  ws.onmessage = (e) => {
+    const v = JSON.parse(e.data);
+    if (v.t === "pong") return pong(v);
+    if (v.t === "hello") { state.map = v.map; state.players = v.players; state.delay = v.delay_ms; say(`Watching ${v.players.join(" vs ")} on node ${node}, ${Math.round(v.delay_ms / 1000)} s behind live.`); }
+    if (v.t === "sp") state.sp = v;
+  };
+  ws.onclose = () => { if (!state.sp || state.sp.phase !== "over") say("The match is over, or gone."); };
 }
 
 // Input: sent 20 times a second while connected.
@@ -145,7 +177,7 @@ setInterval(() => {
   const k = state.keys;
   const mx = (k.d || k.arrowright ? 1 : 0) - (k.a || k.arrowleft ? 1 : 0);
   const my = (k.s || k.arrowdown ? 1 : 0) - (k.w || k.arrowup ? 1 : 0);
-  ws.send(JSON.stringify({ t: "in", mx, my, aim: state.aim, fire: state.fire }));
+  if (!state.watching) ws.send(JSON.stringify({ t: "in", mx, my, aim: state.aim, fire: state.fire }));
 }, 50);
 
 function draw() {
@@ -156,6 +188,32 @@ function draw() {
     ctx.fillStyle = c("--wall");
     for (const [x, y, w, h] of state.map.walls) ctx.fillRect(x, y, w, h);
   }
+  const ms = (p) => p == null ? "?" : `${p} ms`;
+  if (state.watching && state.sp) {
+    // Spectating: both players, every bullet.
+    const v = state.sp, r = state.map ? state.map.r : 14, colors = [c("--you"), c("--them")];
+    v.p.forEach((p, i) => {
+      if (p.dead) return;
+      ctx.fillStyle = colors[i]; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = colors[i]; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x + Math.cos(p.aim) * (r + 10), p.y + Math.sin(p.aim) * (r + 10)); ctx.stroke();
+      ctx.fillStyle = c("--ink"); ctx.font = "12px system-ui"; ctx.textAlign = "center";
+      ctx.fillText(`${state.players[i] || "?"} ${"♥".repeat(p.hp)}`, p.x, p.y - r - 8); ctx.textAlign = "start";
+    });
+    for (const [x, y, o] of v.b) { ctx.fillStyle = colors[o] || c("--shot"); ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill(); }
+    ctx.font = "16px system-ui";
+    ctx.fillStyle = colors[0]; ctx.fillText(`${state.players[0]} ${v.p[0].kills} (${ms(v.ping[0])})`, 16, 26);
+    ctx.fillStyle = colors[1]; ctx.textAlign = "right"; ctx.fillText(`(${ms(v.ping[1])}) ${v.p[1].kills} ${state.players[1]}`, canvas.width - 16, 26); ctx.textAlign = "start";
+    ctx.fillStyle = c("--shot"); ctx.font = "13px system-ui";
+    ctx.fillText(`SPECTATING, ${Math.round(state.delay / 1000)} s BEHIND LIVE · your ping ${ms(state.myPing)}`, 16, canvas.height - 14);
+    const banner = v.phase === "waiting" ? "Waiting for the players..." :
+      v.phase === "paused" ? `Paused by ${state.players[v.paused_by]}: ${Math.ceil(v.left / 1000)} s` :
+      v.phase === "over" ? (v.winner === "draw" ? "A draw." : `${state.players[v.winner]} won!`) : "";
+    if (banner) { ctx.fillStyle = c("--ink"); ctx.font = "28px system-ui"; ctx.textAlign = "center"; ctx.fillText(banner, canvas.width / 2, canvas.height / 2); ctx.textAlign = "start"; }
+    requestAnimationFrame(draw);
+    return;
+  }
+  if (state.watching) { ctx.fillStyle = c("--dim"); ctx.font = "20px system-ui"; ctx.textAlign = "center"; ctx.fillText(`Spectating: the first moments arrive ${Math.round(state.delay / 1000)} s late...`, canvas.width / 2, canvas.height / 2); ctx.textAlign = "start"; }
   const v = state.last;
   if (v) {
     const r = state.map ? state.map.r : 14;
@@ -178,6 +236,8 @@ function draw() {
     ctx.fillStyle = c("--ink"); ctx.font = "18px system-ui";
     const names = state.players.length ? [state.players[state.side], state.players[1 - state.side]] : ["you", "them"];
     ctx.fillText(`${names[0]} ${v.score[0]}  :  ${v.score[1]} ${names[1]}     hp ${"♥".repeat(v.you.hp)}`, 16, 28);
+    ctx.font = "13px system-ui"; ctx.fillStyle = c("--dim");
+    ctx.fillText(`ping: you ${ms(v.ping && v.ping[0])}, them ${ms(v.ping && v.ping[1])}`, 16, canvas.height - 14);
     const banner = v.phase === "waiting" ? "Waiting for the other player..." :
       v.phase === "paused" ? (v.paused_by_you ? `You paused: P to go on (${Math.ceil(v.left / 1000)} s, then you lose)` : `Paused by the other player: ${Math.ceil(v.left / 1000)} s, then you win`) :
       v.phase === "over" ? (v.winner === null ? "A draw." : v.winner ? "You won!" : "You lost.") : (v.you.dead ? "Respawning..." : "");
@@ -186,7 +246,9 @@ function draw() {
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);
-measure().then(record);
+// `?watch=<match>&node=<n>`: spectate it.
+const q = new URLSearchParams(location.search);
+measure().then(() => { record(); if (q.get("watch")) watch(q.get("watch"), q.get("node") || "0"); });
 </script>
 </body>
 </html>

@@ -189,8 +189,12 @@ pub enum Res {
 
 pub enum Event {
     Request { obj: Obj, req: ReqId },
-    /// The executor ran a request; `changed`: it wrote something.
-    Ran { obj: Obj, act: Act, req: ReqId, changed: bool },
+    /// The executor ran a request; `changed`: it wrote something. `proof:
+    /// false`: its answer goes nowhere that needs it proven (an object's own
+    /// beat), so if it changed nothing and every earlier write is already
+    /// acknowledged, it's done now, with no round to the peers. (A read would
+    /// need one: a node that just lost the object mustn't answer for it.)
+    Ran { obj: Obj, act: Act, req: ReqId, changed: bool, proof: bool },
     /// The changes since the last seal: the next entry.
     Sealed { obj: Obj, act: Act, changes: Vec<u8> },
     /// The executor rebuilt the object from its segments (or couldn't).
@@ -728,8 +732,13 @@ impl Core {
                 }
             }
             Event::Request { obj, req } => self.request(now, obj, req),
-            Event::Ran { obj, act, req, changed } => {
+            Event::Ran { obj, act, req, changed, proof } => {
                 if let Some(s) = self.serving(obj, act) {
+                    if !proof && !changed && s.pends.is_empty() && s.sealing.is_none() && !s.dirty && s.running.remove(&req) {
+                        let epoch = s.epoch;
+                        self.answer(req, Answer::Done { epoch });
+                        return std::mem::take(&mut self.out);
+                    }
                     if s.running.remove(&req) {
                         s.batch.push(req);
                         s.dirty |= changed;

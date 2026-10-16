@@ -3267,12 +3267,13 @@ impl<E: Engine> Loop<'_, E> {
             if ok {
                 fr.ws = ws;
             }
-            fr.act
+            // An object's own beat: its answer goes nowhere (see `Ran`).
+            (fr.act, !matches!(fr.origin, Origin::Tick))
         });
         self.reconcile(&name);
         self.next_waiting(&name);
-        if let Some(act) = act {
-            self.core_on(own::Event::Ran { obj: own::obj_id(&name), act, req, changed });
+        if let Some((act, proof)) = act {
+            self.core_on(own::Event::Ran { obj: own::obj_id(&name), act, req, changed, proof });
         }
         None
     }
@@ -3286,7 +3287,7 @@ impl<E: Engine> Loop<'_, E> {
         });
         self.reconcile(name);
         if let Some(act) = act {
-            self.core_on(own::Event::Ran { obj: own::obj_id(name), act, req, changed: false });
+            self.core_on(own::Event::Ran { obj: own::obj_id(name), act, req, changed: false, proof: true });
         }
     }
 

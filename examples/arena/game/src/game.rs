@@ -216,6 +216,18 @@ impl Game {
     }
 }
 
+impl Game {
+    /// Everything, for spectators (who see it late: see the match): both
+    /// players, wherever they are, and every bullet with its owner.
+    pub fn view_all(&self) -> Value {
+        let pos = |p: &Player| json!({ "x": p.x.round(), "y": p.y.round(), "aim": (p.aim * 100.0).round() / 100.0, "hp": p.hp, "dead": p.dead_until.is_some(), "kills": p.kills });
+        json!({
+            "p": [pos(&self.players[0]), pos(&self.players[1])],
+            "b": self.bullets.iter().map(|b| json!([b.x.round(), b.y.round(), b.owner])).collect::<Vec<_>>(),
+        })
+    }
+}
+
 impl Default for Game {
     fn default() -> Game {
         Game::new()

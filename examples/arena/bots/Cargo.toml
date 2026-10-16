@@ -9,3 +9,6 @@ publish = false
 [dependencies]
 arena-game = { path = "../game" }
 serde_json = "1"
+# HTTPS and WSS, for nodes on the internet (the versions combd uses).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"

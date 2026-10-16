@@ -605,7 +605,7 @@ impl Sim {
                 }
                 let h = d.history.clone();
                 self.procs[p].saw.insert(req, h);
-                self.at(0, Msg::Proc(p, Event::Ran { obj, act, req, changed: write.is_some() }));
+                self.at(0, Msg::Proc(p, Event::Ran { obj, act, req, changed: write.is_some(), proof: true }));
             }
             Effect::Seal { obj, act } => {
                 let d = self.procs[p].data.entry(obj).or_default();

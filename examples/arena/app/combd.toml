@@ -7,6 +7,9 @@ name = "arena"
 PAUSE_MS = 30000
 # How long a match lasts: then more kills wins, and a tie is a draw.
 MATCH_MS = 180000
+# How far behind live spectators watch. They see everything, walls or not,
+# so live would let a player watch their own match to see through walls.
+SPECTATE_DELAY_MS = 10000
 
 # The page, and the join and poll API.
 [processes.lobby]

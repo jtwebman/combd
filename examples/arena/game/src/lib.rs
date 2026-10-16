@@ -137,6 +137,17 @@ fn sql(_: &str, _: &[Value]) -> Vec<Value> {
     vec![]
 }
 
+/// Set up an object's tables once per instance, not on every request: a
+/// statement that may write (even `CREATE TABLE IF NOT EXISTS` with the table
+/// there) makes the request a write, and a write waits for the object's
+/// peers, across oceans in a world-wide fleet.
+fn once(f: impl FnOnce()) {
+    thread_local!(static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    if !DONE.with(|d| d.replace(true)) {
+        f();
+    }
+}
+
 fn ok(v: Value) -> String {
     format!("200 {v}")
 }
@@ -274,8 +285,10 @@ fn pair_all(mm: &mut Mm, now: u64) {
 
 fn matchmaker(method: &str, path: &str, body: &str) -> String {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-    sql("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v INTEGER)", &[]);
-    sql("CREATE TABLE IF NOT EXISTS recent (id INTEGER PRIMARY KEY, row TEXT)", &[]);
+    once(|| {
+        sql("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v INTEGER)", &[]);
+        sql("CREATE TABLE IF NOT EXISTS recent (id INTEGER PRIMARY KEY, row TEXT)", &[]);
+    });
     MM.with(|mm| {
         let mut mm = mm.borrow_mut();
         let now = now();
@@ -289,11 +302,19 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                     return err(400, "measure the nodes first: rtt");
                 }
                 let ticket = token();
+                // One ticket per player: a join again (a client that gave up
+                // waiting for an answer) replaces the old one, so stale
+                // tickets can't pile up and get matched with no one there.
+                mm.queue.retain(|w| w.player != player);
                 mm.queue.push(Waiting { ticket: ticket.clone(), player: player.into(), rtt, since: now });
                 pair_all(&mut mm, now);
                 ok(json!({ "ticket": ticket }))
             }
             ("POST", "/poll") => {
+                // Pair on every poll (players poll twice a second while they
+                // wait): the bar for "close enough" drops with time, so a
+                // lone far player is paired soon enough, with no beat.
+                pair_all(&mut mm, now);
                 let ticket = v["ticket"].as_str().unwrap_or("");
                 match mm.ready.remove(ticket) {
                     Some(a) => ok(json!({ "match": a.m, "node": a.node, "token": a.token, "side": a.side, "rtt": a.rtt })),
@@ -301,11 +322,9 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                     None => err(404, "no such ticket (it waited too long?): join again"),
                 }
             }
-            // While anyone waits: try again, as the bar for "close enough"
-            // drops with time. The beat also keeps this object in memory,
-            // so its queue isn't lost while someone's in it.
+            // From an earlier version's beat: stop it.
             ("TICK", _) => {
-                pair_all(&mut mm, now);
+                tick_every(0);
                 ok(json!({}))
             }
             ("GET", "/stats") => {
@@ -315,7 +334,6 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
             }
             _ => err(404, "not found"),
         };
-        tick_every(if mm.queue.is_empty() { 0 } else { 500 });
         answer
     })
 }
@@ -345,7 +363,16 @@ struct Match {
     ticks: u64,
     over_at: u64,
     timing: Timing,
+    /// Each player's round trip to this node, as their client measured it.
+    ping: [Option<u64>; 2],
+    /// Spectators' sockets, and the full frames they'll see once they're
+    /// `spectate_delay_ms` old: (when, frame).
+    spectators: Vec<u64>,
+    frames: std::collections::VecDeque<(u64, String)>,
 }
+
+/// The most spectators a match takes.
+const MAX_SPECTATORS: usize = 50;
 
 /// How the beat and the players kept up, for the record: the gaps between
 /// ticks, and ticks a player sent no new input for (the game then reuses
@@ -377,6 +404,37 @@ fn pause_ms() -> u64 {
 }
 const START_WAIT_MS: u64 = 60_000;
 
+/// How far behind live spectators are (`SPECTATE_DELAY_MS`, 10 s).
+fn spectate_delay_ms() -> u64 {
+    env("SPECTATE_DELAY_MS").and_then(|v| v.parse().ok()).unwrap_or(10_000)
+}
+
+/// What a spectator sees of a tick: everything.
+fn frame(m: &Match, now: u64) -> String {
+    let mut v = m.game.view_all();
+    let (phase, left) = match m.phase {
+        Phase::Waiting => ("waiting", 0),
+        Phase::Play => ("play", 0),
+        Phase::Paused { until, .. } => ("paused", until.saturating_sub(now)),
+        Phase::Over => ("over", 0),
+    };
+    v["t"] = json!("sp");
+    v["phase"] = json!(phase);
+    v["left"] = json!(left);
+    v["paused_by"] = match m.phase {
+        Phase::Paused { who, .. } => json!(who),
+        _ => Value::Null,
+    };
+    v["ping"] = json!(m.ping);
+    v["played"] = json!(m.played);
+    v["winner"] = match (m.phase, m.game.winner) {
+        (Phase::Over, Some(w)) => json!(w),
+        (Phase::Over, None) => json!("draw"),
+        _ => Value::Null,
+    };
+    v.to_string()
+}
+
 fn state_msg(m: &Match, side: usize, now: u64) -> String {
     let mut v = m.game.view(side);
     let (phase, left) = match m.phase {
@@ -390,6 +448,7 @@ fn state_msg(m: &Match, side: usize, now: u64) -> String {
     v["phase"] = json!(phase);
     v["left"] = json!(left);
     v["paused_by_you"] = json!(matches!(m.phase, Phase::Paused { who, .. } if who == side));
+    v["ping"] = json!([m.ping[side], m.ping[1 - side]]);
     if m.phase == Phase::Over {
         let t = &m.timing;
         v["timing"] = json!({ "ticks": t.played_ticks, "max_gap_ms": t.max_gap, "late": t.late, "your_stale": t.stale[side], "their_stale": t.stale[1 - side], "your_inputs": t.inputs[side] });
@@ -427,8 +486,12 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
             let s = |k: &str, i: usize| v[k][i].as_str().unwrap_or("").to_string();
             sql("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)", &[]);
             sql("INSERT OR REPLACE INTO meta (k, v) VALUES ('players', ?)", &[json!(format!("{} vs {}", s("players", 0), s("players", 1)))]);
-            *cell = Some(Match { players: [s("players", 0), s("players", 1)], tokens: [s("tokens", 0), s("tokens", 1)], socks: [None, None], game: game::Game::new(), phase: Phase::Waiting, created: now, played: 0, last_step: now, ticks: 0, over_at: 0, timing: Timing::default() });
-            tick_every(50);
+            if s("players", 0) == s("players", 1) {
+                return err(400, "a player can't play themselves");
+            }
+            *cell = Some(Match { players: [s("players", 0), s("players", 1)], tokens: [s("tokens", 0), s("tokens", 1)], socks: [None, None], game: game::Game::new(), phase: Phase::Waiting, created: now, played: 0, last_step: now, ticks: 0, over_at: 0, timing: Timing::default(), ping: [None, None], spectators: vec![], frames: Default::default() });
+            // Slowly until both players are here: a match nobody joins costs little.
+            tick_every(1000);
             return ok(json!({ "ok": true }));
         }
         let Some(m) = cell.as_mut() else {
@@ -461,12 +524,35 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                             Phase::Waiting if m.socks.iter().all(Option::is_some) => {
                                 m.phase = Phase::Play;
                                 m.last_step = now;
+                                tick_every(50);
                             }
                             Phase::Paused { who, .. } if who == side => {
                                 m.phase = Phase::Play;
                                 m.last_step = now;
                             }
                             _ => {}
+                        }
+                    }
+                    // A spectator: everything, but late (see `frame`).
+                    Some("watch") => {
+                        if m.spectators.len() >= MAX_SPECTATORS {
+                            ws_close(sock);
+                            return ok(json!({}));
+                        }
+                        m.spectators.push(sock);
+                        let hello = json!({ "t": "hello", "watch": true, "players": m.players, "map": game::walls(), "delay_ms": spectate_delay_ms() });
+                        ws_send(sock, &hello.to_string());
+                        // Already over and shown: just how it ended.
+                        if m.phase == Phase::Over && m.frames.is_empty() {
+                            ws_send(sock, &frame(m, now));
+                        }
+                    }
+                    // Anyone's round trip: answered at once.
+                    Some("ping") => ws_send(sock, &json!({ "t": "pong", "c": v["c"] }).to_string()),
+                    // A player's round trip, as their client measured it.
+                    Some("rtt") => {
+                        if let (Some(side), Some(ms)) = ((0..2).find(|&i| m.socks[i] == Some(sock)), v["ms"].as_u64()) {
+                            m.ping[side] = Some(ms.min(10_000));
                         }
                     }
                     // A player pauses (and the clock for the other to win
@@ -500,6 +586,7 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
             }
             "WSCLOSE" => {
                 let sock: u64 = path.trim_start_matches('/').parse().unwrap_or(0);
+                m.spectators.retain(|&s| s != sock);
                 if let Some(side) = (0..2).find(|&i| m.socks[i] == Some(sock)) {
                     m.socks[side] = None;
                     m.game.players[side].input = game::Input::default();
@@ -552,13 +639,33 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                         ws_send(s, &state_msg(m, side, now));
                     }
                 }
-                // A few seconds after the end, close up and stop the beat.
+                // Spectators: this tick goes in line, and the one now old
+                // enough goes out.
+                let delay = spectate_delay_ms();
+                if m.phase != Phase::Over || now.saturating_sub(m.over_at) <= 3000 {
+                    let f = frame(m, now);
+                    m.frames.push_back((now, f));
+                }
+                while m.frames.front().is_some_and(|(t, _)| t + delay <= now) {
+                    let (_, f) = m.frames.pop_front().unwrap();
+                    for &s in &m.spectators {
+                        ws_send(s, &f);
+                    }
+                }
+                // A few seconds after the end, close up the players; once the
+                // spectators have seen the end too, them, and stop the beat.
                 if m.phase == Phase::Over && now.saturating_sub(m.over_at) > 3000 {
                     for s in m.socks.iter().flatten() {
                         ws_close(*s);
                     }
                     m.socks = [None, None];
-                    tick_every(0);
+                    if m.frames.is_empty() {
+                        for &s in &m.spectators {
+                            ws_close(s);
+                        }
+                        m.spectators.clear();
+                        tick_every(0);
+                    }
                 }
                 ok(json!({}))
             }
@@ -571,7 +678,9 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
 // ---------------------------------------------------------------- player
 
 fn player(method: &str, path: &str, body: &str) -> String {
-    sql("CREATE TABLE IF NOT EXISTS stats (k TEXT PRIMARY KEY, v INTEGER)", &[]);
+    once(|| {
+        sql("CREATE TABLE IF NOT EXISTS stats (k TEXT PRIMARY KEY, v INTEGER)", &[]);
+    });
     let get = |k: &str| sql("SELECT v FROM stats WHERE k = ?", &[json!(k)]).first().and_then(|r| r[0].as_i64()).unwrap_or(0);
     let bump = |k: &str| sql("INSERT INTO stats (k, v) VALUES (?, 1) ON CONFLICT (k) DO UPDATE SET v = v + 1", &[json!(k)]);
     match (method, path) {
