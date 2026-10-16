@@ -1520,6 +1520,45 @@ Not yet: node heartbeats over the wire (they still renew in the bucket;
 that's the ownership core, next), secrets, and two vars changes at once on
 two nodes (the later one wins whole).
 
+## Secrets, sealed in the catalog
+
+Secrets live in the catalog, sealed (`spike/src/secrets.rs`). Each app
+gets its own data key with its first secret, sealed by the fleet's master
+key (a file of 64 hex characters, `COMBD_MASTER_KEY_FILE`, refused if
+anyone but its owner can read it; `combd-spike master-key <file>` makes
+one). Each secret is sealed by the app's data key with AES-256-GCM, and
+the app and the secret's name are bound in, so a sealed value copied to
+another name or app won't open. A node opens them only in memory, when it
+loads the app, and hands them to its instances as env vars. The bucket and
+every node's copy on disk only ever hold sealed bytes.
+
+- **Write-only:** `PUT` and `DELETE /v1/apps/<org>/<app>/secrets/<name>`,
+  under their own scope (`secrets`). Nothing reads one back. The CLI reads
+  the value from stdin, never the command line.
+- **Checked like vars:** with a version live, a secret must be declared and
+  valid for its type, and one a process requires can't be deleted. Errors
+  name the secret, never its value.
+- **The data key is written once:** the catalog's check refuses a second
+  one (two nodes making one at once can't both win) and refuses deleting
+  it. The loser uses the winner's key.
+- `submit` now answers only after the node's copy has the write, so a
+  caller reading right after sees its own change.
+
+**Tests:** `deploys_reach_every_node` sets a secret before the first deploy,
+deploys an app that needs it, and every node serves it; a change through
+another node reaches all three; a bad URL, an undeclared name, and deleting
+a required secret are refused (the error never shows the value); then it
+reads every object in the bucket and every node's catalog copy and finds
+no secret in the clear. The Postgres app's URL is a secret now.
+`sealed_secrets_open_only_where_they_belong`: another master key, no
+master key, a value moved to another name or app, and one flipped bit are
+all refused.
+
+ponytail: no key rotation yet (new master key: open each data key with the
+old, seal with the new), and no KMS (the master key would live there, and
+nodes would ask it to open data keys). No env per secret yet: the plan's
+environments bind it in when they land.
+
 ## The catalog: core and simulator
 
 `spike/src/catalog.rs` is the catalog's decision core (no I/O), and

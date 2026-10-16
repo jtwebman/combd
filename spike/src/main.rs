@@ -21,6 +21,7 @@ mod fleet;
 mod host;
 mod own;
 mod s3;
+mod secrets;
 mod sim;
 mod store;
 mod wire;
@@ -916,6 +917,23 @@ fn main_with(args: &[&str]) {
             }
             call("PUT", &format!("/v1/apps/{app}/vars"), serde_json::Value::Object(m).to_string().as_bytes())
         }),
+        // Secrets: the value from stdin (never the command line, which
+        // other users and shell history can see).
+        ["secret", "put", app, name, url] => cli(url, |call| {
+            let mut v = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut v).map_err(|e| e.to_string())?;
+            let v = v.strip_suffix('\n').unwrap_or(&v);
+            call("PUT", &format!("/v1/apps/{app}/secrets/{name}"), v.as_bytes())
+        }),
+        ["secret", "rm", app, name, url] => cli(url, |call| call("DELETE", &format!("/v1/apps/{app}/secrets/{name}"), b"")),
+        // A new master key for a fleet's secrets (every node gets a copy).
+        ["master-key", file] => {
+            if let Err(e) = secrets::new_master(std::path::Path::new(file)) {
+                eprintln!("combd     {e}");
+                std::process::exit(1);
+            }
+            println!("a new master key is in {file}: give every node a copy, with COMBD_MASTER_KEY_FILE");
+        }
         // Every app under `root/<org>/<app>/`, one node, shared process.
         ["serve-apps", engine, root, port] => {
             let (root, port) = (std::path::Path::new(root), port.parse().unwrap());
@@ -1359,6 +1377,7 @@ mod tests {
             environ: Arc::default(),
             public: Default::default(),
             catalog: None,
+            master_key: None,
         }
     }
 
@@ -2498,10 +2517,12 @@ callers = ["api"]
         let admin_ports = free_ports(2);
         let admin_port = admin_ports[0];
         let certs = dir.0.join("certs");
+        let master = dir.0.join("master.key");
+        secrets::new_master(&master).unwrap();
         let nodes: Vec<u16> = (0..3u32)
             .map(|n| {
                 let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false };
-                let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 2) };
+                let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), ..cfg(&dir.0.join(format!("d{n}")), 2) };
                 // Nodes 0 and 1 take deploys (to race them against each other).
                 let admin = (n < 2).then(|| admin::AdminCfg { port: admin_ports[n as usize], public: true, tls: Some(wire::admin_tls(&certs, n).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}")).unwrap() });
                 let port = free_ports(1)[0];
@@ -2592,14 +2613,45 @@ callers = ["api"]
         deploy("blog", &app("blog", "blog.test", "[\"/env/*\"]", "V = \"blog\"")).unwrap();
         everywhere("blog.test", "/env/V", "{\"value\":\"blog\"}");
         everywhere("shop.test", "/env/V", "{\"value\":\"changed\"}");
+        // Secrets: set before the first deploy (nothing to check them against
+        // yet), sealed in the catalog, and opened on every node for the app.
+        let url1 = format!("https://127.0.0.1:{}", admin_ports[1]);
+        let secret = |node: usize, t: &str, method: &str, name: &str, v: &str| match node {
+            0 => api(t, method, &format!("/v1/apps/acme/vault/secrets/{name}"), v.as_bytes()),
+            _ => admin::request(&url1, Some((&tls, "node1.combd")), t, method, &format!("/v1/apps/acme/vault/secrets/{name}"), v.as_bytes()).unwrap(),
+        };
+        assert_eq!(secret(0, &weak, "PUT", "api-key", "x").0, 403, "it takes the secrets scope");
+        assert_eq!(secret(0, &token, "PUT", "api-key", "hunter2-hunter2").0, 200);
+        deploy("vault", &app("vault", "vault.test", "[\"/env/*\"]", "V = \"v\"\n[secrets]\nK = \"api-key\"\n\"U?\" = { secret = \"hook\", type = \"url\" }")).unwrap_or_else(|e| panic!("{e}"));
+        everywhere("vault.test", "/env/K", "{\"value\":\"hunter2-hunter2\"}");
+        // Changed through another node: every node reloads with it.
+        assert_eq!(secret(1, &token, "PUT", "api-key", "correct-horse").0, 200);
+        everywhere("vault.test", "/env/K", "{\"value\":\"correct-horse\"}");
+        // Checked against the live manifest, and errors never show a value.
+        let e = secret(0, &token, "PUT", "hook", "not a url").1["error"].as_str().unwrap().to_string();
+        assert!(e.contains("isn't a valid url") && !e.contains("not a url"), "{e}");
+        assert!(secret(0, &token, "PUT", "nope", "x").1["error"].as_str().unwrap().contains("not declared"));
+        assert!(secret(1, &token, "DELETE", "api-key", "").1["error"].as_str().unwrap().contains("K needs secret"));
+        assert_eq!(secret(1, &token, "PUT", "hook", "https://hooks.test/x").0, 200);
+        everywhere("vault.test", "/env/U", "{\"value\":\"https://hooks.test/x\"}");
+        assert_eq!(secret(0, &token, "DELETE", "hook", "").0, 200, "an optional one can go");
+        everywhere("vault.test", "/env/U", "{\"error\":\"not set\"}");
+        // Never in the clear: not in the bucket, not in a node's copy.
+        let has = |b: &[u8]| ["hunter2-hunter2", "correct-horse", "hooks.test"].iter().any(|s| b.windows(s.len()).any(|w| w == s.as_bytes()));
+        for k in bucket.list("").unwrap() {
+            assert!(!has(&bucket.get(&k).unwrap().unwrap().0), "{k}");
+        }
+        for n in 0..3 {
+            assert!(!has(&std::fs::read(dir.0.join(format!("d{n}/catalog.snap"))).unwrap()), "node {n}'s copy");
+        }
         // An app with a Postgres pool: deployed, its pool starts on every
-        // node, and every node can query. (Its URL is a var until secrets.)
+        // node, and every node can query. Its URL is a secret.
         if let Ok(pg_url) = std::env::var("COMBD_PG_TEST") {
             let d = src.0.join("data");
             std::fs::create_dir_all(d.join("modules")).unwrap();
             std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
-            std::fs::write(d.join("combd.toml"), "[app]\nname = \"data\"\ndomains = [\"data.test\"]\n[vars]\nPG = { type = \"url\" }\n[processes.api]\nkind = \"ev\"\nroutes = [\"/pg/q\"]\n[processes.pg-conn]\nkind = \"combd:postgres\"\nurl = \"$PG\"\n[pools.main]\nmember = \"pg-conn\"\nowners = [\"api\"]\nmax = 2\n").unwrap();
-            assert_eq!(api(&token, "PUT", "/v1/apps/acme/data/vars", serde_json::json!({ "PG": pg_url }).to_string().as_bytes()).0, 200);
+            std::fs::write(d.join("combd.toml"), "[app]\nname = \"data\"\ndomains = [\"data.test\"]\n[secrets]\nPG = { secret = \"pg-url\", type = \"url\" }\n[processes.api]\nkind = \"ev\"\nroutes = [\"/pg/q\"]\n[processes.pg-conn]\nkind = \"combd:postgres\"\nurl = \"$PG\"\n[pools.main]\nmember = \"pg-conn\"\nowners = [\"api\"]\nmax = 2\n").unwrap();
+            assert_eq!(api(&token, "PUT", "/v1/apps/acme/data/secrets/pg-url", pg_url.as_bytes()).0, 200);
             deploy("data", &deploy::bundle(&d).unwrap()).unwrap_or_else(|e| panic!("{e}"));
             for &p in &nodes {
                 assert!(eventually(10_000, || http_to(p, "data.test", "POST", "/pg/q", "{\"q\":\"SELECT 41 + 1\"}").1.contains("[[42]]")), "node {p}: {:?}", http_to(p, "data.test", "POST", "/pg/q", "{\"q\":\"SELECT 41 + 1\"}"));
@@ -2609,7 +2661,6 @@ callers = ["api"]
         // the catalog's log gives them one order, and the second is checked
         // against the first. Exactly one wins, and every node agrees.
         let (bx, by) = (app("racex", "race.test", "[\"/env/*\"]", "V = \"x\""), app("racey", "race.test", "[\"/env/*\"]", "V = \"y\""));
-        let url1 = format!("https://127.0.0.1:{}", admin_ports[1]);
         let (tls1, token1) = (tls.clone(), token.clone());
         let other = std::thread::spawn(move || admin::request(&url1, Some((&tls1, "node1.combd")), &token1, "PUT", "/v1/apps/acme/racey", &by).unwrap());
         let mine = api(&token, "PUT", "/v1/apps/acme/racex", &bx);
@@ -2744,8 +2795,13 @@ callers = ["api"]
         }
         // Two apps on one domain: refused.
         assert!(a.submit("acme/other", b"{\"version\":\"v\",\"domains\":[\"d3\"]}".to_vec()).unwrap_err().contains("domain d3 is already acme/app3's"));
+        // An app's data key is written once, and never deleted.
+        a.submit("acme/app1#key", b"sealed".to_vec()).unwrap();
+        assert!(a.submit("acme/app1#key", b"another".to_vec()).unwrap_err().contains("written once"));
+        assert!(a.submit("acme/app1#key", vec![]).unwrap_err().contains("written once"));
+        assert_eq!(a.now().0.apps["acme/app1#key"], b"sealed", "submit returned, so the copy has it");
         let (sa, _) = a.now();
-        assert_eq!(sa.at, 250);
+        assert_eq!(sa.at, 251);
         // The snapshot and the trim run in the background: wait for them.
         assert!(eventually(10_000, || bucket.list("catalog/log/").unwrap().len() < 200), "the log was never trimmed: {} slots", bucket.list("catalog/log/").unwrap().len());
         assert!(bucket.get(catalog::SNAP_KEY).unwrap().is_some());

@@ -1081,7 +1081,7 @@ v0.1 runs.** Two finish lines.
 3. Durable Objects with their own storage, WebSockets, and the pool capped
    across the whole fleet (one manager, members near their callers).
 4. `callers` and `owners` enforced; `call` and `send` between processes.
-5. Secrets set with the CLI, encrypted in the bucket.
+5. Secrets set with the CLI, encrypted in the bucket. (Done 2026-10-15.)
 
 Waits until after v0.1: supervisors, user-written pool kinds, `enqueue`,
 per-PR environments, `fetch` beyond what the JS line needs.
@@ -1147,8 +1147,10 @@ it now (58.2 million states). **In the nodes (2026-10-15):** deploys and
 vars are on it, a deploy reaches every node in about 25 ms, and two
 racing deploys can't share a domain. Heartbeats are over the wire now (no
 per-node bucket writes), with a liveness check and a lost node in the
-simulator. Next: secrets on the catalog. ponytail: heartbeats go all to
-all; a leader or gossip if fleets get very large.
+simulator. Secrets are on it too, sealed (a data key per app under a
+master key file; write-only API; opened only in a node's memory). Next:
+upload batching. ponytail: heartbeats go all to all; a leader or gossip
+if fleets get very large.
 
 **The data path's cost, found while pricing this:** D3 uploads a busy
 object's writes as fast as the bucket answers (one upload in flight at a

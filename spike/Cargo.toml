@@ -40,6 +40,8 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 # The bucket client: SigV4 signing.
 sha2 = "0.10"
 hmac = "0.12"
+# Secrets: AES-256-GCM (rustls already brings it).
+ring = "0.17"
 wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
 # Random valid Wasm modules for differential fuzzing, the same wasm-tools
 # release as wasmparser.

@@ -147,29 +147,42 @@ pub fn vars(state: &State, org: &str, app: &str) -> BTreeMap<String, Json> {
     state.apps.get(&format!("{org}/{app}#vars")).and_then(|b| serde_json::from_slice(b).ok()).unwrap_or_default()
 }
 
-/// What a node has loaded, per app: (version, the vars as stored).
+/// What a node has loaded, per app: (version, its settings as stored).
 pub type Known = BTreeMap<(String, String), (String, Vec<u8>)>;
 
-/// One app to (re)load: its folder (unpacked in `cache`) and env values.
+/// One app to (re)load: its folder (unpacked in `cache`) and env values
+/// (or why they can't be had, such as a secret that won't open).
 pub struct Change {
     pub org: String,
     pub app: String,
     pub dir: PathBuf,
-    pub env: EnvValues,
+    pub env: Result<EnvValues, String>,
     pub version: String,
-    pub vars_raw: Vec<u8>,
+    pub raw: Vec<u8>,
+}
+
+/// An app's settings (vars, secrets, data key) as stored: a change to any
+/// of them reloads it.
+fn settings_raw(state: &State, org: &str, app: &str) -> Vec<u8> {
+    let p = format!("{org}/{app}#");
+    serde_json::to_vec(&state.apps.range(p.clone()..).take_while(|(k, _)| k.starts_with(&p)).collect::<Vec<_>>()).unwrap()
+}
+
+/// The app's env values: its vars, and its secrets opened.
+pub fn env(state: &State, master: Option<&crate::secrets::Key>, org: &str, app: &str) -> Result<EnvValues, String> {
+    Ok(EnvValues { vars: vars(state, org, app), secrets: crate::secrets::open_all(master, state, org, app)? })
 }
 
 /// Compare the catalog with what's `known`: the apps that are new or
-/// changed (their version or their vars), and the ones taken down.
-pub fn changes(state: &State, s3: &S3, cache: &Path, known: &Known) -> Result<(Vec<Change>, Vec<(String, String)>), String> {
+/// changed (their version or their settings), and the ones taken down.
+pub fn changes(state: &State, s3: &S3, cache: &Path, known: &Known, master: Option<&crate::secrets::Key>) -> Result<(Vec<Change>, Vec<(String, String)>), String> {
     let mut live_apps = vec![];
     let mut out = vec![];
     for k in state.apps.keys().filter(|k| !k.contains('#')) {
         let Some((org, app)) = k.split_once('/') else { continue };
         let Some(v) = live(state, org, app) else { continue };
         live_apps.push((org.to_string(), app.to_string()));
-        let raw = state.apps.get(&format!("{k}#vars")).cloned().unwrap_or_default();
+        let raw = settings_raw(state, org, app);
         if known.get(&(org.to_string(), app.to_string())) == Some(&(v.clone(), raw.clone())) {
             continue;
         }
@@ -177,8 +190,7 @@ pub fn changes(state: &State, s3: &S3, cache: &Path, known: &Known) -> Result<(V
         if !dir.join("modules").is_dir() {
             unpack(&get_version(s3, org, app, &v)?, &dir)?;
         }
-        let env = EnvValues { vars: vars(state, org, app), secrets: BTreeMap::new() };
-        out.push(Change { org: org.into(), app: app.into(), dir, env, version: v, vars_raw: raw });
+        out.push(Change { org: org.into(), app: app.into(), dir, env: env(state, master, org, app), version: v, raw });
     }
     let gone = known.keys().filter(|k| !live_apps.contains(k)).cloned().collect();
     Ok((out, gone))

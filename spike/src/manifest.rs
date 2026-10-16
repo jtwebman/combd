@@ -117,7 +117,7 @@ pub enum Seg {
 }
 
 /// One environment's values: vars by env var name, secrets by secret name.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct EnvValues {
     pub vars: BTreeMap<String, Json>,
     pub secrets: BTreeMap<String, String>,
@@ -592,6 +592,9 @@ fn spec(side: Side, key: &str, v: &Json) -> Result<(String, Spec), String> {
             s.default = Some(d.clone());
         }
     }
+    if s.secret.as_deref().is_some_and(|n| !crate::secrets::valid_name(n)) {
+        return Err("secret names are a-z, 0-9, -, _ and ., up to 128".into());
+    }
     for (k, b) in [("min", &s.min), ("max", &s.max)] {
         let Some(b) = b else { continue };
         let ok = match s.ty {
@@ -818,6 +821,24 @@ impl Manifest {
         };
         check_value(s, &v).map_err(|e| format!("{name}: {e}"))?;
         Ok(v)
+    }
+
+    /// Check a value for secret `name` (by the secret's name) against every
+    /// env var it's for, or with `None`, that none needs it. Errors never
+    /// show the value.
+    pub fn secret_value(&self, name: &str, v: Option<&str>) -> Result<(), String> {
+        let uses: Vec<(&String, &Spec)> = self.secrets.iter().filter(|(_, s)| s.secret.as_deref() == Some(name)).collect();
+        if uses.is_empty() {
+            return Err(format!("secret {name:?}: not declared in [secrets]"));
+        }
+        for (k, s) in uses {
+            match v {
+                Some(v) => check_value(s, &Json::String(v.into())).map_err(|_| format!("{k} (secret {name:?}): that isn't a valid {}", ty_name(&s.ty)))?,
+                None if !s.optional => return Err(format!("{k} needs secret {name:?}: deploy a version that doesn't first")),
+                None => {}
+            }
+        }
+        Ok(())
     }
 
     /// Resolve for one environment: its values checked against their types,
@@ -1207,7 +1228,7 @@ owners = ["pg-unused", "missing"]
         let d = dir(&[("combd.dev.yaml", "vars: { REGION: us-east }\nsecrets: { pg-url: \"postgres://x\" }\n")]);
         let e = load_dev(&d.0).unwrap();
         assert_eq!((e.vars["REGION"].as_str(), e.secrets["pg-url"].as_str()), (Some("us-east"), "postgres://x"));
-        assert!(load_dev(&dir(&[("combd.dev.toml", "[other]\n")]).0).unwrap_err().contains("only [vars] and [secrets]"));
+        assert!(load_dev(&dir(&[("combd.dev.toml", "[other]\n")]).0).err().unwrap().contains("only [vars] and [secrets]"));
     }
 
     #[test]

@@ -6,8 +6,9 @@
 //!
 //! What the catalog holds, for deploys: `<org>/<app>` is the app's live
 //! version and domains (`{"version", "domains"}`; empty when it's taken
-//! down), and `<org>/<app>#vars` its vars. The check run against the log's
-//! head: no two apps may hold one domain.
+//! down), `<org>/<app>#vars` its vars, and its secrets, sealed
+//! (`secrets.rs`). The check run against the log's head: no two apps may
+//! hold one domain.
 
 use crate::catalog::{decode, encode, encode_snap, decode_snap, Call, Catalog, Effect, Entry, Event, Res, Seq, State};
 use crate::kv::Store;
@@ -41,7 +42,12 @@ const BACKSTOP: Duration = Duration::from_secs(30);
 const SNAP_EVERY: u64 = 100;
 
 /// The check: an app's domains are free (another live app holds none).
+/// And an app's data key (`#key`, see `secrets.rs`) is written once: two
+/// nodes making one at once can't both win, and it's never deleted.
 pub fn check(s: &State, e: &Entry) -> Result<(), String> {
+    if e.app.ends_with("#key") && (e.value.is_empty() || s.apps.contains_key(&e.app)) {
+        return Err("the app's data key is written once".into());
+    }
     if e.app.contains('#') || e.value.is_empty() {
         return Ok(());
     }
@@ -82,6 +88,7 @@ impl CatNode {
         let mut waiting: Vec<(u64, Sender<Result<Seq, String>>)> = vec![];
         let mut fx = core.on(Event::Tick);
         loop {
+            let mut acks = vec![];
             for f in std::mem::take(&mut fx) {
                 match f {
                     Effect::Call { op, call } => {
@@ -105,11 +112,7 @@ impl CatNode {
                             }
                         }
                     }
-                    Effect::Ack { write, res } => {
-                        if let Some(i) = waiting.iter().position(|(w, _)| *w == write) {
-                            let _ = waiting.swap_remove(i).1.send(res);
-                        }
-                    }
+                    Effect::Ack { write, res } => acks.push((write, res)),
                 }
             }
             // The copy moved: keep it on disk, and tell whoever waits.
@@ -124,6 +127,12 @@ impl CatNode {
                 if !st.2 && !core.busy() {
                     st.2 = true;
                     self.changed.notify_all();
+                }
+            }
+            // Acks after the copy moves: once `submit` returns, `now` has it.
+            for (write, res) in acks {
+                if let Some(i) = waiting.iter().position(|(w, _)| *w == write) {
+                    let _ = waiting.swap_remove(i).1.send(res);
                 }
             }
             // A long log since the last snapshot: snapshot and trim it.

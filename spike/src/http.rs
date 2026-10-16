@@ -119,6 +119,9 @@ pub struct Config {
     pub public: BTreeMap<u32, String>,
     /// Fleet mode: this node's catalog (pushes reach it over the wire).
     pub catalog: Option<Arc<crate::catnode::CatNode>>,
+    /// Fleet mode: the master key's file (`COMBD_MASTER_KEY_FILE`), which
+    /// opens the apps' secrets. Every node needs the same one.
+    pub master_key: Option<PathBuf>,
 }
 
 impl Config {
@@ -136,6 +139,7 @@ impl Config {
             ev_max: num("COMBD_EV_MAX", 32).max(1),
             environ: Arc::default(),
             catalog: None,
+            master_key: std::env::var("COMBD_MASTER_KEY_FILE").ok().map(PathBuf::from),
             public: std::env::var("COMBD_PUBLIC_URLS").unwrap_or_default().split(',').filter_map(|kv| kv.split_once('=')).filter_map(|(n, u)| Some((n.trim().parse().ok()?, u.trim().to_string()))).collect(),
         }
     }
@@ -640,8 +644,6 @@ where
     }
 }
 
-/// A node serving the apps deployed to its fleet's bucket: it loads them
-/// all, then every `SYNC` swaps in whatever changed. Deploys come in through
 /// A node serving the apps deployed to its fleet: the catalog says which
 /// version of each is live (and its vars), and whenever this node's copy of
 /// the catalog moves, it swaps in what changed. Deploys come in through
@@ -663,10 +665,12 @@ where
     if !cat.ready(Duration::from_secs(60)) {
         return Err("the catalog didn't catch up within 60 s: is the bucket reachable?".into());
     }
+    let master = cfg.master_key.as_deref().map(crate::secrets::Key::load).transpose()?;
+    let master = master.as_ref();
     let cache = cfg.data.join("apps");
     let mut known = crate::deploy::Known::new();
     let (state, mut gen) = cat.now();
-    let first = sync_apps(eng, &s3, &cache, &mut known, &App::empty(), &state)?;
+    let first = sync_apps(eng, &s3, &cache, &mut known, &App::empty(), &state, master)?;
     let live = Live::new(first.unwrap_or_else(App::empty));
     let scratch = cfg.data.join("scratch");
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
@@ -676,7 +680,7 @@ where
             let (s3, stop, cat) = (&s3, cfg.stop.clone(), cat.clone());
             let scratch = scratch.clone();
             sc.spawn(move || {
-                let api = NodeApi { eng, live, s3, cat, scratch };
+                let api = NodeApi { eng, live, s3, cat, scratch, master };
                 if let Err(e) = crate::admin::serve(admin, &api, &stop) {
                     eprintln!("combd     the admin API stopped: {e}");
                 }
@@ -692,7 +696,7 @@ where
                     continue;
                 }
                 gen = g;
-                match sync_apps(eng, &s3, &cache, &mut known, &live.now(), &state) {
+                match sync_apps(eng, &s3, &cache, &mut known, &live.now(), &state, master) {
                     Ok(Some(next)) => live.swap(next),
                     Ok(None) => {}
                     Err(e) => eprintln!("combd     deploys: {e} (still serving what's loaded)"),
@@ -711,6 +715,19 @@ struct NodeApi<'a, E: Engine> {
     s3: &'a crate::s3::S3,
     cat: Arc<crate::catnode::CatNode>,
     scratch: std::path::PathBuf,
+    master: Option<&'a crate::secrets::Key>,
+}
+
+impl<E: Engine> NodeApi<'_, E> {
+    /// The live version's manifest, if one is live.
+    fn manifest(&self, state: &crate::catalog::State, org: &str, app: &str) -> Result<Option<crate::manifest::Manifest>, String> {
+        let Some(v) = crate::deploy::live(state, org, app) else { return Ok(None) };
+        let dir = self.scratch.join(format!("m-{org}-{app}-{v}"));
+        crate::deploy::unpack(&crate::deploy::get_version(self.s3, org, app, &v)?, &dir)?;
+        let m = crate::manifest::load(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        m
+    }
 }
 
 impl<E: Engine + Sync> crate::admin::Api for NodeApi<'_, E>
@@ -718,7 +735,7 @@ where
     E::Program: Sync + Send,
 {
     fn deploy(&self, org: &str, app: &str, bundle: &[u8]) -> Result<String, String> {
-        deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, org, app, bundle)
+        deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, self.master, org, app, bundle)
     }
 
     fn current(&self, org: &str, app: &str) -> Result<Option<String>, String> {
@@ -728,7 +745,7 @@ where
     /// An earlier version, checked again (vars may have changed since).
     fn rollback(&self, org: &str, app: &str, version: &str) -> Result<(), String> {
         let b = crate::deploy::get_version(self.s3, org, app, version)?;
-        deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, org, app, &b).map(|_| ())
+        deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, self.master, org, app, &b).map(|_| ())
     }
 
     fn remove(&self, org: &str, app: &str) -> Result<(), String> {
@@ -739,16 +756,7 @@ where
     /// checked against its declared type, so a bad value never reaches it.
     fn set_vars(&self, org: &str, app: &str, set: std::collections::BTreeMap<String, serde_json::Value>) -> Result<(), String> {
         let state = self.cat.now().0;
-        let manifest = match crate::deploy::live(&state, org, app) {
-            Some(v) => {
-                let dir = self.scratch.join(format!("vars-{org}-{app}-{v}"));
-                crate::deploy::unpack(&crate::deploy::get_version(self.s3, org, app, &v)?, &dir)?;
-                let m = crate::manifest::load(&dir);
-                let _ = std::fs::remove_dir_all(&dir);
-                m?
-            }
-            None => None,
-        };
+        let manifest = self.manifest(&state, org, app)?;
         // ponytail: two vars changes at once on two nodes: the later one
         // wins whole (each writes the full set). Merge in the core if needed.
         let mut vars = crate::deploy::vars(&state, org, app);
@@ -765,11 +773,43 @@ where
         }
         self.cat.submit(&format!("{org}/{app}#vars"), serde_json::to_vec(&vars).unwrap()).map(|_| ())
     }
+
+    /// Set (or, with `None`, delete) a secret, sealed before it's written.
+    /// With a version live, it must be declared and valid for its type, and
+    /// one it requires can't be deleted.
+    fn set_secret(&self, org: &str, app: &str, name: &str, value: Option<&[u8]>) -> Result<(), String> {
+        use crate::secrets::{key_entry, new_key, open_key, seal, secret_entry, valid_name, MAX_VALUE};
+        if !valid_name(name) {
+            return Err("secret names are a-z, 0-9, -, _ and ., up to 128".into());
+        }
+        let master = self.master.ok_or("this node has no master key (COMBD_MASTER_KEY_FILE), so it can't take secrets")?;
+        let value = value.map(|v| std::str::from_utf8(v).map_err(|_| "a secret is text (UTF-8)")).transpose()?;
+        if value.is_some_and(|v| v.len() > MAX_VALUE) {
+            return Err(format!("a secret is at most {MAX_VALUE} bytes"));
+        }
+        let state = self.cat.now().0;
+        if let Some(m) = self.manifest(&state, org, app)? {
+            m.secret_value(name, value)?;
+        }
+        let Some(value) = value else { return self.cat.submit(&secret_entry(org, app, name), vec![]).map(|_| ()) };
+        let key = match open_key(master, &state, org, app)? {
+            Some(k) => k,
+            None => {
+                let (k, sealed) = new_key(master, org, app);
+                match self.cat.submit(&key_entry(org, app), sealed) {
+                    Ok(_) => k,
+                    // Another node made it first: use theirs.
+                    Err(_) => open_key(master, &self.cat.now().0, org, app)?.ok_or("couldn't make the app's data key: try again")?,
+                }
+            }
+        };
+        self.cat.submit(&secret_entry(org, app, name), seal(&key, org, app, name, value)).map(|_| ())
+    }
 }
 
 /// What changed in the catalog since `known`, as a new app (`None`: nothing).
-fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, known: &mut crate::deploy::Known, now: &App<E::Program>, state: &crate::catalog::State) -> Result<Option<App<E::Program>>, String> {
-    let (changes, gone) = crate::deploy::changes(state, s3, cache, known)?;
+fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, known: &mut crate::deploy::Known, now: &App<E::Program>, state: &crate::catalog::State, master: Option<&crate::secrets::Key>) -> Result<Option<App<E::Program>>, String> {
+    let (changes, gone) = crate::deploy::changes(state, s3, cache, known, master)?;
     if changes.is_empty() && gone.is_empty() {
         return Ok(None);
     }
@@ -781,7 +821,7 @@ fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, kn
     }
     let (mut errs, mut applied) = (vec![], !gone.is_empty());
     for c in &changes {
-        let one = load_one(&c.dir, &c.env).and_then(|(m, r)| {
+        let one = c.env.as_ref().map_err(|e| e.clone()).and_then(|env| load_one(&c.dir, env)).and_then(|(m, r)| {
             if m.app != c.app {
                 return Err(format!("its manifest says it's {:?}", m.app));
             }
@@ -792,7 +832,7 @@ fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, kn
             Ok(n) => {
                 next = n;
                 applied = true;
-                known.insert((c.org.clone(), c.app.clone()), (c.version.clone(), c.vars_raw.clone()));
+                known.insert((c.org.clone(), c.app.clone()), (c.version.clone(), c.raw.clone()));
             }
             Err(e) => errs.push(format!("{}/{}: {e}", c.org, c.app)),
         }
@@ -818,7 +858,7 @@ fn load_one(dir: &std::path::Path, env: &crate::manifest::EnvValues) -> Result<(
 /// its write checks the domains again, against the log's head, so two
 /// deploys on two nodes can never both claim one. Every node picks it up.
 #[allow(clippy::too_many_arguments)]
-pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::catnode::CatNode, s3: &crate::s3::S3, scratch: &std::path::Path, org: &str, app: &str, bundle: &[u8]) -> Result<String, String> {
+pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::catnode::CatNode, s3: &crate::s3::S3, scratch: &std::path::Path, master: Option<&crate::secrets::Key>, org: &str, app: &str, bundle: &[u8]) -> Result<String, String> {
     let ident = |s: &str| !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
     if !ident(org) || !ident(app) {
         return Err("org and app: lowercase letters, digits, - and _".into());
@@ -827,8 +867,7 @@ pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::c
     let dir = scratch.join(format!("{org}-{app}-{v}"));
     crate::deploy::unpack(bundle, &dir)?;
     let checked = (|| {
-        let env = crate::manifest::EnvValues { vars: crate::deploy::vars(&cat.now().0, org, app), secrets: Default::default() };
-        let (m, r) = load_one(&dir, &env)?;
+        let (m, r) = load_one(&dir, &crate::deploy::env(&cat.now().0, master, org, app)?)?;
         if m.app != app {
             return Err(format!("its manifest says it's {:?}, not {app:?}", m.app));
         }

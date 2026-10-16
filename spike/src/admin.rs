@@ -14,7 +14,11 @@
 //! POST   /v1/apps/<org>/<app>/rollback  {"version"}: make an earlier one live
 //! DELETE /v1/apps/<org>/<app>           take it down
 //! PUT    /v1/apps/<org>/<app>/vars      {"NAME": value, ...}: set vars
+//! PUT    /v1/apps/<org>/<app>/secrets/<name>   the value (the body): set it
+//! DELETE /v1/apps/<org>/<app>/secrets/<name>   delete it
 //! ```
+//!
+//! Secrets are write-only: nothing reads one back.
 
 use serde_json::{json, Value as Json};
 use std::collections::BTreeMap;
@@ -107,6 +111,8 @@ pub trait Api: Sync {
     fn rollback(&self, org: &str, app: &str, version: &str) -> Result<(), String>;
     fn remove(&self, org: &str, app: &str) -> Result<(), String>;
     fn set_vars(&self, org: &str, app: &str, vars: BTreeMap<String, Json>) -> Result<(), String>;
+    /// `None`: delete it.
+    fn set_secret(&self, org: &str, app: &str, name: &str, value: Option<&[u8]>) -> Result<(), String>;
 }
 
 /// Serve the admin API (blocking: a thread per connection; it's for
@@ -233,6 +239,7 @@ fn endpoint<'a>(method: &str, path: &'a str) -> Option<(&'a str, &'a str, Vec<&'
     let action = match (method, rest.as_slice()) {
         ("GET", []) => "read",
         ("PUT", ["vars"]) => "vars",
+        ("PUT", ["secrets", _]) | ("DELETE", ["secrets", _]) => "secrets",
         ("PUT", []) | ("DELETE", []) | ("POST", ["rollback"]) => "deploy",
         _ => return None,
     };
@@ -259,6 +266,8 @@ fn run(api: &dyn Api, method: &str, path: &str, body: &[u8]) -> (u16, Json) {
             None => Err("want {\"version\": \"...\"}".into()),
         },
         ("DELETE", []) => api.remove(org, app).map(|()| json!({ "removed": true })),
+        ("PUT", ["secrets", name]) => api.set_secret(org, app, name, Some(body)).map(|()| json!({ "ok": true })),
+        ("DELETE", ["secrets", name]) => api.set_secret(org, app, name, None).map(|()| json!({ "ok": true })),
         _ => match serde_json::from_slice::<BTreeMap<String, Json>>(body) {
             Ok(vars) => api.set_vars(org, app, vars).map(|()| json!({ "ok": true })),
             Err(_) => Err("want {\"NAME\": value, ...}".into()),
