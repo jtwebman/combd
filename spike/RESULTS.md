@@ -1470,6 +1470,24 @@ takeovers a run, from over 1), so the bug that needs a takeover while a
 peer's disk is gone (`wipe_forgets_fence`) takes about 7,000 seeds to show
 instead of under 5,000. Its test searches up to 20,000.
 
+**Real nodes** (`bench/cluster`, three Docker nodes and a bucket, 32
+clients on 50 objects, 15 s each; `ENGINE` now picks the engine, `interp`
+here): every run kept `acknowledged <= count <= acknowledged + failed` for
+every object.
+
+| run | writes/s | failed | longest failure stretch |
+|---|---|---|---|
+| steady | 2,950 | 0 | 0 ms |
+| SIGKILL a node, back at 8 s | 1,962 | 1,655 | 2,743 ms |
+| freeze a node 4 s | 1,893 | 34 | 0 ms |
+| SIGKILL and lose its disk | 1,509 | 1,907 | 2,351 ms |
+| cut from the bucket 4 s | 2,194 | 747 | 373 ms |
+| cut from the wire 4 s | 1,197 | 327 | 237 ms |
+| cut from both 4 s | 1,393 | 233 | 346 ms |
+
+A killed node's objects move in under three seconds, a lease and a bit,
+with nothing in the bucket telling anyone it died.
+
 ## The catalog in the nodes: deploys and vars
 
 Every fleet node runs the catalog (`spike/src/catnode.rs`): a thread around
