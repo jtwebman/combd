@@ -1175,6 +1175,33 @@ startup storage test runs against any backend, so a store that can't
 really do compare-and-swap is never used. The catalog code is built on
 this from the start; the bucket code moves behind it then.
 
+## Maybe later: realtime objects (guaranteed ticks)
+
+combd is fair, not realtime: every request gets a slice (about 50 us) in
+turn, so a due tick waits behind whatever is runnable on its loop (100
+ahead is about 5 ms). The arena's run on a shared laptop: 1.4% of ticks
+more than 75 ms apart, worst gap 271 ms (most likely the OS pausing us
+under a load average near 10, not our scheduler, which would need about
+5,000 runnable requests ahead; not yet proven: measure on a quiet Linux
+box).
+
+Compiling without yields wouldn't fix it: it only shortens the tick's own
+run (already microseconds), and a neighbor that never yields could hold
+the loop, and the tick, without limit. Preemption is what caps a
+neighbor's delay. If guaranteed ticks are ever wanted, a realtime class:
+- `realtime = true` and `tick_budget_ms` on a process in the manifest;
+- its objects on their own event loop, pinned to a reserved core (Linux:
+  an isolated CPU, maybe `SCHED_FIFO`), never sharing a run queue with
+  ordinary requests or other tenants;
+- due ticks checked between every slice, not once a round, and first;
+- a budget instead of "no yields": a tick past its budget is cut off and
+  its object demoted, so a buggy game can't take the core;
+- AOT for speed (15 to 39x the interpreter), which needs compile-on-deploy
+  first (today only modules built into the binary run compiled).
+
+On a quiet Linux box that typically holds jitter well under 1 ms. Not
+needed for the arena, which says plainly it isn't a game engine.
+
 ## Build order (when we do build)
 
 0. **DONE 2026-10-13. Spike: the engine race.** Results in
