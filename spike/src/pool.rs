@@ -14,6 +14,9 @@ use std::collections::{HashMap, VecDeque};
 
 pub type Node = u64;
 
+/// How long a member's news may take to reach the manager (`report`).
+const GRACE: u64 = 2000;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cfg {
     pub max: usize,
@@ -122,6 +125,28 @@ impl Core {
         if let Some(m) = self.members.get_mut(&member).filter(|m| m.st == St::Busy) {
             m.st = St::Resetting;
         }
+    }
+
+    /// What a node says its members are (`busy` or not), once a second: the
+    /// books catch up with lost messages. A member it lists that isn't
+    /// known stops; a known one it doesn't list is gone; one busy here but
+    /// free there is free. Changes younger than `GRACE` are left alone: their
+    /// news may still be on its way.
+    pub fn report(&mut self, now: u64, node: Node, members: &[(u64, bool)]) -> Vec<Out> {
+        let mut out = vec![];
+        for &(id, busy) in members {
+            match self.members.get_mut(&id) {
+                None => out.push(Out::Stop { member: id }),
+                Some(m) if !busy && matches!(m.st, St::Busy | St::Resetting) && now >= m.since + GRACE => {
+                    m.st = St::Free;
+                    m.since = now;
+                }
+                _ => {}
+            }
+        }
+        self.members.retain(|id, m| m.node != node || now < m.since + GRACE || members.iter().any(|x| x.0 == *id));
+        out.extend(self.pump(now));
+        out
     }
 
     pub fn gone(&mut self, now: u64, member: u64) -> Vec<Out> {
@@ -242,6 +267,25 @@ mod tests {
         assert_eq!(p.live(), 0);
         assert!(p.tick(500).is_empty());
         assert_eq!(p.tick(1005), vec![Out::Start { ask: 1, member: 2, node: 0 }]);
+    }
+
+    #[test]
+    fn reports_fix_the_books() {
+        let mut p = Core::new(Cfg { max: 3, ..CFG });
+        p.ask(0, 1, 10, vec![]);
+        p.ask(0, 2, 10, vec![]);
+        p.started(0, 1, true, false);
+        p.started(0, 2, true, false);
+        // Fresh news is left alone.
+        assert!(p.report(500, 10, &[(1, false)]).is_empty());
+        assert_eq!(p.live(), 2);
+        // Later: member 1's "free" was lost, and member 2 is gone.
+        assert!(p.report(3000, 10, &[(1, false)]).is_empty());
+        assert_eq!(p.live(), 1);
+        assert_eq!(p.ask(3000, 3, 10, vec![]), vec![Out::Grant { ask: 3, member: 1 }]);
+        // Another node's members aren't touched; a stranger stops.
+        assert_eq!(p.report(3000, 20, &[(99, false)]), vec![Out::Stop { member: 99 }]);
+        assert_eq!(p.live(), 1);
     }
 
     #[test]

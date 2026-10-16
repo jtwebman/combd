@@ -1,8 +1,21 @@
 //! Bring your own database: Postgres, through a pool the host runs.
 //!
-//! Each binding (`COMBD_PG_<NAME>=postgres://...`) is a pool (`pool.rs`
-//! decides). A **member** is one connection on its own thread. A cell never
-//! holds a socket or a password; it asks the pool for a **lease** on a member.
+//! Each pool in the manifest is one for the whole fleet: one **manager**
+//! keeps the books (`pool.rs` decides), so the database never sees more than
+//! `max` connections however many nodes there are. A **member** is one
+//! connection on its own thread, started on the node of the caller who
+//! asked. A cell never holds a socket or a password; it asks the pool for a
+//! **lease** on a member.
+//! - Every node runs an agent per pool: it sends asks to the manager, runs
+//!   its members, and serves other nodes' calls on them. At max, a free
+//!   member on the nearest node is leased, and its calls go over the wire.
+//! - The catalog names the manager (`<org>/<app>#pool/<pool>`: node and
+//!   epoch). A claim is "epoch e + 1, if it's still e", so one node wins. A
+//!   node claims when there's none, or the manager's node is quiet for a
+//!   lease. Members of an older epoch finish their lease and stop
+//!   (`on_manager_loss = "finish"`) or stop now (`"stop"`).
+//! - Once a second each node tells the manager what its members are doing,
+//!   so a lost message can't leak a member.
 //! - The pool starts a member when it's asked and none is free, up to `max`.
 //!   At max, an ask waits in line, and fails after `wait_ms`.
 //! - A lease is the member's alone: everything session-scoped works on it
@@ -25,8 +38,12 @@ use postgres::error::SqlState;
 use postgres::types::{ToSql, Type};
 use postgres::{Client, Config, NoTls};
 use serde_json::{json, Value as Json};
+use crate::fleet::Frame;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The biggest answer a cell can get back (as its SQLite's).
@@ -58,13 +75,16 @@ pub struct PoolCfg {
     pub connect_timeout_ms: u64,
     /// Connect attempts after the first, with backoff.
     pub retries: u32,
+    /// When the manager changes, older members stop now (`stop`), not once
+    /// their lease is done (`finish`).
+    pub on_manager_loss_stop: bool,
 }
 
 impl PoolCfg {
     /// The manifest's defaults, for tests.
     #[cfg(test)]
     pub fn new(name: &str, url: &str) -> PoolCfg {
-        PoolCfg { name: name.into(), url: url.into(), max: 8, wait_ms: 5000, lease_ms: 60_000, idle_ms: 60_000, session_idle_ms: 60_000, statement_timeout_ms: 5000, connect_timeout_ms: 5000, retries: 3 }
+        PoolCfg { name: name.into(), url: url.into(), max: 8, wait_ms: 5000, lease_ms: 60_000, idle_ms: 60_000, session_idle_ms: 60_000, statement_timeout_ms: 5000, connect_timeout_ms: 5000, retries: 3, on_manager_loss_stop: false }
     }
 }
 
@@ -91,6 +111,7 @@ impl PgCfg {
                     statement_timeout_ms: n(&m["statement_timeout_ms"]),
                     connect_timeout_ms: n(&m["connection.timeout_ms"]),
                     retries: n(&m["connection.retries"]) as u32,
+                    on_manager_loss_stop: p["on_manager_loss"].as_str() == Some("stop"),
                 })
             })
             .collect();
@@ -100,25 +121,57 @@ impl PgCfg {
 
 /// A member, leased: calls on it are checked against the lease id, so a
 /// holder whose lease ran out (or was released) can't reach the next one's.
+/// The member may be on this node, or on another (at max, the nearest free
+/// one is reused): then each call goes over the wire.
 #[derive(Clone)]
 pub struct Lease {
     id: u64,
-    member: Sender<Job>,
+    to: To,
     /// Its pool's `session_idle_ms`.
     pub session_idle: Duration,
 }
 
+#[derive(Clone)]
+enum To {
+    Here(Sender<Job>),
+    There { agent: Sender<Msg>, node: u32, key: Key },
+}
+
+fn lost() -> Vec<u8> {
+    json!({ "error": "the database session was lost" }).to_string().into_bytes()
+}
+
 impl Lease {
     pub fn query(&self, req: Vec<u8>, reply: Reply) {
+        self.run(req, reply, false);
+    }
+
+    fn run(&self, req: Vec<u8>, reply: Reply, release: bool) {
         // A member that's gone can't answer: say so, or the caller waits forever.
-        if let Err(std::sync::mpsc::SendError(Job::Query { reply, .. })) = self.member.send(Job::Query { lease: self.id, req, reply, release: false }) {
-            reply(json!({ "error": "the database session was lost" }).to_string().into_bytes());
+        match &self.to {
+            To::Here(m) => {
+                if let Err(std::sync::mpsc::SendError(Job::Query { reply, .. })) = m.send(Job::Query { lease: self.id, req, reply, release }) {
+                    reply(lost());
+                }
+            }
+            To::There { agent, node, key } => {
+                if let Err(std::sync::mpsc::SendError(Msg::RemoteQuery { reply, .. })) = agent.send(Msg::RemoteQuery { node: *node, key: *key, lease: self.id, req, reply, release }) {
+                    reply(lost());
+                }
+            }
         }
     }
 
     /// Done with it: the member resets and goes back to the pool.
     pub fn release(&self) {
-        let _ = self.member.send(Job::Release(self.id));
+        match &self.to {
+            To::Here(m) => {
+                let _ = m.send(Job::Release(self.id));
+            }
+            To::There { agent, node, key } => {
+                let _ = agent.send(Msg::RemoteRelease { node: *node, key: *key, lease: self.id });
+            }
+        }
     }
 }
 
@@ -129,31 +182,95 @@ enum Job {
     Stop,
 }
 
-/// What the pool's thread hears.
+/// A member: (its manager's epoch, its id there).
+type Key = (u32, u64);
+
+/// What a pool's agent hears.
 enum Msg {
     Ask(LeaseReply),
-    Started(u64, Result<(), bool>),
-    Resetting(u64),
-    Free(u64),
-    Gone(u64),
+    /// From its own members.
+    Started(Key, Result<(), bool>),
+    Resetting(Key),
+    Free(Key),
+    Gone(Key),
+    /// From another node (or itself).
+    Net(Env),
+    /// A call on a lease of another node's member.
+    RemoteQuery { node: u32, key: Key, lease: u64, req: Vec<u8>, reply: Reply, release: bool },
+    RemoteRelease { node: u32, key: Key, lease: u64 },
+    /// A claim on the manager's epoch went in, or didn't.
+    Claimed(u32, bool),
+    /// A deploy replaced this pool: let its members finish, then go.
+    Retire,
 }
 
-/// Every binding's pool, shared by a node's event loops.
+/// A message between two nodes' agents of one pool, over the wire.
+#[derive(Serialize, Deserialize)]
+struct Env {
+    pool: String,
+    /// The manager's epoch it's about (a member's, for member calls).
+    epoch: u32,
+    from: u32,
+    #[serde(flatten)]
+    m: Net,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+enum Net {
+    // To the manager.
+    Ask { ask: u64, near: Vec<(u32, u64)> },
+    Started { member: u64, ok: bool, full: bool },
+    Resetting { member: u64 },
+    Free { member: u64 },
+    Gone { member: u64 },
+    /// Once a second: this node's members, and which are busy.
+    Report { members: Vec<(u64, bool)> },
+    // From the manager.
+    Start { ask: u64, member: u64, lease: u64 },
+    /// To a free member's node: lease it, then tell the asker.
+    Grant { ask: u64, asker: u32, member: u64, lease: u64 },
+    Fail { ask: u64 },
+    Stop { member: u64 },
+    // Between the asker's node and the member's.
+    Granted { ask: u64, member: u64, lease: u64 },
+    Query { member: u64, lease: u64, id: u64, req: String, release: bool },
+    Answer { id: u64, body: String },
+    Release { member: u64, lease: u64 },
+}
+
+/// This node in a fleet, for its pools: who it is, the wire to the others,
+/// and the catalog, which names each pool's manager.
+pub struct PoolFleet {
+    pub me: u32,
+    pub wire: crate::wire::Wire,
+    pub cat: Arc<crate::catnode::CatNode>,
+    /// When each node was last heard from (its heartbeats).
+    pub heard: Arc<Mutex<HashMap<u32, (u64, Instant)>>>,
+    pub lease_ms: u64,
+}
+
 /// Every pool on this node, by name. A deploy can add pools (`ensure`).
 pub struct Pools {
-    pools: std::sync::Mutex<HashMap<String, (PoolCfg, Sender<Msg>)>>,
+    pools: Mutex<HashMap<String, (PoolCfg, Sender<Msg>)>>,
+    fleet: Option<Arc<PoolFleet>>,
+    stop: Arc<AtomicBool>,
+    /// Round trips (ms) from here to other nodes, for picking the nearest.
+    pub rtt: Arc<Mutex<HashMap<u32, u64>>>,
 }
 
 impl Pools {
-    pub fn start(cfg: &PgCfg) -> Pools {
-        let p = Pools { pools: std::sync::Mutex::new(HashMap::new()) };
+    /// With `fleet`, each pool is one for the whole fleet (one manager, its
+    /// members on every node); without, one on this node.
+    pub fn start(cfg: &PgCfg, fleet: Option<PoolFleet>, stop: Arc<AtomicBool>) -> Pools {
+        let p = Pools { pools: Mutex::new(HashMap::new()), fleet: fleet.map(Arc::new), stop, rtt: Arc::default() };
         p.ensure(&cfg.pools);
         p
     }
 
     /// Start every pool in `cfgs` that isn't running, or runs with other
-    /// settings (a deploy changed them: the new one takes the name, the old
-    /// one's leases run out). ponytail: a replaced pool's thread stays.
+    /// settings (a deploy changed them: the new one takes the name, and the
+    /// old one's members finish their leases and stop).
     pub fn ensure(&self, cfgs: &[PoolCfg]) {
         let mut pools = self.pools.lock().unwrap();
         for p in cfgs {
@@ -174,11 +291,15 @@ impl Pools {
             pg.options(&format!("-c statement_timeout={} -c idle_in_transaction_session_timeout={}", p.statement_timeout_ms, p.lease_ms + 5000));
             pg.connect_timeout(Duration::from_millis(p.connect_timeout_ms));
             pg.keepalives(true).keepalives_idle(Duration::from_secs(10));
-            pg.application_name("combd");
+            if pg.get_application_name().is_none() {
+                pg.application_name("combd");
+            }
             let (tx, rx) = channel();
-            let (me, c) = (tx.clone(), p.clone());
-            std::thread::spawn(move || run_pool(pg, c, rx, me));
-            pools.insert(p.name.clone(), (p.clone(), tx));
+            let agent = Agent::new(p.clone(), pg, self.fleet.clone(), tx.clone(), self.stop.clone(), self.rtt.clone());
+            std::thread::spawn(move || agent.run(rx));
+            if let Some((_, old)) = pools.insert(p.name.clone(), (p.clone(), tx)) {
+                let _ = old.send(Msg::Retire);
+            }
         }
     }
 
@@ -191,11 +312,7 @@ impl Pools {
         self.lease(
             binding,
             Box::new(move |l| match l {
-                Ok(l) => {
-                    if let Err(std::sync::mpsc::SendError(Job::Query { reply, .. })) = l.member.send(Job::Query { lease: l.id, req, reply, release: true }) {
-                        reply(json!({ "error": "the database session was lost" }).to_string().into_bytes());
-                    }
-                }
+                Ok(l) => l.run(req, reply, true),
                 Err(e) => reply(json!({ "error": e }).to_string().into_bytes()),
             }),
         );
@@ -211,94 +328,500 @@ impl Pools {
             None => reply(Err(format!("no database binding {binding:?}"))),
         }
     }
+
+    /// A pool message from another node.
+    pub fn deliver(&self, body: &[u8]) {
+        let Ok(env) = serde_json::from_slice::<Env>(body) else { return };
+        if let Some((_, tx)) = self.pools.lock().unwrap().get(&env.pool) {
+            let _ = tx.send(Msg::Net(env));
+        }
+    }
 }
 
-/// The pool's thread: `pool::Core` decides, this does what it says.
-fn run_pool(pg: Config, cfg: PoolCfg, rx: Receiver<Msg>, me: Sender<Msg>) {
-    let session_idle = Duration::from_millis(cfg.session_idle_ms);
-    let mut core = pool::Core::new(pool::Cfg { max: cfg.max, idle_ms: cfg.idle_ms, wait_ms: cfg.wait_ms });
-    let t0 = Instant::now();
-    let now = || t0.elapsed().as_millis() as u64;
-    let (mut asks, mut next_ask, mut next_lease) = (HashMap::<u64, LeaseReply>::new(), 0u64, 0u64);
-    let mut members: HashMap<u64, Sender<Job>> = HashMap::new();
-    // Members starting: (their ask, their first lease).
-    let mut starting: HashMap<u64, (u64, u64)> = HashMap::new();
-    loop {
-        let outs = match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(Msg::Ask(reply)) => {
-                next_ask += 1;
-                asks.insert(next_ask, reply);
-                core.ask(now(), next_ask, 0, vec![])
+/// The catalog entry naming a pool's manager: `<org>/<app>#pool/<pool>`.
+fn cat_key(pool: &str) -> String {
+    match pool.rsplit_once('/') {
+        Some((app, p)) => format!("{app}#pool/{p}"),
+        None => format!("{pool}#pool/"),
+    }
+}
+
+/// A manager's epoch for the catalog's check: (node, epoch).
+pub fn manager_of(v: &[u8]) -> Option<(u32, u32)> {
+    let v: Json = serde_json::from_slice(v).ok()?;
+    Some((v["node"].as_u64()? as u32, v["epoch"].as_u64()? as u32))
+}
+
+/// The pool's books, on the node that manages it: `pool::Core` decides,
+/// this turns its answers into messages.
+struct Manager {
+    epoch: u32,
+    core: pool::Core,
+    /// The core's asks: (the asker's node, its own ask id).
+    asks: HashMap<u64, (u32, u64)>,
+    /// Members starting, and the core ask each is for.
+    starts: HashMap<u64, u64>,
+    next_ask: u64,
+    next_lease: u64,
+    /// Each member's node.
+    nodes: HashMap<u64, u32>,
+}
+
+impl Manager {
+    fn new(epoch: u32, cfg: &PoolCfg) -> Manager {
+        let core = pool::Core::new(pool::Cfg { max: cfg.max, idle_ms: cfg.idle_ms, wait_ms: cfg.wait_ms });
+        Manager { epoch, core, asks: HashMap::new(), starts: HashMap::new(), next_ask: 0, next_lease: 0, nodes: HashMap::new() }
+    }
+
+    fn on(&mut self, now: u64, from: u32, m: Net) -> Vec<(u32, Net)> {
+        let outs = match m {
+            Net::Ask { ask, near } => {
+                self.next_ask += 1;
+                self.asks.insert(self.next_ask, (from, ask));
+                self.core.ask(now, self.next_ask, from as u64, near.into_iter().map(|(n, ms)| (n as u64, ms)).collect())
             }
-            Ok(Msg::Started(m, r)) => {
-                let (ask, lease) = starting.remove(&m).unwrap_or_default();
-                match r {
-                    Ok(()) => {
-                        if let Some(reply) = asks.remove(&ask) {
-                            reply(Ok(Lease { id: lease, member: members[&m].clone(), session_idle }));
-                        }
-                    }
-                    // Full: the core puts the ask back in line.
-                    Err(true) => {}
-                    Err(false) => {
-                        if let Some(reply) = asks.remove(&ask) {
-                            reply(Err("the database is unreachable".into()));
-                        }
-                    }
+            Net::Started { member, ok, full } => {
+                // Started, or failed for good: that ask is done. Full: it's
+                // back in line, under the same id.
+                if let Some(a) = self.starts.remove(&member).filter(|_| !full) {
+                    self.asks.remove(&a);
                 }
-                if r.is_err() {
-                    members.remove(&m);
+                if !ok {
+                    self.nodes.remove(&member);
                 }
-                core.started(now(), m, r.is_ok(), r == Err(true))
+                self.core.started(now, member, ok, full)
             }
-            Ok(Msg::Resetting(m)) => {
-                core.resetting(m);
+            Net::Resetting { member } => {
+                self.core.resetting(member);
                 vec![]
             }
-            Ok(Msg::Free(m)) => core.free(now(), m),
-            Ok(Msg::Gone(m)) => {
-                members.remove(&m);
-                core.gone(now(), m)
+            Net::Free { member } => self.core.free(now, member),
+            Net::Gone { member } => {
+                self.nodes.remove(&member);
+                self.core.gone(now, member)
             }
-            Err(RecvTimeoutError::Timeout) => core.tick(now()),
-            Err(RecvTimeoutError::Disconnected) => return,
+            Net::Report { members } => self.core.report(now, from as u64, &members),
+            _ => vec![],
         };
+        self.outs(outs, from)
+    }
+
+    fn outs(&mut self, outs: Vec<pool::Out>, from: u32) -> Vec<(u32, Net)> {
+        let mut sends = vec![];
         for o in outs {
             match o {
                 pool::Out::Grant { ask, member } => {
-                    next_lease += 1;
-                    let tx = members[&member].clone();
-                    let _ = tx.send(Job::Lease(next_lease));
-                    if let Some(r) = asks.remove(&ask) {
-                        r(Ok(Lease { id: next_lease, member: tx, session_idle }));
-                    }
+                    let (Some((asker, their)), Some(&node)) = (self.asks.remove(&ask), self.nodes.get(&member)) else { continue };
+                    self.next_lease += 1;
+                    sends.push((node, Net::Grant { ask: their, asker, member, lease: self.next_lease }));
                 }
-                pool::Out::Start { ask, member, .. } => {
-                    next_lease += 1;
-                    let (tx, jobs) = channel();
-                    members.insert(member, tx);
-                    starting.insert(member, (ask, next_lease));
-                    let (pg, me, lease_ms, lease, retries) = (pg.clone(), me.clone(), cfg.lease_ms, next_lease, cfg.retries);
-                    std::thread::spawn(move || run_member(member, pg, retries, lease, lease_ms, jobs, me));
+                pool::Out::Start { ask, member, node } => {
+                    let Some(&(_, their)) = self.asks.get(&ask) else { continue };
+                    self.next_lease += 1;
+                    self.nodes.insert(member, node as u32);
+                    self.starts.insert(member, ask);
+                    sends.push((node as u32, Net::Start { ask: their, member, lease: self.next_lease }));
                 }
                 pool::Out::Fail { ask } => {
-                    if let Some(r) = asks.remove(&ask) {
-                        r(Err("no database connection free in time".into()));
+                    if let Some((asker, their)) = self.asks.remove(&ask) {
+                        sends.push((asker, Net::Fail { ask: their }));
                     }
                 }
-                pool::Out::Stop { member } => {
-                    if let Some(tx) = members.get(&member) {
-                        let _ = tx.send(Job::Stop);
-                    }
+                pool::Out::Stop { member } => sends.push((self.nodes.get(&member).copied().unwrap_or(from), Net::Stop { member })),
+            }
+        }
+        sends
+    }
+}
+
+struct Mine {
+    tx: Sender<Job>,
+    busy: bool,
+}
+
+/// A pool's agent on one node: it runs this node's members, sends asks and
+/// member news to the manager, serves other nodes' calls on its members,
+/// and, if this node is the manager, runs the books too.
+struct Agent {
+    cfg: PoolCfg,
+    pg: Config,
+    fleet: Option<Arc<PoolFleet>>,
+    me: u32,
+    tx: Sender<Msg>,
+    stop: Arc<AtomicBool>,
+    rtt: Arc<Mutex<HashMap<u32, u64>>>,
+    t0: Instant,
+    /// The manager, as the catalog names it: (node, epoch).
+    mgr: Option<(u32, u32)>,
+    managing: Option<Manager>,
+    /// Epochs this process claimed (and so may manage).
+    claimed: std::collections::HashSet<u32>,
+    claiming: bool,
+    retiring: bool,
+    asks: HashMap<u64, (LeaseReply, Instant)>,
+    next_ask: u64,
+    members: HashMap<Key, Mine>,
+    /// Members starting: (their ask, their first lease).
+    starting: HashMap<Key, (u64, u64)>,
+    /// Calls out on other nodes' members.
+    queries: HashMap<u64, (Reply, Instant)>,
+    next_query: u64,
+    last_tick: Instant,
+    last_report: Instant,
+    local: std::collections::VecDeque<Env>,
+}
+
+impl Agent {
+    fn new(cfg: PoolCfg, pg: Config, fleet: Option<Arc<PoolFleet>>, tx: Sender<Msg>, stop: Arc<AtomicBool>, rtt: Arc<Mutex<HashMap<u32, u64>>>) -> Agent {
+        let me = fleet.as_ref().map_or(0, |f| f.me);
+        let mut a = Agent {
+            cfg,
+            pg,
+            fleet,
+            me,
+            tx,
+            stop,
+            rtt,
+            t0: Instant::now(),
+            mgr: None,
+            managing: None,
+            claimed: Default::default(),
+            claiming: false,
+            retiring: false,
+            asks: HashMap::new(),
+            next_ask: 0,
+            members: HashMap::new(),
+            starting: HashMap::new(),
+            queries: HashMap::new(),
+            next_query: 0,
+            last_tick: Instant::now(),
+            last_report: Instant::now(),
+            local: Default::default(),
+        };
+        // On its own, this node manages its pools.
+        if a.fleet.is_none() {
+            a.mgr = Some((0, 1));
+            a.managing = Some(Manager::new(1, &a.cfg));
+        }
+        a
+    }
+
+    fn now(&self) -> u64 {
+        self.t0.elapsed().as_millis() as u64
+    }
+
+    fn run(mut self, rx: Receiver<Msg>) {
+        loop {
+            if self.stop.load(Relaxed) || (self.retiring && self.members.is_empty()) {
+                for m in self.members.values() {
+                    let _ = m.tx.send(Job::Stop);
+                }
+                return;
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(m) => self.on(m),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            if self.last_tick.elapsed() >= Duration::from_millis(100) {
+                self.last_tick = Instant::now();
+                self.tick();
+            }
+            while let Some(env) = self.local.pop_front() {
+                self.net(env);
+            }
+        }
+    }
+
+    fn send(&mut self, node: u32, epoch: u32, m: Net) {
+        let env = Env { pool: self.cfg.name.clone(), epoch, from: self.me, m };
+        if node == self.me {
+            return self.local.push_back(env);
+        }
+        if let Some(f) = &self.fleet {
+            f.wire.push(node, Frame::Pool { body: serde_json::to_vec(&env).unwrap() });
+        }
+    }
+
+    /// To the manager of `epoch`, if it's still the one.
+    fn to_mgr(&mut self, epoch: u32, m: Net) {
+        if let Some((node, e)) = self.mgr.filter(|g| g.1 == epoch) {
+            self.send(node, e, m);
+        }
+    }
+
+    fn near(&self) -> Vec<(u32, u64)> {
+        self.rtt.lock().unwrap().iter().map(|(&n, &ms)| (n, ms)).collect()
+    }
+
+    fn old(&self, epoch: u32) -> bool {
+        self.retiring || self.mgr.is_some_and(|g| epoch < g.1)
+    }
+
+    fn session_idle(&self) -> Duration {
+        Duration::from_millis(self.cfg.session_idle_ms)
+    }
+
+    fn on(&mut self, m: Msg) {
+        match m {
+            Msg::Ask(reply) => {
+                self.next_ask += 1;
+                let ask = self.next_ask;
+                self.asks.insert(ask, (reply, Instant::now() + Duration::from_millis(self.cfg.wait_ms + 1000)));
+                if let Some((node, e)) = self.mgr {
+                    let near = self.near();
+                    self.send(node, e, Net::Ask { ask, near });
                 }
             }
+            Msg::Started(key, r) => {
+                let (ask, lease) = self.starting.remove(&key).unwrap_or_default();
+                match r {
+                    Ok(()) => match (self.asks.remove(&ask), self.members.get(&key)) {
+                        (Some((reply, _)), Some(m)) => reply(Ok(Lease { id: lease, to: To::Here(m.tx.clone()), session_idle: self.session_idle() })),
+                        // Its asker gave up: it goes back to the pool.
+                        (None, Some(m)) => {
+                            let _ = m.tx.send(Job::Release(lease));
+                        }
+                        _ => {}
+                    },
+                    Err(full) => {
+                        self.members.remove(&key);
+                        // Full: the ask waits in line again.
+                        if !full {
+                            if let Some((reply, _)) = self.asks.remove(&ask) {
+                                reply(Err("the database is unreachable".into()));
+                            }
+                        }
+                    }
+                }
+                self.to_mgr(key.0, Net::Started { member: key.1, ok: r.is_ok(), full: r == Err(true) });
+            }
+            Msg::Resetting(key) => self.to_mgr(key.0, Net::Resetting { member: key.1 }),
+            Msg::Free(key) => {
+                let old = self.old(key.0);
+                if let Some(m) = self.members.get_mut(&key) {
+                    m.busy = false;
+                    // From an older manager, done with its lease: it stops.
+                    if old {
+                        let _ = m.tx.send(Job::Stop);
+                    }
+                }
+                self.to_mgr(key.0, Net::Free { member: key.1 });
+            }
+            Msg::Gone(key) => {
+                self.members.remove(&key);
+                self.to_mgr(key.0, Net::Gone { member: key.1 });
+            }
+            Msg::Net(env) => self.net(env),
+            Msg::RemoteQuery { node, key, lease, req, reply, release } => {
+                self.next_query += 1;
+                let id = self.next_query;
+                self.queries.insert(id, (reply, Instant::now() + Duration::from_millis(self.cfg.statement_timeout_ms + 5000)));
+                self.send(node, key.0, Net::Query { member: key.1, lease, id, req: String::from_utf8_lossy(&req).into_owned(), release });
+            }
+            Msg::RemoteRelease { node, key, lease } => self.send(node, key.0, Net::Release { member: key.1, lease }),
+            Msg::Claimed(e, ok) => {
+                self.claiming = false;
+                if ok {
+                    self.claimed.insert(e);
+                }
+            }
+            Msg::Retire => {
+                self.retiring = true;
+                self.managing = None;
+                for m in self.members.values().filter(|m| !m.busy) {
+                    let _ = m.tx.send(Job::Stop);
+                }
+            }
+        }
+    }
+
+    fn net(&mut self, env: Env) {
+        let Env { epoch, from, m, .. } = env;
+        let cur = self.mgr.map_or(0, |g| g.1);
+        match m {
+            Net::Ask { .. } | Net::Started { .. } | Net::Resetting { .. } | Net::Free { .. } | Net::Gone { .. } | Net::Report { .. } => {
+                let now = self.now();
+                let Some(g) = self.managing.as_mut().filter(|g| g.epoch == epoch) else { return };
+                let sends = g.on(now, from, m);
+                for (node, m) in sends {
+                    self.send(node, epoch, m);
+                }
+            }
+            // From a manager that's been replaced: ignore it.
+            Net::Start { .. } | Net::Grant { .. } | Net::Fail { .. } if epoch < cur || self.retiring => {}
+            Net::Start { ask, member, lease } => {
+                if !self.asks.contains_key(&ask) {
+                    return self.send(from, epoch, Net::Gone { member });
+                }
+                let key = (epoch, member);
+                let (tx, jobs) = channel();
+                self.members.insert(key, Mine { tx, busy: true });
+                self.starting.insert(key, (ask, lease));
+                let (pg, me, lease_ms, retries) = (self.pg.clone(), self.tx.clone(), self.cfg.lease_ms, self.cfg.retries);
+                std::thread::spawn(move || run_member(key, pg, retries, lease, lease_ms, jobs, me));
+            }
+            Net::Grant { ask, asker, member, lease } => match self.members.get_mut(&(epoch, member)) {
+                Some(m) => {
+                    m.busy = true;
+                    let _ = m.tx.send(Job::Lease(lease));
+                    self.send(asker, epoch, Net::Granted { ask, member, lease });
+                }
+                None => self.send(from, epoch, Net::Gone { member }),
+            },
+            Net::Fail { ask } => {
+                if let Some((reply, _)) = self.asks.remove(&ask) {
+                    reply(Err("no database connection free in time".into()));
+                }
+            }
+            Net::Stop { member } => {
+                if let Some(m) = self.members.get(&(epoch, member)) {
+                    let _ = m.tx.send(Job::Stop);
+                }
+            }
+            Net::Granted { ask, member, lease } => {
+                let key = (epoch, member);
+                let Some((reply, _)) = self.asks.remove(&ask) else {
+                    // Its asker gave up (or got another): hand it back.
+                    return self.send(from, epoch, Net::Release { member, lease });
+                };
+                let to = if from == self.me {
+                    match self.members.get(&key) {
+                        Some(m) => To::Here(m.tx.clone()),
+                        None => return reply(Err("the database session was lost".into())),
+                    }
+                } else {
+                    To::There { agent: self.tx.clone(), node: from, key }
+                };
+                reply(Ok(Lease { id: lease, to, session_idle: self.session_idle() }));
+            }
+            Net::Query { member, lease, id, req, release } => {
+                let answer = self.answer_to(from, epoch, id);
+                match self.members.get(&(epoch, member)) {
+                    Some(m) => {
+                        if let Err(std::sync::mpsc::SendError(Job::Query { reply, .. })) = m.tx.send(Job::Query { lease, req: req.into_bytes(), reply: answer, release }) {
+                            reply(lost());
+                        }
+                    }
+                    None => answer(lost()),
+                }
+            }
+            Net::Answer { id, body } => {
+                if let Some((reply, _)) = self.queries.remove(&id) {
+                    reply(body.into_bytes());
+                }
+            }
+            Net::Release { member, lease } => {
+                if let Some(m) = self.members.get(&(epoch, member)) {
+                    let _ = m.tx.send(Job::Release(lease));
+                }
+            }
+        }
+    }
+
+    /// Where a member's answer to another node's call goes: back over the
+    /// wire, from the member's own thread.
+    fn answer_to(&self, to: u32, epoch: u32, id: u64) -> Reply {
+        let (wire, pool, me) = (self.fleet.as_ref().map(|f| f.wire.clone()), self.cfg.name.clone(), self.me);
+        Box::new(move |b| {
+            let env = Env { pool, epoch, from: me, m: Net::Answer { id, body: String::from_utf8_lossy(&b).into_owned() } };
+            if let Some(w) = wire {
+                w.push(to, Frame::Pool { body: serde_json::to_vec(&env).unwrap() });
+            }
+        })
+    }
+
+    fn tick(&mut self) {
+        let t = Instant::now();
+        let late: Vec<u64> = self.asks.iter().filter(|(_, (_, d))| t >= *d).map(|(&a, _)| a).collect();
+        for a in late {
+            let (reply, _) = self.asks.remove(&a).unwrap();
+            reply(Err("no database connection free in time".into()));
+        }
+        let late: Vec<u64> = self.queries.iter().filter(|(_, (_, d))| t >= *d).map(|(&q, _)| q).collect();
+        for q in late {
+            let (reply, _) = self.queries.remove(&q).unwrap();
+            reply(lost());
+        }
+        if let Some(f) = self.fleet.clone() {
+            self.watch(&f);
+        }
+        let now = self.now();
+        if let Some(g) = &mut self.managing {
+            let (epoch, outs) = (g.epoch, g.core.tick(now));
+            let me = self.me;
+            let sends = g.outs(outs, me);
+            for (node, m) in sends {
+                self.send(node, epoch, m);
+            }
+        }
+        // The books catch up with lost messages: once a second, tell the
+        // manager what this node's members are doing.
+        if self.last_report.elapsed() >= Duration::from_secs(1) {
+            self.last_report = Instant::now();
+            if let Some((node, e)) = self.mgr {
+                let members = self.members.iter().filter(|(k, _)| k.0 == e).map(|(k, m)| (k.1, m.busy)).collect();
+                self.send(node, e, Net::Report { members });
+            }
+        }
+    }
+
+    /// Who manages the pool, from the catalog; take over if needed.
+    fn watch(&mut self, f: &PoolFleet) {
+        let key = cat_key(&self.cfg.name);
+        // ponytail: a copy of the whole catalog per pool per tick; a cheaper
+        // look-up if catalogs get big.
+        let cur = f.cat.now().0.apps.get(&key).and_then(|v| manager_of(v));
+        if cur != self.mgr {
+            self.mgr = cur;
+            // A new manager: members of older ones finish their lease (or
+            // stop now), and every ask goes to the new one.
+            let stop_now = self.cfg.on_manager_loss_stop;
+            for (k, m) in &self.members {
+                if self.retiring || cur.is_some_and(|g| k.0 < g.1) && (stop_now || !m.busy) {
+                    let _ = m.tx.send(Job::Stop);
+                }
+            }
+            if let Some((node, e)) = cur {
+                let near = self.near();
+                let asks: Vec<u64> = self.asks.keys().copied().collect();
+                for ask in asks {
+                    self.send(node, e, Net::Ask { ask, near: near.clone() });
+                }
+            }
+        }
+        match cur {
+            Some((n, e)) if n == self.me && self.claimed.contains(&e) && !self.retiring => {
+                if self.managing.as_ref().map(|g| g.epoch) != Some(e) {
+                    self.managing = Some(Manager::new(e, &self.cfg));
+                }
+            }
+            _ => self.managing = None,
+        }
+        // Take over: none yet, ours from an earlier process, or one not
+        // heard from for a lease. Only with something to do.
+        let quiet = |n: u32| f.heard.lock().unwrap().get(&n).map_or(self.t0.elapsed(), |(_, t)| t.elapsed());
+        let dead = match cur {
+            None => true,
+            Some((n, e)) if n == self.me => !self.claimed.contains(&e),
+            Some((n, _)) => quiet(n) >= Duration::from_millis(f.lease_ms),
+        };
+        let busy = !self.asks.is_empty() || !self.members.is_empty();
+        if dead && busy && !self.claiming && !self.retiring {
+            self.claiming = true;
+            let e = cur.map_or(1, |g| g.1 + 1);
+            let (cat, tx, me) = (f.cat.clone(), self.tx.clone(), self.me);
+            std::thread::spawn(move || {
+                let ok = cat.submit(&key, json!({ "node": me, "epoch": e }).to_string().into_bytes()).is_ok();
+                let _ = tx.send(Msg::Claimed(e, ok));
+            });
         }
     }
 }
 
 /// One member: a connection on its own thread, leased to one holder at a
 /// time, from its first lease (the ask it started for).
-fn run_member(id: u64, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs: Receiver<Job>, pool: Sender<Msg>) {
+fn run_member(id: Key, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs: Receiver<Job>, pool: Sender<Msg>) {
     // A failed connect is tried again, 100 ms then doubling, `retries`
     // times. "Too many clients" isn't: the pool puts the ask back in line.
     let mut tries = 0;

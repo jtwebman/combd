@@ -1520,6 +1520,47 @@ Not yet: node heartbeats over the wire (they still renew in the bucket;
 that's the ownership core, next), secrets, and two vars changes at once on
 two nodes (the later one wins whole).
 
+## One Postgres pool for the whole fleet
+
+A pool in the manifest (`max = 100`) is now one for the fleet, not one per
+node: 1,000 nodes never open more than `max` connections. Every node runs
+an agent per pool (`spike/src/pg.rs`); one of them is also the manager,
+running the tested pool core (`pool.rs`) as before.
+- **Members start on the asker's node.** At max, the nearest free member
+  is leased instead, and that holder's queries go over the wire (a new
+  one-way frame, `Pool`). Members never move.
+- **The catalog names the manager** (`<org>/<app>#pool/<pool>`: node and
+  epoch), so every node agrees on it about 25 ms after a change. A claim is
+  "epoch e + 1, if it's still e" (the catalog's check refuses anything
+  else), so of two at once, one wins. A node claims when there's no manager
+  yet, when its own process restarted, or when the manager's node has been
+  quiet for a lease, and only when it has asks or members.
+- **A new manager starts with empty books.** Members of the older epoch
+  finish their current lease and stop (`on_manager_loss = "finish"`, the
+  default) or stop now (`"stop"`). Until they're gone the database can see
+  more than `max` for a moment; "too many clients" makes an ask wait, not
+  fail.
+- **Once a second each node tells the manager what its members are
+  doing,** so a lost message can't leak a member: one it lists that the
+  manager doesn't know stops, one it no longer lists is gone, and one busy
+  in the books but free on its node is free. Changes younger than 2 s are
+  left alone (their news may be on its way).
+
+**Test** (`a_pool_is_one_for_the_whole_fleet`, three nodes and a real
+Postgres): `max = 2`, four `pg_sleep(0.3)` queries on every node at once.
+They took 1.82 s (12 x 0.3 s on two connections is 1.8 s: both kept busy,
+so the node with no member of its own used one on another node), and a
+sampler on `pg_stat_activity` never saw more than two connections. Then
+the manager's node stops during a 2 s query on another node: the query
+finishes, another node takes over, every node still gets answers, and the
+connections fall back to at most two. Five runs in a row: 1.820 to 1.821 s.
+
+ponytail: no simulator for the pool's messages yet (the core has unit
+tests, and this runs on real nodes); a manager cut off from the fleet keeps
+granting to its own node until it hears the new epoch (more than `max`
+until then); the manager is wherever the first ask came from, with no
+placement preference; `on_manager_loss = "stop"` has no test of its own.
+
 ## Upload batching
 
 An object's writes are acknowledged once its peers have them; the bucket

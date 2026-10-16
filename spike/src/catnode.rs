@@ -44,7 +44,17 @@ const SNAP_EVERY: u64 = 100;
 /// The check: an app's domains are free (another live app holds none).
 /// And an app's data key (`#key`, see `secrets.rs`) is written once: two
 /// nodes making one at once can't both win, and it's never deleted.
+///
+/// A pool's manager (`#pool/`, see `pg.rs`) goes up one epoch at a time: a
+/// claim is "epoch e + 1, if it's still e", so of two at once, one wins.
 pub fn check(s: &State, e: &Entry) -> Result<(), String> {
+    if e.app.contains("#pool/") {
+        let cur = s.apps.get(&e.app).and_then(|v| crate::pg::manager_of(v)).map_or(0, |m| m.1);
+        return match crate::pg::manager_of(&e.value) {
+            Some((_, epoch)) if epoch == cur + 1 => Ok(()),
+            _ => Err(format!("the pool's manager is at epoch {cur}")),
+        };
+    }
     if e.app.ends_with("#key") && (e.value.is_empty() || s.apps.contains_key(&e.app)) {
         return Err("the app's data key is written once".into());
     }

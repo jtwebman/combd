@@ -131,6 +131,8 @@ pub trait Sink: Send + 'static {
     fn catalog(&self, seq: u64, entry: Vec<u8>);
     /// A node says it's alive.
     fn heartbeat(&self, node: Node, boot: u64);
+    /// A pool message from another node (`pg.rs`).
+    fn pool(&self, body: Vec<u8>);
 }
 
 enum Cmd {
@@ -437,6 +439,7 @@ impl<S: Sink> Hub<S> {
                 Ok(Frame::WsPush { name, sock, op, payload }) if c.node.is_none() => self.sink.ws_push(name, sock, op, payload),
                 Ok(Frame::Catalog { seq, entry }) if c.node.is_none() => self.sink.catalog(seq, entry),
                 Ok(Frame::Heartbeat { node, boot }) if c.node.is_none() => self.sink.heartbeat(node, boot),
+                Ok(Frame::Pool { body }) if c.node.is_none() => self.sink.pool(body),
                 Ok(Frame::PeerReply { id: fid, res }) if c.node.is_some() => {
                     if let Some((back, _)) = c.waiting.remove(&fid) {
                         self.sink.peer_reply(back, fid, Some(res));
@@ -502,6 +505,7 @@ mod tests {
         fn ws_lost(&self, _: String, _: u64) {}
         fn catalog(&self, _: u64, _: Vec<u8>) {}
         fn heartbeat(&self, _: Node, _: u64) {}
+        fn pool(&self, _: Vec<u8>) {}
         fn peer_reply(&self, _back: usize, id: u64, res: Option<PeerRes>) {
             let status = match res {
                 Some(PeerRes::Have(n)) if n == id => 200,

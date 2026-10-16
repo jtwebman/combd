@@ -1079,7 +1079,8 @@ v0.1 runs.** Two finish lines.
    a Durable Object, and a Postgres pool.
 2. `combd deploy` to a 3-node fleet on one bucket.
 3. Durable Objects with their own storage, WebSockets, and the pool capped
-   across the whole fleet (one manager, members near their callers).
+   across the whole fleet (one manager, members near their callers). (Done
+   2026-10-15.)
 4. `callers` and `owners` enforced; `call` and `send` between processes.
 5. Secrets set with the CLI, encrypted in the bucket. (Done 2026-10-15.)
 
@@ -1150,7 +1151,10 @@ per-node bucket writes), with a liveness check and a lost node in the
 simulator. Secrets are on it too, sealed (a data key per app under a
 master key file; write-only API; opened only in a node's memory). Uploads
 are batched (10 s or 1 MB while every peer is up: 12 to 56x fewer bucket
-writes on the Docker cluster). Next: the fleet-wide Postgres pool.
+writes on the Docker cluster). Postgres pools are fleet-wide (one manager,
+named by the catalog; members near their callers; at max the nearest free
+one over the wire; tested on three nodes with a real database). Next: the
+multi-region demo on DigitalOcean, with Terraform.
 ponytail: heartbeats go all to all; a leader or gossip
 if fleets get very large.
 

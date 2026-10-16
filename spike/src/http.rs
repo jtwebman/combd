@@ -195,7 +195,7 @@ struct SyncJob {
 /// What the loops share.
 struct Shared {
     /// Postgres pools, one per binding (`pg.rs`).
-    pg: Option<crate::pg::Pools>,
+    pg: Option<Arc<crate::pg::Pools>>,
     cfg: Config,
     peers: Vec<(Sender<Msg>, Arc<Waker>)>,
     sync: Mutex<Sender<SyncJob>>,
@@ -217,6 +217,10 @@ struct FleetShared {
     peer_store: Mutex<Sender<(own::PeerCall, PeerBack)>>,
     next_id: AtomicU64,
     start: Instant,
+    /// When each node was last heard from (its heartbeats).
+    heard: Arc<Mutex<HashMap<own::Node, (u64, Instant)>>>,
+    /// Where pool messages from other nodes go.
+    pools: Arc<std::sync::OnceLock<Arc<crate::pg::Pools>>>,
 }
 
 enum Job {
@@ -1012,8 +1016,14 @@ where
         });
     }
     let fleet = cfg.fleet.take().map(|fc| start_fleet(fc, &peers, cfg.threads, &cfg.data, cfg.catalog.clone()));
-    // Always a set of pools (maybe empty): a deploy can add to it.
-    let pg = Some(crate::pg::Pools::start(&cfg.pg.clone().unwrap_or_default()));
+    // Always a set of pools (maybe empty): a deploy can add to it. In a
+    // fleet with a catalog, each pool is one for the whole fleet.
+    let pool_fleet = fleet.as_ref().zip(cfg.catalog.clone()).map(|(f, cat)| crate::pg::PoolFleet { me: f.cfg.node, wire: f.wire.clone(), cat, heard: f.heard.clone(), lease_ms: f.cfg.lease_ms });
+    let pools = Arc::new(crate::pg::Pools::start(&cfg.pg.clone().unwrap_or_default(), pool_fleet, cfg.stop.clone()));
+    if let Some(f) = &fleet {
+        let _ = f.pools.set(pools.clone());
+    }
+    let pg = Some(pools);
     let sh = Shared {
         pg,
         cfg,
@@ -1189,6 +1199,7 @@ pub fn node_id_free(fc: &FleetCfg, boot: u64) -> Result<(), String> {
         fn ws_lost(&self, _: String, _: u64) {}
         fn catalog(&self, _: u64, _: Vec<u8>) {}
         fn heartbeat(&self, _: own::Node, _: u64) {}
+        fn pool(&self, _: Vec<u8>) {}
     }
     let tls = match (&fc.wire_certs, fc.insecure) {
         (Some(dir), _) => Some(wire::load_tls(dir, fc.node)?),
@@ -1317,7 +1328,8 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
     let (ptx, prx) = channel();
     let heard: Arc<Mutex<HashMap<own::Node, (u64, Instant)>>> = Arc::default();
     let wire_cell: Arc<std::sync::OnceLock<Wire>> = Arc::default();
-    let sink = LoopSink { loops: loops.to_vec(), threads, peer_store: ptx.clone(), catalog: catalog.clone(), heard: heard.clone(), wire: wire_cell.clone() };
+    let pools: Arc<std::sync::OnceLock<Arc<crate::pg::Pools>>> = Arc::default();
+    let sink = LoopSink { loops: loops.to_vec(), threads, peer_store: ptx.clone(), catalog: catalog.clone(), heard: heard.clone(), wire: wire_cell.clone(), pools: pools.clone() };
     let wire = wire::start(fc.wire_port, fc.peers.clone(), tls, sink).expect("start the wire");
     // The catalog started first (deploys are read before serving); now it
     // can push.
@@ -1362,6 +1374,8 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
         peer_store: Mutex::new(ptx),
         next_id: AtomicU64::new(1),
         start: Instant::now(),
+        heard,
+        pools,
     }
 }
 
@@ -3363,6 +3377,9 @@ impl<E: Engine> Loop<'_, E> {
         let e = self.rtt.entry(node).or_insert((r, r / 2.0));
         e.1 = 0.75 * e.1 + 0.25 * (e.0 - r).abs();
         e.0 = 0.875 * e.0 + 0.125 * r;
+        if let Some(p) = &self.sh.pg {
+            p.rtt.lock().unwrap().insert(node, (e.0 * 1000.0) as u64);
+        }
     }
 
     fn forward_limit(&self, node: own::Node) -> Duration {
@@ -3384,6 +3401,8 @@ struct LoopSink {
     heard: Arc<Mutex<HashMap<own::Node, (u64, Instant)>>>,
     /// This node's wire, once it's up (to answer "who has node N?").
     wire: Arc<std::sync::OnceLock<Wire>>,
+    /// This node's pools, once they're up.
+    pools: Arc<std::sync::OnceLock<Arc<crate::pg::Pools>>>,
 }
 
 impl wire::Sink for LoopSink {
@@ -3430,6 +3449,11 @@ impl wire::Sink for LoopSink {
     fn catalog(&self, seq: u64, entry: Vec<u8>) {
         if let Some(c) = &self.catalog {
             c.push(seq, &entry);
+        }
+    }
+    fn pool(&self, body: Vec<u8>) {
+        if let Some(p) = self.pools.get() {
+            p.deliver(&body);
         }
     }
     fn heartbeat(&self, node: own::Node, boot: u64) {

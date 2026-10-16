@@ -165,7 +165,8 @@ pub struct Change {
 /// of them reloads it.
 fn settings_raw(state: &State, org: &str, app: &str) -> Vec<u8> {
     let p = format!("{org}/{app}#");
-    serde_json::to_vec(&state.apps.range(p.clone()..).take_while(|(k, _)| k.starts_with(&p)).collect::<Vec<_>>()).unwrap()
+    // Not a pool's manager: that changing reloads nothing.
+    serde_json::to_vec(&state.apps.range(p.clone()..).take_while(|(k, _)| k.starts_with(&p)).filter(|(k, _)| !k.contains("#pool/")).collect::<Vec<_>>()).unwrap()
 }
 
 /// The app's env values: its vars, and its secrets opened.

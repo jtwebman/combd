@@ -2792,6 +2792,112 @@ callers = ["api"]
         assert_eq!(stats["matches"], 1, "{stats}");
     }
 
+    /// A pool is one for the whole fleet: three nodes, `max = 2`, every node
+    /// running slow queries at once, and Postgres never sees more than two
+    /// connections. A node with no member of its own uses the nearest free
+    /// one, over the wire. Then the manager's node stops mid-query: the
+    /// query still finishes (`finish`), another node takes over, and every
+    /// node still gets answers.
+    #[test]
+    fn a_pool_is_one_for_the_whole_fleet() {
+        let (Some(base), Ok(pg_url)) = (s3::S3::from_env(), std::env::var("COMBD_PG_TEST")) else {
+            eprintln!("skipping: set COMBD_S3 and COMBD_PG_TEST");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        let certs = dir.0.join("certs");
+        wire::make_certs(&certs, 3).unwrap();
+        let bucket = s3::S3 { bucket: test_bucket(), ..base.clone() };
+        let wports = free_ports(3);
+        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
+        let (token, line) = admin::new_token(&["acme/*:*"]);
+        let admin_port = free_ports(1)[0];
+        let stops: Vec<Arc<AtomicBool>> = (0..3).map(|_| Arc::default()).collect();
+        let nodes: Vec<u16> = (0..3u32)
+            .map(|n| {
+                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20 };
+                let c = http::Config { fleet: Some(fc), stop: stops[n as usize].clone(), ..cfg(&dir.0.join(format!("d{n}")), 2) };
+                let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: false, tls: None, tokens: admin::parse_tokens(&line).unwrap() });
+                let port = free_ports(1)[0];
+                std::thread::spawn(move || http::serve_fleet_apps(&interp::Interp { max_pages: 16384 }, port, c, admin).unwrap());
+                port
+            })
+            .collect();
+        assert!(eventually(10_000, || std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok()));
+        for &p in &nodes {
+            assert!(eventually(10_000, || std::net::TcpStream::connect(("127.0.0.1", p)).is_ok()));
+            stat(p, "fences");
+        }
+        // Its own application name, to count its connections in Postgres.
+        let tag = format!("combd-fleet-pool-{}", std::process::id());
+        let url = format!("{pg_url}{}application_name={tag}", if pg_url.contains('?') { "&" } else { "?" });
+        let src = store::tempdir::Dir::new();
+        std::fs::create_dir_all(src.0.join("modules")).unwrap();
+        std::fs::copy(GUEST_EV, manifest::module_path(&src.0, "ev")).unwrap();
+        std::fs::write(src.0.join("combd.toml"), "[app]\nname = \"data\"\ndomains = [\"data.test\"]\n[vars]\nPG = { type = \"url\" }\n[processes.api]\nkind = \"ev\"\nroutes = [\"/pg/q\"]\n[processes.pg-conn]\nkind = \"combd:postgres\"\nurl = \"$PG\"\n[pools.main]\nmember = \"pg-conn\"\nowners = [\"api\"]\nmax = 2\nwait_ms = 20000\n").unwrap();
+        let api = |method: &str, path: &str, body: &[u8]| admin::request(&format!("http://127.0.0.1:{admin_port}"), None, &token, method, path, body).unwrap();
+        assert_eq!(api("PUT", "/v1/apps/acme/data/vars", serde_json::json!({ "PG": url }).to_string().as_bytes()).0, 200);
+        let (code, v) = api("PUT", "/v1/apps/acme/data", &deploy::bundle(&src.0).unwrap());
+        assert_eq!(code, 200, "{v}");
+        let q = |port: u16, sql: &str| http_to(port, "data.test", "POST", "/pg/q", &serde_json::json!({ "q": sql }).to_string());
+        for &p in &nodes {
+            assert!(eventually(10_000, || q(p, "SELECT 1").0 == 200), "node {p}: {:?}", q(p, "SELECT 1"));
+        }
+        // How many connections Postgres sees from this pool, sampled.
+        let count = {
+            let tag = tag.clone();
+            let mut c = postgres::Client::connect(&pg_url, postgres::NoTls).unwrap();
+            move || -> i64 { c.query_one("SELECT count(*) FROM pg_stat_activity WHERE application_name = $1", &[&tag]).unwrap().get(0) }
+        };
+        let most = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let sampling = Arc::new(AtomicBool::new(true));
+        let sampler = {
+            let (most, sampling) = (most.clone(), sampling.clone());
+            let mut count = count;
+            std::thread::spawn(move || {
+                while sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                    most.fetch_max(count(), std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                count
+            })
+        };
+        // Four slow queries per node, all at once.
+        let t = Instant::now();
+        let runs: Vec<_> = nodes.iter().flat_map(|&p| (0..4).map(move |_| std::thread::spawn(move || q(p, "SELECT pg_sleep(0.3)")))).collect();
+        for r in runs {
+            let (code, body) = r.join().unwrap();
+            assert_eq!(code, 200, "{body}");
+        }
+        eprintln!("12 queries of 0.3 s on 2 connections across 3 nodes: {:?}", t.elapsed());
+        assert!(t.elapsed() >= Duration::from_millis(1700), "two at a time: {:?}", t.elapsed());
+        assert!(most.load(std::sync::atomic::Ordering::Relaxed) <= 2, "Postgres saw {} connections", most.load(std::sync::atomic::Ordering::Relaxed));
+        // The manager is the node that asked first: node 0. A long query on
+        // node 1 runs while node 0 stops; it finishes, and the others carry on.
+        let long = std::thread::spawn({
+            let p = nodes[1];
+            move || q(p, "SELECT pg_sleep(2), 7")
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        stops[0].store(true, std::sync::atomic::Ordering::Relaxed);
+        let (code, body) = long.join().unwrap();
+        assert!(code == 200 && body.contains("7"), "the query on an older manager's member finishes: {code} {body}");
+        for &p in &nodes[1..] {
+            assert!(eventually(10_000, || q(p, "SELECT 2").0 == 200), "node {p} after the takeover: {:?}", q(p, "SELECT 2"));
+        }
+        let runs: Vec<_> = nodes[1..].iter().flat_map(|&p| (0..3).map(move |_| std::thread::spawn(move || q(p, "SELECT pg_sleep(0.2)")))).collect();
+        for r in runs {
+            assert_eq!(r.join().unwrap().0, 200);
+        }
+        sampling.store(false, std::sync::atomic::Ordering::Relaxed);
+        let count = std::sync::Mutex::new(sampler.join().unwrap());
+        // Members of the old manager go; at most `max` stay.
+        assert!(eventually(10_000, || count.lock().unwrap()() <= 2), "{} connections left", count.lock().unwrap()());
+        for s in &stops {
+            s.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// The catalog on a real bucket: 250 changes snapshot and trim the log,
     /// and a node starting with no copy at all catches up to the same state
     /// (from the snapshot, then the slots after it).
