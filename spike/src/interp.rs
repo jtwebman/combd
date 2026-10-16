@@ -5,8 +5,8 @@
 //! untyped `u64` stack (validation already proved the types). A running cell
 //! is plain data, so a snapshot is just a clone, even mid-call.
 //!
-//! Reductions are spent at loop heads and calls, the same safe points a JIT
-//! tier would have to honor later.
+//! Reductions are spent on loop back-edges (a branch to a loop) and calls,
+//! the same safe points a JIT tier would have to honor later.
 //!
 //! ponytail: naive stack interpreter, one big match. Register bytecode and
 //! fused ops are the known next step if compute speed matters.
@@ -27,9 +27,11 @@ const MAX_STACK: usize = 1 << 20;
 const MAX_TABLE: u64 = 1 << 20;
 /// Spare stack slots past a function's max height, for host call results.
 const SLACK: usize = 8;
+/// In `Target::keep`: the branch goes back to a loop, so it spends a reduction.
+const TICK: u32 = 1 << 31;
 
 /// Where a branch goes: the new pc, the operand height to cut back to, and how
-/// many values on top to carry over.
+/// many values on top to carry over (with `TICK` set when it goes to a loop).
 #[derive(Clone, Copy, Debug)]
 struct Target {
     pc: u32,
@@ -41,14 +43,16 @@ macro_rules! ops {
     (plain: $($p:ident)*; mem: $($m:ident)*;) => {
         #[derive(Clone, Copy, Debug)]
         enum Op {
-            Unreachable, Tick,
+            Unreachable,
             Br(Target), Jump(u32), BrTable { start: u32, len: u32 },
+            // A branch through the table (the target may still be patched).
+            BrT(u32),
             MemorySize, MemoryGrow, MemoryCopy, MemoryFill, MemoryInit(u32), DataDrop(u32),
             // Register forms: operands are frame slots (locals and stack slots alike).
             Copy { d: u32, src: u32 }, ConstTo { d: u32, v: u64 }, SetSp(u32),
             // Calls and returns carry their stack height, so no `SetSp` is needed first.
             CallAt(u32, u32), CallIndirectAt { ty: u32, table: u32, h: u32 }, ReturnAt(u32),
-            BrIfR { c: u32, t: u32 }, IfR { c: u32, to: u32 },
+            BrIfR { c: u32, t: u32 }, IfR { c: u32, to: u32 }, BrTableR { c: u32, start: u32, len: u32 },
             GlobalGetR { d: u32, g: u32 }, GlobalSetR { g: u32, a: u32 },
             SelectR { d: u32, a: u32, b: u32, c: u16 },
             Store32RI { a: u32, imm: i32, off: u32 }, Store64RI { a: u32, imm: i32, off: u32 },
@@ -353,7 +357,46 @@ fn label(
             0
         }
     };
-    Ok(Target { pc, height: fr.height as u32, keep })
+    let tick = if fr.kind == FrameKind::Loop { TICK } else { 0 };
+    Ok(Target { pc, height: fr.height as u32, keep: keep | tick })
+}
+
+/// How many values a branch to `depth` carries.
+fn carries(fv: &FuncValidator<ValidatorResources>, m: &Module, depth: u32) -> u32 {
+    fv.get_control_frame(depth as usize).map_or(0, |fr| {
+        let (params, results) = arity(m, fr.block_type);
+        if fr.kind == FrameKind::Loop { params } else { results }
+    })
+}
+
+/// A conditional branch with the opposite test, going to table entry `nt`
+/// instead. Returns it with the old entry.
+fn invert_br(op: Op, nt: u32) -> Option<(Op, u32)> {
+    macro_rules! pairs {
+        ($($rr:ident $ri:ident / $nrr:ident $nri:ident),*) => {
+            match op {
+                $(Op::$rr { a, b, t } => (Op::$nrr { a, b, t: nt }, t),
+                Op::$nrr { a, b, t } => (Op::$rr { a, b, t: nt }, t),
+                Op::$ri { a, imm, t } => (Op::$nri { a, imm, t: nt }, t),
+                Op::$nri { a, imm, t } => (Op::$ri { a, imm, t: nt }, t),)*
+                Op::BrIfI32EqzR { a, t } => (Op::BrIfR { c: a, t: nt }, t),
+                Op::BrIfR { c, t } => (Op::BrIfI32EqzR { a: c, t: nt }, t),
+                _ => return None,
+            }
+        };
+    }
+    Some(pairs!(
+        BrIfI32EqRR BrIfI32EqRI / BrIfI32NeRR BrIfI32NeRI,
+        BrIfI32LtSRR BrIfI32LtSRI / BrIfI32GeSRR BrIfI32GeSRI,
+        BrIfI32LtURR BrIfI32LtURI / BrIfI32GeURR BrIfI32GeURI,
+        BrIfI32GtSRR BrIfI32GtSRI / BrIfI32LeSRR BrIfI32LeSRI,
+        BrIfI32GtURR BrIfI32GtURI / BrIfI32LeURR BrIfI32LeURI,
+        BrIfI64EqRR BrIfI64EqRI / BrIfI64NeRR BrIfI64NeRI,
+        BrIfI64LtSRR BrIfI64LtSRI / BrIfI64GeSRR BrIfI64GeSRI,
+        BrIfI64LtURR BrIfI64LtURI / BrIfI64GeURR BrIfI64GeURI,
+        BrIfI64GtSRR BrIfI64GtSRI / BrIfI64LeSRR BrIfI64LeSRI,
+        BrIfI64GtURR BrIfI64GtURI / BrIfI64LeURR BrIfI64LeURI
+    ))
 }
 
 /// One entry of the translator's virtual operand stack: the value lives in a
@@ -549,6 +592,7 @@ enum Kind {
     GlobalSet(u32),
     Select,
     BrIf(u32),
+    BrTable,
     If,
 }
 
@@ -563,6 +607,7 @@ fn classify(op: &Operator) -> Kind {
         Operator::F64Const { value } => Kind::Const(value.bits()),
         Operator::Drop => Kind::Drop,
         Operator::BrIf { relative_depth } => Kind::BrIf(*relative_depth),
+        Operator::BrTable { .. } => Kind::BrTable,
         Operator::If { .. } => Kind::If,
         Operator::GlobalGet { global_index } => Kind::GlobalGet(*global_index),
         Operator::GlobalSet { global_index } => Kind::GlobalSet(*global_index),
@@ -645,19 +690,21 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
         let dead = fv.get_control_frame(0).map_or(true, |fr| fr.unreachable);
         let kind = if dead { Kind::Stack } else { classify(&op) };
         let stack = matches!(kind, Kind::Stack);
-        let resync = matches!(kind, Kind::Stack | Kind::If);
+        let resync = matches!(kind, Kind::Stack | Kind::If | Kind::BrTable);
         // Structural ops, calls, and returns don't read `sp` (calls and returns
         // carry their height). Everything else on the stack path does.
-        let needs_sp = !matches!(
-            op,
+        // A branch that carries nothing sets `sp` itself.
+        let needs_sp = match op {
             Operator::Block { .. }
-                | Operator::Loop { .. }
-                | Operator::Else
-                | Operator::End
-                | Operator::Call { .. }
-                | Operator::CallIndirect { .. }
-                | Operator::Return
-        );
+            | Operator::Loop { .. }
+            | Operator::Else
+            | Operator::End
+            | Operator::Call { .. }
+            | Operator::CallIndirect { .. }
+            | Operator::Return => false,
+            Operator::Br { relative_depth } => carries(&fv, m, relative_depth) > 0,
+            _ => true,
+        };
         if stack && !dead {
             rg.materialize(&mut f);
             if needs_sp {
@@ -814,7 +861,7 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
                 let rc = rg.slot(&mut f, c, h);
                 rg.materialize(&mut f);
                 let t = label(&fv, m, &mut ctl, depth, Patch::Table(f.table.len()))?;
-                if t.keep > 0 {
+                if t.keep & !TICK > 0 {
                     rg.ensure_sp(&mut f); // carried values are found from `sp`
                 }
                 f.table.push(t);
@@ -827,6 +874,27 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
                     Some(op) => f.ops[n - 1] = op,
                     None => f.ops.push(Op::BrIfR { c: rc, t: ti }),
                 }
+                rg.last_def = None;
+            }
+            Kind::BrTable => {
+                let Operator::BrTable { targets } = &op else { unreachable!() };
+                let c = rg.vs.pop().ok_or("stack underflow")?;
+                rg.sp_ok = false; // the index left the stack, so `sp` must move too
+                let h = rg.vs.len();
+                let rc = rg.slot(&mut f, c, h);
+                rg.materialize(&mut f);
+                let start = f.table.len() as u32;
+                let depths: Vec<u32> = targets.targets().chain([Ok(targets.default())]).collect::<Result<_, _>>().map_err(e)?;
+                let mut carry = false;
+                for d in &depths {
+                    let t = label(&fv, m, &mut ctl, *d, Patch::Table(f.table.len()))?;
+                    carry |= t.keep & !TICK > 0;
+                    f.table.push(t);
+                }
+                if carry {
+                    rg.ensure_sp(&mut f); // carried values are found from `sp`
+                }
+                f.ops.push(Op::BrTableR { c: rc, start, len: depths.len() as u32 });
                 rg.last_def = None;
             }
             Kind::If => {
@@ -857,7 +925,6 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
             Operator::Block { .. } => ctl.push(Ctl { loop_start: None, patches: vec![], else_fix: None }),
             Operator::Loop { .. } => {
                 ctl.push(Ctl { loop_start: Some(here as u32), patches: vec![], else_fix: None });
-                f.ops.push(Op::Tick);
                 barrier = here;
             }
             // Only reached in dead code: reachable `if` takes the register path.
@@ -887,7 +954,17 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
             _ if dead => {}
             Operator::Br { relative_depth } => {
                 let t = label(&fv, m, &mut ctl, *relative_depth, Patch::Op(here))?;
-                f.ops.push(Op::Br(t));
+                // `br_if out; br loop` becomes `br_if !cond loop; br out`, so a
+                // pass through the loop takes one branch, not two.
+                let nt = f.table.len() as u32;
+                match (t.keep & TICK != 0 && here > barrier).then(|| invert_br(f.ops[here - 1], nt)).flatten() {
+                    Some((op, old)) => {
+                        f.table.push(t);
+                        f.ops[here - 1] = op;
+                        f.ops.push(Op::BrT(old));
+                    }
+                    None => f.ops.push(Op::Br(t)),
+                }
             }
             Operator::BrTable { targets } => {
                 let start = f.table.len() as u32;
@@ -1222,12 +1299,329 @@ const U64R: (f64, f64) = (0.0, 18446744073709551616.0);
 /// Move the carried values down to the label's height. Returns the new sp.
 fn branch(s: &mut [u64], base: usize, sp: usize, t: Target) -> usize {
     let dst = base + t.height as usize;
-    let keep = t.keep as usize;
+    let keep = (t.keep & !TICK) as usize;
     let src = sp - keep;
-    if dst != src {
-        s.copy_within(src..sp, dst);
+    // By hand, not `copy_within`: a library call here would push the hot
+    // loop's state out of registers. `dst <= src`, so forward is safe.
+    for i in 0..keep {
+        s[dst + i] = s[src + i];
     }
     dst + keep
+}
+
+/// Where the hot loop is in the current function.
+struct Pos {
+    fi: usize,
+    pc: usize,
+    fp: usize,
+    sp: usize,
+    fuel: u32,
+}
+
+/// The register ops and branches: everything the hot paths run, in a function
+/// small enough that its state stays in machine registers (the whole `exec`
+/// is not). Returns at the first op it doesn't run (`Ok(false)`, `pc` on that
+/// op) or when a back-edge runs out of fuel (`Ok(true)`, `pc` on the loop).
+#[inline(never)]
+fn hot(m: &Module, frames: &mut Vec<Frame>, s: &mut [u64], mem: &mut [u8], globals: &mut [u64], p: &mut Pos) -> Result<bool, &'static str> {
+    let Pos { mut fi, mut pc, mut fp, mut sp, mut fuel } = *p;
+    let mut f = &m.funcs[fi];
+    let mut ops: &[Op] = &f.ops;
+    let mut base = fp + f.nlocals as usize;
+    macro_rules! out {
+        ($pc:expr, $yield:expr) => {{
+            *p = Pos { fi, pc: $pc, fp, sp, fuel };
+            return Ok($yield);
+        }};
+    }
+    macro_rules! pop {
+        () => {{
+            sp -= 1;
+            s[sp]
+        }};
+    }
+    macro_rules! reg {
+        ($d:expr, $from:ident, $to:ident, $a:expr, $b:expr, |$x:ident, $y:ident| $e:expr) => {{
+            let $x = $from($a);
+            let $y = $from($b);
+            s[fp + $d as usize] = $to($e);
+        }};
+    }
+    macro_rules! go {
+        ($t:expr) => {{
+            let t = $t;
+            sp = branch(s, base, sp, t);
+            pc = t.pc as usize;
+            if t.keep & TICK != 0 {
+                if fuel == 0 {
+                    out!(pc, true);
+                }
+                fuel -= 1;
+            }
+        }};
+    }
+    macro_rules! take {
+        ($t:expr) => {
+            go!(f.table[$t as usize])
+        };
+    }
+    loop {
+        let op = ops[pc];
+        pc += 1;
+        match op {
+            Op::Br(t) => go!(t),
+            Op::BrT(t) => take!(t),
+            Op::Jump(to) => pc = to as usize,
+            Op::BrTableR { c, start, len } => {
+                let i = (s[fp + c as usize] as u32).min(len - 1);
+                take!(start + i)
+            }
+            Op::BrTable { start, len } => {
+                let i = (pop!() as u32).min(len - 1);
+                take!(start + i)
+            }
+            Op::Copy { d, src } => s[fp + d as usize] = s[fp + src as usize],
+            Op::ConstTo { d, v } => s[fp + d as usize] = v,
+            Op::SetSp(h) => sp = base + h as usize,
+            Op::BrIfR { c, t } => {
+                if s[fp + c as usize] as u32 != 0 {
+                    take!(t)
+                }
+            }
+            Op::BrIfI32EqRR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x == y { take!(t) } }
+            Op::BrIfI32EqRI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x == y { take!(t) } }
+            Op::IfI32EqRR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x == y) { pc = to as usize; } }
+            Op::IfI32EqRI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x == y) { pc = to as usize; } }
+            Op::BrIfI32NeRR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x != y { take!(t) } }
+            Op::BrIfI32NeRI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x != y { take!(t) } }
+            Op::IfI32NeRR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x != y) { pc = to as usize; } }
+            Op::IfI32NeRI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x != y) { pc = to as usize; } }
+            Op::BrIfI32LtSRR { a, b, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if x < y { take!(t) } }
+            Op::BrIfI32LtSRI { a, imm, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if x < y { take!(t) } }
+            Op::IfI32LtSRR { a, b, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if !(x < y) { pc = to as usize; } }
+            Op::IfI32LtSRI { a, imm, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if !(x < y) { pc = to as usize; } }
+            Op::BrIfI32LtURR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x < y { take!(t) } }
+            Op::BrIfI32LtURI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x < y { take!(t) } }
+            Op::IfI32LtURR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x < y) { pc = to as usize; } }
+            Op::IfI32LtURI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x < y) { pc = to as usize; } }
+            Op::BrIfI32GtSRR { a, b, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if x > y { take!(t) } }
+            Op::BrIfI32GtSRI { a, imm, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if x > y { take!(t) } }
+            Op::IfI32GtSRR { a, b, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if !(x > y) { pc = to as usize; } }
+            Op::IfI32GtSRI { a, imm, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if !(x > y) { pc = to as usize; } }
+            Op::BrIfI32GtURR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x > y { take!(t) } }
+            Op::BrIfI32GtURI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x > y { take!(t) } }
+            Op::IfI32GtURR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x > y) { pc = to as usize; } }
+            Op::IfI32GtURI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x > y) { pc = to as usize; } }
+            Op::BrIfI32LeSRR { a, b, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if x <= y { take!(t) } }
+            Op::BrIfI32LeSRI { a, imm, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if x <= y { take!(t) } }
+            Op::IfI32LeSRR { a, b, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if !(x <= y) { pc = to as usize; } }
+            Op::IfI32LeSRI { a, imm, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if !(x <= y) { pc = to as usize; } }
+            Op::BrIfI32LeURR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x <= y { take!(t) } }
+            Op::BrIfI32LeURI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x <= y { take!(t) } }
+            Op::IfI32LeURR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x <= y) { pc = to as usize; } }
+            Op::IfI32LeURI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x <= y) { pc = to as usize; } }
+            Op::BrIfI32GeSRR { a, b, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if x >= y { take!(t) } }
+            Op::BrIfI32GeSRI { a, imm, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if x >= y { take!(t) } }
+            Op::IfI32GeSRR { a, b, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if !(x >= y) { pc = to as usize; } }
+            Op::IfI32GeSRI { a, imm, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if !(x >= y) { pc = to as usize; } }
+            Op::BrIfI32GeURR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x >= y { take!(t) } }
+            Op::BrIfI32GeURI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x >= y { take!(t) } }
+            Op::IfI32GeURR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x >= y) { pc = to as usize; } }
+            Op::IfI32GeURI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x >= y) { pc = to as usize; } }
+            Op::BrIfI64EqRR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x == y { take!(t) } }
+            Op::BrIfI64EqRI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x == y { take!(t) } }
+            Op::IfI64EqRR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x == y) { pc = to as usize; } }
+            Op::IfI64EqRI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x == y) { pc = to as usize; } }
+            Op::BrIfI64NeRR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x != y { take!(t) } }
+            Op::BrIfI64NeRI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x != y { take!(t) } }
+            Op::IfI64NeRR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x != y) { pc = to as usize; } }
+            Op::IfI64NeRI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x != y) { pc = to as usize; } }
+            Op::BrIfI64LtSRR { a, b, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if x < y { take!(t) } }
+            Op::BrIfI64LtSRI { a, imm, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if x < y { take!(t) } }
+            Op::IfI64LtSRR { a, b, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if !(x < y) { pc = to as usize; } }
+            Op::IfI64LtSRI { a, imm, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if !(x < y) { pc = to as usize; } }
+            Op::BrIfI64LtURR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x < y { take!(t) } }
+            Op::BrIfI64LtURI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x < y { take!(t) } }
+            Op::IfI64LtURR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x < y) { pc = to as usize; } }
+            Op::IfI64LtURI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x < y) { pc = to as usize; } }
+            Op::BrIfI64GtSRR { a, b, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if x > y { take!(t) } }
+            Op::BrIfI64GtSRI { a, imm, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if x > y { take!(t) } }
+            Op::IfI64GtSRR { a, b, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if !(x > y) { pc = to as usize; } }
+            Op::IfI64GtSRI { a, imm, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if !(x > y) { pc = to as usize; } }
+            Op::BrIfI64GtURR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x > y { take!(t) } }
+            Op::BrIfI64GtURI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x > y { take!(t) } }
+            Op::IfI64GtURR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x > y) { pc = to as usize; } }
+            Op::IfI64GtURI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x > y) { pc = to as usize; } }
+            Op::BrIfI64LeSRR { a, b, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if x <= y { take!(t) } }
+            Op::BrIfI64LeSRI { a, imm, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if x <= y { take!(t) } }
+            Op::IfI64LeSRR { a, b, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if !(x <= y) { pc = to as usize; } }
+            Op::IfI64LeSRI { a, imm, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if !(x <= y) { pc = to as usize; } }
+            Op::BrIfI64LeURR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x <= y { take!(t) } }
+            Op::BrIfI64LeURI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x <= y { take!(t) } }
+            Op::IfI64LeURR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x <= y) { pc = to as usize; } }
+            Op::IfI64LeURI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x <= y) { pc = to as usize; } }
+            Op::BrIfI64GeSRR { a, b, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if x >= y { take!(t) } }
+            Op::BrIfI64GeSRI { a, imm, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if x >= y { take!(t) } }
+            Op::IfI64GeSRR { a, b, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if !(x >= y) { pc = to as usize; } }
+            Op::IfI64GeSRI { a, imm, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if !(x >= y) { pc = to as usize; } }
+            Op::BrIfI64GeURR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x >= y { take!(t) } }
+            Op::BrIfI64GeURI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x >= y { take!(t) } }
+            Op::IfI64GeURR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x >= y) { pc = to as usize; } }
+            Op::IfI64GeURI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x >= y) { pc = to as usize; } }
+            Op::BrIfI32EqzR { a, t } => { if u32_(s[fp + a as usize]) == 0 { take!(t) } }
+            Op::IfI32EqzR { a, to } => { if u32_(s[fp + a as usize]) != 0 { pc = to as usize; } }
+            Op::BrIfI64EqzR { a, t } => { if u64_(s[fp + a as usize]) == 0 { take!(t) } }
+            Op::IfI64EqzR { a, to } => { if u64_(s[fp + a as usize]) != 0 { pc = to as usize; } }
+            Op::GlobalGetR { d, g } => s[fp + d as usize] = globals[g as usize],
+            Op::GlobalSetR { g, a } => globals[g as usize] = s[fp + a as usize],
+            Op::SelectR { d, a, b, c } => {
+                let v = if s[fp + c as usize] as u32 != 0 { s[fp + a as usize] } else { s[fp + b as usize] };
+                s[fp + d as usize] = v;
+            }
+            Op::Store32RI { a, imm, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = (imm as i64 as u64).to_le_bytes(); mem.get_mut(ea..ea + 4).ok_or("out of bounds memory access")?.copy_from_slice(&v[..4]); }
+            Op::Store64RI { a, imm, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = (imm as i64 as u64).to_le_bytes(); mem.get_mut(ea..ea + 8).ok_or("out of bounds memory access")?.copy_from_slice(&v[..8]); }
+            Op::Store8RI { a, imm, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = (imm as i64 as u64).to_le_bytes(); mem.get_mut(ea..ea + 1).ok_or("out of bounds memory access")?.copy_from_slice(&v[..1]); }
+            Op::Store16RI { a, imm, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = (imm as i64 as u64).to_le_bytes(); mem.get_mut(ea..ea + 2).ok_or("out of bounds memory access")?.copy_from_slice(&v[..2]); }
+            Op::IfR { c, to } => {
+                if s[fp + c as usize] as u32 == 0 {
+                    pc = to as usize;
+                }
+            }
+            Op::I32AddRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_add(y)),
+            Op::I32AddRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x.wrapping_add(y)),
+            Op::I32SubRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_sub(y)),
+            Op::I32SubRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x.wrapping_sub(y)),
+            Op::I32MulRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_mul(y)),
+            Op::I32MulRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x.wrapping_mul(y)),
+            Op::I32AndRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x & y),
+            Op::I32AndRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x & y),
+            Op::I32OrRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x | y),
+            Op::I32OrRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x | y),
+            Op::I32XorRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x ^ y),
+            Op::I32XorRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x ^ y),
+            Op::I32ShlRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_shl(y)),
+            Op::I32ShlRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x.wrapping_shl(y)),
+            Op::I32ShrSRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| (x as i32).wrapping_shr(y) as u32),
+            Op::I32ShrSRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| (x as i32).wrapping_shr(y) as u32),
+            Op::I32ShrURR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_shr(y)),
+            Op::I32ShrURI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x.wrapping_shr(y)),
+            Op::I32EqRR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x == y),
+            Op::I32EqRI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x == y),
+            Op::I32NeRR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x != y),
+            Op::I32NeRI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x != y),
+            Op::I32LtSRR { d, a, b } => reg!(d, i32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x < y),
+            Op::I32LtSRI { d, a, imm } => reg!(d, i32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x < y),
+            Op::I32LtURR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x < y),
+            Op::I32LtURI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x < y),
+            Op::I32GtSRR { d, a, b } => reg!(d, i32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x > y),
+            Op::I32GtSRI { d, a, imm } => reg!(d, i32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x > y),
+            Op::I32GtURR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x > y),
+            Op::I32GtURI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x > y),
+            Op::I32LeSRR { d, a, b } => reg!(d, i32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x <= y),
+            Op::I32LeSRI { d, a, imm } => reg!(d, i32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x <= y),
+            Op::I32LeURR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x <= y),
+            Op::I32LeURI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x <= y),
+            Op::I32GeSRR { d, a, b } => reg!(d, i32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x >= y),
+            Op::I32GeSRI { d, a, imm } => reg!(d, i32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x >= y),
+            Op::I32GeURR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x >= y),
+            Op::I32GeURI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x >= y),
+            Op::I64AddRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_add(y)),
+            Op::I64AddRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x.wrapping_add(y)),
+            Op::I64SubRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_sub(y)),
+            Op::I64SubRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x.wrapping_sub(y)),
+            Op::I64MulRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_mul(y)),
+            Op::I64MulRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x.wrapping_mul(y)),
+            Op::I64AndRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x & y),
+            Op::I64AndRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x & y),
+            Op::I64OrRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x | y),
+            Op::I64OrRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x | y),
+            Op::I64XorRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x ^ y),
+            Op::I64XorRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x ^ y),
+            Op::I64ShlRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_shl(y as u32)),
+            Op::I64ShlRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x.wrapping_shl(y as u32)),
+            Op::I64ShrSRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| (x as i64).wrapping_shr(y as u32) as u64),
+            Op::I64ShrSRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| (x as i64).wrapping_shr(y as u32) as u64),
+            Op::I64ShrURR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_shr(y as u32)),
+            Op::I64ShrURI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x.wrapping_shr(y as u32)),
+            Op::I64EqRR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x == y),
+            Op::I64EqRI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x == y),
+            Op::I64NeRR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x != y),
+            Op::I64NeRI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x != y),
+            Op::I64LtSRR { d, a, b } => reg!(d, i64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x < y),
+            Op::I64LtSRI { d, a, imm } => reg!(d, i64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x < y),
+            Op::I64LtURR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x < y),
+            Op::I64LtURI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x < y),
+            Op::I64GtSRR { d, a, b } => reg!(d, i64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x > y),
+            Op::I64GtSRI { d, a, imm } => reg!(d, i64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x > y),
+            Op::I64GtURR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x > y),
+            Op::I64GtURI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x > y),
+            Op::I64LeSRR { d, a, b } => reg!(d, i64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x <= y),
+            Op::I64LeSRI { d, a, imm } => reg!(d, i64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x <= y),
+            Op::I64LeURR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x <= y),
+            Op::I64LeURI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x <= y),
+            Op::I64GeSRR { d, a, b } => reg!(d, i64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x >= y),
+            Op::I64GeSRI { d, a, imm } => reg!(d, i64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x >= y),
+            Op::I64GeURR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x >= y),
+            Op::I64GeURI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x >= y),
+            Op::I32EqzR { d, a } => { let x = u32_(s[fp + a as usize]); s[fp + d as usize] = rb(x == 0); }
+            Op::I64EqzR { d, a } => { let x = u64_(s[fp + a as usize]); s[fp + d as usize] = rb(x == 0); }
+            Op::I32WrapI64R { d, a } => { let x = u64_(s[fp + a as usize]); s[fp + d as usize] = ru32(x as u32); }
+            Op::I64ExtendI32UR { d, a } => { let x = u32_(s[fp + a as usize]); s[fp + d as usize] = ru64(x as u64); }
+            Op::I64ExtendI32SR { d, a } => { let x = i32_(s[fp + a as usize]); s[fp + d as usize] = ri64(x as i64); }
+            Op::I32LoadR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 4] = mem.get(ea..ea + 4).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = u32::from_le_bytes(b) as u64; }
+            Op::I64LoadR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 8] = mem.get(ea..ea + 8).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = u64::from_le_bytes(b); }
+            Op::Load8UR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 1] = mem.get(ea..ea + 1).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = b[0] as u64; }
+            Op::Load16UR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 2] = mem.get(ea..ea + 2).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = u16::from_le_bytes(b) as u64; }
+            Op::I32Load8SR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 1] = mem.get(ea..ea + 1).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = ri32(b[0] as i8 as i32); }
+            Op::I32Load16SR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 2] = mem.get(ea..ea + 2).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = ri32(i16::from_le_bytes(b) as i32); }
+            Op::Store32R { a, v, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = s[fp + v as usize].to_le_bytes(); mem.get_mut(ea..ea + 4).ok_or("out of bounds memory access")?.copy_from_slice(&v[..4]); }
+            Op::Store64R { a, v, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = s[fp + v as usize].to_le_bytes(); mem.get_mut(ea..ea + 8).ok_or("out of bounds memory access")?.copy_from_slice(&v[..8]); }
+            Op::Store8R { a, v, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = s[fp + v as usize].to_le_bytes(); mem.get_mut(ea..ea + 1).ok_or("out of bounds memory access")?.copy_from_slice(&v[..1]); }
+            Op::Store16R { a, v, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = s[fp + v as usize].to_le_bytes(); mem.get_mut(ea..ea + 2).ok_or("out of bounds memory access")?.copy_from_slice(&v[..2]); }
+            // A call to a function of this module, with room on both stacks
+            // and few enough locals to clear in one go. The slow path does the rest.
+            Op::CallAt(idx, h) => {
+                let Some(callee) = (idx as usize).checked_sub(m.imports as usize) else { out!(pc - 1, false) };
+                let g = &m.funcs[callee];
+                let nfp = base + h as usize - g.nparams as usize;
+                let nbase = nfp + g.nlocals as usize;
+                if fuel == 0 || frames.len() >= MAX_FRAMES || nbase + g.max_height as usize + SLACK > s.len() || g.nlocals - g.nparams > SLACK as u32 {
+                    out!(pc - 1, false)
+                }
+                fuel -= 1;
+                frames.push(Frame { func: fi as u32, pc: pc as u32, fp: fp as u32 });
+                // Clears the new locals and maybe some operand slots past
+                // them, which are always written before they're read. A fixed
+                // size is plain stores, not a call.
+                let l = nfp + g.nparams as usize;
+                s[l..l + SLACK].copy_from_slice(&[0; SLACK]);
+                fi = callee;
+                f = g;
+                ops = &f.ops;
+                fp = nfp;
+                base = nbase;
+                sp = nbase;
+                pc = 0;
+            }
+            Op::ReturnAt(h) => {
+                let Some(&fr) = frames.last() else { out!(pc - 1, false) };
+                frames.pop();
+                sp = base + h as usize;
+                let n = f.nresults as usize;
+                for i in 0..n {
+                    s[fp + i] = s[sp - n + i];
+                }
+                sp = fp + n;
+                fi = fr.func as usize;
+                f = &m.funcs[fi];
+                ops = &f.ops;
+                pc = fr.pc as usize;
+                fp = fr.fp as usize;
+                base = fp + f.nlocals as usize;
+            }
+            _ => out!(pc - 1, false),
+        }
+    }
 }
 
 impl Vm {
@@ -1235,16 +1629,13 @@ impl Vm {
         let m = self.m.clone();
         let Vm { stack: sv, frames, func, pc: spc, fp: sfp, sp: ssp, mem, max_pages, globals, tables, dropped, state, .. } = self;
         let mut fi = *func as usize;
-        let mut f = &m.funcs[fi];
         let mut pc = *spc as usize;
         let mut fp = *sfp as usize;
         let mut sp = *ssp as usize;
-        let mut base = fp + f.nlocals as usize;
         let lm = mem;
         let mut mem: &mut [u8] = &mut lm.buf[..lm.len];
         // Plain slices keep pointer and length in registers. Re-slice after any resize.
         let mut s: &mut [u64] = &mut sv[..];
-        let mut ops: &[Op] = &f.ops;
 
         macro_rules! pop {
             () => {{
@@ -1296,20 +1687,6 @@ impl Vm {
                 mem.get_mut(a..a + $n).ok_or("out of bounds memory access")?.copy_from_slice(&$e[..$n]);
             }};
         }
-        macro_rules! reg {
-            ($d:expr, $from:ident, $to:ident, $a:expr, $b:expr, |$x:ident, $y:ident| $e:expr) => {{
-                let $x = $from($a);
-                let $y = $from($b);
-                s[fp + $d as usize] = $to($e);
-            }};
-        }
-        macro_rules! take {
-            ($t:expr) => {{
-                let t = f.table[$t as usize];
-                sp = branch(s, base, sp, t);
-                pc = t.pc as usize;
-            }};
-        }
         macro_rules! call {
             ($idx:expr, $redo:expr) => {{
                 let idx = $idx as usize;
@@ -1332,10 +1709,9 @@ impl Vm {
                 }
                 frames.push(Frame { func: fi as u32, pc: pc as u32, fp: fp as u32 });
                 fi = idx - m.imports as usize;
-                f = &m.funcs[fi];
-                ops = &f.ops;
+                let f = &m.funcs[fi];
                 fp = sp - f.nparams as usize;
-                base = fp + f.nlocals as usize;
+                let base = fp + f.nlocals as usize;
                 let need = base + f.max_height as usize + SLACK;
                 if need > MAX_STACK {
                     return Err("value stack exhausted");
@@ -1352,28 +1728,20 @@ impl Vm {
         }
 
         loop {
+            let mut p = Pos { fi, pc, fp, sp, fuel };
+            let exit = hot(&m, frames, s, mem, globals, &mut p);
+            (fi, pc, fp, sp, fuel) = (p.fi, p.pc, p.fp, p.sp, p.fuel);
+            let f = &m.funcs[fi];
+            let ops = &f.ops;
+            let base = fp + f.nlocals as usize;
+            if exit? {
+                save!(pc);
+                return Ok(Outcome::Yield);
+            }
             let op = ops[pc];
             pc += 1;
             match op {
-                Op::Tick => {
-                    if fuel == 0 {
-                        save!(pc - 1);
-                        return Ok(Outcome::Yield);
-                    }
-                    fuel -= 1;
-                }
                 Op::Unreachable => return Err("unreachable"),
-                Op::Br(t) => {
-                    sp = branch(s, base, sp, t);
-                    pc = t.pc as usize;
-                }
-                Op::Jump(to) => pc = to as usize,
-                Op::BrTable { start, len } => {
-                    let i = (pop!() as u32).min(len - 1);
-                    let t = f.table[(start + i) as usize];
-                    sp = branch(s, base, sp, t);
-                    pc = t.pc as usize;
-                }
                 Op::ReturnAt(h) => {
                     sp = base + h as usize;
                     let n = f.nresults as usize;
@@ -1386,11 +1754,8 @@ impl Vm {
                         }
                         Some(fr) => {
                             fi = fr.func as usize;
-                            f = &m.funcs[fi];
-                            ops = &f.ops;
                             pc = fr.pc as usize;
                             fp = fr.fp as usize;
-                            base = fp + f.nlocals as usize;
                         }
                     }
                 }
@@ -1462,206 +1827,6 @@ impl Vm {
                 Op::I32Store8(o) | Op::I64Store8(o) => store!(o, 1, |v| v.to_le_bytes()),
                 Op::I32Store16(o) | Op::I64Store16(o) => store!(o, 2, |v| v.to_le_bytes()),
 
-                Op::Copy { d, src } => s[fp + d as usize] = s[fp + src as usize],
-                Op::ConstTo { d, v } => s[fp + d as usize] = v,
-                Op::SetSp(h) => sp = base + h as usize,
-                Op::BrIfR { c, t } => {
-                    if s[fp + c as usize] as u32 != 0 {
-                        let t = f.table[t as usize];
-                        sp = branch(s, base, sp, t);
-                        pc = t.pc as usize;
-                    }
-                }
-                Op::BrIfI32EqRR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x == y { take!(t) } }
-                Op::BrIfI32EqRI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x == y { take!(t) } }
-                Op::IfI32EqRR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x == y) { pc = to as usize; } }
-                Op::IfI32EqRI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x == y) { pc = to as usize; } }
-                Op::BrIfI32NeRR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x != y { take!(t) } }
-                Op::BrIfI32NeRI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x != y { take!(t) } }
-                Op::IfI32NeRR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x != y) { pc = to as usize; } }
-                Op::IfI32NeRI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x != y) { pc = to as usize; } }
-                Op::BrIfI32LtSRR { a, b, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if x < y { take!(t) } }
-                Op::BrIfI32LtSRI { a, imm, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if x < y { take!(t) } }
-                Op::IfI32LtSRR { a, b, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if !(x < y) { pc = to as usize; } }
-                Op::IfI32LtSRI { a, imm, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if !(x < y) { pc = to as usize; } }
-                Op::BrIfI32LtURR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x < y { take!(t) } }
-                Op::BrIfI32LtURI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x < y { take!(t) } }
-                Op::IfI32LtURR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x < y) { pc = to as usize; } }
-                Op::IfI32LtURI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x < y) { pc = to as usize; } }
-                Op::BrIfI32GtSRR { a, b, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if x > y { take!(t) } }
-                Op::BrIfI32GtSRI { a, imm, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if x > y { take!(t) } }
-                Op::IfI32GtSRR { a, b, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if !(x > y) { pc = to as usize; } }
-                Op::IfI32GtSRI { a, imm, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if !(x > y) { pc = to as usize; } }
-                Op::BrIfI32GtURR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x > y { take!(t) } }
-                Op::BrIfI32GtURI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x > y { take!(t) } }
-                Op::IfI32GtURR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x > y) { pc = to as usize; } }
-                Op::IfI32GtURI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x > y) { pc = to as usize; } }
-                Op::BrIfI32LeSRR { a, b, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if x <= y { take!(t) } }
-                Op::BrIfI32LeSRI { a, imm, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if x <= y { take!(t) } }
-                Op::IfI32LeSRR { a, b, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if !(x <= y) { pc = to as usize; } }
-                Op::IfI32LeSRI { a, imm, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if !(x <= y) { pc = to as usize; } }
-                Op::BrIfI32LeURR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x <= y { take!(t) } }
-                Op::BrIfI32LeURI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x <= y { take!(t) } }
-                Op::IfI32LeURR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x <= y) { pc = to as usize; } }
-                Op::IfI32LeURI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x <= y) { pc = to as usize; } }
-                Op::BrIfI32GeSRR { a, b, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if x >= y { take!(t) } }
-                Op::BrIfI32GeSRI { a, imm, t } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if x >= y { take!(t) } }
-                Op::IfI32GeSRR { a, b, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(s[fp + b as usize])); if !(x >= y) { pc = to as usize; } }
-                Op::IfI32GeSRI { a, imm, to } => { let (x, y) = (i32_(s[fp + a as usize]), i32_(imm as u32 as u64)); if !(x >= y) { pc = to as usize; } }
-                Op::BrIfI32GeURR { a, b, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if x >= y { take!(t) } }
-                Op::BrIfI32GeURI { a, imm, t } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if x >= y { take!(t) } }
-                Op::IfI32GeURR { a, b, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(s[fp + b as usize])); if !(x >= y) { pc = to as usize; } }
-                Op::IfI32GeURI { a, imm, to } => { let (x, y) = (u32_(s[fp + a as usize]), u32_(imm as u32 as u64)); if !(x >= y) { pc = to as usize; } }
-                Op::BrIfI64EqRR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x == y { take!(t) } }
-                Op::BrIfI64EqRI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x == y { take!(t) } }
-                Op::IfI64EqRR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x == y) { pc = to as usize; } }
-                Op::IfI64EqRI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x == y) { pc = to as usize; } }
-                Op::BrIfI64NeRR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x != y { take!(t) } }
-                Op::BrIfI64NeRI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x != y { take!(t) } }
-                Op::IfI64NeRR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x != y) { pc = to as usize; } }
-                Op::IfI64NeRI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x != y) { pc = to as usize; } }
-                Op::BrIfI64LtSRR { a, b, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if x < y { take!(t) } }
-                Op::BrIfI64LtSRI { a, imm, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if x < y { take!(t) } }
-                Op::IfI64LtSRR { a, b, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if !(x < y) { pc = to as usize; } }
-                Op::IfI64LtSRI { a, imm, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if !(x < y) { pc = to as usize; } }
-                Op::BrIfI64LtURR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x < y { take!(t) } }
-                Op::BrIfI64LtURI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x < y { take!(t) } }
-                Op::IfI64LtURR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x < y) { pc = to as usize; } }
-                Op::IfI64LtURI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x < y) { pc = to as usize; } }
-                Op::BrIfI64GtSRR { a, b, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if x > y { take!(t) } }
-                Op::BrIfI64GtSRI { a, imm, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if x > y { take!(t) } }
-                Op::IfI64GtSRR { a, b, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if !(x > y) { pc = to as usize; } }
-                Op::IfI64GtSRI { a, imm, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if !(x > y) { pc = to as usize; } }
-                Op::BrIfI64GtURR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x > y { take!(t) } }
-                Op::BrIfI64GtURI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x > y { take!(t) } }
-                Op::IfI64GtURR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x > y) { pc = to as usize; } }
-                Op::IfI64GtURI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x > y) { pc = to as usize; } }
-                Op::BrIfI64LeSRR { a, b, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if x <= y { take!(t) } }
-                Op::BrIfI64LeSRI { a, imm, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if x <= y { take!(t) } }
-                Op::IfI64LeSRR { a, b, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if !(x <= y) { pc = to as usize; } }
-                Op::IfI64LeSRI { a, imm, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if !(x <= y) { pc = to as usize; } }
-                Op::BrIfI64LeURR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x <= y { take!(t) } }
-                Op::BrIfI64LeURI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x <= y { take!(t) } }
-                Op::IfI64LeURR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x <= y) { pc = to as usize; } }
-                Op::IfI64LeURI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x <= y) { pc = to as usize; } }
-                Op::BrIfI64GeSRR { a, b, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if x >= y { take!(t) } }
-                Op::BrIfI64GeSRI { a, imm, t } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if x >= y { take!(t) } }
-                Op::IfI64GeSRR { a, b, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(s[fp + b as usize])); if !(x >= y) { pc = to as usize; } }
-                Op::IfI64GeSRI { a, imm, to } => { let (x, y) = (i64_(s[fp + a as usize]), i64_(imm as i64 as u64)); if !(x >= y) { pc = to as usize; } }
-                Op::BrIfI64GeURR { a, b, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if x >= y { take!(t) } }
-                Op::BrIfI64GeURI { a, imm, t } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if x >= y { take!(t) } }
-                Op::IfI64GeURR { a, b, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(s[fp + b as usize])); if !(x >= y) { pc = to as usize; } }
-                Op::IfI64GeURI { a, imm, to } => { let (x, y) = (u64_(s[fp + a as usize]), u64_(imm as i64 as u64)); if !(x >= y) { pc = to as usize; } }
-                Op::BrIfI32EqzR { a, t } => { if u32_(s[fp + a as usize]) == 0 { take!(t) } }
-                Op::IfI32EqzR { a, to } => { if u32_(s[fp + a as usize]) != 0 { pc = to as usize; } }
-                Op::BrIfI64EqzR { a, t } => { if u64_(s[fp + a as usize]) == 0 { take!(t) } }
-                Op::IfI64EqzR { a, to } => { if u64_(s[fp + a as usize]) != 0 { pc = to as usize; } }
-                Op::GlobalGetR { d, g } => s[fp + d as usize] = globals[g as usize],
-                Op::GlobalSetR { g, a } => globals[g as usize] = s[fp + a as usize],
-                Op::SelectR { d, a, b, c } => {
-                    let v = if s[fp + c as usize] as u32 != 0 { s[fp + a as usize] } else { s[fp + b as usize] };
-                    s[fp + d as usize] = v;
-                }
-                Op::Store32RI { a, imm, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = (imm as i64 as u64).to_le_bytes(); mem.get_mut(ea..ea + 4).ok_or("out of bounds memory access")?.copy_from_slice(&v[..4]); }
-                Op::Store64RI { a, imm, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = (imm as i64 as u64).to_le_bytes(); mem.get_mut(ea..ea + 8).ok_or("out of bounds memory access")?.copy_from_slice(&v[..8]); }
-                Op::Store8RI { a, imm, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = (imm as i64 as u64).to_le_bytes(); mem.get_mut(ea..ea + 1).ok_or("out of bounds memory access")?.copy_from_slice(&v[..1]); }
-                Op::Store16RI { a, imm, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = (imm as i64 as u64).to_le_bytes(); mem.get_mut(ea..ea + 2).ok_or("out of bounds memory access")?.copy_from_slice(&v[..2]); }
-                Op::IfR { c, to } => {
-                    if s[fp + c as usize] as u32 == 0 {
-                        pc = to as usize;
-                    }
-                }
-                Op::I32AddRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_add(y)),
-                Op::I32AddRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x.wrapping_add(y)),
-                Op::I32SubRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_sub(y)),
-                Op::I32SubRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x.wrapping_sub(y)),
-                Op::I32MulRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_mul(y)),
-                Op::I32MulRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x.wrapping_mul(y)),
-                Op::I32AndRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x & y),
-                Op::I32AndRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x & y),
-                Op::I32OrRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x | y),
-                Op::I32OrRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x | y),
-                Op::I32XorRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x ^ y),
-                Op::I32XorRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x ^ y),
-                Op::I32ShlRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_shl(y)),
-                Op::I32ShlRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x.wrapping_shl(y)),
-                Op::I32ShrSRR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| (x as i32).wrapping_shr(y) as u32),
-                Op::I32ShrSRI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| (x as i32).wrapping_shr(y) as u32),
-                Op::I32ShrURR { d, a, b } => reg!(d, u32_, ru32, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_shr(y)),
-                Op::I32ShrURI { d, a, imm } => reg!(d, u32_, ru32, s[fp + a as usize], imm as u32 as u64, |x, y| x.wrapping_shr(y)),
-                Op::I32EqRR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x == y),
-                Op::I32EqRI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x == y),
-                Op::I32NeRR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x != y),
-                Op::I32NeRI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x != y),
-                Op::I32LtSRR { d, a, b } => reg!(d, i32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x < y),
-                Op::I32LtSRI { d, a, imm } => reg!(d, i32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x < y),
-                Op::I32LtURR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x < y),
-                Op::I32LtURI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x < y),
-                Op::I32GtSRR { d, a, b } => reg!(d, i32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x > y),
-                Op::I32GtSRI { d, a, imm } => reg!(d, i32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x > y),
-                Op::I32GtURR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x > y),
-                Op::I32GtURI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x > y),
-                Op::I32LeSRR { d, a, b } => reg!(d, i32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x <= y),
-                Op::I32LeSRI { d, a, imm } => reg!(d, i32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x <= y),
-                Op::I32LeURR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x <= y),
-                Op::I32LeURI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x <= y),
-                Op::I32GeSRR { d, a, b } => reg!(d, i32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x >= y),
-                Op::I32GeSRI { d, a, imm } => reg!(d, i32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x >= y),
-                Op::I32GeURR { d, a, b } => reg!(d, u32_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x >= y),
-                Op::I32GeURI { d, a, imm } => reg!(d, u32_, rb, s[fp + a as usize], imm as u32 as u64, |x, y| x >= y),
-                Op::I64AddRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_add(y)),
-                Op::I64AddRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x.wrapping_add(y)),
-                Op::I64SubRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_sub(y)),
-                Op::I64SubRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x.wrapping_sub(y)),
-                Op::I64MulRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_mul(y)),
-                Op::I64MulRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x.wrapping_mul(y)),
-                Op::I64AndRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x & y),
-                Op::I64AndRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x & y),
-                Op::I64OrRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x | y),
-                Op::I64OrRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x | y),
-                Op::I64XorRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x ^ y),
-                Op::I64XorRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x ^ y),
-                Op::I64ShlRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_shl(y as u32)),
-                Op::I64ShlRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x.wrapping_shl(y as u32)),
-                Op::I64ShrSRR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| (x as i64).wrapping_shr(y as u32) as u64),
-                Op::I64ShrSRI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| (x as i64).wrapping_shr(y as u32) as u64),
-                Op::I64ShrURR { d, a, b } => reg!(d, u64_, ru64, s[fp + a as usize], s[fp + b as usize], |x, y| x.wrapping_shr(y as u32)),
-                Op::I64ShrURI { d, a, imm } => reg!(d, u64_, ru64, s[fp + a as usize], imm as i64 as u64, |x, y| x.wrapping_shr(y as u32)),
-                Op::I64EqRR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x == y),
-                Op::I64EqRI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x == y),
-                Op::I64NeRR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x != y),
-                Op::I64NeRI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x != y),
-                Op::I64LtSRR { d, a, b } => reg!(d, i64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x < y),
-                Op::I64LtSRI { d, a, imm } => reg!(d, i64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x < y),
-                Op::I64LtURR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x < y),
-                Op::I64LtURI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x < y),
-                Op::I64GtSRR { d, a, b } => reg!(d, i64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x > y),
-                Op::I64GtSRI { d, a, imm } => reg!(d, i64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x > y),
-                Op::I64GtURR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x > y),
-                Op::I64GtURI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x > y),
-                Op::I64LeSRR { d, a, b } => reg!(d, i64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x <= y),
-                Op::I64LeSRI { d, a, imm } => reg!(d, i64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x <= y),
-                Op::I64LeURR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x <= y),
-                Op::I64LeURI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x <= y),
-                Op::I64GeSRR { d, a, b } => reg!(d, i64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x >= y),
-                Op::I64GeSRI { d, a, imm } => reg!(d, i64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x >= y),
-                Op::I64GeURR { d, a, b } => reg!(d, u64_, rb, s[fp + a as usize], s[fp + b as usize], |x, y| x >= y),
-                Op::I64GeURI { d, a, imm } => reg!(d, u64_, rb, s[fp + a as usize], imm as i64 as u64, |x, y| x >= y),
-                Op::I32EqzR { d, a } => { let x = u32_(s[fp + a as usize]); s[fp + d as usize] = rb(x == 0); }
-                Op::I64EqzR { d, a } => { let x = u64_(s[fp + a as usize]); s[fp + d as usize] = rb(x == 0); }
-                Op::I32WrapI64R { d, a } => { let x = u64_(s[fp + a as usize]); s[fp + d as usize] = ru32(x as u32); }
-                Op::I64ExtendI32UR { d, a } => { let x = u32_(s[fp + a as usize]); s[fp + d as usize] = ru64(x as u64); }
-                Op::I64ExtendI32SR { d, a } => { let x = i32_(s[fp + a as usize]); s[fp + d as usize] = ri64(x as i64); }
-                Op::I32LoadR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 4] = mem.get(ea..ea + 4).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = u32::from_le_bytes(b) as u64; }
-                Op::I64LoadR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 8] = mem.get(ea..ea + 8).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = u64::from_le_bytes(b); }
-                Op::Load8UR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 1] = mem.get(ea..ea + 1).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = b[0] as u64; }
-                Op::Load16UR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 2] = mem.get(ea..ea + 2).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = u16::from_le_bytes(b) as u64; }
-                Op::I32Load8SR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 1] = mem.get(ea..ea + 1).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = ri32(b[0] as i8 as i32); }
-                Op::I32Load16SR { d, a, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let b: [u8; 2] = mem.get(ea..ea + 2).ok_or("out of bounds memory access")?.try_into().unwrap(); s[fp + d as usize] = ri32(i16::from_le_bytes(b) as i32); }
-                Op::Store32R { a, v, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = s[fp + v as usize].to_le_bytes(); mem.get_mut(ea..ea + 4).ok_or("out of bounds memory access")?.copy_from_slice(&v[..4]); }
-                Op::Store64R { a, v, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = s[fp + v as usize].to_le_bytes(); mem.get_mut(ea..ea + 8).ok_or("out of bounds memory access")?.copy_from_slice(&v[..8]); }
-                Op::Store8R { a, v, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = s[fp + v as usize].to_le_bytes(); mem.get_mut(ea..ea + 1).ok_or("out of bounds memory access")?.copy_from_slice(&v[..1]); }
-                Op::Store16R { a, v, off } => { let ea = s[fp + a as usize] as u32 as usize + off as usize; let v = s[fp + v as usize].to_le_bytes(); mem.get_mut(ea..ea + 2).ok_or("out of bounds memory access")?.copy_from_slice(&v[..2]); }
                 Op::I32Eqz => un!(u32_, rb, |x| x == 0),
                 Op::I32Eq => bin!(u32_, rb, |a, b| a == b),
                 Op::I32Ne => bin!(u32_, rb, |a, b| a != b),
@@ -1808,6 +1973,7 @@ impl Vm {
                 Op::I64TruncSatF32U => un!(f32_, ru64, |x| x as u64),
                 Op::I64TruncSatF64S => un!(f64_, ri64, |x| x as i64),
                 Op::I64TruncSatF64U => un!(f64_, ru64, |x| x as u64),
+                _ => unreachable!("the hot loop runs {op:?}"),
             }
         }
     }
