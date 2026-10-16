@@ -1423,6 +1423,42 @@ fn hot(m: &Module, frames: &mut Vec<Frame>, s: &mut [u64], mem: &mut [u8], globa
             r[sp]
         }};
     }
+    macro_rules! push {
+        ($v:expr) => {{
+            let v = $v;
+            r[sp] = v;
+            sp += 1;
+        }};
+    }
+    macro_rules! un {
+        ($from:ident, $to:ident, |$x:ident| $e:expr) => {{
+            let v = &mut r[sp - 1];
+            let $x = $from(*v);
+            *v = $to($e);
+        }};
+    }
+    macro_rules! bin {
+        ($from:ident, $to:ident, |$a:ident, $b:ident| $e:expr) => {{
+            let $b = $from(pop!());
+            let v = &mut r[sp - 1];
+            let $a = $from(*v);
+            *v = $to($e);
+        }};
+    }
+    macro_rules! load {
+        ($off:expr, $n:literal, |$b:ident| $e:expr) => {{
+            let a = pop!() as u32 as usize + $off as usize;
+            let $b: [u8; $n] = mem.get(a..a + $n).ok_or("out of bounds memory access")?.try_into().unwrap();
+            push!($e);
+        }};
+    }
+    macro_rules! store {
+        ($off:expr, $n:literal, |$v:ident| $e:expr) => {{
+            let $v = pop!();
+            let a = pop!() as u32 as usize + $off as usize;
+            mem.get_mut(a..a + $n).ok_or("out of bounds memory access")?.copy_from_slice(&$e[..$n]);
+        }};
+    }
     macro_rules! reg {
         ($d:expr, $from:ident, $to:ident, $a:expr, $b:expr, |$x:ident, $y:ident| $e:expr) => {{
             let $x = $from($a);
@@ -1718,6 +1754,167 @@ fn hot(m: &Module, frames: &mut Vec<Frame>, s: &mut [u64], mem: &mut [u8], globa
                 fp = cfp;
                 base = f.nlocals as usize;
             }
+            // Stack-form ops, for what has no register form yet (floats, mostly).
+            Op::I32Load(o) | Op::F32Load(o) | Op::I64Load32U(o) => load!(o, 4, |b| u32::from_le_bytes(b) as u64),
+            Op::I64Load(o) | Op::F64Load(o) => load!(o, 8, |b| u64::from_le_bytes(b)),
+            Op::I32Load8U(o) | Op::I64Load8U(o) => load!(o, 1, |b| b[0] as u64),
+            Op::I32Load16U(o) | Op::I64Load16U(o) => load!(o, 2, |b| u16::from_le_bytes(b) as u64),
+            Op::I32Load8S(o) => load!(o, 1, |b| ri32(b[0] as i8 as i32)),
+            Op::I32Load16S(o) => load!(o, 2, |b| ri32(i16::from_le_bytes(b) as i32)),
+            Op::I64Load8S(o) => load!(o, 1, |b| b[0] as i8 as i64 as u64),
+            Op::I64Load16S(o) => load!(o, 2, |b| i16::from_le_bytes(b) as i64 as u64),
+            Op::I64Load32S(o) => load!(o, 4, |b| i32::from_le_bytes(b) as i64 as u64),
+            Op::I32Store(o) | Op::F32Store(o) | Op::I64Store32(o) => store!(o, 4, |v| v.to_le_bytes()),
+            Op::I64Store(o) | Op::F64Store(o) => store!(o, 8, |v| v.to_le_bytes()),
+            Op::I32Store8(o) | Op::I64Store8(o) => store!(o, 1, |v| v.to_le_bytes()),
+            Op::I32Store16(o) | Op::I64Store16(o) => store!(o, 2, |v| v.to_le_bytes()),
+
+            Op::I32Eqz => un!(u32_, rb, |x| x == 0),
+            Op::I32Eq => bin!(u32_, rb, |a, b| a == b),
+            Op::I32Ne => bin!(u32_, rb, |a, b| a != b),
+            Op::I32LtS => bin!(i32_, rb, |a, b| a < b),
+            Op::I32LtU => bin!(u32_, rb, |a, b| a < b),
+            Op::I32GtS => bin!(i32_, rb, |a, b| a > b),
+            Op::I32GtU => bin!(u32_, rb, |a, b| a > b),
+            Op::I32LeS => bin!(i32_, rb, |a, b| a <= b),
+            Op::I32LeU => bin!(u32_, rb, |a, b| a <= b),
+            Op::I32GeS => bin!(i32_, rb, |a, b| a >= b),
+            Op::I32GeU => bin!(u32_, rb, |a, b| a >= b),
+            Op::I64Eqz => un!(u64_, rb, |x| x == 0),
+            Op::I64Eq => bin!(u64_, rb, |a, b| a == b),
+            Op::I64Ne => bin!(u64_, rb, |a, b| a != b),
+            Op::I64LtS => bin!(i64_, rb, |a, b| a < b),
+            Op::I64LtU => bin!(u64_, rb, |a, b| a < b),
+            Op::I64GtS => bin!(i64_, rb, |a, b| a > b),
+            Op::I64GtU => bin!(u64_, rb, |a, b| a > b),
+            Op::I64LeS => bin!(i64_, rb, |a, b| a <= b),
+            Op::I64LeU => bin!(u64_, rb, |a, b| a <= b),
+            Op::I64GeS => bin!(i64_, rb, |a, b| a >= b),
+            Op::I64GeU => bin!(u64_, rb, |a, b| a >= b),
+            Op::F32Eq => bin!(f32_, rb, |a, b| a == b),
+            Op::F32Ne => bin!(f32_, rb, |a, b| a != b),
+            Op::F32Lt => bin!(f32_, rb, |a, b| a < b),
+            Op::F32Gt => bin!(f32_, rb, |a, b| a > b),
+            Op::F32Le => bin!(f32_, rb, |a, b| a <= b),
+            Op::F32Ge => bin!(f32_, rb, |a, b| a >= b),
+            Op::F64Eq => bin!(f64_, rb, |a, b| a == b),
+            Op::F64Ne => bin!(f64_, rb, |a, b| a != b),
+            Op::F64Lt => bin!(f64_, rb, |a, b| a < b),
+            Op::F64Gt => bin!(f64_, rb, |a, b| a > b),
+            Op::F64Le => bin!(f64_, rb, |a, b| a <= b),
+            Op::F64Ge => bin!(f64_, rb, |a, b| a >= b),
+
+            Op::I32Clz => un!(u32_, ru32, |x| x.leading_zeros()),
+            Op::I32Ctz => un!(u32_, ru32, |x| x.trailing_zeros()),
+            Op::I32Popcnt => un!(u32_, ru32, |x| x.count_ones()),
+            Op::I32Add => bin!(u32_, ru32, |a, b| a.wrapping_add(b)),
+            Op::I32Sub => bin!(u32_, ru32, |a, b| a.wrapping_sub(b)),
+            Op::I32Mul => bin!(u32_, ru32, |a, b| a.wrapping_mul(b)),
+            Op::I32DivS => bin!(i32_, ri32, |a, b| match (a, b) {
+                (_, 0) => return Err("integer divide by zero"),
+                (i32::MIN, -1) => return Err("integer overflow"),
+                _ => a / b,
+            }),
+            Op::I32DivU => bin!(u32_, ru32, |a, b| a.checked_div(b).ok_or("integer divide by zero")?),
+            Op::I32RemS => bin!(i32_, ri32, |a, b| if b == 0 { return Err("integer divide by zero") } else { a.wrapping_rem(b) }),
+            Op::I32RemU => bin!(u32_, ru32, |a, b| a.checked_rem(b).ok_or("integer divide by zero")?),
+            Op::I32And => bin!(u32_, ru32, |a, b| a & b),
+            Op::I32Or => bin!(u32_, ru32, |a, b| a | b),
+            Op::I32Xor => bin!(u32_, ru32, |a, b| a ^ b),
+            Op::I32Shl => bin!(u32_, ru32, |a, b| a.wrapping_shl(b)),
+            Op::I32ShrS => bin!(u32_, ru32, |a, b| (a as i32).wrapping_shr(b) as u32),
+            Op::I32ShrU => bin!(u32_, ru32, |a, b| a.wrapping_shr(b)),
+            Op::I32Rotl => bin!(u32_, ru32, |a, b| a.rotate_left(b % 32)),
+            Op::I32Rotr => bin!(u32_, ru32, |a, b| a.rotate_right(b % 32)),
+            Op::I64Clz => un!(u64_, ru64, |x| x.leading_zeros() as u64),
+            Op::I64Ctz => un!(u64_, ru64, |x| x.trailing_zeros() as u64),
+            Op::I64Popcnt => un!(u64_, ru64, |x| x.count_ones() as u64),
+            Op::I64Add => bin!(u64_, ru64, |a, b| a.wrapping_add(b)),
+            Op::I64Sub => bin!(u64_, ru64, |a, b| a.wrapping_sub(b)),
+            Op::I64Mul => bin!(u64_, ru64, |a, b| a.wrapping_mul(b)),
+            Op::I64DivS => bin!(i64_, ri64, |a, b| match (a, b) {
+                (_, 0) => return Err("integer divide by zero"),
+                (i64::MIN, -1) => return Err("integer overflow"),
+                _ => a / b,
+            }),
+            Op::I64DivU => bin!(u64_, ru64, |a, b| a.checked_div(b).ok_or("integer divide by zero")?),
+            Op::I64RemS => bin!(i64_, ri64, |a, b| if b == 0 { return Err("integer divide by zero") } else { a.wrapping_rem(b) }),
+            Op::I64RemU => bin!(u64_, ru64, |a, b| a.checked_rem(b).ok_or("integer divide by zero")?),
+            Op::I64And => bin!(u64_, ru64, |a, b| a & b),
+            Op::I64Or => bin!(u64_, ru64, |a, b| a | b),
+            Op::I64Xor => bin!(u64_, ru64, |a, b| a ^ b),
+            Op::I64Shl => bin!(u64_, ru64, |a, b| a.wrapping_shl(b as u32)),
+            Op::I64ShrS => bin!(u64_, ru64, |a, b| (a as i64).wrapping_shr(b as u32) as u64),
+            Op::I64ShrU => bin!(u64_, ru64, |a, b| a.wrapping_shr(b as u32)),
+            Op::I64Rotl => bin!(u64_, ru64, |a, b| a.rotate_left((b % 64) as u32)),
+            Op::I64Rotr => bin!(u64_, ru64, |a, b| a.rotate_right((b % 64) as u32)),
+
+            Op::F32Abs => un!(f32_, rf32, |x| x.abs()),
+            Op::F32Neg => un!(f32_, rf32, |x| -x),
+            Op::F32Ceil => un!(f32_, rf32, |x| x.ceil()),
+            Op::F32Floor => un!(f32_, rf32, |x| x.floor()),
+            Op::F32Trunc => un!(f32_, rf32, |x| x.trunc()),
+            Op::F32Nearest => un!(f32_, rf32, |x| x.round_ties_even()),
+            Op::F32Sqrt => un!(f32_, rf32, |x| x.sqrt()),
+            Op::F32Add => bin!(f32_, rf32, |a, b| a + b),
+            Op::F32Sub => bin!(f32_, rf32, |a, b| a - b),
+            Op::F32Mul => bin!(f32_, rf32, |a, b| a * b),
+            Op::F32Div => bin!(f32_, rf32, |a, b| a / b),
+            Op::F32Min => bin!(f32_, rf32, |a, b| fmin32(a, b)),
+            Op::F32Max => bin!(f32_, rf32, |a, b| fmax32(a, b)),
+            Op::F32Copysign => bin!(f32_, rf32, |a, b| a.copysign(b)),
+            Op::F64Abs => un!(f64_, rf64, |x| x.abs()),
+            Op::F64Neg => un!(f64_, rf64, |x| -x),
+            Op::F64Ceil => un!(f64_, rf64, |x| x.ceil()),
+            Op::F64Floor => un!(f64_, rf64, |x| x.floor()),
+            Op::F64Trunc => un!(f64_, rf64, |x| x.trunc()),
+            Op::F64Nearest => un!(f64_, rf64, |x| x.round_ties_even()),
+            Op::F64Sqrt => un!(f64_, rf64, |x| x.sqrt()),
+            Op::F64Add => bin!(f64_, rf64, |a, b| a + b),
+            Op::F64Sub => bin!(f64_, rf64, |a, b| a - b),
+            Op::F64Mul => bin!(f64_, rf64, |a, b| a * b),
+            Op::F64Div => bin!(f64_, rf64, |a, b| a / b),
+            Op::F64Min => bin!(f64_, rf64, |a, b| fmin64(a, b)),
+            Op::F64Max => bin!(f64_, rf64, |a, b| fmax64(a, b)),
+            Op::F64Copysign => bin!(f64_, rf64, |a, b| a.copysign(b)),
+
+            Op::I32WrapI64 => un!(u64_, ru32, |x| x as u32),
+            Op::I32TruncF32S => un!(f32_, ri32, |x| trunc(x as f64, I32R.0, I32R.1)? as i32),
+            Op::I32TruncF32U => un!(f32_, ru32, |x| trunc(x as f64, U32R.0, U32R.1)? as u32),
+            Op::I32TruncF64S => un!(f64_, ri32, |x| trunc(x, I32R.0, I32R.1)? as i32),
+            Op::I32TruncF64U => un!(f64_, ru32, |x| trunc(x, U32R.0, U32R.1)? as u32),
+            Op::I64ExtendI32S => un!(i32_, ri64, |x| x as i64),
+            Op::I64ExtendI32U => un!(u32_, ru64, |x| x as u64),
+            Op::I64TruncF32S => un!(f32_, ri64, |x| trunc(x as f64, I64R.0, I64R.1)? as i64),
+            Op::I64TruncF32U => un!(f32_, ru64, |x| trunc(x as f64, U64R.0, U64R.1)? as u64),
+            Op::I64TruncF64S => un!(f64_, ri64, |x| trunc(x, I64R.0, I64R.1)? as i64),
+            Op::I64TruncF64U => un!(f64_, ru64, |x| trunc(x, U64R.0, U64R.1)? as u64),
+            Op::F32ConvertI32S => un!(i32_, rf32, |x| x as f32),
+            Op::F32ConvertI32U => un!(u32_, rf32, |x| x as f32),
+            Op::F32ConvertI64S => un!(i64_, rf32, |x| x as f32),
+            Op::F32ConvertI64U => un!(u64_, rf32, |x| x as f32),
+            Op::F32DemoteF64 => un!(f64_, rf32, |x| x as f32),
+            Op::F64ConvertI32S => un!(i32_, rf64, |x| x as f64),
+            Op::F64ConvertI32U => un!(u32_, rf64, |x| x as f64),
+            Op::F64ConvertI64S => un!(i64_, rf64, |x| x as f64),
+            Op::F64ConvertI64U => un!(u64_, rf64, |x| x as f64),
+            Op::F64PromoteF32 => un!(f32_, rf64, |x| x as f64),
+            // Values are stored as raw bits, so reinterpreting is free.
+            Op::I32ReinterpretF32 | Op::I64ReinterpretF64 | Op::F32ReinterpretI32 | Op::F64ReinterpretI64 => {}
+            Op::I32Extend8S => un!(u32_, ri32, |x| x as i8 as i32),
+            Op::I32Extend16S => un!(u32_, ri32, |x| x as i16 as i32),
+            Op::I64Extend8S => un!(u64_, ri64, |x| x as i8 as i64),
+            Op::I64Extend16S => un!(u64_, ri64, |x| x as i16 as i64),
+            Op::I64Extend32S => un!(u64_, ri64, |x| x as i32 as i64),
+            // Rust's `as` already saturates and maps NaN to 0, exactly like wasm.
+            Op::I32TruncSatF32S => un!(f32_, ri32, |x| x as i32),
+            Op::I32TruncSatF32U => un!(f32_, ru32, |x| x as u32),
+            Op::I32TruncSatF64S => un!(f64_, ri32, |x| x as i32),
+            Op::I32TruncSatF64U => un!(f64_, ru32, |x| x as u32),
+            Op::I64TruncSatF32S => un!(f32_, ri64, |x| x as i64),
+            Op::I64TruncSatF32U => un!(f32_, ru64, |x| x as u64),
+            Op::I64TruncSatF64S => un!(f64_, ri64, |x| x as i64),
+            Op::I64TruncSatF64U => un!(f64_, ru64, |x| x as u64),
             _ => out!(pc - 1, false),
         }
     }
@@ -1755,35 +1952,6 @@ impl Vm {
                 *spc = $pc as u32;
                 *sfp = fp as u32;
                 *ssp = sp as u32;
-            }};
-        }
-        macro_rules! un {
-            ($from:ident, $to:ident, |$x:ident| $e:expr) => {{
-                let v = &mut s[sp - 1];
-                let $x = $from(*v);
-                *v = $to($e);
-            }};
-        }
-        macro_rules! bin {
-            ($from:ident, $to:ident, |$a:ident, $b:ident| $e:expr) => {{
-                let $b = $from(pop!());
-                let v = &mut s[sp - 1];
-                let $a = $from(*v);
-                *v = $to($e);
-            }};
-        }
-        macro_rules! load {
-            ($off:expr, $n:literal, |$b:ident| $e:expr) => {{
-                let a = pop!() as u32 as usize + $off as usize;
-                let $b: [u8; $n] = mem.get(a..a + $n).ok_or("out of bounds memory access")?.try_into().unwrap();
-                push!($e);
-            }};
-        }
-        macro_rules! store {
-            ($off:expr, $n:literal, |$v:ident| $e:expr) => {{
-                let $v = pop!();
-                let a = pop!() as u32 as usize + $off as usize;
-                mem.get_mut(a..a + $n).ok_or("out of bounds memory access")?.copy_from_slice(&$e[..$n]);
             }};
         }
         macro_rules! call {
@@ -1911,166 +2079,6 @@ impl Vm {
                 }
                 Op::DataDrop(seg) => dropped[seg as usize] = true,
 
-                Op::I32Load(o) | Op::F32Load(o) | Op::I64Load32U(o) => load!(o, 4, |b| u32::from_le_bytes(b) as u64),
-                Op::I64Load(o) | Op::F64Load(o) => load!(o, 8, |b| u64::from_le_bytes(b)),
-                Op::I32Load8U(o) | Op::I64Load8U(o) => load!(o, 1, |b| b[0] as u64),
-                Op::I32Load16U(o) | Op::I64Load16U(o) => load!(o, 2, |b| u16::from_le_bytes(b) as u64),
-                Op::I32Load8S(o) => load!(o, 1, |b| ri32(b[0] as i8 as i32)),
-                Op::I32Load16S(o) => load!(o, 2, |b| ri32(i16::from_le_bytes(b) as i32)),
-                Op::I64Load8S(o) => load!(o, 1, |b| b[0] as i8 as i64 as u64),
-                Op::I64Load16S(o) => load!(o, 2, |b| i16::from_le_bytes(b) as i64 as u64),
-                Op::I64Load32S(o) => load!(o, 4, |b| i32::from_le_bytes(b) as i64 as u64),
-                Op::I32Store(o) | Op::F32Store(o) | Op::I64Store32(o) => store!(o, 4, |v| v.to_le_bytes()),
-                Op::I64Store(o) | Op::F64Store(o) => store!(o, 8, |v| v.to_le_bytes()),
-                Op::I32Store8(o) | Op::I64Store8(o) => store!(o, 1, |v| v.to_le_bytes()),
-                Op::I32Store16(o) | Op::I64Store16(o) => store!(o, 2, |v| v.to_le_bytes()),
-
-                Op::I32Eqz => un!(u32_, rb, |x| x == 0),
-                Op::I32Eq => bin!(u32_, rb, |a, b| a == b),
-                Op::I32Ne => bin!(u32_, rb, |a, b| a != b),
-                Op::I32LtS => bin!(i32_, rb, |a, b| a < b),
-                Op::I32LtU => bin!(u32_, rb, |a, b| a < b),
-                Op::I32GtS => bin!(i32_, rb, |a, b| a > b),
-                Op::I32GtU => bin!(u32_, rb, |a, b| a > b),
-                Op::I32LeS => bin!(i32_, rb, |a, b| a <= b),
-                Op::I32LeU => bin!(u32_, rb, |a, b| a <= b),
-                Op::I32GeS => bin!(i32_, rb, |a, b| a >= b),
-                Op::I32GeU => bin!(u32_, rb, |a, b| a >= b),
-                Op::I64Eqz => un!(u64_, rb, |x| x == 0),
-                Op::I64Eq => bin!(u64_, rb, |a, b| a == b),
-                Op::I64Ne => bin!(u64_, rb, |a, b| a != b),
-                Op::I64LtS => bin!(i64_, rb, |a, b| a < b),
-                Op::I64LtU => bin!(u64_, rb, |a, b| a < b),
-                Op::I64GtS => bin!(i64_, rb, |a, b| a > b),
-                Op::I64GtU => bin!(u64_, rb, |a, b| a > b),
-                Op::I64LeS => bin!(i64_, rb, |a, b| a <= b),
-                Op::I64LeU => bin!(u64_, rb, |a, b| a <= b),
-                Op::I64GeS => bin!(i64_, rb, |a, b| a >= b),
-                Op::I64GeU => bin!(u64_, rb, |a, b| a >= b),
-                Op::F32Eq => bin!(f32_, rb, |a, b| a == b),
-                Op::F32Ne => bin!(f32_, rb, |a, b| a != b),
-                Op::F32Lt => bin!(f32_, rb, |a, b| a < b),
-                Op::F32Gt => bin!(f32_, rb, |a, b| a > b),
-                Op::F32Le => bin!(f32_, rb, |a, b| a <= b),
-                Op::F32Ge => bin!(f32_, rb, |a, b| a >= b),
-                Op::F64Eq => bin!(f64_, rb, |a, b| a == b),
-                Op::F64Ne => bin!(f64_, rb, |a, b| a != b),
-                Op::F64Lt => bin!(f64_, rb, |a, b| a < b),
-                Op::F64Gt => bin!(f64_, rb, |a, b| a > b),
-                Op::F64Le => bin!(f64_, rb, |a, b| a <= b),
-                Op::F64Ge => bin!(f64_, rb, |a, b| a >= b),
-
-                Op::I32Clz => un!(u32_, ru32, |x| x.leading_zeros()),
-                Op::I32Ctz => un!(u32_, ru32, |x| x.trailing_zeros()),
-                Op::I32Popcnt => un!(u32_, ru32, |x| x.count_ones()),
-                Op::I32Add => bin!(u32_, ru32, |a, b| a.wrapping_add(b)),
-                Op::I32Sub => bin!(u32_, ru32, |a, b| a.wrapping_sub(b)),
-                Op::I32Mul => bin!(u32_, ru32, |a, b| a.wrapping_mul(b)),
-                Op::I32DivS => bin!(i32_, ri32, |a, b| match (a, b) {
-                    (_, 0) => return Err("integer divide by zero"),
-                    (i32::MIN, -1) => return Err("integer overflow"),
-                    _ => a / b,
-                }),
-                Op::I32DivU => bin!(u32_, ru32, |a, b| a.checked_div(b).ok_or("integer divide by zero")?),
-                Op::I32RemS => bin!(i32_, ri32, |a, b| if b == 0 { return Err("integer divide by zero") } else { a.wrapping_rem(b) }),
-                Op::I32RemU => bin!(u32_, ru32, |a, b| a.checked_rem(b).ok_or("integer divide by zero")?),
-                Op::I32And => bin!(u32_, ru32, |a, b| a & b),
-                Op::I32Or => bin!(u32_, ru32, |a, b| a | b),
-                Op::I32Xor => bin!(u32_, ru32, |a, b| a ^ b),
-                Op::I32Shl => bin!(u32_, ru32, |a, b| a.wrapping_shl(b)),
-                Op::I32ShrS => bin!(u32_, ru32, |a, b| (a as i32).wrapping_shr(b) as u32),
-                Op::I32ShrU => bin!(u32_, ru32, |a, b| a.wrapping_shr(b)),
-                Op::I32Rotl => bin!(u32_, ru32, |a, b| a.rotate_left(b % 32)),
-                Op::I32Rotr => bin!(u32_, ru32, |a, b| a.rotate_right(b % 32)),
-                Op::I64Clz => un!(u64_, ru64, |x| x.leading_zeros() as u64),
-                Op::I64Ctz => un!(u64_, ru64, |x| x.trailing_zeros() as u64),
-                Op::I64Popcnt => un!(u64_, ru64, |x| x.count_ones() as u64),
-                Op::I64Add => bin!(u64_, ru64, |a, b| a.wrapping_add(b)),
-                Op::I64Sub => bin!(u64_, ru64, |a, b| a.wrapping_sub(b)),
-                Op::I64Mul => bin!(u64_, ru64, |a, b| a.wrapping_mul(b)),
-                Op::I64DivS => bin!(i64_, ri64, |a, b| match (a, b) {
-                    (_, 0) => return Err("integer divide by zero"),
-                    (i64::MIN, -1) => return Err("integer overflow"),
-                    _ => a / b,
-                }),
-                Op::I64DivU => bin!(u64_, ru64, |a, b| a.checked_div(b).ok_or("integer divide by zero")?),
-                Op::I64RemS => bin!(i64_, ri64, |a, b| if b == 0 { return Err("integer divide by zero") } else { a.wrapping_rem(b) }),
-                Op::I64RemU => bin!(u64_, ru64, |a, b| a.checked_rem(b).ok_or("integer divide by zero")?),
-                Op::I64And => bin!(u64_, ru64, |a, b| a & b),
-                Op::I64Or => bin!(u64_, ru64, |a, b| a | b),
-                Op::I64Xor => bin!(u64_, ru64, |a, b| a ^ b),
-                Op::I64Shl => bin!(u64_, ru64, |a, b| a.wrapping_shl(b as u32)),
-                Op::I64ShrS => bin!(u64_, ru64, |a, b| (a as i64).wrapping_shr(b as u32) as u64),
-                Op::I64ShrU => bin!(u64_, ru64, |a, b| a.wrapping_shr(b as u32)),
-                Op::I64Rotl => bin!(u64_, ru64, |a, b| a.rotate_left((b % 64) as u32)),
-                Op::I64Rotr => bin!(u64_, ru64, |a, b| a.rotate_right((b % 64) as u32)),
-
-                Op::F32Abs => un!(f32_, rf32, |x| x.abs()),
-                Op::F32Neg => un!(f32_, rf32, |x| -x),
-                Op::F32Ceil => un!(f32_, rf32, |x| x.ceil()),
-                Op::F32Floor => un!(f32_, rf32, |x| x.floor()),
-                Op::F32Trunc => un!(f32_, rf32, |x| x.trunc()),
-                Op::F32Nearest => un!(f32_, rf32, |x| x.round_ties_even()),
-                Op::F32Sqrt => un!(f32_, rf32, |x| x.sqrt()),
-                Op::F32Add => bin!(f32_, rf32, |a, b| a + b),
-                Op::F32Sub => bin!(f32_, rf32, |a, b| a - b),
-                Op::F32Mul => bin!(f32_, rf32, |a, b| a * b),
-                Op::F32Div => bin!(f32_, rf32, |a, b| a / b),
-                Op::F32Min => bin!(f32_, rf32, |a, b| fmin32(a, b)),
-                Op::F32Max => bin!(f32_, rf32, |a, b| fmax32(a, b)),
-                Op::F32Copysign => bin!(f32_, rf32, |a, b| a.copysign(b)),
-                Op::F64Abs => un!(f64_, rf64, |x| x.abs()),
-                Op::F64Neg => un!(f64_, rf64, |x| -x),
-                Op::F64Ceil => un!(f64_, rf64, |x| x.ceil()),
-                Op::F64Floor => un!(f64_, rf64, |x| x.floor()),
-                Op::F64Trunc => un!(f64_, rf64, |x| x.trunc()),
-                Op::F64Nearest => un!(f64_, rf64, |x| x.round_ties_even()),
-                Op::F64Sqrt => un!(f64_, rf64, |x| x.sqrt()),
-                Op::F64Add => bin!(f64_, rf64, |a, b| a + b),
-                Op::F64Sub => bin!(f64_, rf64, |a, b| a - b),
-                Op::F64Mul => bin!(f64_, rf64, |a, b| a * b),
-                Op::F64Div => bin!(f64_, rf64, |a, b| a / b),
-                Op::F64Min => bin!(f64_, rf64, |a, b| fmin64(a, b)),
-                Op::F64Max => bin!(f64_, rf64, |a, b| fmax64(a, b)),
-                Op::F64Copysign => bin!(f64_, rf64, |a, b| a.copysign(b)),
-
-                Op::I32WrapI64 => un!(u64_, ru32, |x| x as u32),
-                Op::I32TruncF32S => un!(f32_, ri32, |x| trunc(x as f64, I32R.0, I32R.1)? as i32),
-                Op::I32TruncF32U => un!(f32_, ru32, |x| trunc(x as f64, U32R.0, U32R.1)? as u32),
-                Op::I32TruncF64S => un!(f64_, ri32, |x| trunc(x, I32R.0, I32R.1)? as i32),
-                Op::I32TruncF64U => un!(f64_, ru32, |x| trunc(x, U32R.0, U32R.1)? as u32),
-                Op::I64ExtendI32S => un!(i32_, ri64, |x| x as i64),
-                Op::I64ExtendI32U => un!(u32_, ru64, |x| x as u64),
-                Op::I64TruncF32S => un!(f32_, ri64, |x| trunc(x as f64, I64R.0, I64R.1)? as i64),
-                Op::I64TruncF32U => un!(f32_, ru64, |x| trunc(x as f64, U64R.0, U64R.1)? as u64),
-                Op::I64TruncF64S => un!(f64_, ri64, |x| trunc(x, I64R.0, I64R.1)? as i64),
-                Op::I64TruncF64U => un!(f64_, ru64, |x| trunc(x, U64R.0, U64R.1)? as u64),
-                Op::F32ConvertI32S => un!(i32_, rf32, |x| x as f32),
-                Op::F32ConvertI32U => un!(u32_, rf32, |x| x as f32),
-                Op::F32ConvertI64S => un!(i64_, rf32, |x| x as f32),
-                Op::F32ConvertI64U => un!(u64_, rf32, |x| x as f32),
-                Op::F32DemoteF64 => un!(f64_, rf32, |x| x as f32),
-                Op::F64ConvertI32S => un!(i32_, rf64, |x| x as f64),
-                Op::F64ConvertI32U => un!(u32_, rf64, |x| x as f64),
-                Op::F64ConvertI64S => un!(i64_, rf64, |x| x as f64),
-                Op::F64ConvertI64U => un!(u64_, rf64, |x| x as f64),
-                Op::F64PromoteF32 => un!(f32_, rf64, |x| x as f64),
-                // Values are stored as raw bits, so reinterpreting is free.
-                Op::I32ReinterpretF32 | Op::I64ReinterpretF64 | Op::F32ReinterpretI32 | Op::F64ReinterpretI64 => {}
-                Op::I32Extend8S => un!(u32_, ri32, |x| x as i8 as i32),
-                Op::I32Extend16S => un!(u32_, ri32, |x| x as i16 as i32),
-                Op::I64Extend8S => un!(u64_, ri64, |x| x as i8 as i64),
-                Op::I64Extend16S => un!(u64_, ri64, |x| x as i16 as i64),
-                Op::I64Extend32S => un!(u64_, ri64, |x| x as i32 as i64),
-                // Rust's `as` already saturates and maps NaN to 0, exactly like wasm.
-                Op::I32TruncSatF32S => un!(f32_, ri32, |x| x as i32),
-                Op::I32TruncSatF32U => un!(f32_, ru32, |x| x as u32),
-                Op::I32TruncSatF64S => un!(f64_, ri32, |x| x as i32),
-                Op::I32TruncSatF64U => un!(f64_, ru32, |x| x as u32),
-                Op::I64TruncSatF32S => un!(f32_, ri64, |x| x as i64),
-                Op::I64TruncSatF32U => un!(f32_, ru64, |x| x as u64),
-                Op::I64TruncSatF64S => un!(f64_, ri64, |x| x as i64),
-                Op::I64TruncSatF64U => un!(f64_, ru64, |x| x as u64),
                 _ => unreachable!("the hot loop runs {op:?}"),
             }
         }
