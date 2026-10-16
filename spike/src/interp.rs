@@ -90,6 +90,9 @@ macro_rules! ops {
             // Fused pairs: an address `a + (b << sh)`; a load whose address is
             // `a + imm` (wrapping, as the add would); a load straight into a store.
             I32AddShlRR { d: u32, a: u32, b: u32, sh: u8 },
+            // f64 math (JS numbers): register forms, and a compare fused with its `br_if`.
+            F64AddRR { d: u32, a: u32, b: u32 }, F64SubRR { d: u32, a: u32, b: u32 }, F64MulRR { d: u32, a: u32, b: u32 }, F64DivRR { d: u32, a: u32, b: u32 }, F64EqRR { d: u32, a: u32, b: u32 }, F64NeRR { d: u32, a: u32, b: u32 }, F64LtRR { d: u32, a: u32, b: u32 }, F64GtRR { d: u32, a: u32, b: u32 }, F64LeRR { d: u32, a: u32, b: u32 }, F64GeRR { d: u32, a: u32, b: u32 },
+            BrIfF64EqRR { a: u32, b: u32, t: u32 }, BrIfF64NeRR { a: u32, b: u32, t: u32 }, BrIfF64LtRR { a: u32, b: u32, t: u32 }, BrIfF64GtRR { a: u32, b: u32, t: u32 }, BrIfF64LeRR { a: u32, b: u32, t: u32 }, BrIfF64GeRR { a: u32, b: u32, t: u32 },
             // `imm - a`; and the shadow stack pointer moves of every function
             // prologue (`d = g + imm`, then `g = d` too) and epilogue (`g = a + imm`).
             I32RSubRI { d: u32, a: u32, imm: i32 },
@@ -528,6 +531,12 @@ fn fuse_cmp_br(cmp: Op, t: u32) -> Option<Op> {
         Op::I64GeURR { a, b, .. } => Op::BrIfI64GeURR { a, b, t },
         Op::I64GeURI { a, imm, .. } => Op::BrIfI64GeURI { a, imm, t },
         Op::I32EqzR { a, .. } => Op::BrIfI32EqzR { a, t },
+        Op::F64EqRR { a, b, .. } => Op::BrIfF64EqRR { a, b, t },
+        Op::F64NeRR { a, b, .. } => Op::BrIfF64NeRR { a, b, t },
+        Op::F64LtRR { a, b, .. } => Op::BrIfF64LtRR { a, b, t },
+        Op::F64GtRR { a, b, .. } => Op::BrIfF64GtRR { a, b, t },
+        Op::F64LeRR { a, b, .. } => Op::BrIfF64LeRR { a, b, t },
+        Op::F64GeRR { a, b, .. } => Op::BrIfF64GeRR { a, b, t },
         Op::I64EqzR { a, .. } => Op::BrIfI64EqzR { a, t },
         _ => return None,
     })
@@ -625,6 +634,7 @@ fn push_fused(f: &mut Func, rg: &Regs, barrier: usize, op: Op) {
 /// Point a register op's result at slot `x` instead.
 fn retarget(op: &mut Op, x: u32) {
     match op {
+        Op::F64AddRR { d, .. } | Op::F64SubRR { d, .. } | Op::F64MulRR { d, .. } | Op::F64DivRR { d, .. } | Op::F64EqRR { d, .. } | Op::F64NeRR { d, .. } | Op::F64LtRR { d, .. } | Op::F64GtRR { d, .. } | Op::F64LeRR { d, .. } | Op::F64GeRR { d, .. } => *d = x,
         Op::GlobalGetR { d, .. } | Op::SelectR { d, .. } | Op::I32AddShlRR { d, .. } | Op::I32RSubRI { d, .. } | Op::I32GlobalAddR { d, .. } | Op::I32LoadAddR { d, .. } | Op::I64LoadAddR { d, .. } => *d = x,
         Op::I32AddRI { d, .. } | Op::I32AddRR { d, .. } | Op::I32AndRI { d, .. } | Op::I32AndRR { d, .. } | Op::I32EqRI { d, .. } | Op::I32EqRR { d, .. } | Op::I32EqzR { d, .. } | Op::I32GeSRI { d, .. } | Op::I32GeSRR { d, .. } | Op::I32GeURI { d, .. } | Op::I32GeURR { d, .. } | Op::I32GtSRI { d, .. } | Op::I32GtSRR { d, .. } | Op::I32GtURI { d, .. } | Op::I32GtURR { d, .. } | Op::I32LeSRI { d, .. } | Op::I32LeSRR { d, .. } | Op::I32LeURI { d, .. } | Op::I32LeURR { d, .. } | Op::I32Load16SR { d, .. } | Op::I32Load8SR { d, .. } | Op::I32LoadR { d, .. } | Op::I32LtSRI { d, .. } | Op::I32LtSRR { d, .. } | Op::I32LtURI { d, .. } | Op::I32LtURR { d, .. } | Op::I32MulRI { d, .. } | Op::I32MulRR { d, .. } | Op::I32NeRI { d, .. } | Op::I32NeRR { d, .. } | Op::I32OrRI { d, .. } | Op::I32OrRR { d, .. } | Op::I32ShlRI { d, .. } | Op::I32ShlRR { d, .. } | Op::I32ShrSRI { d, .. } | Op::I32ShrSRR { d, .. } | Op::I32ShrURI { d, .. } | Op::I32ShrURR { d, .. } | Op::I32SubRI { d, .. } | Op::I32SubRR { d, .. } | Op::I32WrapI64R { d, .. } | Op::I32XorRI { d, .. } | Op::I32XorRR { d, .. } | Op::I64AddRI { d, .. } | Op::I64AddRR { d, .. } | Op::I64AndRI { d, .. } | Op::I64AndRR { d, .. } | Op::I64EqRI { d, .. } | Op::I64EqRR { d, .. } | Op::I64EqzR { d, .. } | Op::I64ExtendI32SR { d, .. } | Op::I64ExtendI32UR { d, .. } | Op::I64GeSRI { d, .. } | Op::I64GeSRR { d, .. } | Op::I64GeURI { d, .. } | Op::I64GeURR { d, .. } | Op::I64GtSRI { d, .. } | Op::I64GtSRR { d, .. } | Op::I64GtURI { d, .. } | Op::I64GtURR { d, .. } | Op::I64LeSRI { d, .. } | Op::I64LeSRR { d, .. } | Op::I64LeURI { d, .. } | Op::I64LeURR { d, .. } | Op::I64LoadR { d, .. } | Op::I64LtSRI { d, .. } | Op::I64LtSRR { d, .. } | Op::I64LtURI { d, .. } | Op::I64LtURR { d, .. } | Op::I64MulRI { d, .. } | Op::I64MulRR { d, .. } | Op::I64NeRI { d, .. } | Op::I64NeRR { d, .. } | Op::I64OrRI { d, .. } | Op::I64OrRR { d, .. } | Op::I64ShlRI { d, .. } | Op::I64ShlRR { d, .. } | Op::I64ShrSRI { d, .. } | Op::I64ShrSRR { d, .. } | Op::I64ShrURI { d, .. } | Op::I64ShrURR { d, .. } | Op::I64SubRI { d, .. } | Op::I64SubRR { d, .. } | Op::I64XorRI { d, .. } | Op::I64XorRR { d, .. } | Op::Load16UR { d, .. } | Op::Load8UR { d, .. } => *d = x,
         _ => {}
@@ -641,6 +651,8 @@ enum Kind {
     Drop,
     Bin { rr: fn(u32, u32, u32) -> Op, ri: fn(u32, u32, i32) -> Op, comm: bool, wide: bool },
     Un(fn(u32, u32) -> Op),
+    /// A float op: no immediate form, constants go to a slot.
+    FBin(fn(u32, u32, u32) -> Op),
     Load(fn(u32, u32, u32) -> Op, u32),
     Store(fn(u32, u32, u32) -> Op, fn(u32, i32, u32) -> Op, u32, bool),
     GlobalGet(u32),
@@ -707,6 +719,16 @@ fn classify(op: &Operator) -> Kind {
         Operator::I64GeU => Kind::Bin { rr: |d, a, b| Op::I64GeURR { d, a, b }, ri: |d, a, imm| Op::I64GeURI { d, a, imm }, comm: false, wide: true },
         Operator::I32Eqz => Kind::Un(|d, a| Op::I32EqzR { d, a }),
         Operator::I64Eqz => Kind::Un(|d, a| Op::I64EqzR { d, a }),
+        Operator::F64Add => Kind::FBin(|d, a, b| Op::F64AddRR { d, a, b }),
+        Operator::F64Sub => Kind::FBin(|d, a, b| Op::F64SubRR { d, a, b }),
+        Operator::F64Mul => Kind::FBin(|d, a, b| Op::F64MulRR { d, a, b }),
+        Operator::F64Div => Kind::FBin(|d, a, b| Op::F64DivRR { d, a, b }),
+        Operator::F64Eq => Kind::FBin(|d, a, b| Op::F64EqRR { d, a, b }),
+        Operator::F64Ne => Kind::FBin(|d, a, b| Op::F64NeRR { d, a, b }),
+        Operator::F64Lt => Kind::FBin(|d, a, b| Op::F64LtRR { d, a, b }),
+        Operator::F64Gt => Kind::FBin(|d, a, b| Op::F64GtRR { d, a, b }),
+        Operator::F64Le => Kind::FBin(|d, a, b| Op::F64LeRR { d, a, b }),
+        Operator::F64Ge => Kind::FBin(|d, a, b| Op::F64GeRR { d, a, b }),
         Operator::I32WrapI64 => Kind::Un(|d, a| Op::I32WrapI64R { d, a }),
         Operator::I64ExtendI32U => Kind::Un(|d, a| Op::I64ExtendI32UR { d, a }),
         Operator::I64ExtendI32S => Kind::Un(|d, a| Op::I64ExtendI32SR { d, a }),
@@ -840,6 +862,18 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
                     }
                 };
                 push_fused(&mut f, &rg, barrier, op);
+                rg.last_def = Some((f.ops.len() - 1, d));
+                rg.vs.push(V::Slot(d));
+                rg.sp_ok = false;
+            }
+            Kind::FBin(rr) => {
+                let b = rg.vs.pop().ok_or("stack underflow")?;
+                let a = rg.vs.pop().ok_or("stack underflow")?;
+                let ha = rg.vs.len();
+                let ra = rg.slot(&mut f, a, ha);
+                let rb = rg.slot(&mut f, b, ha + 1);
+                let d = rg.own(ha);
+                f.ops.push(rr(d, ra, rb));
                 rg.last_def = Some((f.ops.len() - 1, d));
                 rg.vs.push(V::Slot(d));
                 rg.sp_ok = false;
@@ -1705,6 +1739,22 @@ fn hot(m: &Module, frames: &mut Vec<Frame>, s: &mut [u64], mem: &mut [u8], globa
                 r[d as u16 as usize] = v;
             }
             Op::I32GlobalSetAddR { g, a, imm } => globals[g as usize] = ru32(u32_(r[a as u16 as usize]).wrapping_add(imm as u32)),
+            Op::F64AddRR { d, a, b } => reg!(d, f64_, rf64, r[a as u16 as usize], r[b as u16 as usize], |x, y| x + y),
+            Op::F64SubRR { d, a, b } => reg!(d, f64_, rf64, r[a as u16 as usize], r[b as u16 as usize], |x, y| x - y),
+            Op::F64MulRR { d, a, b } => reg!(d, f64_, rf64, r[a as u16 as usize], r[b as u16 as usize], |x, y| x * y),
+            Op::F64DivRR { d, a, b } => reg!(d, f64_, rf64, r[a as u16 as usize], r[b as u16 as usize], |x, y| x / y),
+            Op::F64EqRR { d, a, b } => reg!(d, f64_, rb, r[a as u16 as usize], r[b as u16 as usize], |x, y| x == y),
+            Op::BrIfF64EqRR { a, b, t } => { if f64_(r[a as u16 as usize]) == f64_(r[b as u16 as usize]) { take!(t) } }
+            Op::F64NeRR { d, a, b } => reg!(d, f64_, rb, r[a as u16 as usize], r[b as u16 as usize], |x, y| x != y),
+            Op::BrIfF64NeRR { a, b, t } => { if f64_(r[a as u16 as usize]) != f64_(r[b as u16 as usize]) { take!(t) } }
+            Op::F64LtRR { d, a, b } => reg!(d, f64_, rb, r[a as u16 as usize], r[b as u16 as usize], |x, y| x < y),
+            Op::BrIfF64LtRR { a, b, t } => { if f64_(r[a as u16 as usize]) < f64_(r[b as u16 as usize]) { take!(t) } }
+            Op::F64GtRR { d, a, b } => reg!(d, f64_, rb, r[a as u16 as usize], r[b as u16 as usize], |x, y| x > y),
+            Op::BrIfF64GtRR { a, b, t } => { if f64_(r[a as u16 as usize]) > f64_(r[b as u16 as usize]) { take!(t) } }
+            Op::F64LeRR { d, a, b } => reg!(d, f64_, rb, r[a as u16 as usize], r[b as u16 as usize], |x, y| x <= y),
+            Op::BrIfF64LeRR { a, b, t } => { if f64_(r[a as u16 as usize]) <= f64_(r[b as u16 as usize]) { take!(t) } }
+            Op::F64GeRR { d, a, b } => reg!(d, f64_, rb, r[a as u16 as usize], r[b as u16 as usize], |x, y| x >= y),
+            Op::BrIfF64GeRR { a, b, t } => { if f64_(r[a as u16 as usize]) >= f64_(r[b as u16 as usize]) { take!(t) } }
             Op::I32AddShlRR { d, a, b, sh } => reg!(d, u32_, ru32, r[a as u16 as usize], r[b as u16 as usize], |x, y| x.wrapping_add(y << sh)),
             Op::I32LoadAddR { d, a, imm } => { let ea = u32_(r[a as u16 as usize]).wrapping_add(imm as u32) as usize; let b: [u8; 4] = mem.get(ea..ea + 4).ok_or("out of bounds memory access")?.try_into().unwrap(); r[d as u16 as usize] = u32::from_le_bytes(b) as u64; }
             Op::I64LoadAddR { d, a, imm } => { let ea = u32_(r[a as u16 as usize]).wrapping_add(imm as u32) as usize; let b: [u8; 8] = mem.get(ea..ea + 8).ok_or("out of bounds memory access")?.try_into().unwrap(); r[d as u16 as usize] = u64::from_le_bytes(b); }
