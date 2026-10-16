@@ -2902,6 +2902,68 @@ callers = ["api"]
         assert_eq!(http(port, "GET", "/api/stats", "").0, 200);
     }
 
+    /// A match in play on a fleet (two peers per object) answers its
+    /// messages under the read lease: the game writes nothing, so a ping
+    /// mustn't wait for a round to the peers (an ocean away, in the arena).
+    #[test]
+    fn a_match_in_play_reads_under_the_lease() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::copy(format!("{ARENA}/combd.toml"), app.0.join("combd.toml")).unwrap();
+        std::fs::copy(format!("{ARENA}/modules/game.wasm"), app.0.join("modules/game.wasm")).expect("build the arena first: examples/arena/build.sh");
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 3).unwrap();
+        let bucket = test_bucket();
+        let wports = free_ports(3);
+        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
+        let nodes: Vec<u16> = (0..3u32)
+            .map(|n| {
+                let fc = fleet::FleetCfg { node: n, lease_ms: 3000, replicas: 2, s3: s3::S3 { bucket: bucket.clone(), ..base.clone() }, peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(dir.0.join("certs")), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true };
+                let eng = interp::Interp { max_pages: 16384 };
+                let (a, pg) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+                let c = http::Config { pg, fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
+                server_app(eng, c, move |_| a).0
+            })
+            .collect();
+        for &p in &nodes {
+            stat(p, "fences");
+        }
+        let p = nodes[0];
+        let b = (0..100).find_map(|_| match http(p, "POST", "/api/bot", &serde_json::json!({ "player": "alice", "rtt": { "0": 5 } }).to_string()) {
+            (200, b) => Some(b),
+            _ => {
+                std::thread::sleep(Duration::from_millis(100));
+                None
+            }
+        });
+        let m: serde_json::Value = serde_json::from_str(&b.expect("a bot match")).unwrap();
+        assert_eq!(m["node"], 0, "{m}");
+        let mut ws = Ws::open(p, &format!("/match/{}/ws", m["match"].as_str().unwrap())).unwrap();
+        ws.text(&serde_json::json!({ "t": "hello", "token": m["token"] }).to_string());
+        // Into play (the countdown is 3 s), then count while it plays.
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(4000) {
+            ws.recv_within(100);
+        }
+        let (acks0, leases0, msgs0) = (stat(p, "peer_acks"), stat(p, "lease_reads"), stat(p, "ws_messages"));
+        let t = Instant::now();
+        let mut i = 0;
+        while t.elapsed() < Duration::from_millis(3000) {
+            ws.text(&serde_json::json!({ "t": "in", "mx": 1.0, "my": 0.0, "aim": 0.0, "fire": i % 7 == 0 }).to_string());
+            i += 1;
+            ws.recv_within(20);
+        }
+        let (acks, leases, msgs) = (stat(p, "peer_acks") - acks0, stat(p, "lease_reads") - leases0, stat(p, "ws_messages") - msgs0);
+        eprintln!("in 3 s of play: {msgs} messages, {leases} lease reads, {acks} peer acks");
+        assert!(msgs > 50, "{msgs} messages");
+        // A round renews the lease about twice a second: a few acks a second, not one per message.
+        assert!(acks < msgs / 4, "{acks} peer acks for {msgs} messages ({leases} lease reads): the messages waited for rounds");
+    }
+
     #[test]
     fn arena_plays_a_match() {
         let app = store::tempdir::Dir::new();

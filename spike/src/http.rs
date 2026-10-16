@@ -168,6 +168,7 @@ struct Stats {
     fences: AtomicU64,
     tail_entries: AtomicU64,
     uploads: AtomicU64,
+    lease_reads: AtomicU64,
     /// WebSockets open, and messages in from them.
     sockets_open: AtomicU64,
     ws_messages: AtomicU64,
@@ -2699,7 +2700,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -2716,6 +2717,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.fences.load(Relaxed),
                     s.tail_entries.load(Relaxed),
                     s.uploads.load(Relaxed),
+                    s.lease_reads.load(Relaxed),
                     s.sockets_open.load(Relaxed),
                     s.ws_messages.load(Relaxed),
                     s.ws_handoffs.load(Relaxed),
@@ -3107,6 +3109,7 @@ impl<E: Engine> Loop<'_, E> {
         st.fences.fetch_add(now.fences - was.fences, Relaxed);
         st.tail_entries.fetch_add(now.tail_entries - was.tail_entries, Relaxed);
         st.uploads.fetch_add(now.uploads - was.uploads, Relaxed);
+        st.lease_reads.fetch_add(now.lease_reads - was.lease_reads, Relaxed);
         for e in effects {
             self.effect(e);
         }
