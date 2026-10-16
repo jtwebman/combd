@@ -118,7 +118,8 @@ pub fn sees(ax: f64, ay: f64, bx: f64, by: f64) -> bool {
     !WALLS.iter().any(|&w| segment_hits(ax, ay, bx, by, w))
 }
 
-fn blocked(x: f64, y: f64) -> bool {
+/// Would a player at (x, y) touch a wall or the edge?
+pub fn blocked(x: f64, y: f64) -> bool {
     !(R..=W - R).contains(&x) || !(R..=H - R).contains(&y) || WALLS.iter().any(|&w| circle_hits(x, y, R, w))
 }
 

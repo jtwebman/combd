@@ -14,7 +14,7 @@ pub mod game;
 
 use serde_json::{json, Value};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 
 /// The page: the game client.
 const INDEX: &str = include_str!("../../client/index.html");
@@ -203,13 +203,15 @@ struct Assigned {
     token: String,
     side: usize,
     rtt: Option<u64>,
+    at: u64,
 }
 
 #[derive(Default)]
 struct Mm {
     queue: Vec<Waiting>,
     ready: HashMap<String, Assigned>,
-    recent: VecDeque<Value>,
+    /// Counts matches in memory, only to name them (the count that's kept
+    /// is in storage).
     matches: u64,
 }
 
@@ -229,13 +231,57 @@ fn fair_enough(score: u64, waited_ms: u64) -> bool {
     score <= 80 + 25 * waited_ms / 1000
 }
 
+/// Pair whoever can be paired: the closest pair first, each pair close
+/// enough for how long its older player has waited. Each pair's match
+/// starts on the node best for both.
+fn pair_all(mm: &mut Mm, now: u64) {
+    loop {
+        let mut best: Option<(u64, usize, usize, u64)> = None;
+        for i in 0..mm.queue.len() {
+            for j in i + 1..mm.queue.len() {
+                let (a, b) = (&mm.queue[i], &mm.queue[j]);
+                if a.player == b.player {
+                    continue;
+                }
+                let Some((node, score)) = best_node(&a.rtt, &b.rtt) else { continue };
+                let waited = now.saturating_sub(a.since.min(b.since));
+                if fair_enough(score, waited) && best.is_none_or(|x| score < x.0) {
+                    best = Some((score, i, j, node));
+                }
+            }
+        }
+        let Some((score, i, j, node)) = best else { return };
+        let (b, a) = (mm.queue.remove(j), mm.queue.remove(i));
+        mm.matches += 1;
+        let id = format!("m{}{}", now, mm.matches);
+        let tokens = [token(), token()];
+        // Start the match on the node best for both.
+        let r = call(&json!({ "to": "match", "id": id, "node": node, "path": "/create", "body": json!({ "players": [a.player, b.player], "tokens": tokens }).to_string() }));
+        if r["status"].as_u64() != Some(200) {
+            // Couldn't start it: they wait on, and the next tick tries again.
+            mm.queue.push(a);
+            mm.queue.push(b);
+            return;
+        }
+        let row = json!({ "match": id, "node": node, "players": [a.player, b.player], "worst_rtt": score, "at": now });
+        sql("INSERT INTO recent (row) VALUES (?)", &[json!(row.to_string())]);
+        sql("DELETE FROM recent WHERE id <= (SELECT MAX(id) - 20 FROM recent)", &[]);
+        sql("INSERT INTO kv (k, v) VALUES ('matches', 1) ON CONFLICT (k) DO UPDATE SET v = v + 1", &[]);
+        mm.ready.insert(a.ticket.clone(), Assigned { m: id.clone(), node, token: tokens[0].clone(), side: 0, rtt: a.rtt.get(&node).copied(), at: now });
+        mm.ready.insert(b.ticket.clone(), Assigned { m: id, node, token: tokens[1].clone(), side: 1, rtt: b.rtt.get(&node).copied(), at: now });
+    }
+}
+
 fn matchmaker(method: &str, path: &str, body: &str) -> String {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    sql("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v INTEGER)", &[]);
+    sql("CREATE TABLE IF NOT EXISTS recent (id INTEGER PRIMARY KEY, row TEXT)", &[]);
     MM.with(|mm| {
         let mut mm = mm.borrow_mut();
         let now = now();
         mm.queue.retain(|w| now.saturating_sub(w.since) < 60_000);
-        match (method, path) {
+        mm.ready.retain(|_, a| now.saturating_sub(a.at) < 60_000);
+        let answer = match (method, path) {
             ("POST", "/join") => {
                 let Some(player) = v["player"].as_str().filter(|p| !p.is_empty() && p.len() <= 32) else { return err(400, "want {\"player\": name, \"rtt\": {node: ms}}") };
                 let rtt: BTreeMap<u64, u64> = v["rtt"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect()).unwrap_or_default();
@@ -243,33 +289,8 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                     return err(400, "measure the nodes first: rtt");
                 }
                 let ticket = token();
-                // The best partner already waiting: the closest, if close enough.
-                let partner = mm
-                    .queue
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, w)| w.player != player)
-                    .filter_map(|(i, w)| best_node(&w.rtt, &rtt).map(|(n, score)| (score, i, n, now.saturating_sub(w.since))))
-                    .filter(|(score, _, _, waited)| fair_enough(*score, *waited))
-                    .min();
-                let Some((score, i, node, _)) = partner else {
-                    mm.queue.push(Waiting { ticket: ticket.clone(), player: player.into(), rtt, since: now });
-                    return ok(json!({ "ticket": ticket }));
-                };
-                let other = mm.queue.remove(i);
-                mm.matches += 1;
-                let id = format!("m{}{}", now, mm.matches);
-                let tokens = [token(), token()];
-                // Start the match on the node best for both.
-                let r = call(&json!({ "to": "match", "id": id, "node": node, "path": "/create", "body": json!({ "players": [other.player, player], "tokens": tokens }).to_string() }));
-                if r["status"].as_u64() != Some(200) {
-                    mm.queue.push(other);
-                    return err(503, &format!("couldn't start a match: {r}"));
-                }
-                mm.ready.insert(other.ticket.clone(), Assigned { m: id.clone(), node, token: tokens[0].clone(), side: 0, rtt: other.rtt.get(&node).copied() });
-                mm.ready.insert(ticket.clone(), Assigned { m: id.clone(), node, token: tokens[1].clone(), side: 1, rtt: rtt.get(&node).copied() });
-                mm.recent.push_front(json!({ "match": id, "node": node, "players": [other.player, player], "worst_rtt": score, "at": now }));
-                mm.recent.truncate(20);
+                mm.queue.push(Waiting { ticket: ticket.clone(), player: player.into(), rtt, since: now });
+                pair_all(&mut mm, now);
                 ok(json!({ "ticket": ticket }))
             }
             ("POST", "/poll") => {
@@ -280,9 +301,22 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                     None => err(404, "no such ticket (it waited too long?): join again"),
                 }
             }
-            ("GET", "/stats") => ok(json!({ "queue": mm.queue.len(), "matches": mm.matches, "recent": mm.recent })),
+            // While anyone waits: try again, as the bar for "close enough"
+            // drops with time. The beat also keeps this object in memory,
+            // so its queue isn't lost while someone's in it.
+            ("TICK", _) => {
+                pair_all(&mut mm, now);
+                ok(json!({}))
+            }
+            ("GET", "/stats") => {
+                let matches = sql("SELECT v FROM kv WHERE k = 'matches'", &[]).first().and_then(|r| r[0].as_i64()).unwrap_or(0);
+                let recent: Vec<Value> = sql("SELECT row FROM recent ORDER BY id DESC LIMIT 20", &[]).iter().filter_map(|r| serde_json::from_str(r[0].as_str()?).ok()).collect();
+                ok(json!({ "queue": mm.queue.len(), "matches": matches, "recent": recent }))
+            }
             _ => err(404, "not found"),
-        }
+        };
+        tick_every(if mm.queue.is_empty() { 0 } else { 500 });
+        answer
     })
 }
 
@@ -305,13 +339,36 @@ struct Match {
     game: game::Game,
     phase: Phase,
     created: u64,
+    /// Time played, not counting pauses.
+    played: u64,
     last_step: u64,
     ticks: u64,
     over_at: u64,
+    timing: Timing,
+}
+
+/// How the beat and the players kept up, for the record: the gaps between
+/// ticks, and ticks a player sent no new input for (the game then reuses
+/// their last one).
+#[derive(Default)]
+struct Timing {
+    played_ticks: u64,
+    last_tick: u64,
+    max_gap: u64,
+    late: u64,
+    fresh: [bool; 2],
+    stale: [u64; 2],
+    inputs: [u64; 2],
 }
 
 thread_local! {
     static MATCH: RefCell<Option<Match>> = const { RefCell::new(None) };
+}
+
+/// How long a match lasts (`MATCH_MS`, 3 minutes): then more kills wins,
+/// and a tie is a draw.
+fn match_ms() -> u64 {
+    env("MATCH_MS").and_then(|v| v.parse().ok()).unwrap_or(180_000)
 }
 
 /// How long a pause may last before the other player wins (`PAUSE_MS`).
@@ -333,6 +390,10 @@ fn state_msg(m: &Match, side: usize, now: u64) -> String {
     v["phase"] = json!(phase);
     v["left"] = json!(left);
     v["paused_by_you"] = json!(matches!(m.phase, Phase::Paused { who, .. } if who == side));
+    if m.phase == Phase::Over {
+        let t = &m.timing;
+        v["timing"] = json!({ "ticks": t.played_ticks, "max_gap_ms": t.max_gap, "late": t.late, "your_stale": t.stale[side], "their_stale": t.stale[1 - side], "your_inputs": t.inputs[side] });
+    }
     v["winner"] = match m.game.winner {
         Some(w) => json!(w == side),
         None => Value::Null,
@@ -340,13 +401,20 @@ fn state_msg(m: &Match, side: usize, now: u64) -> String {
     v.to_string()
 }
 
-fn finish(m: &mut Match, winner: usize, now: u64) {
-    m.game.winner = Some(winner);
+/// The end: a winner, or (`None`) a draw.
+fn finish(m: &mut Match, winner: Option<usize>, now: u64) {
+    m.game.winner = winner;
     m.phase = Phase::Over;
     m.over_at = now;
-    sql("INSERT OR REPLACE INTO meta (k, v) VALUES ('winner', ?)", &[json!(m.players[winner])]);
+    let who = winner.map_or("draw".to_string(), |w| m.players[w].clone());
+    sql("INSERT OR REPLACE INTO meta (k, v) VALUES ('winner', ?)", &[json!(who)]);
     for side in 0..2 {
-        send(&json!({ "to": "player", "id": m.players[side], "path": "/result", "body": json!({ "won": side == winner }).to_string() }));
+        let result = match winner {
+            None => "draw",
+            Some(w) if w == side => "won",
+            Some(_) => "lost",
+        };
+        send(&json!({ "to": "player", "id": m.players[side], "path": "/result", "body": json!({ "result": result }).to_string() }));
     }
 }
 
@@ -359,7 +427,7 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
             let s = |k: &str, i: usize| v[k][i].as_str().unwrap_or("").to_string();
             sql("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)", &[]);
             sql("INSERT OR REPLACE INTO meta (k, v) VALUES ('players', ?)", &[json!(format!("{} vs {}", s("players", 0), s("players", 1)))]);
-            *cell = Some(Match { players: [s("players", 0), s("players", 1)], tokens: [s("tokens", 0), s("tokens", 1)], socks: [None, None], game: game::Game::new(), phase: Phase::Waiting, created: now, last_step: now, ticks: 0, over_at: 0 });
+            *cell = Some(Match { players: [s("players", 0), s("players", 1)], tokens: [s("tokens", 0), s("tokens", 1)], socks: [None, None], game: game::Game::new(), phase: Phase::Waiting, created: now, played: 0, last_step: now, ticks: 0, over_at: 0, timing: Timing::default() });
             tick_every(50);
             return ok(json!({ "ok": true }));
         }
@@ -422,6 +490,8 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                         if let Some(side) = (0..2).find(|&i| m.socks[i] == Some(sock)) {
                             let f = |k: &str| v[k].as_f64().unwrap_or(0.0);
                             m.game.players[side].input = game::Input { mx: f("mx"), my: f("my"), aim: f("aim"), fire: v["fire"].as_bool().unwrap_or(false) };
+                            m.timing.fresh[side] = true;
+                            m.timing.inputs[side] += 1;
                         }
                     }
                     _ => {}
@@ -440,6 +510,10 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                 ok(json!({}))
             }
             "TICK" => {
+                if m.phase != Phase::Play {
+                    m.last_step = now;
+                    m.timing.last_tick = 0;
+                }
                 m.ticks += 1;
                 match m.phase {
                     Phase::Waiting if now.saturating_sub(m.created) > START_WAIT_MS => {
@@ -447,14 +521,30 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                         m.over_at = now;
                     }
                     Phase::Play => {
+                        let t = &mut m.timing;
+                        if t.last_tick > 0 {
+                            let gap = now.saturating_sub(t.last_tick);
+                            t.max_gap = t.max_gap.max(gap);
+                            t.late += (gap > 75) as u64;
+                        }
+                        t.last_tick = now;
+                        t.played_ticks += 1;
+                        for side in 0..2 {
+                            t.stale[side] += !t.fresh[side] as u64;
+                            t.fresh[side] = false;
+                        }
                         let dt = (now.saturating_sub(m.last_step) as f64 / 1000.0).clamp(0.0, 0.2);
+                        m.played += now.saturating_sub(m.last_step);
                         m.last_step = now;
                         m.game.step(now, dt);
                         if let Some(w) = m.game.winner {
-                            finish(m, w, now);
+                            finish(m, Some(w), now);
+                        } else if m.played >= match_ms() {
+                            let (k0, k1) = (m.game.players[0].kills, m.game.players[1].kills);
+                            finish(m, if k0 == k1 { None } else { Some(if k0 > k1 { 0 } else { 1 }) }, now);
                         }
                     }
-                    Phase::Paused { who, until } if now >= until => finish(m, 1 - who, now),
+                    Phase::Paused { who, until } if now >= until => finish(m, Some(1 - who), now),
                     _ => {}
                 }
                 for side in 0..2 {
@@ -487,10 +577,15 @@ fn player(method: &str, path: &str, body: &str) -> String {
     match (method, path) {
         ("POST", "/result") => {
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-            bump(if v["won"].as_bool() == Some(true) { "wins" } else { "losses" });
+            match v["result"].as_str() {
+                Some("won") => bump("wins"),
+                Some("lost") => bump("losses"),
+                Some("draw") => bump("draws"),
+                _ => return err(400, "want {\"result\": won, lost, or draw}"),
+            };
             ok(json!({}))
         }
-        ("GET", "/") => ok(json!({ "wins": get("wins"), "losses": get("losses") })),
+        ("GET", "/") => ok(json!({ "wins": get("wins"), "losses": get("losses"), "draws": get("draws") })),
         _ => err(404, "not found"),
     }
 }

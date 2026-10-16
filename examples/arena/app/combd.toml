@@ -5,6 +5,8 @@ name = "arena"
 [vars]
 # How long a pause (or a dropped player) may last before the other wins.
 PAUSE_MS = 30000
+# How long a match lasts: then more kills wins, and a tie is a draw.
+MATCH_MS = 180000
 
 # The page, and the join and poll API.
 [processes.lobby]

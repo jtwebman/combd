@@ -77,7 +77,7 @@ async function api(path, body) {
 
 async function record() {
   const r = await api("/api/player/" + encodeURIComponent(name.value));
-  $("record").textContent = `${r.wins || 0} wins, ${r.losses || 0} losses`;
+  $("record").textContent = `${r.wins || 0} wins, ${r.losses || 0} losses, ${r.draws || 0} draws`;
   const s = await api("/api/stats");
   $("recent").innerHTML = (s.recent || []).slice(0, 8).map(m =>
     `<tr><td>${m.players.join(" vs ")}</td><td class="r">node ${m.node}, ${m.worst_rtt} ms</td></tr>`).join("") || `<tr><td class="dim">none yet</td></tr>`;
@@ -111,7 +111,7 @@ function connect(m) {
     if (v.t === "st") {
       state.last = v; state.phase = v.phase;
       if (v.them) state.lastSeen = { ...v.them, at: performance.now() };
-      if (v.phase === "over") { say(v.winner ? "You won!" : "You lost."); record(); }
+      if (v.phase === "over") { say(v.winner === null ? "A draw." : v.winner ? "You won!" : "You lost."); record(); }
     }
   };
   ws.onclose = () => {
@@ -180,7 +180,7 @@ function draw() {
     ctx.fillText(`${names[0]} ${v.score[0]}  :  ${v.score[1]} ${names[1]}     hp ${"♥".repeat(v.you.hp)}`, 16, 28);
     const banner = v.phase === "waiting" ? "Waiting for the other player..." :
       v.phase === "paused" ? (v.paused_by_you ? `You paused: P to go on (${Math.ceil(v.left / 1000)} s, then you lose)` : `Paused by the other player: ${Math.ceil(v.left / 1000)} s, then you win`) :
-      v.phase === "over" ? (v.winner ? "You won!" : "You lost.") : (v.you.dead ? "Respawning..." : "");
+      v.phase === "over" ? (v.winner === null ? "A draw." : v.winner ? "You won!" : "You lost.") : (v.you.dead ? "Respawning..." : "");
     if (banner) { ctx.font = "28px system-ui"; ctx.textAlign = "center"; ctx.fillText(banner, canvas.width / 2, canvas.height / 2); ctx.textAlign = "start"; }
   }
   requestAnimationFrame(draw);

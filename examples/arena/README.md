@@ -23,7 +23,8 @@ Line of sight is the server's job: a player's view leaves out the other
 player (and bullets) whenever a wall is in between, so there's nothing for a
 client to cheat its way to. Either player may pause; a dropped connection
 pauses too. Back within `PAUSE_MS` (30 s) and the match goes on; otherwise
-the other player wins.
+the other player wins. A match lasts `MATCH_MS` (3 minutes) of play: then
+more kills wins, and a tie is a draw.
 
 What's durable and what isn't, plainly: the records are; a match's state
 lives in memory only. If its node dies mid-match, that match is lost.
@@ -36,6 +37,49 @@ cd ../../spike && cargo run --release -- serve-app interp ../examples/arena/app 
 ```
 
 Then open http://localhost:8080 in two browser windows.
+
+## Bots
+
+`bots/` plays over the same HTTP and WebSockets a browser uses, and sees
+only what the server sends (so it has to search for you around walls).
+Four strategies: `chaser` (heads for where you were last seen), `sniper`
+(keeps about 400 away and strafes), `camper` (hides in cover, peeks every
+few seconds), `random`. A bot plays match after match, so a person who
+joins gets matched with one.
+
+```sh
+cd bots && cargo run --release -- http://localhost:8080 8 mix      # 8 bots, all four kinds
+```
+
+`ARENA_SPREAD=40` pretends the bots live around the world (each has a home
+node; every node away from home adds 40 ms to what it measured), so matches
+land on different nodes even with every bot on one machine.
+
+## Three nodes, with distance
+
+`./demo.sh` (Docker) starts a Silo bucket and three combd nodes with
+pretend distance between them (node 0 near, node 1 40 ms away, node 2
+100 ms, using `tc`), deploys the arena through node 0's admin API over TLS,
+and prints where to go. `./demo.sh down` stops it all.
+
+## What a run looks like
+
+8 bots, `ARENA_SPREAD=40`, on the three-node demo (pretend distance 0, 40,
+and 100 ms), a laptop shared with other work, 75 s: 20,438 ticks seen by
+players; 1.43% of ticks came more than 75 ms after the last (the beat is
+50 ms), the worst gap 271 ms. 21% of a player's ticks had no new input from
+them, because it arrived a few ms after the tick: the server reuses the
+last input, so play goes on. (A real game holds inputs a tick or two to
+smooth that; this one keeps it simple.) Matches went to more than one node,
+each pair's worst round trip 2 to 81 ms.
+
+Bugs it found, in the game: waiting players were paired only when someone
+new joined (they could wait out their ticket); a match had no time limit
+(two campers could hide forever); the matchmaker's stats lived in memory
+(an evicted object lost them); and the bots answered every other tick.
+Now the matchmaker ticks while anyone waits (which also keeps it in
+memory), a match lasts `MATCH_MS`, the stats are in its storage, and a bot
+answers every state.
 
 ## Notes for the site
 
