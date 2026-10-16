@@ -20,8 +20,9 @@
 //!   At max, an ask waits in line, and fails after `wait_ms`.
 //! - A lease is the member's alone: everything session-scoped works on it
 //!   (transactions over many calls, row locks, advisory locks, `SET`).
-//! - On release the member resets (`ROLLBACK; DISCARD ALL`), which rolls
-//!   back and releases every lock, and tells the pool it's free.
+//! - On release the member resets (`RESET`: a rollback, then what `DISCARD
+//!   ALL` does, in one round trip), which rolls back and releases every
+//!   lock, and tells the pool it's free.
 //! - A lease past `lease_ms` is taken back by the member itself: it resets,
 //!   and the holder's next call gets an error. It doesn't need the pool for
 //!   that.
@@ -45,6 +46,11 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// A session back to new: no transaction, settings, prepared statements,
+/// cursors, temp tables, advisory locks, or LISTENs left from its last
+/// holder. Checked in an open, an aborted, and no transaction.
+const RESET: &str = "ROLLBACK; CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; DEALLOCATE ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES";
 
 /// The biggest answer a cell can get back (as its SQLite's).
 const MAX_ANSWER: usize = crate::store::MAX_RESULT;
@@ -854,9 +860,12 @@ fn run_member(id: Key, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs
         if broken {
             return false;
         }
-        // Two statements: in one string they'd share an implicit
-        // transaction, which DISCARD ALL refuses to run in.
-        if client.batch_execute("ROLLBACK").is_err() || client.batch_execute("DISCARD ALL").is_err() {
+        // One round trip: ROLLBACK (a no-op, with a warning, if no
+        // transaction is open), then what DISCARD ALL does, piece by piece
+        // (DISCARD ALL itself won't run in the implicit transaction a
+        // multi-statement string gets). It was two round trips, a third of
+        // a pooled statement's time.
+        if client.batch_execute(RESET).is_err() {
             return false;
         }
         let _ = pool.send(Msg::Free(id));

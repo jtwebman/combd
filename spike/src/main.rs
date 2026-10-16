@@ -2798,11 +2798,21 @@ callers = ["api"]
     /// one, over the wire. Then the manager's node stops mid-query: the
     /// query still finishes (`finish`), another node takes over, and every
     /// node still gets answers.
-    #[test]
-    fn a_pool_is_one_for_the_whole_fleet() {
+    /// Three nodes serving an app with a Postgres pool of `max`, on its own
+    /// application name (to count its connections). `None`: no bucket or
+    /// database to test against.
+    struct PgFleet {
+        nodes: Vec<u16>,
+        stops: Vec<Arc<AtomicBool>>,
+        pg_url: String,
+        tag: String,
+        _dirs: (store::tempdir::Dir, store::tempdir::Dir),
+    }
+
+    fn pg_fleet(max: usize) -> Option<PgFleet> {
         let (Some(base), Ok(pg_url)) = (s3::S3::from_env(), std::env::var("COMBD_PG_TEST")) else {
             eprintln!("skipping: set COMBD_S3 and COMBD_PG_TEST");
-            return;
+            return None;
         };
         let dir = store::tempdir::Dir::new();
         let certs = dir.0.join("certs");
@@ -2828,21 +2838,120 @@ callers = ["api"]
             assert!(eventually(10_000, || std::net::TcpStream::connect(("127.0.0.1", p)).is_ok()));
             stat(p, "fences");
         }
-        // Its own application name, to count its connections in Postgres.
-        let tag = format!("combd-fleet-pool-{}", std::process::id());
+        let tag = format!("combd-fleet-pool-{}-{}", std::process::id(), admin_port);
         let url = format!("{pg_url}{}application_name={tag}", if pg_url.contains('?') { "&" } else { "?" });
         let src = store::tempdir::Dir::new();
         std::fs::create_dir_all(src.0.join("modules")).unwrap();
         std::fs::copy(GUEST_EV, manifest::module_path(&src.0, "ev")).unwrap();
-        std::fs::write(src.0.join("combd.toml"), "[app]\nname = \"data\"\ndomains = [\"data.test\"]\n[vars]\nPG = { type = \"url\" }\n[processes.api]\nkind = \"ev\"\nroutes = [\"/pg/q\"]\n[processes.pg-conn]\nkind = \"combd:postgres\"\nurl = \"$PG\"\n[pools.main]\nmember = \"pg-conn\"\nowners = [\"api\"]\nmax = 2\nwait_ms = 20000\n").unwrap();
+        std::fs::write(src.0.join("combd.toml"), format!("[app]\nname = \"data\"\ndomains = [\"data.test\"]\n[vars]\nPG = {{ type = \"url\" }}\n[processes.api]\nkind = \"ev\"\nroutes = [\"/pg/q\", \"/hello\"]\n[processes.pg-conn]\nkind = \"combd:postgres\"\nurl = \"$PG\"\n[pools.main]\nmember = \"pg-conn\"\nowners = [\"api\"]\nmax = {max}\nwait_ms = 20000\n")).unwrap();
         let api = |method: &str, path: &str, body: &[u8]| admin::request(&format!("http://127.0.0.1:{admin_port}"), None, &token, method, path, body).unwrap();
         assert_eq!(api("PUT", "/v1/apps/acme/data/vars", serde_json::json!({ "PG": url }).to_string().as_bytes()).0, 200);
         let (code, v) = api("PUT", "/v1/apps/acme/data", &deploy::bundle(&src.0).unwrap());
         assert_eq!(code, 200, "{v}");
-        let q = |port: u16, sql: &str| http_to(port, "data.test", "POST", "/pg/q", &serde_json::json!({ "q": sql }).to_string());
+        // Node 0 asks first, so it's the manager.
         for &p in &nodes {
-            assert!(eventually(10_000, || q(p, "SELECT 1").0 == 200), "node {p}: {:?}", q(p, "SELECT 1"));
+            assert!(eventually(10_000, || pg_q(p, "SELECT 1", serde_json::json!([])).0 == 200), "node {p}: {:?}", pg_q(p, "SELECT 1", serde_json::json!([])));
         }
+        Some(PgFleet { nodes, stops, pg_url, tag, _dirs: (dir, src) })
+    }
+
+    fn pg_q(port: u16, sql: &str, params: serde_json::Value) -> (u16, String) {
+        http_to(port, "data.test", "POST", "/pg/q", &serde_json::json!({ "q": sql, "p": params }).to_string())
+    }
+
+    /// Load for `secs` from `threads` threads, each running `op` (true: it
+    /// worked): (ops a second, p50 ms, p99 ms, failures).
+    fn load(secs: f64, threads: usize, op: impl Fn(usize, &mut sim::Rng) -> bool + Sync) -> (f64, f64, f64, usize) {
+        let end = Instant::now() + Duration::from_secs_f64(secs);
+        let (lat, bad) = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads)
+                .map(|t| {
+                    let op = &op;
+                    sc.spawn(move || {
+                        let (mut lat, mut bad, mut rng) = (vec![], 0, sim::Rng::new(t as u64 + 1));
+                        while Instant::now() < end {
+                            let s = Instant::now();
+                            if op(t, &mut rng) {
+                                lat.push(s.elapsed().as_secs_f64() * 1000.0);
+                            } else {
+                                bad += 1;
+                            }
+                        }
+                        (lat, bad)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).fold((vec![], 0), |(mut l, b), (l2, b2)| {
+                l.extend(l2);
+                (l, b + b2)
+            })
+        });
+        let mut lat = lat;
+        lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |p: f64| lat.get(((lat.len() as f64 * p) as usize).min(lat.len().saturating_sub(1))).copied().unwrap_or(0.0);
+        (lat.len() as f64 / secs, pct(0.5), pct(0.99), bad)
+    }
+
+    /// How fast Postgres goes through combd, next to Postgres itself and to
+    /// plain HTTP: reads, inserts, and updates by primary key, on the
+    /// manager's node, on another node, and on all three. Not run by
+    /// default: `cargo test --release -- --ignored pg_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn pg_bench() {
+        const MAX: usize = 8;
+        const THREADS: usize = 16;
+        const SECS: f64 = 4.0;
+        let Some(f) = pg_fleet(MAX) else { return };
+        let table = format!("bench_{}", std::process::id());
+        let mut c = postgres::Client::connect(&f.pg_url, postgres::NoTls).unwrap();
+        c.batch_execute(&format!("DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (id serial PRIMARY KEY, n int NOT NULL, s text NOT NULL); INSERT INTO {table} (n, s) SELECT i, 'row ' || i FROM generate_series(1, 10000) i;")).unwrap();
+        let get = format!("SELECT n, s FROM {table} WHERE id = $1");
+        let ins = format!("INSERT INTO {table} (n, s) VALUES ($1, $2)");
+        let upd = format!("UPDATE {table} SET n = n + 1 WHERE id = $1");
+        let report = |name: &str, (ops, p50, p99, bad): (f64, f64, f64, usize)| eprintln!("{name:<44} {ops:>8.0} ops/s   p50 {p50:>6.2} ms   p99 {p99:>6.2} ms{}", if bad > 0 { format!("   {bad} failed") } else { String::new() });
+        eprintln!("--- {THREADS} clients, a pool of {MAX}, {SECS} s each, 10,000 rows");
+        // Plain HTTP to a cell, no database: what the web side costs.
+        report("HTTP only (GET /hello), node 0", load(SECS, THREADS, |_, _| http_to(f.nodes[0], "data.test", "GET", "/hello", "").0 == 200));
+        // Postgres itself: one connection per thread, no HTTP.
+        for (name, sql) in [("get", &get), ("insert", &ins), ("update", &upd)] {
+            let conns: Vec<_> = (0..MAX).map(|_| std::sync::Mutex::new(postgres::Client::connect(&f.pg_url, postgres::NoTls).unwrap())).collect();
+            let r = load(SECS, MAX, |t, rng| {
+                let mut c = conns[t].lock().unwrap();
+                let id = 1 + rng.below(10_000) as i32;
+                match name {
+                    "insert" => c.execute(sql.as_str(), &[&id, &"new"]).is_ok(),
+                    _ => if name == "get" { c.query(sql.as_str(), &[&id]).is_ok() } else { c.execute(sql.as_str(), &[&id]).is_ok() },
+                }
+            });
+            report(&format!("Postgres direct, {MAX} connections: {name}"), r);
+        }
+        // Through combd.
+        let op = |name: &'static str, sql: String| {
+            move |port: u16, rng: &mut sim::Rng| {
+                let id = 1 + rng.below(10_000);
+                let p = if name == "insert" { serde_json::json!([id, "new"]) } else { serde_json::json!([id]) };
+                pg_q(port, &sql, p).0 == 200
+            }
+        };
+        for (name, sql) in [("get", get.clone()), ("insert", ins.clone()), ("update", upd.clone())] {
+            let o = op(name, sql);
+            report(&format!("combd, manager's node: {name}"), load(SECS, THREADS, |_, rng| o(f.nodes[0], rng)));
+            report(&format!("combd, another node: {name}"), load(SECS, THREADS, |_, rng| o(f.nodes[1], rng)));
+            report(&format!("combd, all three nodes: {name}"), load(SECS, THREADS, |t, rng| o(f.nodes[t % 3], rng)));
+        }
+        let n: i64 = c.query_one(&format!("SELECT count(*) FROM {table}"), &[]).unwrap().get(0);
+        eprintln!("--- {n} rows at the end");
+        c.batch_execute(&format!("DROP TABLE {table}")).unwrap();
+        for s in &f.stops {
+            s.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn a_pool_is_one_for_the_whole_fleet() {
+        let Some(PgFleet { nodes, stops, pg_url, tag, _dirs }) = pg_fleet(2) else { return };
+        let q = |port: u16, sql: &str| pg_q(port, sql, serde_json::json!([]));
         // How many connections Postgres sees from this pool, sampled.
         let count = {
             let tag = tag.clone();

@@ -1561,6 +1561,38 @@ granting to its own node until it hears the new epoch (more than `max`
 until then); the manager is wherever the first ask came from, with no
 placement preference; `on_manager_loss = "stop"` has no test of its own.
 
+## Postgres through combd: how fast
+
+`pg_bench` (not run by default: `cargo test --release -- --ignored pg_bench
+--nocapture`): three nodes on one laptop (nothing else running), a real
+Postgres, a pool of 8, 16 clients, 4 s each, 10,000 rows, by primary key.
+
+| | ops/s | p50 |
+|---|---|---|
+| HTTP only, no database (`GET /hello`) | 7,350 | 2.1 ms |
+| Postgres direct, 8 connections: get / insert / update | 8,374 / 7,178 / 7,072 | 0.9 to 1.1 ms |
+| combd, manager's node: get / insert / update | 3,397 / 3,466 / 3,412 | 4.4 to 4.5 ms |
+| combd, another node | 2,952 / 2,991 / 3,034 | 5.0 to 5.3 ms |
+| combd, all three nodes | 3,044 / 3,265 / 3,235 | 4.8 to 5.1 ms |
+
+The first run found a third of the time in the reset after each pooled
+statement: `ROLLBACK`, then `DISCARD ALL`, two round trips. Most leases
+never open a transaction, and the pieces of `DISCARD ALL` can run in the
+same string as the `ROLLBACK`, so it's one round trip now (checked clean in
+an open, an aborted, and no transaction: settings, temp tables, prepared
+statements, advisory locks). That took combd from about 3,000 to 3,400 a
+second.
+
+What's left: each connection is busy about 2.3 ms per statement through
+combd against 1 ms direct. Every pooled statement is its own lease, so it
+asks the manager, waits for the grant, runs, and resets, and between two
+statements the connection sits idle while that goes around. On one laptop
+the manager is microseconds away (another node costs about 12%); across
+regions it would be a round trip to the manager on every statement (about
+230 ms New York to Singapore). Next: let a node keep a member for its own
+asks while it has them, so the manager is only asked when a node needs
+more, or another needs one back.
+
 ## Upload batching
 
 An object's writes are acknowledged once its peers have them; the bucket
