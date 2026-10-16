@@ -320,6 +320,22 @@ impl<T: Read + Write> ReadWrite for T {}
 mod tests {
     use super::*;
 
+    /// Requests come from the internet: damaged at random, the reader must
+    /// never panic (and never read past a refusal).
+    #[test]
+    fn mangled_requests_never_panic() {
+        let good = b"PUT /v1/apps/acme/shop/secrets/pg-url HTTP/1.1\r\nauthorization: Bearer combd_abc\r\ncontent-length: 12\r\n\r\nhello world!";
+        let mut rng = crate::sim::Rng::new(19);
+        for i in 0..100_000 {
+            let b = crate::sim::mangle(&mut rng, good);
+            let refuse = i % 2 == 0;
+            let r = std::panic::catch_unwind(|| read_request(&mut &b[..], |_, _, _| if refuse { Err((403, json!({}))) } else { Ok(()) })).expect("the request reader panicked");
+            if let Ok(Ok((_, _, body))) = r {
+                assert!(body.len() <= crate::deploy::MAX_BUNDLE);
+            }
+        }
+    }
+
     #[test]
     fn tokens_and_scopes() {
         let (t, line) = new_token(&["acme/shop:deploy", "acme/*:vars"]);

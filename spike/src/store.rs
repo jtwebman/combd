@@ -462,10 +462,18 @@ pub fn restore(path: &Path, segs: &[Vec<u8>]) -> std::io::Result<()> {
         if n == 0 {
             continue;
         }
+        // What SQLite allows, and our cap: a damaged segment is refused,
+        // never written past the database it describes.
+        if !(512..=65536).contains(&page) || !page.is_power_of_two() || db * page > MAX_DB_BYTES as u64 {
+            return Err(bad());
+        }
         page_size = page;
         let mut at = 12;
         for _ in 0..n {
             let pgno = u(at)? as u64;
+            if !(1..=db).contains(&pgno) {
+                return Err(bad());
+            }
             let body = seg.get(at + 4..at + 4 + page as usize).ok_or_else(bad)?;
             f.seek(SeekFrom::Start((pgno - 1) * page))?;
             f.write_all(body)?;
@@ -562,6 +570,43 @@ fn to_sql(v: &Json) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
+    /// Segments come from the bucket: damaged at random, a restore refuses
+    /// them or writes a file no bigger than they say, and never panics.
+    #[test]
+    fn mangled_segments_never_panic_or_grow_past_their_size() {
+        let page = 512u32;
+        let mut seg = vec![];
+        for v in [page, 3, 2] {
+            seg.extend_from_slice(&v.to_le_bytes());
+        }
+        for pgno in [1u32, 3] {
+            seg.extend_from_slice(&pgno.to_le_bytes());
+            seg.extend(std::iter::repeat_n(pgno as u8, page as usize));
+        }
+        let d = super::tempdir::Dir::new();
+        let path = d.0.join("db");
+        restore(&path, &[seg.clone()]).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 3 * 512);
+        // What random damage rarely hits, by hand: page 0, a page past the
+        // end, a page size SQLite can't have, a database past the cap.
+        let with = |at: usize, v: u32| {
+            let mut b = seg.clone();
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            b
+        };
+        for (at, v, what) in [(12, 0, "page 0"), (12, 4, "a page past the end"), (0, 1000, "page size 1000"), (4, u32::MAX, "past the cap")] {
+            assert!(restore(&path, &[with(at, v)]).is_err(), "{what}");
+        }
+        let mut rng = crate::sim::Rng::new(29);
+        for _ in 0..1_500 {
+            let b = crate::sim::mangle(&mut rng, &seg);
+            let r = std::panic::catch_unwind(|| restore(&path, &[b])).expect("restore panicked");
+            if r.is_ok() {
+                assert!(std::fs::metadata(&path).unwrap().len() <= MAX_DB_BYTES as u64);
+            }
+        }
+    }
+
     use super::*;
 
     fn db() -> (tempdir::Dir, Db) {

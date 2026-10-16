@@ -1435,6 +1435,22 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
+    /// Bucket values come from storage anyone may have damaged: the
+    /// decoders must never panic.
+    #[test]
+    fn mangled_bucket_values_never_panic() {
+        let o: Obj = 0xabc;
+        let rec = Val::Rec(Rec { node: 2, epoch: 7, sealed: false, peers: vec![0, 1] }).encode();
+        let man = Val::Manifest(vec![seg_key(o, 1, 4), tail_key(o, 2)]).encode();
+        let seg = frame(&[vec![1, 2, 3], vec![9; 100]]);
+        let mut rng = crate::sim::Rng::new(23);
+        for i in 0..100_000 {
+            let (k, good) = [(own_key(o), &rec), (manifest_key(o, 2), &man), (seg_key(o, 1, 4), &seg)][i % 3].clone();
+            let b = crate::sim::mangle(&mut rng, good);
+            std::panic::catch_unwind(|| (Val::decode(&k, &b), unframe(&b))).expect("a bucket value decoder panicked");
+        }
+    }
+
     use super::*;
 
     #[test]

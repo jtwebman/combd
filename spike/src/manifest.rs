@@ -197,12 +197,17 @@ fn read_one(dir: &Path, stem: &str) -> Result<Option<(String, Json)>, String> {
         return Err(format!("{file}: bigger than {MAX_FILE} bytes"));
     }
     let text = std::fs::read_to_string(dir.join(&file)).map_err(|e| format!("{file}: {e}"))?;
+    tree_of(k, &text).map(|t| Some((file.clone(), t))).map_err(|e| format!("{file}: {e}"))
+}
+
+/// A manifest's text, in format `k` (toml, yaml, json), as one tree.
+fn tree_of(k: &str, text: &str) -> Result<Json, String> {
     let tree = match k {
-        "toml" => toml::from_str::<Json>(&text).map_err(|e| e.to_string()),
-        "yaml" => serde_yaml_ng::from_str::<Json>(&text).map_err(|e| e.to_string()),
-        _ => serde_json::from_str::<Json>(&text).map_err(|e| e.to_string()),
+        "toml" => toml::from_str::<Json>(text).map_err(|e| e.to_string()),
+        "yaml" => serde_yaml_ng::from_str::<Json>(text).map_err(|e| e.to_string()),
+        _ => serde_json::from_str::<Json>(text).map_err(|e| e.to_string()),
     };
-    tree.map(|t| Some((file.clone(), untoml(t)))).map_err(|e| format!("{file}: {e}"))
+    tree.map(untoml)
 }
 
 /// A TOML datetime written bare comes through as a one-key table: make it
@@ -1019,6 +1024,27 @@ pools:
 
     fn env(vars: &[(&str, Json)], secrets: &[(&str, &str)]) -> EnvValues {
         EnvValues { vars: vars.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(), secrets: secrets.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() }
+    }
+
+    /// Manifests are anyone's text: damaged at random, in all three formats,
+    /// the parse and every check (and resolving it) must never panic.
+    #[test]
+    fn mangled_manifests_never_panic() {
+        let e = env(&[("REGION", "us-east".into()), ("PG_MAX", 100.into())], &[("pg-url", "postgres://db/x")]);
+        let mut rng = crate::sim::Rng::new(17);
+        for i in 0..30_000 {
+            let (k, text) = [("toml", TOML), ("yaml", YAML), ("json", JSON)][i % 3];
+            let b = crate::sim::mangle(&mut rng, text.as_bytes());
+            let text = String::from_utf8_lossy(&b).into_owned();
+            std::panic::catch_unwind(|| {
+                if let Ok(tree) = tree_of(k, &text) {
+                    if let Ok(m) = from_tree(&tree, &|_| true) {
+                        let _ = m.resolve(&e);
+                    }
+                }
+            })
+            .expect("the manifest checks panicked");
+        }
     }
 
     #[test]
