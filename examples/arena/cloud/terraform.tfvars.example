@@ -1,5 +1,5 @@
 # Copy to terraform.tfvars (gitignored) and fill in.
-domain                = "example.com"     # a zone on your Cloudflare account
+domain                = "combd.dev"       # a zone on your Cloudflare account
 name                  = "arena"           # arena.example.com, n0.arena.example.com, ...
 regions               = ["nyc3", "fra1", "sgp1"]
 admin_cidr            = "203.0.113.7/32"  # your IP: curl -4 ifconfig.me
@@ -7,4 +7,5 @@ cloudflare_account_id = "..."             # Cloudflare dashboard, the account's 
 r2_bucket             = "combd-arena"     # wrangler r2 bucket create combd-arena
 r2_key                = "..."             # R2, Manage API tokens: Object Read & Write, this bucket
 r2_secret             = "..."
+acme_email            = "you@example.com" # Let's Encrypt's account
 load_balancer         = true              # false: no Load Balancing add-on, round robin DNS instead

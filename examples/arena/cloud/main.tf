@@ -2,6 +2,9 @@
 # region, an R2 bucket, and one name (arena.<domain>) that Cloudflare answers
 # with the nearest healthy node, DNS only (not proxied, so a player's ping is
 # to the node itself). Each node also gets its own name, n<i>.arena.<domain>.
+# HTTPS (a .dev name must have it): a Let's Encrypt certificate for the name
+# and *.name, got through a DNS challenge on Cloudflare, served by Caddy on
+# each node in front of combd.
 #
 #   ./up.sh     secrets, then terraform apply, then deploy the game
 #   ./down.sh   terraform destroy (the bucket stays: empty it to delete it)
@@ -14,11 +17,16 @@ terraform {
   required_providers {
     digitalocean = { source = "digitalocean/digitalocean", version = "~> 2.40" }
     cloudflare   = { source = "cloudflare/cloudflare", version = "~> 4.52" }
+    acme         = { source = "vancluever/acme", version = "~> 2.26" }
+    tls          = { source = "hashicorp/tls", version = "~> 4.0" }
   }
 }
 
 provider "digitalocean" {}
 provider "cloudflare" {}
+provider "acme" {
+  server_url = "https://acme-v02.api.letsencrypt.org/directory"
+}
 
 variable "domain" {
   description = "A zone on Cloudflare, e.g. example.com"
@@ -56,6 +64,9 @@ variable "ssh_public_key" {
 variable "do_project" {
   default = "Combd"
 }
+variable "acme_email" {
+  description = "Let's Encrypt account email (it may send notices there)"
+}
 variable "load_balancer" {
   description = "Cloudflare Load Balancing (a paid add-on). Off: arena.<domain> is the three nodes, round robin."
   default     = true
@@ -66,7 +77,7 @@ locals {
   secrets = "${path.module}/.secrets"
   nodes   = { for i, r in var.regions : tostring(i) => r }
   peers   = join(",", [for i, r in var.regions : "${i}=n${i}.${local.host}:7100"])
-  public  = join(",", [for i, r in var.regions : "${i}=http://n${i}.${local.host}"])
+  public  = join(",", [for i, r in var.regions : "${i}=https://n${i}.${local.host}"])
   # Where each region is, for the load balancer's nearest-node steering.
   where = {
     nyc3 = [40.7, -74.0], sfo3 = [37.8, -122.4], tor1 = [43.7, -79.4], lon1 = [51.5, -0.1], ams3 = [52.4, 4.9],
@@ -76,6 +87,27 @@ locals {
 
 data "cloudflare_zone" "zone" {
   name = var.domain
+}
+
+# The certificate: arena.<domain> and *.arena.<domain>, for every node.
+resource "tls_private_key" "acme" {
+  algorithm = "ECDSA"
+}
+
+resource "acme_registration" "me" {
+  account_key_pem = tls_private_key.acme.private_key_pem
+  email_address   = var.acme_email
+}
+
+resource "acme_certificate" "arena" {
+  account_key_pem           = acme_registration.me.account_key_pem
+  common_name               = local.host
+  subject_alternative_names = ["*.${local.host}"]
+  key_type                  = "P256"
+  # CF_DNS_API_TOKEN from the environment (up.sh sets it).
+  dns_challenge {
+    provider = "cloudflare"
+  }
 }
 
 data "digitalocean_project" "project" {
@@ -116,11 +148,14 @@ resource "digitalocean_droplet" "node" {
       "COMBD_MASTER_KEY_FILE=/etc/combd/master.key",
       "",
     ])
-    ca     = file("${local.secrets}/certs/ca.pem")
-    cert   = file("${local.secrets}/certs/node${each.key}.pem")
-    key    = file("${local.secrets}/certs/node${each.key}.key")
-    tokens = file("${local.secrets}/tokens")
-    master = file("${local.secrets}/master.key")
+    ca       = file("${local.secrets}/certs/ca.pem")
+    cert     = file("${local.secrets}/certs/node${each.key}.pem")
+    key      = file("${local.secrets}/certs/node${each.key}.key")
+    tokens   = file("${local.secrets}/tokens")
+    master   = file("${local.secrets}/master.key")
+    tls_cert = "${acme_certificate.arena.certificate_pem}${acme_certificate.arena.issuer_pem}"
+    tls_key  = acme_certificate.arena.private_key_pem
+    host     = local.host
   })
 }
 
@@ -129,7 +164,7 @@ resource "digitalocean_project_resources" "arena" {
   resources = [for d in digitalocean_droplet.node : d.urn]
 }
 
-# HTTP for everyone; the wire only between the nodes; SSH and the admin API
+# HTTP and HTTPS for everyone; the wire only between the nodes; SSH and the admin API
 # only from you.
 resource "digitalocean_firewall" "arena" {
   name        = "combd-arena"
@@ -137,6 +172,11 @@ resource "digitalocean_firewall" "arena" {
   inbound_rule {
     protocol         = "tcp"
     port_range       = "80"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "443"
     source_addresses = ["0.0.0.0/0", "::/0"]
   }
   inbound_rule {
@@ -187,12 +227,16 @@ resource "cloudflare_record" "node" {
 
 # The one name: the nearest healthy node.
 resource "cloudflare_load_balancer_monitor" "ping" {
-  count          = var.load_balancer ? 1 : 0
-  account_id     = var.cloudflare_account_id
-  type           = "http"
-  method         = "GET"
-  path           = "/_combd/ping"
-  port           = 80
+  count      = var.load_balancer ? 1 : 0
+  account_id = var.cloudflare_account_id
+  type       = "https"
+  method     = "GET"
+  path       = "/_combd/ping"
+  port       = 443
+  header {
+    header = "Host"
+    values = [local.host]
+  }
   expected_codes = "200"
   interval       = 60
   timeout        = 5

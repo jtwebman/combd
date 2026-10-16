@@ -103,7 +103,10 @@ on games until we've checked what it does.
 York, Frankfurt, Singapore by default), with an R2 bucket and one name,
 `arena.<your domain>`, that Cloudflare answers with the nearest healthy
 node (DNS only, so a player's ping is to the node itself). Each node also
-has its own name, `n0.arena.<domain>` and so on.
+has its own name, `n0.arena.<domain>` and so on. HTTPS throughout (a
+`.dev` name must have it): Terraform gets a Let's Encrypt certificate for
+the name and `*.name` through a DNS challenge, and Caddy serves it on each
+node in front of combd.
 
 1. GitHub builds the image (`.github/workflows/arena-image.yml`) on each
    push; make the `combd-arena` package public once so droplets can pull it.

@@ -5,6 +5,8 @@
 set -e
 cd "$(dirname "$0")"
 : "${DIGITALOCEAN_TOKEN:?set DIGITALOCEAN_TOKEN}" "${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN}"
+# The certificate's DNS challenge uses the same Cloudflare token.
+export CF_DNS_API_TOKEN="$CLOUDFLARE_API_TOKEN"
 [ -f terraform.tfvars ] || { echo "copy terraform.tfvars.example to terraform.tfvars and fill it in"; exit 1; }
 BIN=../../../spike/target/release/combd-spike
 [ -x $BIN ] || (cd ../../../spike && cargo build --release)
@@ -26,8 +28,8 @@ HOST=$(terraform output -raw host)
 # Up: each node answers its own name (DNS and cloud-init can take a few minutes).
 for n in 0 1 2; do
     printf "waiting for n$n.$HOST"
-    i=0; until curl -sf -m 3 -o /dev/null "http://n$n.$HOST/_combd/ping"; do i=$((i + 1)); [ $i -gt 120 ] && { echo " no answer after 10 minutes"; exit 1; }; printf .; sleep 5; done
+    i=0; until curl -sf -m 3 -o /dev/null "https://n$n.$HOST/_combd/ping"; do i=$((i + 1)); [ $i -gt 120 ] && { echo " no answer after 10 minutes"; exit 1; }; printf .; sleep 5; done
     echo " up"
 done
 ./deploy.sh
-echo "up: http://$HOST (the nearest node), or http://n0.$HOST, n1, n2"
+echo "up: https://$HOST (the nearest node), or https://n0.$HOST, n1, n2"
