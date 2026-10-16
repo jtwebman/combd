@@ -89,6 +89,7 @@ pub fn run_call(s3: &S3, call: &Call) -> Res {
             s3.put(k, &v.encode(), &cond).map(Res::Put)
         }
         Call::List(prefix) => s3.list(prefix).map(Res::Listed),
+        Call::Delete(k) => s3.delete(k).map(|_| Res::Deleted),
     };
     r.unwrap_or_else(|e| {
         eprintln!("bucket: {call:?}: {e}");

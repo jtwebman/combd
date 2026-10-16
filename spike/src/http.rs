@@ -170,6 +170,7 @@ struct Stats {
     uploads: AtomicU64,
     lease_reads: AtomicU64,
     fence_waits: AtomicU64,
+    gc_deleted: AtomicU64,
     /// WebSockets open, and messages in from them.
     sockets_open: AtomicU64,
     ws_messages: AtomicU64,
@@ -231,7 +232,7 @@ enum Job {
     Fetch { obj: own::Obj, act: Act, segs: Vec<String>, image: Option<String>, back: usize },
     /// Write an object's image (write-once), for the next owner to start
     /// from. No answer: without it, the next one reads the long way.
-    Image { key: String, entry: Vec<u8> },
+    Image { obj: own::Obj, act: Act, key: String, entry: Vec<u8>, back: usize },
     /// Move an object's alarm index entry from `old` to `new` (due times).
     Index { name: String, obj: own::Obj, old: Option<i64>, new: Option<i64>, back: usize },
     /// The due alarms in the index.
@@ -326,6 +327,8 @@ enum Msg {
     Bucket { op: own::OpId, res: own::Res },
     /// Fleet mode: an object's segments, for a restore, and its alarm index entries.
     Fetched { obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>, image: Option<String> },
+    /// An object's image is written.
+    Imaged { obj: own::Obj, act: Act },
     /// Fleet mode: an alarm index move finished.
     Indexed { name: String, new: Option<i64>, ok: bool },
     /// Fleet mode: due alarms from the index: (name, due).
@@ -1268,14 +1271,17 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
                     let index = s3.list(&alarm_prefix(obj)).unwrap_or_default().iter().filter_map(|k| k.rsplit('/').next()?.parse().ok()).collect();
                     (back, Msg::Fetched { obj, act, data: crate::fleet::fetch(&s3, &segs), index, image })
                 }
-                Job::Image { key, entry } => {
-                    match s3.put(&key, &own::frame(&[entry]), &crate::s3::Cond::IfAbsent) {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(_)) => eprintln!("{key}: an image is there already"),
-                        Err(e) => eprintln!("{key}: image not written: {e}"),
+                Job::Image { obj, act, key, entry, back } => match s3.put(&key, &own::frame(&[entry]), &crate::s3::Cond::IfAbsent) {
+                    Ok(Ok(_)) => (back, Msg::Imaged { obj, act }),
+                    Ok(Err(_)) => {
+                        eprintln!("{key}: an image is there already");
+                        continue;
                     }
-                    continue;
-                }
+                    Err(e) => {
+                        eprintln!("{key}: image not written: {e}");
+                        continue;
+                    }
+                },
                 Job::Index { name, obj, old, new, back } => {
                     // The new entry first, then the old one goes: never a moment with neither.
                     let put = new.map_or(Ok(()), |at| s3.put(&alarm_key(obj, at), name.as_bytes(), &crate::s3::Cond::Any).map(|_| ()));
@@ -1588,6 +1594,7 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Msg::Bucket { op, res } => self.core_on(own::Event::Reply { op, res }),
                 Msg::Fetched { obj, act, data, index, image } => self.fetched(obj, act, data, index, image),
+                Msg::Imaged { obj, act } => self.core_on(own::Event::Imaged { obj, act }),
                 Msg::Indexed { name, new, ok } => {
                     if let Some(o) = self.objects.get_mut(&name) {
                         o.index_busy = false;
@@ -2714,7 +2721,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -2733,6 +2740,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.uploads.load(Relaxed),
                     s.lease_reads.load(Relaxed),
                     s.fence_waits.load(Relaxed),
+                    s.gc_deleted.load(Relaxed),
                     s.sockets_open.load(Relaxed),
                     s.ws_messages.load(Relaxed),
                     s.ws_handoffs.load(Relaxed),
@@ -3126,6 +3134,7 @@ impl<E: Engine> Loop<'_, E> {
         st.uploads.fetch_add(now.uploads - was.uploads, Relaxed);
         st.lease_reads.fetch_add(now.lease_reads - was.lease_reads, Relaxed);
         st.fence_waits.fetch_add(now.fence_waits - was.fence_waits, Relaxed);
+        st.gc_deleted.fetch_add(now.gc_deleted - was.gc_deleted, Relaxed);
         for e in effects {
             self.effect(e);
         }
@@ -3242,7 +3251,7 @@ impl<E: Engine> Loop<'_, E> {
         // The image: the file as restored, before anything runs on it.
         if let (Ok(()), Some(key)) = (&restored, image) {
             match store::image(&path) {
-                Ok(Some(entry)) => self.job(Job::Image { key, entry }),
+                Ok(Some(entry)) => self.job(Job::Image { obj, act, key, entry, back: self.me }),
                 Ok(None) => {}
                 Err(e) => eprintln!("object {name:?}: no image: {e}"),
             }

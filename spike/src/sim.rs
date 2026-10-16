@@ -136,6 +136,8 @@ pub struct Stats {
     pub tail_entries: u64,
     pub uploads: u64,
     pub lease_reads: u64,
+    /// Keys compaction deleted.
+    pub gc_deleted: u64,
     /// The longest a probe took to get a write in, from when they start.
     pub probe_ms: u64,
     pub splits: u64,
@@ -701,7 +703,10 @@ impl Sim {
                 // The image, as restored (and sometimes not written: a crash,
                 // a lost PUT), so loads from it and without it both happen.
                 if let Some(k) = image.filter(|_| ok && self.rng.chance(0.7)) {
-                    self.apply(&Call::Put(k, Val::Seg(crate::own::frame(&[encode(&history)])), Cond::IfAbsent));
+                    if let Res::Put(Ok(_)) = self.apply(&Call::Put(k, Val::Seg(crate::own::frame(&[encode(&history)])), Cond::IfAbsent)) {
+                        let d = self.latency();
+                        self.at(d, Msg::Proc(p, Event::Imaged { obj, act }));
+                    }
                 }
                 self.procs[p].data.insert(obj, Data { history, unsealed: vec![] });
                 let d = self.latency();
@@ -736,6 +741,10 @@ impl Sim {
             }
             Call::List(prefix) => {
                 Res::Listed(self.bucket.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(prefix.as_str())).map(|(k, _)| k.clone()).collect())
+            }
+            Call::Delete(k) => {
+                self.bucket.remove(k);
+                Res::Deleted
             }
         }
     }
@@ -848,11 +857,26 @@ impl Sim {
 
     /// The bucket's invariants: every manifest holds every write acknowledged
     /// in an earlier epoch, and starts with what that epoch proved.
+    ///
+    /// With compaction: an epoch's image stands for its manifest (its keys
+    /// may be gone), and a manifest older than some image is superseded (its
+    /// owner deleted what that one replaced). The newest manifest is always
+    /// checked in full, so a delete of something it needs is still caught.
     fn check_bucket(&self) -> Result<(), String> {
+        let mut images: HashMap<Obj, Vec<u32>> = HashMap::new();
+        for k in self.bucket.keys() {
+            if let Some((o, e)) = parse_part(k, "i") {
+                images.entry(o).or_default().push(e);
+            }
+        }
         for (k, (v, _)) in &self.bucket {
             let Val::Manifest(segs) = v else { continue };
             let Some((o, e)) = parse_manifest(k) else { continue };
-            let m = self.expand(segs);
+            let imaged = images.get(&o).map_or(&[][..], |v| v.as_slice());
+            if imaged.iter().any(|&i| i > e) {
+                continue;
+            }
+            let m = if imaged.contains(&e) { self.expand(&[image_key(o, e)]) } else { self.expand(segs) };
             for (&w, &(wo, we, _)) in &self.acked {
                 if wo == o && we < e && !m.contains(&w) {
                     return Err(format!("lost write {w}: acknowledged in object {o} epoch {we}, missing from epoch {e}"));
@@ -869,11 +893,16 @@ impl Sim {
 }
 
 fn parse_manifest(k: &str) -> Option<(Obj, u32)> {
+    parse_part(k, "m")
+}
+
+/// An object key's object and epoch, if its part is `part` (`m`, `i`).
+fn parse_part(k: &str, part: &str) -> Option<(Obj, u32)> {
     let rest = k.strip_prefix("obj/")?;
     let (o, _) = rest.split_once('/')?;
     let o = Obj::from_str_radix(o, 16).ok()?;
     match parse_key(o, k)? {
-        (e, "m") => Some((o, e)),
+        (e, p) if p == part => Some((o, e)),
         _ => None,
     }
 }
@@ -895,6 +924,7 @@ pub fn run_with(seeds: std::ops::Range<u64>, settings: &dyn Fn() -> Settings) ->
             total.tail_entries += p.core.stats.tail_entries;
             total.uploads += p.core.stats.uploads;
             total.lease_reads += p.core.stats.lease_reads;
+            total.gc_deleted += p.core.stats.gc_deleted;
         }
         let s = &sim.stats;
         total.writes_acked += s.writes_acked;
@@ -1047,6 +1077,10 @@ mod tests {
             ("trunc_early", 2, Bugs { trunc_early: true, ..Bugs::default() }),
             ("seal_early", 2, Bugs { seal_early: true, ..Bugs::default() }),
         ];
+        // Compaction that deletes before proving it still owns the object
+        // (a race with a newer owner's load: splits make it common).
+        let (_, bad) = run_with(0..3000, &|| Settings { replicas: 2, splits: true, bugs: Bugs { gc_unproven: true, ..Bugs::default() }, ..Settings::default() });
+        assert!(bad.as_ref().is_some_and(|(_, why)| why.contains("lost write")), "gc_unproven wasn't caught: {bad:?}");
         for (name, replicas, bugs) in cases {
             let (_, bad) = run_many(0..6000, replicas, bugs);
             assert!(bad.is_some(), "{name} was not caught in 6,000 seeds");

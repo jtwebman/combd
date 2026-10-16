@@ -144,6 +144,8 @@ pub enum Call {
     Put(String, Val, Cond),
     /// The keys under a prefix, in order.
     List(String),
+    /// Delete a key (gone already is fine).
+    Delete(String),
 }
 
 /// A call to a node's peer store.
@@ -191,6 +193,7 @@ pub enum Res {
     /// The new etag, or `Err` if the condition failed.
     Put(Result<String, ()>),
     Listed(Vec<String>),
+    Deleted,
     Peer(PeerRes),
     /// No reply in time: the call may or may not have happened.
     Lost,
@@ -208,6 +211,9 @@ pub enum Event {
     Sealed { obj: Obj, act: Act, changes: Vec<u8> },
     /// The executor rebuilt the object from its segments (or couldn't).
     Restored { obj: Obj, act: Act, ok: bool },
+    /// The image `Restore` asked for is written: once ownership is proven
+    /// again, older epochs' keys can go.
+    Imaged { obj: Obj, act: Act },
     Reply { op: OpId, res: Res },
     /// Time passes: retry peers that went quiet.
     Tick,
@@ -283,6 +289,9 @@ pub struct Bugs {
     pub lease_overtrust: bool,
     /// Read lease: the owner counts a `Kept` (no promise) as a promise.
     pub lease_trusts_kept: bool,
+    /// Compaction: delete older epochs' keys as soon as the image is
+    /// written, with no proof that we still own the object.
+    pub gc_unproven: bool,
 }
 
 /// A node's peer store: the entries it keeps for other nodes' objects. The
@@ -474,6 +483,8 @@ pub fn image_key(o: Obj, e: u32) -> String {
 
 /// A restore from this many segments or more writes an image (each is a GET).
 pub const COMPACT_SEGS: usize = 16;
+/// At most this many deletes per compaction (the rest go next time).
+const GC_MAX: usize = 1000;
 /// The epoch and the part (`m`, `t`, or `s...`) of an object key.
 pub fn parse_key(o: Obj, k: &str) -> Option<(u32, &str)> {
     let rest = k.strip_prefix(&format!("obj/{o:032x}/e"))?;
@@ -512,6 +523,10 @@ enum Wait {
     Prove(Obj, u32, u64, u64),
     /// Marking the record sealed; nothing waits on it.
     SealRec,
+    /// Compaction: listing an object to delete what its image replaced, and
+    /// the deletes. Nothing waits on them.
+    GcList(Obj, u32),
+    GcDelete,
 }
 
 impl Wait {
@@ -522,7 +537,7 @@ impl Wait {
             | List(o, _) | PrevManifest(o, ..) | TailSeg(o, ..) | Manifest(o, _) | Upload(o, ..) | Append(o, ..) | Prove(o, ..) => {
                 Some(*o)
             }
-            SealRec => None,
+            SealRec | GcList(..) | GcDelete => None,
         }
     }
 }
@@ -560,6 +575,9 @@ struct Pend {
     /// When it started waiting (our clock).
     since: u64,
     reqs: Vec<ReqId>,
+    /// Compaction waits on this round: once it's proven, we still own the
+    /// object after our image was written.
+    gc: bool,
 }
 
 #[derive(Debug)]
@@ -658,6 +676,8 @@ pub struct CoreStats {
     pub lease_reads: u64,
     /// Fences told to wait out a peer's promise (a takeover held off).
     pub fence_waits: u64,
+    /// Keys deleted by compaction (what an image replaced).
+    pub gc_deleted: u64,
 }
 
 pub struct Core {
@@ -875,12 +895,27 @@ impl Core {
                     s.since.get_or_insert(now);
                     s.ents.push_back(changes);
                     s.round += 1;
-                    s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs });
+                    s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs, gc: false });
                     self.flush(obj);
                     self.kick(obj);
                 }
             }
             Event::Restored { obj, act, ok } => self.restored(obj, act, ok),
+            Event::Imaged { obj, act } => {
+                let unproven = self.bugs.gc_unproven;
+                if let Some(s) = self.serving(obj, act) {
+                    if unproven {
+                        let e = s.epoch;
+                        self.gc_list(obj, e);
+                    } else {
+                        // A round to prove we still own it, now that the image
+                        // is there (see `gc_list`).
+                        s.round += 1;
+                        s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs: vec![], gc: true });
+                        self.kick(obj);
+                    }
+                }
+            }
             Event::Release { obj } => {
                 let seal_early = self.bugs.seal_early;
                 let st = self.st(obj);
@@ -1018,15 +1053,19 @@ impl Core {
             if lease - now < trust / 2 {
                 s.round += 1;
             }
+            let gc = s.pends.iter().any(|p| p.gc);
             let waiting: Vec<ReqId> = s.pends.drain(..).flat_map(|p| p.reqs).collect();
             self.stats.lease_reads += (waiting.len() + reqs.len()) as u64;
             for r in waiting.into_iter().chain(reqs) {
                 self.answer(r, Answer::Done { epoch });
             }
+            if gc {
+                self.gc_list(o, epoch);
+            }
             self.kick(o);
         } else {
             s.round += 1;
-            s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs });
+            s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs, gc: false });
             self.kick(o);
         }
     }
@@ -1108,7 +1147,7 @@ impl Core {
         let ack_one = self.bugs.ack_one;
         let Phase::Serving(s) = &mut self.st(o).phase else { return };
         let e = s.epoch;
-        let (mut done, mut by) = (vec![], (0, 0));
+        let (mut done, mut by, mut gc) = (vec![], (0, 0), false);
         while let Some(f) = s.pends.front() {
             let ok = |p: &PeerSt| p.round >= f.round && p.have >= f.need;
             let by_peers = !s.peers.is_empty() && if ack_one { s.peers.iter().any(ok) } else { s.peers.iter().all(ok) };
@@ -1121,12 +1160,17 @@ impl Core {
             } else {
                 by.1 += 1;
             }
-            done.extend(s.pends.pop_front().unwrap().reqs);
+            let p = s.pends.pop_front().unwrap();
+            gc |= p.gc;
+            done.extend(p.reqs);
         }
         self.stats.peer_acks += by.0;
         self.stats.bucket_acks += by.1;
         for r in done {
             self.answer(r, Answer::Done { epoch: e });
+        }
+        if gc {
+            self.gc_list(o, e);
         }
     }
 
@@ -1260,6 +1304,19 @@ impl Core {
                 base.push(tail_key(o, e));
                 self.write_manifest(o, e, base);
             }
+            // Compaction: what our image replaced goes.
+            (Wait::GcList(o, e), Res::Listed(keys)) => {
+                // Our image must be there (it is: we were told it's written).
+                if !keys.contains(&image_key(o, e)) {
+                    return;
+                }
+                let old: Vec<String> = keys.into_iter().filter(|k| parse_key(o, k).is_some_and(|(ep, _)| ep < e)).take(GC_MAX).collect();
+                for k in old {
+                    self.call(Wait::GcDelete, Call::Delete(k));
+                }
+            }
+            (Wait::GcDelete, Res::Deleted) => self.stats.gc_deleted += 1,
+            (Wait::GcList(..) | Wait::GcDelete, _) => {}
             (Wait::Manifest(o, e), Res::Put(Ok(_))) => {
                 let segs = self.pending_base.remove(&(o, e)).unwrap_or_default();
                 let image = (segs.len() >= self.compact_segs).then(|| image_key(o, e));
@@ -1435,6 +1492,18 @@ impl Core {
         self.stats.tail_entries += more.len() as u64;
         let cond = self.write_once();
         self.call(Wait::TailSeg(o, e, base), Call::Put(tail_key(o, e), Val::Seg(frame(&more)), cond));
+    }
+
+    /// Compaction, once our image is written and a round after it proved we
+    /// still own the object: every key of an older epoch goes. Safe because
+    /// a newer owner lists only after that round (it must fence our peers
+    /// first, or, with no peers, the record named us then), so it sees our
+    /// manifest and image and starts from them or from something newer; our
+    /// image holds everything our manifest named. Only a stale claimer, still
+    /// loading from before us, could miss a key, and its restore then fails
+    /// (safe: it's stale).
+    fn gc_list(&mut self, o: Obj, e: u32) {
+        self.call(Wait::GcList(o, e), Call::List(obj_prefix(o)));
     }
 
     /// From a listing: the last epoch q before `e` with a manifest, plus q's
