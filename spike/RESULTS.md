@@ -2133,11 +2133,12 @@ cells.
    counting `Kept` as a promise (`lease_trusts_kept`) is caught. The spec
    needs no change: peers renewing less is a subset of what it checks, and
    it already models an owner's lease as needing every peer's promise.
-0b. **Compact an object's segments.** Each upload is a segment, kept
-   forever, and a restore reads them all: the arena's matchmaker had 201
-   over 99 epochs, a minute to restore from Singapore one GET at a time.
-   Restores fetch 16 at a time now; a snapshot that replaces the old
-   segments would bound it.
+0b. ~~**Compact an object's segments.**~~ Done for restores: an owner
+   that restored from 16 segments or more writes an image (`obj/o/e<E>/i`,
+   the object as one entry), and the next owner starts from it. The arena's
+   matchmaker went from a 201-key manifest to 2 keys. Still to do: delete the
+   segments an image replaced (the bucket keeps them, and a claim still lists
+   them), and image a long-lived object mid-epoch, not only at a restore.
 1. ~~Run the official Wasm spec test suite against the interpreter.~~ Done:
    30,497 checks pass, plus differential fuzzing against Wasmtime.
 2. ~~Register-based interpreter, toward the 5x target.~~ Done (rounds 2 and
