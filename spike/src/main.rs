@@ -2792,7 +2792,10 @@ callers = ["api"]
             panic!("no such state within {ms} ms");
         };
         let (mut a, mut b) = (join(&ma["token"]), join(&mb["token"]));
-        let first = until(&mut a, 3000, &|v| v["phase"] == "play");
+        // 3, 2, 1, then play.
+        let cd = until(&mut a, 3000, &|v| v["phase"] == "countdown");
+        assert!(cd["left"].as_u64().unwrap() <= 3000, "{cd}");
+        let first = until(&mut a, 6000, &|v| v["phase"] == "play");
         assert!(first["them"].is_null(), "the spawns can't see each other through the middle wall: {first}");
         // 20 ticks a second.
         let t = Instant::now();
@@ -2805,13 +2808,14 @@ callers = ["api"]
         let v = until(&mut b, 2000, &|v| v["phase"] == "paused");
         assert_eq!(v["paused_by_you"], false);
         a.text(r#"{"t":"resume"}"#);
-        until(&mut b, 2000, &|v| v["phase"] == "play");
+        until(&mut b, 2000, &|v| v["phase"] == "countdown");
+        until(&mut b, 5000, &|v| v["phase"] == "play");
         // Bob drops: paused. He's back: it goes on.
         drop(b);
         until(&mut a, 2000, &|v| v["phase"] == "paused");
         let mut b = join(&mb["token"]);
-        until(&mut a, 2000, &|v| v["phase"] == "play");
-        until(&mut b, 2000, &|v| v["phase"] == "play");
+        until(&mut a, 5000, &|v| v["phase"] == "play");
+        until(&mut b, 5000, &|v| v["phase"] == "play");
         // Bob drops for good: alice wins once the pause runs out.
         drop(b);
         let over = until(&mut a, 5000, &|v| v["phase"] == "over");

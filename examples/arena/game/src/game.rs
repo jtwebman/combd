@@ -12,9 +12,9 @@ use serde_json::{json, Value};
 pub const W: f64 = 960.0;
 pub const H: f64 = 640.0;
 pub const R: f64 = 14.0;
-pub const SPEED: f64 = 220.0;
-pub const BULLET_SPEED: f64 = 550.0;
-pub const BULLET_LIFE_MS: u64 = 1200;
+pub const SPEED: f64 = 160.0;
+pub const BULLET_SPEED: f64 = 400.0;
+pub const BULLET_LIFE_MS: u64 = 1600;
 pub const FIRE_MS: u64 = 450;
 pub const HP: u32 = 4;
 pub const RESPAWN_MS: u64 = 1500;
@@ -71,6 +71,9 @@ pub struct Game {
     pub players: [Player; 2],
     pub bullets: Vec<Bullet>,
     pub winner: Option<usize>,
+    /// What happened in the last step, for sounds: ("shot", who fired),
+    /// ("hit", who was hit), ("kill", who scored).
+    pub events: Vec<(&'static str, usize)>,
 }
 
 fn spawn(side: usize) -> Player {
@@ -125,11 +128,22 @@ pub fn blocked(x: f64, y: f64) -> bool {
 
 impl Game {
     pub fn new() -> Game {
-        Game { players: [spawn(0), spawn(1)], bullets: vec![], winner: None }
+        Game { players: [spawn(0), spawn(1)], bullets: vec![], winner: None, events: vec![] }
+    }
+
+    /// A new round, after a kill: both back at their spawns, the bullets
+    /// gone, the score kept.
+    pub fn new_round(&mut self) {
+        for side in 0..2 {
+            let kills = self.players[side].kills;
+            self.players[side] = Player { kills, ..spawn(side) };
+        }
+        self.bullets.clear();
     }
 
     /// One step: `dt` seconds, at time `now` (ms).
     pub fn step(&mut self, now: u64, dt: f64) {
+        self.events.clear();
         if self.winner.is_some() {
             return;
         }
@@ -163,6 +177,7 @@ impl Game {
             }
             if i.fire && now.saturating_sub(p.last_fire) >= FIRE_MS {
                 p.last_fire = now;
+                self.events.push(("shot", side));
                 let (c, s) = (p.aim.cos(), p.aim.sin());
                 self.bullets.push(Bullet { x: p.x + c * (R + 4.0), y: p.y + s * (R + 4.0), vx: c * BULLET_SPEED, vy: s * BULLET_SPEED, owner: side, born: now });
             }
@@ -184,9 +199,11 @@ impl Game {
                 let t = &mut self.players[target];
                 if t.dead_until.is_none() && (t.x - b.x).powi(2) + (t.y - b.y).powi(2) < (R + 3.0).powi(2) {
                     t.hp = t.hp.saturating_sub(1);
+                    self.events.push(("hit", target));
                     if t.hp == 0 {
                         t.dead_until = Some(now + RESPAWN_MS);
                         self.players[b.owner].kills += 1;
+                        self.events.push(("kill", b.owner));
                         if self.players[b.owner].kills >= KILLS_TO_WIN {
                             self.winner = Some(b.owner);
                         }
@@ -206,7 +223,8 @@ impl Game {
         let them = &self.players[1 - side];
         let visible = them.dead_until.is_none() && me.dead_until.is_none() && sees(me.x, me.y, them.x, them.y);
         let pos = |p: &Player| json!({ "x": p.x.round(), "y": p.y.round(), "aim": (p.aim * 100.0).round() / 100.0, "hp": p.hp, "dead": p.dead_until.is_some() });
-        let bullets: Vec<Value> = self.bullets.iter().filter(|b| b.owner == side || sees(me.x, me.y, b.x, b.y)).map(|b| json!([b.x.round(), b.y.round()])).collect();
+        // With their velocity: a client moves them smoothly between updates.
+        let bullets: Vec<Value> = self.bullets.iter().filter(|b| b.owner == side || sees(me.x, me.y, b.x, b.y)).map(|b| json!([b.x.round(), b.y.round(), b.vx.round(), b.vy.round()])).collect();
         json!({
             "you": pos(me),
             "them": if visible { pos(them) } else { Value::Null },
@@ -223,7 +241,7 @@ impl Game {
         let pos = |p: &Player| json!({ "x": p.x.round(), "y": p.y.round(), "aim": (p.aim * 100.0).round() / 100.0, "hp": p.hp, "dead": p.dead_until.is_some(), "kills": p.kills });
         json!({
             "p": [pos(&self.players[0]), pos(&self.players[1])],
-            "b": self.bullets.iter().map(|b| json!([b.x.round(), b.y.round(), b.owner])).collect::<Vec<_>>(),
+            "b": self.bullets.iter().map(|b| json!([b.x.round(), b.y.round(), b.owner, b.vx.round(), b.vy.round()])).collect::<Vec<_>>(),
         })
     }
 }
@@ -235,7 +253,7 @@ impl Default for Game {
 }
 
 pub fn walls() -> Value {
-    json!({ "w": W, "h": H, "r": R, "walls": WALLS.iter().map(|w| json!([w.0, w.1, w.2, w.3])).collect::<Vec<_>>() })
+    json!({ "w": W, "h": H, "r": R, "speed": SPEED, "walls": WALLS.iter().map(|w| json!([w.0, w.1, w.2, w.3])).collect::<Vec<_>>() })
 }
 
 #[cfg(test)]

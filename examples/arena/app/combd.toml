@@ -11,6 +11,11 @@ MATCH_MS = 180000
 # so live would let a player watch their own match to see through walls.
 SPECTATE_DELAY_MS = 10000
 
+[secrets]
+# Who may say "a new version is coming: start no new matches" (CI, before a
+# deploy). Unset: nobody can.
+"DRAIN_KEY?" = "drain-key"
+
 # The page, and the join and poll API.
 [processes.lobby]
 kind = "game"

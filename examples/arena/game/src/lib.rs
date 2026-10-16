@@ -19,6 +19,11 @@ use std::collections::{BTreeMap, HashMap};
 
 /// The page: the game client.
 const INDEX: &str = include_str!("../../client/index.html");
+/// The git commit this was built from (`ARENA_VERSION`, set by CI).
+const VERSION: &str = match option_env!("ARENA_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
 
 #[cfg(target_arch = "wasm32")]
 mod host {
@@ -183,7 +188,15 @@ fn lobby(method: &str, path: &str, body: &str) -> String {
         }
     };
     match (method, path) {
-        ("GET", "/") => format!("200\ncontent-type: text/html; charset=utf-8\ncache-control: no-store\n\n{INDEX}"),
+        ("GET", "/") => format!("200\ncontent-type: text/html; charset=utf-8\ncache-control: no-store\n\n{}", INDEX.replace("{{VERSION}}", VERSION)),
+        // A new version is coming (CI, with the drain key): no new matches.
+        ("POST", "/api/drain") => {
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            match env("DRAIN_KEY") {
+                Some(k) if !k.is_empty() && v["key"].as_str() == Some(k.as_str()) => mm("/drain", "{}"),
+                _ => err(403, "no"),
+            }
+        }
         ("POST", "/api/join") => mm("/join", body),
         ("POST", "/api/poll") => mm("/poll", body),
         // No one around: play one of our bots, which the match plays itself.
@@ -227,6 +240,8 @@ struct Mm {
     /// Counts matches in memory, only to name them (the count that's kept
     /// is in storage).
     matches: u64,
+    /// A new version is coming: no new matches.
+    draining: bool,
 }
 
 thread_local! {
@@ -249,6 +264,9 @@ fn fair_enough(score: u64, waited_ms: u64) -> bool {
 /// enough for how long its older player has waited. Each pair's match
 /// starts on the node best for both.
 fn pair_all(mm: &mut Mm, now: u64) {
+    if mm.draining {
+        return;
+    }
     loop {
         let mut best: Option<(u64, usize, usize, u64)> = None;
         for i in 0..mm.queue.len() {
@@ -286,6 +304,8 @@ fn pair_all(mm: &mut Mm, now: u64) {
     }
 }
 
+const DRAINING: &str = "a new version is on its way: new matches start again in a minute or two";
+
 fn matchmaker(method: &str, path: &str, body: &str) -> String {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     once(|| {
@@ -298,6 +318,8 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
         mm.queue.retain(|w| now.saturating_sub(w.since) < 60_000);
         mm.ready.retain(|_, a| now.saturating_sub(a.at) < 60_000);
         let answer = match (method, path) {
+            // A new version is on its way: no new matches until it's here.
+            ("POST", "/join" | "/bot") if mm.draining => err(503, DRAINING),
             ("POST", "/join") => {
                 let Some(player) = v["player"].as_str().filter(|p| !p.is_empty() && p.len() <= 32) else { return err(400, "want {\"player\": name, \"rtt\": {node: ms}}") };
                 let rtt: BTreeMap<u64, u64> = v["rtt"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect()).unwrap_or_default();
@@ -331,6 +353,12 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                 ok(json!({}))
             }
             // Play a bot now: the match plays it, on the node nearest you.
+            // A new version is coming: start no new matches (the deploy reloads
+            // this, and that ends it).
+            ("POST", "/drain") => {
+                mm.draining = true;
+                ok(json!({ "draining": true }))
+            }
             ("POST", "/bot") => {
                 let Some(player) = v["player"].as_str().filter(|p| !p.is_empty() && p.len() <= 32 && !p.starts_with("bot-")) else { return err(400, "want {\"player\": name, \"rtt\": {node: ms}}") };
                 let rtt: BTreeMap<u64, u64> = v["rtt"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect()).unwrap_or_default();
@@ -359,7 +387,9 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
             ("GET", "/stats") => {
                 let matches = sql("SELECT v FROM kv WHERE k = 'matches'", &[]).first().and_then(|r| r[0].as_i64()).unwrap_or(0);
                 let recent: Vec<Value> = sql("SELECT row FROM recent ORDER BY id DESC LIMIT 20", &[]).iter().filter_map(|r| serde_json::from_str(r[0].as_str()?).ok()).collect();
-                ok(json!({ "queue": mm.queue.len(), "matches": matches, "recent": recent }))
+                // Live: not over, and not older than a match can last.
+                let live = recent.iter().filter(|m| !m["over"].as_bool().unwrap_or(false) && m["at"].as_u64().unwrap_or(0) + match_ms() * 2 > now).count();
+                ok(json!({ "queue": mm.queue.len(), "matches": matches, "recent": recent, "live": live, "draining": mm.draining, "version": VERSION }))
             }
             _ => err(404, "not found"),
         };
@@ -373,6 +403,8 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
 enum Phase {
     /// Waiting for both players to say hello.
     Waiting,
+    /// 3, 2, 1: before the first round, each new one, and after a pause.
+    Countdown { until: u64 },
     Play,
     /// A player dropped: back by the deadline, or the other wins.
     Paused { who: usize, until: u64 },
@@ -435,6 +467,8 @@ fn pause_ms() -> u64 {
     env("PAUSE_MS").and_then(|v| v.parse().ok()).unwrap_or(30_000)
 }
 const START_WAIT_MS: u64 = 60_000;
+/// The 3, 2, 1 before a round.
+const COUNTDOWN_MS: u64 = 3000;
 
 /// How far behind live spectators are (`SPECTATE_DELAY_MS`, 10 s).
 fn spectate_delay_ms() -> u64 {
@@ -451,11 +485,13 @@ fn frame(m: &Match, now: u64) -> String {
     let mut v = m.game.view_all();
     let (phase, left) = match m.phase {
         Phase::Waiting => ("waiting", 0),
+        Phase::Countdown { until } => ("countdown", until.saturating_sub(now)),
         Phase::Play => ("play", 0),
         Phase::Paused { until, .. } => ("paused", until.saturating_sub(now)),
         Phase::Over => ("over", 0),
     };
     v["t"] = json!("sp");
+    v["ev"] = json!(m.game.events.iter().map(|(k, w)| json!([k, w])).collect::<Vec<_>>());
     v["phase"] = json!(phase);
     v["left"] = json!(left);
     v["paused_by"] = match m.phase {
@@ -476,6 +512,7 @@ fn state_msg(m: &Match, side: usize, now: u64) -> String {
     let mut v = m.game.view(side);
     let (phase, left) = match m.phase {
         Phase::Waiting => ("waiting", 0),
+        Phase::Countdown { until } => ("countdown", until.saturating_sub(now)),
         Phase::Play => ("play", 0),
         Phase::Paused { until, .. } => ("paused", until.saturating_sub(now)),
         Phase::Over => ("over", 0),
@@ -486,6 +523,8 @@ fn state_msg(m: &Match, side: usize, now: u64) -> String {
     v["left"] = json!(left);
     v["paused_by_you"] = json!(matches!(m.phase, Phase::Paused { who, .. } if who == side));
     v["ping"] = json!([m.ping[side], m.ping[1 - side]]);
+    // This tick's events, for sounds: who as you (0) or them (1).
+    v["ev"] = json!(m.game.events.iter().map(|(k, w)| json!([k, (*w != side) as u8])).collect::<Vec<_>>());
     if m.phase == Phase::Over {
         let t = &m.timing;
         v["timing"] = json!({ "ticks": t.played_ticks, "max_gap_ms": t.max_gap, "late": t.late, "your_stale": t.stale[side], "their_stale": t.stale[1 - side], "your_inputs": t.inputs[side] });
@@ -570,12 +609,12 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                         ws_send(sock, &hello.to_string());
                         match m.phase {
                             Phase::Waiting if (0..2).all(|i| here(m, i)) => {
-                                m.phase = Phase::Play;
+                                m.phase = Phase::Countdown { until: now + COUNTDOWN_MS };
                                 m.last_step = now;
                                 tick_every(50);
                             }
                             Phase::Paused { who, .. } if who == side => {
-                                m.phase = Phase::Play;
+                                m.phase = Phase::Countdown { until: now + COUNTDOWN_MS };
                                 m.last_step = now;
                             }
                             _ => {}
@@ -613,7 +652,7 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                                     m.game.players[side].input = game::Input::default();
                                 }
                                 ("resume", Phase::Paused { who, .. }) if who == side && (0..2).all(|i| here(m, i)) => {
-                                    m.phase = Phase::Play;
+                                    m.phase = Phase::Countdown { until: now + COUNTDOWN_MS };
                                     m.last_step = now;
                                 }
                                 _ => {}
@@ -638,13 +677,15 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                 if let Some(side) = (0..2).find(|&i| m.socks[i] == Some(sock)) {
                     m.socks[side] = None;
                     m.game.players[side].input = game::Input::default();
-                    if m.phase == Phase::Play {
+                    if matches!(m.phase, Phase::Play | Phase::Countdown { .. }) {
                         m.phase = Phase::Paused { who: side, until: now + pause_ms() };
                     }
                 }
                 ok(json!({}))
             }
             "TICK" => {
+                // Events are one tick's: none carry over (a countdown steps nothing).
+                m.game.events.clear();
                 if m.phase != Phase::Play {
                     m.last_step = now;
                     m.timing.last_tick = 0;
@@ -682,12 +723,20 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
                         m.game.step(now, dt);
                         if let Some(w) = m.game.winner {
                             finish(m, Some(w), now);
+                        } else if m.game.events.iter().any(|e| e.0 == "kill") {
+                            // A round won: both back at their spawns, then 3, 2, 1.
+                            m.game.new_round();
+                            m.phase = Phase::Countdown { until: now + COUNTDOWN_MS };
                         } else if m.played >= match_ms() {
                             let (k0, k1) = (m.game.players[0].kills, m.game.players[1].kills);
                             finish(m, if k0 == k1 { None } else { Some(if k0 > k1 { 0 } else { 1 }) }, now);
                         }
                     }
                     Phase::Paused { who, until } if now >= until => finish(m, Some(1 - who), now),
+                    Phase::Countdown { until } if now >= until => {
+                        m.phase = Phase::Play;
+                        m.last_step = now;
+                    }
                     _ => {}
                 }
                 for side in 0..2 {

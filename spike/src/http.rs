@@ -2724,7 +2724,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Nodes => {
                 let me = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node);
                 let nodes: serde_json::Map<String, serde_json::Value> = self.sh.cfg.public.iter().map(|(n, u)| (n.to_string(), serde_json::Value::String(u.clone()))).collect();
-                let body = serde_json::json!({ "me": me, "nodes": nodes }).to_string();
+                let body = serde_json::json!({ "me": me, "nodes": nodes, "version": option_env!("COMBD_VERSION").unwrap_or("dev") }).to_string();
                 self.queue_reply(who, (200, format!("\0access-control-allow-origin: *\0{body}")));
             }
             Req::Cell(p, cell_req) => self.run_cell(Origin::Local(who), p, cell_req)?,

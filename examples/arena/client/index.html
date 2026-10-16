@@ -2,14 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Arena on combd</title>
 <style>
   :root { --bg: #0f1218; --panel: #171b23; --ink: #e6e8ee; --dim: #8a90a0; --you: #4da3ff; --them: #ff5d5d; --wall: #3a4152; --shot: #ffd84d; }
   body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.4 system-ui, sans-serif; }
   main { max-width: 1240px; margin: 0 auto; padding: 16px; display: grid; grid-template-columns: 1fr 280px; gap: 16px; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
-  canvas { width: 100%; aspect-ratio: 3 / 2; background: #12161e; border-radius: 8px; display: block; cursor: crosshair; }
+  canvas { width: 100%; aspect-ratio: 3 / 2; background: #12161e; border-radius: 8px; display: block; touch-action: none; }
   aside { background: var(--panel); border-radius: 8px; padding: 12px; }
   h1 { font-size: 20px; margin: 0 0 4px; } h2 { font-size: 14px; color: var(--dim); margin: 16px 0 6px; font-weight: 600; }
   input, button { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid #333a48; background: #0f1218; color: var(--ink); }
@@ -17,16 +17,28 @@
   button:disabled { opacity: .5; cursor: default; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; } td { padding: 2px 4px; } td.r { text-align: right; color: var(--dim); }
   .best { color: var(--you); font-weight: 600; } .dim { color: var(--dim); font-size: 13px; }
-  a { color: var(--you); } .late { color: var(--shot); font-size: 13px; }
+  a { color: var(--you); }
+  #drain { display: none; background: #3a3216; color: var(--shot); border-radius: 6px; padding: 8px 10px; margin: 6px 0; font-size: 14px; }
+  #ver { position: fixed; right: 10px; bottom: 6px; font-size: 11px; color: var(--dim); opacity: .7; pointer-events: none; }
+  /* Phones, in a match: the arena fills the screen, sideways. */
+  #rotate { display: none; position: fixed; inset: 0; background: var(--bg); z-index: 10; align-items: center; justify-content: center; text-align: center; padding: 24px; font-size: 20px; }
+  @media (pointer: coarse) and (orientation: portrait) { body.playing #rotate { display: flex; } }
+  @media (pointer: coarse) {
+    body.playing main { display: block; padding: 0; max-width: none; }
+    body.playing aside, body.playing h1, body.playing #help, body.playing #status { display: none; }
+    body.playing canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; aspect-ratio: auto; object-fit: contain; border-radius: 0; }
+  }
 </style>
 </head>
 <body>
+<div id="rotate">Turn your phone sideways to play.</div>
 <main>
   <div>
     <h1>Arena</h1>
     <div class="dim" id="status">Measuring the nodes...</div>
+    <div id="drain"></div>
     <canvas id="c" width="960" height="640" aria-label="the arena"></canvas>
-    <div class="dim" id="help">Move: WASD or the arrow keys. Aim: the mouse. Shoot: click. Pause: P (the other player wins if you don't come back in time). You only see the other player when no wall is in the way.</div>
+    <div class="dim" id="help"></div>
   </div>
   <aside>
     <label>Name <input id="name" maxlength="24" autocomplete="off"></label>
@@ -40,21 +52,41 @@
     <div class="dim">Watch: the whole map, a little behind live.</div>
   </aside>
 </main>
+<div id="ver"></div>
 <script>
 "use strict";
+const PAGE_VERSION = "{{VERSION}}";
 const $ = (id) => document.getElementById(id);
 const canvas = $("c"), ctx = canvas.getContext("2d");
-const state = { nodes: {}, rtt: {}, map: null, side: 0, last: null, lastSeen: null, phase: "idle", players: [], ws: null, match: null, keys: {}, aim: 0, fire: false, watching: false, sp: null, delay: 0, myPing: null };
+const touch = matchMedia("(pointer: coarse)").matches;
+const state = {
+  nodes: {}, rtt: {}, me: null, combd: "", map: null, side: 0, phase: "idle", players: [], ws: null, match: null,
+  keys: {}, aim: 0, fire: false, watching: false, delay: 0, myPing: null, draining: false,
+  // The last update and when it came: everything drawn moves on from it.
+  last: null, lastAt: 0, base: null, drawn: null, them: null, themPrev: null, lastSeen: null,
+  sp: null, spAt: 0, spPrev: null,
+  // Phones: the left thumb moves, the right one aims and fires.
+  sticks: {},
+};
 const name = $("name");
 name.value = localStorage.getItem("arena-name") || ("player" + Math.floor(Math.random() * 10000));
 name.onchange = () => localStorage.setItem("arena-name", name.value);
+$("help").textContent = touch
+  ? "Left thumb: move. Right thumb: aim, and fire while you hold it. You only see the other player when no wall is in the way."
+  : "Move: WASD or the arrow keys. Turret: J and L. Fire: Space. Pause: P (the other player wins if you don't come back in time). Sound: M. You only see the other player when no wall is in the way.";
 
 function say(t) { $("status").textContent = t; }
+const short = (v) => (v || "?").slice(0, 7);
+function showVersion() { $("ver").textContent = `game ${short(PAGE_VERSION)} · combd ${short(state.combd)}${state.me != null ? ` · node ${state.me}` : ""}`; }
 
 // Every node's address, and our round trip to each (the best of four).
 async function measure() {
   let nodes = {};
-  try { nodes = (await (await fetch("/_combd/nodes")).json()).nodes || {}; } catch (e) {}
+  try {
+    const n = await (await fetch("/_combd/nodes")).json();
+    nodes = n.nodes || {}; state.me = n.me; state.combd = n.version;
+  } catch (e) {}
+  showVersion();
   if (Object.keys(nodes).length === 0) nodes = { 0: location.origin };
   state.nodes = nodes;
   for (const [id, url] of Object.entries(nodes)) {
@@ -69,8 +101,7 @@ async function measure() {
   $("nodes").innerHTML = Object.entries(nodes).map(([id, url]) =>
     `<tr><td class="${state.rtt[id] === min ? "best" : ""}">node ${id}</td><td class="r">${state.rtt[id] ?? "-"} ms</td></tr>`).join("");
   say("Ready. Find a match: you'll be paired with someone close to you. No one around? Play a bot.");
-  $("play").disabled = false;
-  $("bot").disabled = false;
+  buttons();
 }
 
 async function api(path, body) {
@@ -78,25 +109,42 @@ async function api(path, body) {
   return r.json();
 }
 
+const busy = () => !!state.ws && state.ws.readyState <= 1;
+function buttons() {
+  const off = busy() || state.draining || Object.keys(state.rtt).length === 0;
+  $("play").disabled = $("bot").disabled = off;
+}
+
+// The lobby's news: your record, recent matches, and a deploy on its way.
 async function record() {
-  const r = await api("/api/player/" + encodeURIComponent(name.value));
-  $("record").textContent = `${r.wins || 0} wins, ${r.losses || 0} losses, ${r.draws || 0} draws`;
-  const s = await api("/api/stats");
+  try {
+    const r = await api("/api/player/" + encodeURIComponent(name.value));
+    $("record").textContent = `${r.wins || 0} wins, ${r.losses || 0} losses, ${r.draws || 0} draws`;
+  } catch (e) {}
+  let s = {};
+  try { s = await api("/api/stats"); } catch (e) { return; }
   const esc = (t) => String(t).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
   $("recent").innerHTML = (s.recent || []).slice(0, 8).map(m =>
     `<tr><td>${esc(m.players.join(" vs "))}</td><td class="r">node ${m.node}, ${m.worst_rtt} ms</td><td class="r">${m.over ? "over" : `<a href="?watch=${encodeURIComponent(m.match)}&node=${m.node}">watch</a>`}</td></tr>`).join("") || `<tr><td class="dim">none yet</td></tr>`;
+  state.draining = !!s.draining;
+  $("drain").style.display = state.draining ? "block" : "none";
+  $("drain").textContent = `A new version is on its way: new matches start again in a minute or two. ${s.live ? `${s.live} match${s.live === 1 ? "" : "es"} still finishing.` : "Deploying now."}`;
+  buttons();
+  // A new version is live, and you're not in a match: come up to it.
+  if (s.version && PAGE_VERSION !== "{{VERSION}}" && s.version !== PAGE_VERSION && !busy()) location.reload();
 }
+setInterval(record, 10000);
 
 $("play").onclick = async () => {
-  $("play").disabled = true;
+  $("play").disabled = $("bot").disabled = true;
   say("Looking for someone close to you...");
   const j = await api("/api/join", { player: name.value, rtt: state.rtt });
-  if (!j.ticket) { say("Couldn't join: " + (j.error || "?")); $("play").disabled = false; return; }
+  if (!j.ticket) { say("Couldn't join: " + (j.error || "?")); buttons(); return; }
   for (;;) {
     await new Promise(r => setTimeout(r, 500));
     const p = await api("/api/poll", { ticket: j.ticket });
     if (p.match) { connect(p); return; }
-    if (p.error) { say(p.error); $("play").disabled = false; return; }
+    if (p.error) { say(p.error); buttons(); return; }
     say(`Waiting for an opponent (${p.queue} in the queue)...`);
   }
 };
@@ -106,30 +154,56 @@ $("bot").onclick = async () => {
   $("play").disabled = $("bot").disabled = true;
   say("Starting a match with a bot on the node nearest you...");
   const j = await api("/api/bot", { player: name.value, rtt: state.rtt });
-  if (!j.match) { say("Couldn't start it: " + (j.error || "?")); $("play").disabled = $("bot").disabled = false; return; }
+  if (!j.match) { say("Couldn't start it: " + (j.error || "?")); buttons(); return; }
   connect(j);
 };
+
+// Phones: the whole screen, sideways, where the browser lets us.
+function bigScreen(on) {
+  document.body.classList.toggle("playing", on && touch);
+  if (!touch) return;
+  if (on) {
+    document.documentElement.requestFullscreen?.().then(() => screen.orientation?.lock?.("landscape")).catch(() => {});
+  } else if (document.fullscreenElement) {
+    document.exitFullscreen?.().catch(() => {});
+  }
+}
 
 // Straight to the match's node: that's the one picked for both players.
 function connect(m) {
   state.match = m;
+  bigScreen(true);
   const url = (state.nodes[m.node] || location.origin).replace(/^http/, "ws") + `/match/${m.match}/ws`;
   say(`Match on node ${m.node} (${m.rtt ?? "?"} ms for you).`);
   const ws = new WebSocket(url);
   state.ws = ws;
+  state.ended = false; state.beep = 0;
   ws.onopen = () => ws.send(JSON.stringify({ t: "hello", token: m.token }));
   ws.onmessage = (e) => {
     const v = JSON.parse(e.data);
     if (v.t === "pong") return pong(v);
-    if (v.t === "hello") { state.map = v.map; state.side = v.side; state.players = v.players; }
+    if (v.t === "hello") {
+      state.map = v.map; state.side = v.side; state.players = v.players;
+      // The turret starts facing the middle.
+      state.aim = v.side === 0 ? 0 : Math.PI;
+    }
     if (v.t === "st") {
-      state.last = v; state.phase = v.phase;
-      if (v.them) state.lastSeen = { ...v.them, at: performance.now() };
+      const now = performance.now();
+      state.last = v; state.lastAt = now; state.phase = v.phase;
+      sounds(v, false);
+      state.base = { x: v.you.x, y: v.you.y };
+      if (v.them) {
+        state.themPrev = state.them;
+        state.them = { ...v.them, at: now };
+        state.lastSeen = state.them;
+      } else {
+        state.them = state.themPrev = null;
+      }
       if (v.phase === "over") { say(v.winner === null ? "A draw." : v.winner ? "You won!" : "You lost."); record(); }
     }
   };
   ws.onclose = () => {
-    if (state.phase === "over" || state.match !== m) { $("play").disabled = $("bot").disabled = false; return; }
+    if (state.phase === "over" || state.match !== m) { state.ws = null; bigScreen(false); buttons(); return; }
     // Dropped mid-match: the game pauses for us. Come back.
     say("Connection lost: reconnecting (the match is paused for you)...");
     setTimeout(() => state.match === m && connect(m), 1000);
@@ -149,48 +223,163 @@ function pong(v) {
 // Watch a match: everything, but late (so it can't be used to see through walls).
 function watch(id, node) {
   state.watching = true;
-  $("play").disabled = true;
   $("help").innerHTML = 'Spectating: you see the whole map, both players and every bullet. So it runs behind live: nobody can use it to see through walls in their own match. <a href="/">Play instead</a>';
   const url = (state.nodes[node] || location.origin).replace(/^http/, "ws") + `/match/${encodeURIComponent(id)}/ws`;
   const ws = new WebSocket(url);
   state.ws = ws;
+  buttons();
   ws.onopen = () => ws.send(JSON.stringify({ t: "watch" }));
   ws.onmessage = (e) => {
     const v = JSON.parse(e.data);
     if (v.t === "pong") return pong(v);
     if (v.t === "hello") { state.map = v.map; state.players = v.players; state.delay = v.delay_ms; say(`Watching ${v.players.join(" vs ")} on node ${node}, ${Math.round(v.delay_ms / 1000)} s behind live.`); }
-    if (v.t === "sp") state.sp = v;
+    if (v.t === "sp") { sounds(v, true); state.spPrev = state.sp && { p: state.sp.p, at: state.spAt }; state.sp = v; state.spAt = performance.now(); }
   };
   ws.onclose = () => { if (!state.sp || state.sp.phase !== "over") say("The match is over, or gone."); };
 }
 
-// Input: sent 20 times a second while connected.
+// Sounds, made here (no files): one per event the server sends, the
+// countdown's beeps, and the ending. M mutes.
+let audio = null, muted = localStorage.getItem("arena-mute") === "1";
+function unlock() { if (!audio) { try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} } audio?.resume?.(); }
+addEventListener("pointerdown", unlock); addEventListener("keydown", unlock);
+function tone(f0, f1, dur, type = "square", gain = 0.06, at = 0) {
+  if (!audio || muted) return;
+  const t = audio.currentTime + at, o = audio.createOscillator(), g = audio.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(Math.max(f1, 1), t + dur);
+  g.gain.setValueAtTime(gain, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(audio.destination); o.start(t); o.stop(t + dur + 0.02);
+}
+const sound = {
+  shot: (you) => you ? tone(900, 300, 0.08) : tone(500, 160, 0.09, "square", 0.04),
+  hit: (you) => you ? tone(140, 60, 0.18, "sawtooth", 0.09) : tone(1400, 1200, 0.07, "triangle", 0.08),
+  kill: (you) => you ? [523, 659, 784].forEach((f, i) => tone(f, f, 0.12, "triangle", 0.08, i * 0.09)) : [392, 330, 262].forEach((f, i) => tone(f, f, 0.14, "sawtooth", 0.06, i * 0.1)),
+  tick: () => tone(660, 660, 0.12, "sine", 0.08),
+  go: () => tone(990, 990, 0.3, "sine", 0.1),
+  won: () => [523, 659, 784, 1047].forEach((f, i) => tone(f, f, 0.18, "triangle", 0.09, i * 0.12)),
+  lost: () => [392, 349, 311, 262].forEach((f, i) => tone(f, f, 0.2, "sawtooth", 0.06, i * 0.14)),
+  draw: () => [440, 440].forEach((f, i) => tone(f, f, 0.18, "triangle", 0.08, i * 0.2)),
+};
+// One update's events: [kind, who], who 0 being you (or, spectating, side 0).
+function sounds(v, spectating) {
+  for (const [k, who] of v.ev || []) {
+    const you = spectating ? who === 0 : who === 0;
+    if (k === "shot") sound.shot(you);
+    if (k === "hit") sound.hit(you); // `you`: you were hit
+    if (k === "kill") sound.kill(you); // `you`: you scored
+  }
+  // The countdown: a beep each second, then go.
+  const sec = v.phase === "countdown" ? Math.ceil(v.left / 1000) : 0;
+  if (sec && sec !== state.beep) sound.tick();
+  if (!sec && state.beep && v.phase === "play") { sound.go(); state.goAt = performance.now(); }
+  state.beep = sec;
+  if (v.phase === "over" && state.endSound !== v) {
+    if (!state.ended) { state.ended = true; spectating ? sound.won() : v.winner === null ? sound.draw() : v.winner ? sound.won() : sound.lost(); }
+  }
+}
+
+// Keys: WASD or arrows move, J and L turn the turret, Space fires, P pauses, M mutes.
 addEventListener("keydown", (e) => {
-  state.keys[e.key.toLowerCase()] = true;
-  // P: pause (the other player's clock starts), or resume your own pause.
-  if (e.key.toLowerCase() === "p" && state.ws && state.ws.readyState === 1) {
+  const k = e.key.toLowerCase();
+  if (k === " " && busy()) e.preventDefault();
+  state.keys[k] = true;
+  if (k === "m") { muted = !muted; localStorage.setItem("arena-mute", muted ? "1" : "0"); }
+  if (k === "p" && state.ws && state.ws.readyState === 1 && !state.watching) {
     state.ws.send(JSON.stringify({ t: state.phase === "paused" ? "resume" : "pause" }));
   }
 });
 addEventListener("keyup", (e) => { state.keys[e.key.toLowerCase()] = false; });
-canvas.addEventListener("mousemove", (e) => {
-  const b = canvas.getBoundingClientRect(), you = state.last && state.last.you;
-  if (!you) return;
-  const x = (e.clientX - b.left) * canvas.width / b.width, y = (e.clientY - b.top) * canvas.height / b.height;
-  state.aim = Math.atan2(y - you.y, x - you.x);
-});
-canvas.addEventListener("mousedown", () => { state.fire = true; });
-addEventListener("mouseup", () => { state.fire = false; });
+
+// Phones: a stick under each thumb, wherever it lands (left half moves,
+// right half aims and fires).
+function stickOf(t) {
+  const b = canvas.getBoundingClientRect();
+  return t.clientX - b.left < b.width / 2 ? "move" : "aim";
+}
+canvas.addEventListener("touchstart", (e) => {
+  e.preventDefault();
+  for (const t of e.changedTouches) state.sticks[t.identifier] = { kind: stickOf(t), x0: t.clientX, y0: t.clientY, dx: 0, dy: 0 };
+}, { passive: false });
+canvas.addEventListener("touchmove", (e) => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const s = state.sticks[t.identifier];
+    if (s) { s.dx = t.clientX - s.x0; s.dy = t.clientY - s.y0; }
+  }
+}, { passive: false });
+const lift = (e) => { for (const t of e.changedTouches) delete state.sticks[t.identifier]; };
+canvas.addEventListener("touchend", lift);
+canvas.addEventListener("touchcancel", lift);
+
+// What the player is doing right now: (mx, my), and fire.
+const TURN = 3; // radians a second, for J and L
+function controls(dt) {
+  const k = state.keys;
+  let mx = (k.d || k.arrowright ? 1 : 0) - (k.a || k.arrowleft ? 1 : 0);
+  let my = (k.s || k.arrowdown ? 1 : 0) - (k.w || k.arrowup ? 1 : 0);
+  state.aim += ((k.l ? 1 : 0) - (k.j ? 1 : 0)) * TURN * dt;
+  let fire = !!k[" "];
+  for (const s of Object.values(state.sticks)) {
+    const len = Math.hypot(s.dx, s.dy);
+    if (len < 12) continue;
+    if (s.kind === "move") { const f = Math.min(1, len / 60); mx = s.dx / len * f; my = s.dy / len * f; }
+    else { state.aim = Math.atan2(s.dy, s.dx); fire = true; }
+  }
+  const len = Math.hypot(mx, my);
+  if (len > 1) { mx /= len; my /= len; }
+  return { mx, my, fire };
+}
 setInterval(() => {
   const ws = state.ws;
-  if (!ws || ws.readyState !== 1) return;
-  const k = state.keys;
-  const mx = (k.d || k.arrowright ? 1 : 0) - (k.a || k.arrowleft ? 1 : 0);
-  const my = (k.s || k.arrowdown ? 1 : 0) - (k.w || k.arrowup ? 1 : 0);
-  if (!state.watching) ws.send(JSON.stringify({ t: "in", mx, my, aim: state.aim, fire: state.fire }));
+  if (!ws || ws.readyState !== 1 || state.watching) return;
+  const c = controls(0);
+  ws.send(JSON.stringify({ t: "in", mx: c.mx, my: c.my, aim: state.aim, fire: c.fire }));
 }, 50);
 
+// The map's walls, as the server has them: a player can't go through.
+function blocked(x, y) {
+  const m = state.map; if (!m) return false;
+  if (x < m.r || x > m.w - m.r || y < m.r || y > m.h - m.r) return true;
+  return m.walls.some(([wx, wy, ww, wh]) => {
+    const cx = Math.max(wx, Math.min(x, wx + ww)), cy = Math.max(wy, Math.min(y, wy + wh));
+    return (x - cx) ** 2 + (y - cy) ** 2 < m.r * m.r;
+  });
+}
+const inWall = (x, y) => state.map && state.map.walls.some(([wx, wy, ww, wh]) => x >= wx && x <= wx + ww && y >= wy && y <= wy + wh);
+
+// Your own move, at once: the last update shows where you were about a round
+// trip ago, so carry your input on from there by that long plus the time
+// since (each axis on its own, as the server does). Each update corrects it.
+function predicted(dt) {
+  const b = state.base, c = controls(0), speed = (state.map && state.map.speed) || 160;
+  if (!b || state.phase !== "play" || state.last.you.dead) return b;
+  let { x, y } = b;
+  const steps = Math.max(1, Math.ceil(dt / 0.016));
+  for (let i = 0; i < steps; i++) {
+    const nx = x + c.mx * speed * dt / steps; if (!blocked(nx, y)) x = nx;
+    const ny = y + c.my * speed * dt / steps; if (!blocked(x, ny)) y = ny;
+  }
+  return { x, y };
+}
+// Someone else, moving on at the speed they last moved (a little way only).
+function glide(cur, prev, now) {
+  if (!cur) return null;
+  if (!prev || cur.at - prev.at <= 0 || cur.at - prev.at > 200) return cur;
+  const t = Math.min(now - cur.at, 100) / (cur.at - prev.at);
+  return { ...cur, x: cur.x + (cur.x - prev.x) * t, y: cur.y + (cur.y - prev.y) * t };
+}
+// A bullet, flown on from its last update along its velocity.
+function flown(b, dt, vxAt) {
+  const [x, y] = b, vx = b[vxAt] || 0, vy = b[vxAt + 1] || 0, t = Math.min(dt, 0.2);
+  const p = [x + vx * t, y + vy * t];
+  return inWall(p[0], p[1]) ? null : p;
+}
+
+let lastFrame = performance.now();
 function draw() {
+  const now = performance.now(), frameDt = Math.min((now - lastFrame) / 1000, 0.1);
+  lastFrame = now;
+  controls(frameDt); // turns the turret with J and L, smoothly
   const css = getComputedStyle(document.documentElement);
   const c = (n) => css.getPropertyValue(n);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -198,60 +387,86 @@ function draw() {
     ctx.fillStyle = c("--wall");
     for (const [x, y, w, h] of state.map.walls) ctx.fillRect(x, y, w, h);
   }
+  const r = state.map ? state.map.r : 14;
+  const body = (p, aim, color, alpha) => {
+    ctx.globalAlpha = alpha; ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.x + Math.cos(aim) * (r + 10), p.y + Math.sin(aim) * (r + 10)); ctx.stroke();
+    ctx.globalAlpha = 1;
+  };
   const ms = (p) => p == null ? "?" : `${p} ms`;
+  const center = (text, size) => { ctx.fillStyle = c("--ink"); ctx.font = `${size}px system-ui`; ctx.textAlign = "center"; ctx.fillText(text, canvas.width / 2, canvas.height / 2); ctx.textAlign = "start"; };
   if (state.watching && state.sp) {
-    // Spectating: both players, every bullet.
-    const v = state.sp, r = state.map ? state.map.r : 14, colors = [c("--you"), c("--them")];
+    // Spectating: both players, every bullet, moving on between updates.
+    const v = state.sp, colors = [c("--you"), c("--them")], dt = (now - state.spAt) / 1000;
     v.p.forEach((p, i) => {
       if (p.dead) return;
-      ctx.fillStyle = colors[i]; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
-      ctx.strokeStyle = colors[i]; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(p.x, p.y);
-      ctx.lineTo(p.x + Math.cos(p.aim) * (r + 10), p.y + Math.sin(p.aim) * (r + 10)); ctx.stroke();
+      const prev = state.spPrev && state.spPrev.p[i] && { ...state.spPrev.p[i], at: state.spPrev.at };
+      const g = glide({ ...p, at: state.spAt }, prev, now);
+      body(g, p.aim, colors[i], 1);
       ctx.fillStyle = c("--ink"); ctx.font = "12px system-ui"; ctx.textAlign = "center";
-      ctx.fillText(`${state.players[i] || "?"} ${"♥".repeat(p.hp)}`, p.x, p.y - r - 8); ctx.textAlign = "start";
+      ctx.fillText(`${state.players[i] || "?"} ${"♥".repeat(p.hp)}`, g.x, g.y - r - 8); ctx.textAlign = "start";
     });
-    for (const [x, y, o] of v.b) { ctx.fillStyle = colors[o] || c("--shot"); ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill(); }
+    for (const b of v.b) {
+      const p = flown(b, dt, 3); if (!p) continue;
+      ctx.fillStyle = colors[b[2]] || c("--shot"); ctx.beginPath(); ctx.arc(p[0], p[1], 3, 0, Math.PI * 2); ctx.fill();
+    }
     ctx.font = "16px system-ui";
     ctx.fillStyle = colors[0]; ctx.fillText(`${state.players[0]} ${v.p[0].kills} (${ms(v.ping[0])})`, 16, 26);
     ctx.fillStyle = colors[1]; ctx.textAlign = "right"; ctx.fillText(`(${ms(v.ping[1])}) ${v.p[1].kills} ${state.players[1]}`, canvas.width - 16, 26); ctx.textAlign = "start";
     ctx.fillStyle = c("--shot"); ctx.font = "13px system-ui";
     ctx.fillText(`SPECTATING, ${Math.round(state.delay / 1000)} s BEHIND LIVE · your ping ${ms(state.myPing)}`, 16, canvas.height - 14);
-    const banner = v.phase === "waiting" ? "Waiting for the players..." :
+    const banner = v.phase === "countdown" ? String(Math.ceil(v.left / 1000)) : v.phase === "waiting" ? "Waiting for the players..." :
       v.phase === "paused" ? `Paused by ${state.players[v.paused_by]}: ${Math.ceil(v.left / 1000)} s` :
       v.phase === "over" ? (v.winner === "draw" ? "A draw." : `${state.players[v.winner]} won!`) : "";
-    if (banner) { ctx.fillStyle = c("--ink"); ctx.font = "28px system-ui"; ctx.textAlign = "center"; ctx.fillText(banner, canvas.width / 2, canvas.height / 2); ctx.textAlign = "start"; }
-    requestAnimationFrame(draw);
-    return;
-  }
-  if (state.watching) { ctx.fillStyle = c("--dim"); ctx.font = "20px system-ui"; ctx.textAlign = "center"; ctx.fillText(`Spectating: the first moments arrive ${Math.round(state.delay / 1000)} s late...`, canvas.width / 2, canvas.height / 2); ctx.textAlign = "start"; }
-  const v = state.last;
-  if (v) {
-    const r = state.map ? state.map.r : 14;
-    const body = (p, color, alpha) => {
-      ctx.globalAlpha = alpha; ctx.fillStyle = color;
-      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
-      ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(p.x, p.y);
-      ctx.lineTo(p.x + Math.cos(p.aim) * (r + 10), p.y + Math.sin(p.aim) * (r + 10)); ctx.stroke();
-      ctx.globalAlpha = 1;
-    };
-    if (!v.you.dead) body(v.you, c("--you"), 1);
-    if (v.them && !v.them.dead) body(v.them, c("--them"), 1);
+    if (banner) center(banner, v.phase === "countdown" ? 96 : 28);
+  } else if (state.watching) {
+    center(`Spectating: the first moments arrive ${Math.round(state.delay / 1000)} s late...`, 20);
+  } else if (state.last) {
+    const v = state.last, dt = (now - state.lastAt) / 1000;
+    if (!v.you.dead) {
+      // Where you should be, eased toward over a few frames (a jump if far
+      // off: a respawn, or a wall the guess went through).
+      const target = predicted(Math.min(dt + (state.myPing || 0) / 1000, 0.35));
+      const d = state.drawn;
+      if (!d || Math.hypot(target.x - d.x, target.y - d.y) > 60) state.drawn = { ...target };
+      else { const k = 1 - Math.exp(-frameDt * 20); d.x += (target.x - d.x) * k; d.y += (target.y - d.y) * k; }
+      body(state.drawn, state.aim, c("--you"), 1);
+    } else {
+      state.drawn = null;
+    }
+    const g = glide(state.them, state.themPrev, now);
+    if (g && !g.dead) body(g, g.aim, c("--them"), 1);
     else if (state.lastSeen) {
       // Out of sight: where they were last seen, fading.
-      const age = (performance.now() - state.lastSeen.at) / 1000;
-      if (age < 6) { body(state.lastSeen, c("--them"), Math.max(0.1, 0.35 - age / 20)); }
+      const age = (now - state.lastSeen.at) / 1000;
+      if (age < 6) body(state.lastSeen, state.lastSeen.aim, c("--them"), Math.max(0.1, 0.35 - age / 20));
     }
     ctx.fillStyle = c("--shot");
-    for (const [x, y] of v.b) { ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill(); }
+    for (const b of v.b) { const p = flown(b, dt, 2); if (p) { ctx.beginPath(); ctx.arc(p[0], p[1], 3, 0, Math.PI * 2); ctx.fill(); } }
     ctx.fillStyle = c("--ink"); ctx.font = "18px system-ui";
     const names = state.players.length ? [state.players[state.side], state.players[1 - state.side]] : ["you", "them"];
     ctx.fillText(`${names[0]} ${v.score[0]}  :  ${v.score[1]} ${names[1]}     hp ${"♥".repeat(v.you.hp)}`, 16, 28);
     ctx.font = "13px system-ui"; ctx.fillStyle = c("--dim");
     ctx.fillText(`ping: you ${ms(v.ping && v.ping[0])}, them ${ms(v.ping && v.ping[1])}`, 16, canvas.height - 14);
-    const banner = v.phase === "waiting" ? "Waiting for the other player..." :
+    const go = state.goAt && now - state.goAt < 600;
+    const banner = v.phase === "countdown" ? String(Math.ceil(v.left / 1000)) : go && v.phase === "play" ? "Go!" :
+      v.phase === "waiting" ? "Waiting for the other player..." :
       v.phase === "paused" ? (v.paused_by_you ? `You paused: P to go on (${Math.ceil(v.left / 1000)} s, then you lose)` : `Paused by the other player: ${Math.ceil(v.left / 1000)} s, then you win`) :
       v.phase === "over" ? (v.winner === null ? "A draw." : v.winner ? "You won!" : "You lost.") : (v.you.dead ? "Respawning..." : "");
-    if (banner) { ctx.font = "28px system-ui"; ctx.textAlign = "center"; ctx.fillText(banner, canvas.width / 2, canvas.height / 2); ctx.textAlign = "start"; }
+    if (banner) center(banner, v.phase === "countdown" || go ? 96 : 28);
+  }
+  // Phones: where each thumb's stick is.
+  if (touch && busy() && !state.watching) {
+    const b = canvas.getBoundingClientRect(), sx = canvas.width / b.width, sy = canvas.height / b.height;
+    for (const s of Object.values(state.sticks)) {
+      const x0 = (s.x0 - b.left) * sx, y0 = (s.y0 - b.top) * sy;
+      ctx.globalAlpha = 0.25; ctx.strokeStyle = c("--ink"); ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(x0, y0, 60 * sx, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(x0 + s.dx * sx, y0 + s.dy * sy, 22 * sx, 0, Math.PI * 2); ctx.fillStyle = c("--ink"); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
   }
   requestAnimationFrame(draw);
 }

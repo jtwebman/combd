@@ -10,6 +10,9 @@ WORKDIR /combd
 COPY guest guest
 COPY spike spike
 COPY examples/arena examples/arena
+# The git commit, built into combd and the game (shown on the page).
+ARG ARENA_VERSION=dev
+ENV ARENA_VERSION=$ARENA_VERSION COMBD_VERSION=$ARENA_VERSION
 RUN cd guest && cargo build --locked --release --target wasm32-unknown-unknown
 RUN cd spike && cargo build --locked --release --no-default-features
 RUN examples/arena/build.sh

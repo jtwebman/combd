@@ -28,6 +28,7 @@ jobs:
           context: .
           file: examples/arena/Dockerfile
           push: true
+          build-args: ARENA_VERSION=${{ github.sha }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/combd-arena:latest
             ghcr.io/${{ github.repository_owner }}/combd-arena:${{ github.sha }}
@@ -36,13 +37,21 @@ jobs:
     runs-on: ubuntu-latest
     concurrency: arena-deploy
     steps:
+      - name: Say a new version is coming (no new matches start)
+        env:
+          KEY: ${{ secrets.ARENA_DRAIN_KEY }}
+        run: |
+          body=$(python3 -c 'import json, os; print(json.dumps({"key": os.environ.get("KEY", "")}))')
+          curl -s -m 15 -X POST https://arena.combd.dev/api/drain -d "$body" || true
+          echo
       - name: Wait for live matches to end (up to 10 minutes)
         run: |
           for i in $(seq 1 60); do
             live=$(curl -s -m 10 https://arena.combd.dev/api/stats | python3 -c "
           import sys, json, time
-          r = json.load(sys.stdin).get('recent', [])
-          print(sum(1 for m in r if not m.get('over') and m['at'] > time.time() * 1000 - 600000))" || echo 0)
+          s = json.load(sys.stdin)
+          r = s.get('recent', [])
+          print(s['live'] if 'live' in s else sum(1 for m in r if not m.get('over') and m['at'] > time.time() * 1000 - 600000))" || echo 0)
             [ "$live" = "0" ] && exit 0
             echo "$live live match(es): waiting"
             sleep 10

@@ -247,6 +247,8 @@ fn play(url: &str, name: &str, s: Strategy, rng: &mut Rng, home: usize, timing: 
     }
     // `ARENA_VS_BOT=1`: play the match's own bot (the page's "Play a bot").
     let vs_bot = std::env::var("ARENA_VS_BOT").is_ok_and(|v| v == "1");
+    // Names starting "bot-" are our bots' own: against one, play as a probe.
+    let name = if vs_bot { name.replacen("bot-", "probe-", 1) } else { name.to_string() };
     let j = json_of(http(url, "POST", if vs_bot { "/api/bot" } else { "/api/join" }, &json!({ "player": name, "rtt": rtt }).to_string()));
     let ticket = j["ticket"].as_str().unwrap_or_default().to_string();
     if !vs_bot && ticket.is_empty() {
