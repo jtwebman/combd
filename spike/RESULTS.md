@@ -257,6 +257,46 @@ Since phase 0: **1.8x to 2.7x faster** on Rust compute, 1.3x to 1.5x on JS.
 Wasmtime is still 6x to 15x ahead on compute (Linux) and about 20x ahead on
 JS.
 
+### Round 3: a hot loop that stays in registers (2026-10-16)
+
+A sampling profile, down to single instructions, showed the real cost. The
+one big `exec` loop spilled its key state (the frame pointer, the op
+pointer, fuel) to memory, so every op reloaded it from the stack. Cutting
+ops didn't help at first: the sieve ran a third fewer ops in the same time.
+What changed:
+- **A small hot loop.** Register ops, branches, calls, and returns run in a
+  separate function small enough that its state stays in registers. Anything
+  else falls back to the old loop. No library calls inside it (a `memmove`
+  for branch values forced spills too).
+- **A fixed window per frame.** Each frame sees a 64K-slot window of the value
+  stack, so a slot index (a `u16`) needs no bounds check. A function whose
+  frame doesn't fit is refused at load.
+- **Fewer ops.** A reduction is spent on a loop's back-edge, not on a `Tick` at
+  its head; `br_if out; br loop` is one branch; `br_table` reads its index
+  from a slot. Fused, from the profile: `a + (b << k)`, a load from `a + imm`,
+  a load straight into a store, `imm - x`, and the shadow stack pointer moves
+  every compiled Rust function does on entry (five ops become two).
+
+macOS, best of 5, quiet machine:
+
+| | Before | After | Wasmtime |
+|---|---|---|---|
+| fib 30 | 19.5 ms | **15.5 ms** | 2.2 ms |
+| sieve 5,000,000 | 103 ms | **94 ms** | 12.0 ms |
+| sort 1,000,000 | 208 ms | **160 ms** | 13.1 ms |
+| JS (jsc) GET /api/users/42 | 39.0 us | **30.6 us** | 3.2 us |
+| JS (jsc) GET /api/users | 74.1 us | **60.8 us** | 6.0 us |
+| JS (jsc) POST /api/orders | 155 us | **127 us** | 12.3 us |
+| Rust GET /api/users/42 | 5.8 us | **4.9 us** | 1.4 us |
+| Rust POST /api/orders | 62.5 us | **49.9 us** | 5.7 us |
+
+**20% to 25% faster** on most rows. One cost: a cell paused mid-call is about
+23 KB bigger (density, 10,000 cells: 118 to 141 KB per cell), since its stack
+no longer shares pages with other small allocations. The spec suite (30,497
+checks) and the differential fuzzer still agree. The gap is now 7x to 12x.
+The rest is dispatch: each op is a table jump, about 1 ns. Fewer, bigger ops
+or the AOT tier are the ways past it.
+
 **One bug, found and fixed.** TinyGo's `hello` crashed. Two tools found it:
 - a trace of every write to locals, globals, and memory in the old stack mode
   and the new register mode, diffed to the first difference;
