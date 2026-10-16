@@ -277,25 +277,35 @@ What changed:
   a load straight into a store, `imm - x`, and the shadow stack pointer moves
   every compiled Rust function does on entry (five ops become two).
 
-macOS, best of 5, quiet machine:
+Later the same night: the stack-form ops (all float math) moved into the hot
+loop too, then f64 add, sub, mul, div, and compares got register forms (JS
+numbers are f64; each f64 op had cost four ops).
+
+macOS, this morning's binary against tonight's, interleaved, best of 5:
 
 | | Before | After | Wasmtime |
 |---|---|---|---|
-| fib 30 | 19.5 ms | **15.5 ms** | 2.2 ms |
-| sieve 5,000,000 | 103 ms | **94 ms** | 12.0 ms |
-| sort 1,000,000 | 208 ms | **160 ms** | 13.1 ms |
-| JS (jsc) GET /api/users/42 | 39.0 us | **30.6 us** | 3.2 us |
-| JS (jsc) GET /api/users | 74.1 us | **60.8 us** | 6.0 us |
-| JS (jsc) POST /api/orders | 155 us | **127 us** | 12.3 us |
-| Rust GET /api/users/42 | 5.8 us | **4.9 us** | 1.4 us |
-| Rust POST /api/orders | 62.5 us | **49.9 us** | 5.7 us |
+| fib 30 | 19.2 ms | **16.0 ms** | 2.2 ms |
+| sieve 5,000,000 | 105 ms | **95 ms** | 12.0 ms |
+| sort 1,000,000 | 208 ms | **177 ms** | 13.1 ms |
+| JS fib 30 | 47.1 ms | **24.5 ms** | 6.5 ms |
+| Go fib 30 | 22.6 ms | **17.7 ms** | 3.5 ms |
+| JS (jsc) GET /api/users/42 | 33.3 us | **28.6 us** | 3.2 us |
+| JS (jsc) GET /api/users | 60.7 us | **55.6 us** | 6.0 us |
+| JS (jsc) POST /api/orders | 134 us | **122 us** | 12.3 us |
+| Rust GET /api/users/42 | 4.84 us | 4.87 us | 1.4 us |
+| Rust POST /api/orders | 53.0 us | **46.7 us** | 5.7 us |
 
-**20% to 25% faster** on most rows. One cost: a cell paused mid-call is about
-23 KB bigger (density, 10,000 cells: 118 to 141 KB per cell), since its stack
-no longer shares pages with other small allocations. The spec suite (30,497
-checks) and the differential fuzzer still agree. The gap is now 7x to 12x.
-The rest is dispatch: each op is a table jump, about 1 ns. Fewer, bigger ops
-or the AOT tier are the ways past it.
+JS compute is **1.9x faster**; Rust compute and the JS API 8% to 17%; Rust
+API requests are about the same (except POST, 12%). Every time the hot loop
+grew, the Rust compute rows paid a few percent back in register allocation
+and layout, so it holds only what real workloads run. One cost: a cell paused
+mid-call is about 23 KB bigger (density, 10,000 cells: 118 to 141 KB per
+cell), since its stack no longer shares pages with other small allocations.
+The spec suite (30,497 checks), the differential fuzzer, and a new test of
+each fused op at its edges (`fused_ops_match_wasmtime`) all agree with
+Wasmtime. The gap is now 4x to 10x. The rest is dispatch: each op is a
+table jump, about 1 ns. Fewer, bigger ops or the AOT tier are the ways past it.
 
 **One bug, found and fixed.** TinyGo's `hello` crashed. Two tools found it:
 - a trace of every write to locals, globals, and memory in the old stack mode
