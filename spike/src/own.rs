@@ -645,6 +645,8 @@ pub struct CoreStats {
     pub uploads: u64,
     /// Reads answered under the read lease, with no round.
     pub lease_reads: u64,
+    /// Fences told to wait out a peer's promise (a takeover held off).
+    pub fence_waits: u64,
 }
 
 pub struct Core {
@@ -1211,6 +1213,7 @@ impl Core {
                 // (on a tick), the call still counted as out.
                 if let Res::Peer(PeerRes::Wait(ms)) = res {
                     f.again.push((n, now + ms));
+                    self.stats.fence_waits += 1;
                     return;
                 }
                 f.out -= 1;

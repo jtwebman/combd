@@ -169,6 +169,7 @@ struct Stats {
     tail_entries: AtomicU64,
     uploads: AtomicU64,
     lease_reads: AtomicU64,
+    fence_waits: AtomicU64,
     /// WebSockets open, and messages in from them.
     sockets_open: AtomicU64,
     ws_messages: AtomicU64,
@@ -1137,7 +1138,8 @@ struct Loop<'a, E: Engine> {
     names: HashMap<own::Obj, String>,
     /// Requests we forwarded: frame id -> where the answer goes, the node, when
     /// it was sent, and when it gives up.
-    wire_out: HashMap<u64, (Origin, own::Node, Instant, Duration)>,
+    /// Forwards waiting for the owner: (origin, owner, sent, limit, object).
+    wire_out: HashMap<u64, (Origin, own::Node, Instant, Duration, String)>,
     /// Peer calls out: frame id -> the core's op, the node, when sent, and
     /// when it gives up.
     peer_out: HashMap<u64, (own::OpId, own::Node, Instant, Duration)>,
@@ -1439,9 +1441,10 @@ impl<E: Engine> Loop<'_, E> {
                 self.settle(id)?;
             }
             if self.core.is_some() {
-                let late: Vec<u64> = self.wire_out.iter().filter(|(_, (_, _, t, limit))| t.elapsed() >= *limit).map(|(id, _)| *id).collect();
+                let late: Vec<u64> = self.wire_out.iter().filter(|(_, (_, _, t, limit, _))| t.elapsed() >= *limit).map(|(id, _)| *id).collect();
                 for id in late {
-                    let (origin, ..) = self.wire_out.remove(&id).unwrap();
+                    let (origin, node, _, limit, name) = self.wire_out.remove(&id).unwrap();
+                    eprintln!("object {name:?}: forwarded to node {node}, no answer in {limit:?}");
                     self.deliver(origin, (503, "{\"error\":\"owner didn't answer\"}".into()))?;
                 }
                 let late: Vec<u64> = self.peer_out.iter().filter(|(_, (_, _, t, limit))| t.elapsed() >= *limit).map(|(id, _)| *id).collect();
@@ -1591,7 +1594,7 @@ impl<E: Engine> Loop<'_, E> {
                     }
                 }
                 Msg::WireReply { id, reply } => {
-                    if let Some((origin, node, sent, _)) = self.wire_out.remove(&id) {
+                    if let Some((origin, node, sent, ..)) = self.wire_out.remove(&id) {
                         self.measured(node, sent.elapsed());
                         self.deliver(origin, reply)?;
                     }
@@ -2700,7 +2703,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -2718,6 +2721,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.tail_entries.load(Relaxed),
                     s.uploads.load(Relaxed),
                     s.lease_reads.load(Relaxed),
+                    s.fence_waits.load(Relaxed),
                     s.sockets_open.load(Relaxed),
                     s.ws_messages.load(Relaxed),
                     s.ws_handoffs.load(Relaxed),
@@ -3110,6 +3114,7 @@ impl<E: Engine> Loop<'_, E> {
         st.tail_entries.fetch_add(now.tail_entries - was.tail_entries, Relaxed);
         st.uploads.fetch_add(now.uploads - was.uploads, Relaxed);
         st.lease_reads.fetch_add(now.lease_reads - was.lease_reads, Relaxed);
+        st.fence_waits.fetch_add(now.fence_waits - was.fence_waits, Relaxed);
         for e in effects {
             self.effect(e);
         }
@@ -3391,7 +3396,7 @@ impl<E: Engine> Loop<'_, E> {
         let id = f.next_id.fetch_add(1, Relaxed);
         self.sh.stats.forwarded.fetch_add(1, Relaxed);
         let limit = self.forward_limit(node);
-        self.wire_out.insert(id, (fr.origin, node, Instant::now(), limit));
+        self.wire_out.insert(id, (fr.origin, node, Instant::now(), limit, fr.name.clone()));
         f.wire.send(node, Frame::Forward { id, name: fr.name, req: fr.cell_req }, self.me);
     }
 }
