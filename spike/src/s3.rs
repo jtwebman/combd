@@ -368,8 +368,21 @@ impl S3 {
         }
     }
 
-    /// The startup storage test. A node that fails it must not serve.
+    /// The startup storage test. A node that fails it must not serve. A
+    /// bucket that passed once in this process isn't tested again (a node's
+    /// start reaches it twice, and each run is seconds against a far bucket).
     pub fn check(&self) -> Result<(), String> {
+        static PASSED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+        let me = (self.host.clone(), self.bucket.clone());
+        if PASSED.lock().unwrap().contains(&me) {
+            return Ok(());
+        }
+        self.check_now()?;
+        PASSED.lock().unwrap().push(me);
+        Ok(())
+    }
+
+    fn check_now(&self) -> Result<(), String> {
         let e = |x: std::io::Error| x.to_string();
         self.make_bucket().map_err(e)?;
         // Unique per run: several nodes check at once (and in containers
