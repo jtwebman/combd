@@ -702,6 +702,9 @@ pub struct Core {
     objs: BTreeMap<Obj, ObjSt>,
     /// The segment list of a manifest being written, until it's written.
     pending_base: HashMap<(Obj, u32), Vec<String>>,
+    /// Loads that listed many keys: their restore writes an image, so the
+    /// old keys can go even if the list to restore is short.
+    crowded: HashSet<(Obj, u32)>,
     /// When we last heard from each node (our clock), and when this core
     /// started (a node never heard from counts from then).
     heard: HashMap<Node, u64>,
@@ -736,6 +739,7 @@ impl Core {
             ops: HashMap::new(),
             objs: BTreeMap::new(),
             pending_base: HashMap::new(),
+            crowded: HashSet::new(),
             heard: HashMap::new(),
             born: None,
             hints: HashMap::new(),
@@ -1319,7 +1323,9 @@ impl Core {
             (Wait::GcList(..) | Wait::GcDelete, _) => {}
             (Wait::Manifest(o, e), Res::Put(Ok(_))) => {
                 let segs = self.pending_base.remove(&(o, e)).unwrap_or_default();
-                let image = (segs.len() >= self.compact_segs).then(|| image_key(o, e));
+                // A long list, or a bucket full of old keys (an image lets them go).
+                let crowded = self.crowded.remove(&(o, e));
+                let image = (segs.len() >= self.compact_segs || crowded).then(|| image_key(o, e));
                 self.next_act += 1;
                 let act = self.next_act;
                 let st = self.st(o);
@@ -1509,6 +1515,9 @@ impl Core {
     /// From a listing: the last epoch q before `e` with a manifest, plus q's
     /// uploads. `early`: this is the wrong, before-the-CAS version.
     fn history(&mut self, o: Obj, e: u32, keys: Vec<String>, early: Option<Option<String>>) {
+        if keys.len() >= 4 * self.compact_segs {
+            self.crowded.insert((o, e));
+        }
         let mut manifests = vec![];
         let mut images = HashSet::new();
         let mut segs: BTreeMap<u32, Vec<String>> = BTreeMap::new();
