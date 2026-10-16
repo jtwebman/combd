@@ -1670,6 +1670,28 @@ now (a dead owner is found by its silence). The bucket client keeps
 connections now (40 ms a call to R2 from Oregon: its edge is near, most of
 the 250 ms is R2 itself).
 
+**Later the same night, the lease stuck.** A clean ping (a spectator's,
+nothing else on the socket) on a live match took 416 to 1,050 ms, against
+73 ms on a waiting one, and node 0 counted about one peer round per
+WebSocket message. A read could use the lease only with nothing waiting
+for a round. Once one read had to wait (say the lease lapsed between
+messages), each of the match's 20 beats a second queued behind it, and a
+round to Singapore (230 ms) is longer than the gap between beats: the queue
+never emptied, so every read waited from then on. Locally a round takes no
+time, so it never showed. The condition that matters is that every entry
+made so far is acknowledged, which waiting reads don't change; under a valid
+lease, what waits is proven too and goes first, keeping answers in order.
+The simulator holds every invariant over 260,000 seeds, and breaks within 17
+without the acknowledged-entries check.
+
+| live match, same laptop bot | stuck lease | fixed |
+|---|---|---|
+| ping (clean, median) | 220 to 613 ms | **73 ms** (the network's: 75) |
+| ping (the bot's own) | 453 ms | **84 ms** |
+| a player's ticks with no fresh input | 79.5% | **1.2%** |
+| late ticks | 1.0% | **0.0%** |
+| reads under the lease, node 0 | 4 of 132 | **558 of 532** (beats too), 14 rounds |
+
 ## Postgres through combd: how fast
 
 `pg_bench` (not run by default: `cargo test --release -- --ignored pg_bench
