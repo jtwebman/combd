@@ -105,12 +105,20 @@ pub struct Settings {
     /// How long D3 uploads may wait, and how many bytes may build up first
     /// (`None`: picked by the seed, from no wait to 5 s).
     pub uploads: Option<(u64, usize)>,
+    /// Each object beats every 50 ms where it's served (`tick_every`): a
+    /// request no one waits on, so it needs no proof.
+    pub beats: bool,
+    /// Peer round trips in this range, ms (`None`: 1 to 5, a data center).
+    pub peer_ms: Option<(u64, u64)>,
+    /// Check that a write gets in soon after the faults stop. Off only where
+    /// a known livelock is (see `beats_keep_reads_under_the_lease`).
+    pub liveness: bool,
     pub bugs: Bugs,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, lease: true, uploads: None, bugs: Bugs::default() }
+        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, lease: true, uploads: None, beats: false, peer_ms: None, liveness: true, bugs: Bugs::default() }
     }
 }
 
@@ -156,6 +164,8 @@ enum Msg {
     ClientNext(u32),
     ClientTimeout(ReqId),
     Tick(usize),
+    /// A process's objects beat.
+    Beat(usize),
     Restart(Node),
     Thaw(usize),
     /// Start the next network split.
@@ -245,10 +255,15 @@ pub struct Sim {
     gone: Option<Node>,
     /// After the faults: has each object taken a write yet?
     probes: BTreeMap<Obj, bool>,
+    /// Beats in flight (no client, no proof).
+    beats: std::collections::HashSet<ReqId>,
 }
 
 /// Probe clients (one per object, after the faults) have ids from here.
 const PROBE: u32 = 1_000_000;
+
+/// An object's beat, as in the arena's matches.
+const BEAT_MS: u64 = 50;
 
 fn is_prefix(a: &[W], b: &[W]) -> bool {
     a.len() <= b.len() && b[..a.len()] == *a
@@ -293,6 +308,7 @@ impl Sim {
             proven: HashMap::new(),
             gone: None,
             probes: BTreeMap::new(),
+            beats: Default::default(),
         };
         for n in 0..sim.s.nodes {
             sim.spawn(n);
@@ -348,6 +364,9 @@ impl Sim {
         }
         st.started(now);
         self.at(0, Msg::Tick(p));
+        if self.s.beats {
+            self.at(BEAT_MS, Msg::Beat(p));
+        }
     }
 
     fn clock(&self, p: usize) -> u64 {
@@ -363,10 +382,11 @@ impl Sim {
     }
 
     fn peer_latency(&mut self) -> u64 {
+        let (lo, hi) = self.s.peer_ms.unwrap_or((1, 5));
         if self.rng.chance(0.01) {
             500
         } else {
-            1 + self.rng.below(5)
+            lo + self.rng.below(hi - lo + 1)
         }
     }
 
@@ -389,7 +409,7 @@ impl Sim {
             return Err(format!("object {o} never took a write after the faults stopped (lost node: {:?})", self.gone));
         }
         // And soon: the worst seen is about 4 s (a takeover, then a write).
-        if self.stats.probe_ms > 10 * crate::own::LEASE_MS {
+        if self.s.liveness && self.stats.probe_ms > 10 * crate::own::LEASE_MS {
             return Err(format!("a write took {} ms to get in after the faults stopped (lost node: {:?})", self.stats.probe_ms, self.gone));
         }
         Ok(())
@@ -411,6 +431,22 @@ impl Sim {
     fn step(&mut self, m: Msg) -> Result<(), String> {
         match m {
             Msg::Proc(p, ev) => self.deliver(p, ev),
+            Msg::Beat(p) => {
+                if !self.procs[p].alive {
+                    return Ok(());
+                }
+                if self.now < self.s.duration + 30_000 {
+                    self.at(BEAT_MS, Msg::Beat(p));
+                }
+                let mut objs: Vec<Obj> = self.procs[p].data.keys().copied().collect();
+                objs.sort();
+                for obj in objs {
+                    self.next_req += 1;
+                    let req = self.next_req;
+                    self.beats.insert(req);
+                    self.deliver(p, Event::Request { obj, req });
+                }
+            }
             Msg::Tick(p) => {
                 if !self.procs[p].alive {
                     return Ok(());
@@ -630,6 +666,9 @@ impl Sim {
                 }
             }
             Effect::Answer { req, ans } => {
+                if self.beats.remove(&req) {
+                    return;
+                }
                 let d = self.latency();
                 self.at(d, Msg::Client(req, ans, p));
             }
@@ -642,7 +681,8 @@ impl Sim {
                 }
                 let h = d.history.clone();
                 self.procs[p].saw.insert(req, h);
-                self.at(0, Msg::Proc(p, Event::Ran { obj, act, req, changed: write.is_some(), proof: true }));
+                let proof = !self.beats.contains(&req);
+                self.at(0, Msg::Proc(p, Event::Ran { obj, act, req, changed: write.is_some(), proof }));
             }
             Effect::Seal { obj, act } => {
                 let d = self.procs[p].data.entry(obj).or_default();
@@ -962,6 +1002,30 @@ mod tests {
             let (_, bad) = run_with(0..2000, &|| Settings { replicas: 2, splits: true, bugs, ..Settings::default() });
             assert!(bad.as_ref().is_some_and(|(_, why)| why.contains("missed write")), "{name} wasn't caught: {bad:?}");
         }
+    }
+
+    /// Objects that beat every 50 ms, with peers far away (a round of 200 to
+    /// 500 ms): reads must still be answered under the lease. Once one read
+    /// waited for a round, every beat queued behind it and the lease was
+    /// never used again (found on the arena's fleet: pings of 400 to 1,000 ms).
+    ///
+    /// The liveness check is off here: an old owner that keeps renewing its
+    /// lease with a peer holds off a newer owner's fence there (a peer
+    /// extends its promise on every append), so a takeover can wait as long
+    /// as the old owner keeps going (seed 113: 15 s). Safety holds. Fixing it
+    /// changes the protocol (a peer with a newer fence waiting stops
+    /// promising, and says so), so it goes through the spec first.
+    #[test]
+    fn beats_keep_reads_under_the_lease() {
+        let far = || Settings { replicas: 2, beats: true, peer_ms: Some((100, 250)), liveness: false, ..Settings::default() };
+        let (s, bad) = run_with(0..300, &far);
+        assert!(bad.is_none(), "{bad:?}");
+        assert!(s.lease_reads > s.reads_done / 2, "the lease should answer most reads: {s:?}");
+        let (_, bad) = run_with(0..300, &|| Settings { splits: true, wipes: true, ..far() });
+        assert!(bad.is_none(), "{bad:?}");
+        // Near peers: the liveness check holds too.
+        let (_, bad) = run_with(0..500, &|| Settings { replicas: 2, beats: true, splits: true, ..Settings::default() });
+        assert!(bad.is_none(), "{bad:?}");
     }
 
     /// Each known-bad version must be caught, or the oracle is blind.

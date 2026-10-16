@@ -778,8 +778,11 @@ fn main_with(args: &[&str]) {
             let t = Instant::now();
             // Extra faults, any of: `splits` (network splits), `only-splits`
             // (splits and no other faults), `wipes` (a lost disk), `loss` (a
-            // node lost for good).
+            // node lost for good), `beats` (each object beats every 50 ms),
+            // `far` (peer round trips of 100 to 250 ms).
             let more = args.get(4..).unwrap_or_default();
+            let beats = more.contains(&"beats");
+            let peer_ms = more.contains(&"far").then_some((100, 250));
             let loss = more.contains(&"loss");
             let only = more.contains(&"only-splits");
             let splits = only || more.contains(&"splits");
@@ -787,7 +790,7 @@ fn main_with(args: &[&str]) {
             // `uploads=MS`: every seed waits this long (and 1 MB); else by seed.
             let uploads = more.iter().find_map(|a| a.strip_prefix("uploads=")?.parse().ok()).map(|ms| (ms, 1 << 20));
             let (stats, bad) = sim::run_with(seeds, &|| {
-                let mut s = sim::Settings { replicas, bugs, splits, wipes, loss, uploads, ..Default::default() };
+                let mut s = sim::Settings { replicas, bugs, splits, wipes, loss, uploads, beats, peer_ms, ..Default::default() };
                 if only {
                     (s.lost, s.crash, s.freeze) = (0.0, 0.0, 0.0);
                 }

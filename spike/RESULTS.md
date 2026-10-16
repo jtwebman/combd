@@ -2113,6 +2113,15 @@ cells.
 
 ## Next
 
+0. **A takeover can wait on an old owner that keeps renewing its lease.** A
+   peer extends its promise on every append, and a fence for a newer epoch
+   waits out the promise, so an old owner that still reaches a peer (a
+   one-sided split, a stalled process that wakes) holds off a newer owner
+   there for as long as it keeps renewing. Safety holds; clients routed to
+   the newer owner wait (simulator, objects beating with peers far away:
+   `combd-spike sim 113..114 none 2 beats far`, 15 s). Fix: a peer with a
+   newer fence waiting stops promising the old epoch, and says so in its
+   answer (or the old owner over-trusts its lease); spec it in TLA+ first.
 1. ~~Run the official Wasm spec test suite against the interpreter.~~ Done:
    30,497 checks pass, plus differential fuzzing against Wasmtime.
 2. ~~Register-based interpreter, toward the 5x target.~~ Done (rounds 2 and
