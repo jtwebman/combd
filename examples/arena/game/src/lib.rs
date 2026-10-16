@@ -244,6 +244,36 @@ struct Mm {
     matches: u64,
     /// A new version is coming: no new matches.
     draining: bool,
+    /// A warm match object per node: claimed and loaded already, so a new
+    /// match there starts at once (a fresh one is a few bucket calls first,
+    /// about a second with the bucket an ocean away). (id, made at).
+    spares: BTreeMap<u64, (String, u64)>,
+}
+
+/// A spare older than this isn't used (it expires itself at twice that).
+const SPARE_MS: u64 = 300_000;
+
+/// A match's id on `node`: its warm spare if there's a fresh one (then a
+/// new spare is made, in the background), or a new id.
+fn match_id(mm: &mut Mm, node: u64, now: u64) -> String {
+    mm.matches += 1;
+    let id = match mm.spares.remove(&node) {
+        Some((id, at)) if now < at + SPARE_MS => id,
+        _ => format!("m{}{}", now, mm.matches),
+    };
+    warm(mm, node, now);
+    id
+}
+
+/// Make sure `node` has a warm spare: a fire-and-forget start, there.
+fn warm(mm: &mut Mm, node: u64, now: u64) {
+    if mm.spares.get(&node).is_some_and(|s| now < s.1 + SPARE_MS) {
+        return;
+    }
+    mm.matches += 1;
+    let id = format!("m{}{}", now, mm.matches);
+    send(&json!({ "to": "match", "id": id, "node": node, "path": "/spare" }));
+    mm.spares.insert(node, (id, now));
 }
 
 thread_local! {
@@ -286,8 +316,7 @@ fn pair_all(mm: &mut Mm, now: u64) {
         }
         let Some((score, i, j, node)) = best else { return };
         let (b, a) = (mm.queue.remove(j), mm.queue.remove(i));
-        mm.matches += 1;
-        let id = format!("m{}{}", now, mm.matches);
+        let id = match_id(mm, node, now);
         let tokens = [token(), token()];
         // Start the match on the node best for both.
         let r = call(&json!({ "to": "match", "id": id, "node": node, "path": "/create", "body": json!({ "id": id, "players": [a.player, b.player], "tokens": tokens }).to_string() }));
@@ -329,6 +358,10 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                     return err(400, "measure the nodes first: rtt");
                 }
                 let ticket = token();
+                // Warm spares near this player, for when they're matched.
+                for &n in rtt.keys() {
+                    warm(&mut mm, n, now);
+                }
                 // One ticket per player: a join again (a client that gave up
                 // waiting for an answer) replaces the old one, so stale
                 // tickets can't pile up and get matched with no one there.
@@ -368,8 +401,7 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                 let strategy = v["strategy"].as_str().and_then(bot::Strategy::from_name).unwrap_or(bot::Strategy::ALL[(now % 4) as usize]);
                 let bot_name = format!("bot-{}", strategy.name());
                 mm.queue.retain(|w| w.player != player);
-                mm.matches += 1;
-                let id = format!("m{}{}", now, mm.matches);
+                let id = match_id(&mut mm, node, now);
                 let tok = token();
                 let r = call(&json!({ "to": "match", "id": id, "node": node, "path": "/create", "body": json!({ "id": id, "players": [player, bot_name], "tokens": [tok, ""], "bot": strategy.name() }).to_string() }));
                 if r["status"].as_u64() != Some(200) {
@@ -456,6 +488,8 @@ struct Timing {
 
 thread_local! {
     static MATCH: RefCell<Option<Match>> = const { RefCell::new(None) };
+    /// A warm spare since then, not yet a match.
+    static SPARE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// How long a match lasts (`MATCH_MS`, 3 minutes): then more kills wins,
@@ -566,7 +600,15 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
     let now = now();
     MATCH.with(|cell| {
         let mut cell = cell.borrow_mut();
+        // A warm spare: claimed and loaded, nothing in it yet. A slow beat
+        // keeps it in memory; it expires itself if it's never used.
+        if method == "POST" && path == "/spare" && cell.is_none() {
+            SPARE.with(|s| s.set(Some(now)));
+            tick_every(30_000);
+            return ok(json!({ "spare": true }));
+        }
         if method == "POST" && path == "/create" {
+            SPARE.with(|s| s.set(None));
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let s = |k: &str, i: usize| v[k][i].as_str().unwrap_or("").to_string();
             sql("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)", &[]);
@@ -589,7 +631,10 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
             return match method {
                 "WSOPEN" => err(410, "this match is gone"),
                 "TICK" => {
-                    tick_every(0);
+                    // A spare waits (until it's old: then it goes).
+                    if !SPARE.with(|s| s.get()).is_some_and(|at| now < at + 2 * SPARE_MS) {
+                        tick_every(0);
+                    }
                     ok(json!({}))
                 }
                 _ => err(404, "no such match"),
