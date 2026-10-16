@@ -122,7 +122,8 @@ no round. Time enters only as one assumption, `Expire`: a promise lapses
 only after the owner's lease has ended (the owner trusts less than was
 promised, counted from before it was made). New invariant, `NoStaleRead`: a
 read under a lease sees every acknowledged write. 95.9 million states, no
-errors. Two more known-bad versions must fail:
+errors; with a wiped peer too (`RepWipe.cfg` now has leases), 624 million
+states, no errors. Two more known-bad versions must fail:
 
 | Bug | Caught by |
 |---|---|
