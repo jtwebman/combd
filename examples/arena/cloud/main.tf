@@ -103,7 +103,8 @@ data "cloudflare_zone" "zone" {
 
 # The certificate: arena.<domain> and *.arena.<domain>, for every node.
 resource "tls_private_key" "acme" {
-  algorithm = "ECDSA"
+  algorithm   = "ECDSA"
+  ecdsa_curve = "P256"
 }
 
 resource "acme_registration" "me" {
