@@ -90,6 +90,10 @@ macro_rules! ops {
             // Fused pairs: an address `a + (b << sh)`; a load whose address is
             // `a + imm` (wrapping, as the add would); a load straight into a store.
             I32AddShlRR { d: u32, a: u32, b: u32, sh: u8 },
+            // `imm - a`; and the shadow stack pointer moves of every function
+            // prologue (`d = g + imm`, then `g = d` too) and epilogue (`g = a + imm`).
+            I32RSubRI { d: u32, a: u32, imm: i32 },
+            I32GlobalAddR { d: u32, g: u32, imm: i32 }, I32GlobalAddTo { d: u32, g: u32, imm: i32 }, I32GlobalSetAddR { g: u32, a: u32, imm: i32 },
             I32LoadAddR { d: u32, a: u32, imm: i32 }, I64LoadAddR { d: u32, a: u32, imm: i32 },
             Move8 { to: u32, from: u32, to_off: u16, from_off: u16 }, Move32 { to: u32, from: u32, to_off: u16, from_off: u16 }, Move64 { to: u32, from: u32, to_off: u16, from_off: u16 },
             $($p,)* $($m(u32),)*
@@ -585,6 +589,10 @@ fn fuse_pair(prev: Op, op: Op, t: u32) -> Option<Op> {
         (Op::I32ShlRI { a: x, imm, .. }, Op::I32AddRR { d, a, b }) if b == t && a != t => Op::I32AddShlRR { d, a, b: x, sh: (imm & 31) as u8 },
         (Op::I32ShlRI { a: x, imm, .. }, Op::I32AddRR { d, a, b }) if a == t && b != t => Op::I32AddShlRR { d, a: b, b: x, sh: (imm & 31) as u8 },
         (Op::I32AddRI { a: x, imm, .. }, Op::I32LoadR { d, a, off: 0 }) if a == t => Op::I32LoadAddR { d, a: x, imm },
+        (Op::GlobalGetR { g, .. }, Op::I32AddRI { d, a, imm }) if a == t => Op::I32GlobalAddR { d, g, imm },
+        (Op::GlobalGetR { g, .. }, Op::I32SubRI { d, a, imm }) if a == t => Op::I32GlobalAddR { d, g, imm: imm.wrapping_neg() },
+        (Op::I32AddRI { a: x, imm, .. }, Op::GlobalSetR { g, a }) if a == t => Op::I32GlobalSetAddR { g, a: x, imm },
+        (Op::I32SubRI { a: x, imm, .. }, Op::GlobalSetR { g, a }) if a == t => Op::I32GlobalSetAddR { g, a: x, imm: imm.wrapping_neg() },
         (Op::I32AddRI { a: x, imm, .. }, Op::I64LoadR { d, a, off: 0 }) if a == t => Op::I64LoadAddR { d, a: x, imm },
         (Op::Load8UR { a: from, off: fo, .. }, Op::Store8R { a: to, v, off: to_off }) if v == t && to != t => {
             Op::Move8 { to, from, to_off: to_off.try_into().ok()?, from_off: fo.try_into().ok()? }
@@ -617,7 +625,7 @@ fn push_fused(f: &mut Func, rg: &Regs, barrier: usize, op: Op) {
 /// Point a register op's result at slot `x` instead.
 fn retarget(op: &mut Op, x: u32) {
     match op {
-        Op::GlobalGetR { d, .. } | Op::SelectR { d, .. } | Op::I32AddShlRR { d, .. } | Op::I32LoadAddR { d, .. } | Op::I64LoadAddR { d, .. } => *d = x,
+        Op::GlobalGetR { d, .. } | Op::SelectR { d, .. } | Op::I32AddShlRR { d, .. } | Op::I32RSubRI { d, .. } | Op::I32GlobalAddR { d, .. } | Op::I32LoadAddR { d, .. } | Op::I64LoadAddR { d, .. } => *d = x,
         Op::I32AddRI { d, .. } | Op::I32AddRR { d, .. } | Op::I32AndRI { d, .. } | Op::I32AndRR { d, .. } | Op::I32EqRI { d, .. } | Op::I32EqRR { d, .. } | Op::I32EqzR { d, .. } | Op::I32GeSRI { d, .. } | Op::I32GeSRR { d, .. } | Op::I32GeURI { d, .. } | Op::I32GeURR { d, .. } | Op::I32GtSRI { d, .. } | Op::I32GtSRR { d, .. } | Op::I32GtURI { d, .. } | Op::I32GtURR { d, .. } | Op::I32LeSRI { d, .. } | Op::I32LeSRR { d, .. } | Op::I32LeURI { d, .. } | Op::I32LeURR { d, .. } | Op::I32Load16SR { d, .. } | Op::I32Load8SR { d, .. } | Op::I32LoadR { d, .. } | Op::I32LtSRI { d, .. } | Op::I32LtSRR { d, .. } | Op::I32LtURI { d, .. } | Op::I32LtURR { d, .. } | Op::I32MulRI { d, .. } | Op::I32MulRR { d, .. } | Op::I32NeRI { d, .. } | Op::I32NeRR { d, .. } | Op::I32OrRI { d, .. } | Op::I32OrRR { d, .. } | Op::I32ShlRI { d, .. } | Op::I32ShlRR { d, .. } | Op::I32ShrSRI { d, .. } | Op::I32ShrSRR { d, .. } | Op::I32ShrURI { d, .. } | Op::I32ShrURR { d, .. } | Op::I32SubRI { d, .. } | Op::I32SubRR { d, .. } | Op::I32WrapI64R { d, .. } | Op::I32XorRI { d, .. } | Op::I32XorRR { d, .. } | Op::I64AddRI { d, .. } | Op::I64AddRR { d, .. } | Op::I64AndRI { d, .. } | Op::I64AndRR { d, .. } | Op::I64EqRI { d, .. } | Op::I64EqRR { d, .. } | Op::I64EqzR { d, .. } | Op::I64ExtendI32SR { d, .. } | Op::I64ExtendI32UR { d, .. } | Op::I64GeSRI { d, .. } | Op::I64GeSRR { d, .. } | Op::I64GeURI { d, .. } | Op::I64GeURR { d, .. } | Op::I64GtSRI { d, .. } | Op::I64GtSRR { d, .. } | Op::I64GtURI { d, .. } | Op::I64GtURR { d, .. } | Op::I64LeSRI { d, .. } | Op::I64LeSRR { d, .. } | Op::I64LeURI { d, .. } | Op::I64LeURR { d, .. } | Op::I64LoadR { d, .. } | Op::I64LtSRI { d, .. } | Op::I64LtSRR { d, .. } | Op::I64LtURI { d, .. } | Op::I64LtURR { d, .. } | Op::I64MulRI { d, .. } | Op::I64MulRR { d, .. } | Op::I64NeRI { d, .. } | Op::I64NeRR { d, .. } | Op::I64OrRI { d, .. } | Op::I64OrRR { d, .. } | Op::I64ShlRI { d, .. } | Op::I64ShlRR { d, .. } | Op::I64ShrSRI { d, .. } | Op::I64ShrSRR { d, .. } | Op::I64ShrURI { d, .. } | Op::I64ShrURR { d, .. } | Op::I64SubRI { d, .. } | Op::I64SubRR { d, .. } | Op::I64XorRI { d, .. } | Op::I64XorRR { d, .. } | Op::Load16UR { d, .. } | Op::Load8UR { d, .. } => *d = x,
         _ => {}
     }
@@ -817,14 +825,18 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
                 if comm && imm_of(a).is_some() && matches!(b, V::Slot(_)) {
                     std::mem::swap(&mut a, &mut b);
                 }
-                let ra = rg.slot(&mut f, a, ha);
                 let d = rg.own(ha);
-                let imm = imm_of(b);
-                let op = match imm {
-                    Some(imm) => ri(d, ra, imm),
-                    None => {
-                        let rb = rg.slot(&mut f, b, ha + 1);
-                        rr(d, ra, rb)
+                let op = match (imm_of(a), b, rr(0, 0, 0)) {
+                    (Some(imm), V::Slot(rb), Op::I32SubRR { .. }) => Op::I32RSubRI { d, a: rb, imm },
+                    _ => {
+                        let ra = rg.slot(&mut f, a, ha);
+                        match imm_of(b) {
+                            Some(imm) => ri(d, ra, imm),
+                            None => {
+                                let rb = rg.slot(&mut f, b, ha + 1);
+                                rr(d, ra, rb)
+                            }
+                        }
                     }
                 };
                 push_fused(&mut f, &rg, barrier, op);
@@ -883,7 +895,14 @@ fn translate(m: &Module, mut fv: FuncValidator<ValidatorResources>, body: &Funct
                 let v = rg.vs.pop().ok_or("stack underflow")?;
                 let h = rg.vs.len();
                 let a = rg.slot(&mut f, v, h);
-                f.ops.push(Op::GlobalSetR { g, a });
+                let n = f.ops.len();
+                match f.ops.last_mut() {
+                    // The prologue's `local.tee`: the new value stays in its local too.
+                    Some(Op::I32GlobalAddR { d, g: g2, imm }) if n > barrier && *g2 == g && *d == a => {
+                        f.ops[n - 1] = Op::I32GlobalAddTo { d: a, g, imm: *imm };
+                    }
+                    _ => push_fused(&mut f, &rg, barrier, Op::GlobalSetR { g, a }),
+                }
                 rg.last_def = None;
                 rg.sp_ok = false;
             }
@@ -1642,6 +1661,14 @@ fn hot(m: &Module, frames: &mut Vec<Frame>, s: &mut [u64], mem: &mut [u8], globa
             Op::Store64R { a, v, off } => { let ea = r[a as u16 as usize] as u32 as usize + off as usize; let v = r[v as u16 as usize].to_le_bytes(); mem.get_mut(ea..ea + 8).ok_or("out of bounds memory access")?.copy_from_slice(&v[..8]); }
             Op::Store8R { a, v, off } => { let ea = r[a as u16 as usize] as u32 as usize + off as usize; let v = r[v as u16 as usize].to_le_bytes(); mem.get_mut(ea..ea + 1).ok_or("out of bounds memory access")?.copy_from_slice(&v[..1]); }
             Op::Store16R { a, v, off } => { let ea = r[a as u16 as usize] as u32 as usize + off as usize; let v = r[v as u16 as usize].to_le_bytes(); mem.get_mut(ea..ea + 2).ok_or("out of bounds memory access")?.copy_from_slice(&v[..2]); }
+            Op::I32RSubRI { d, a, imm } => reg!(d, u32_, ru32, imm as u32 as u64, r[a as u16 as usize], |x, y| x.wrapping_sub(y)),
+            Op::I32GlobalAddR { d, g, imm } => r[d as u16 as usize] = ru32(u32_(globals[g as usize]).wrapping_add(imm as u32)),
+            Op::I32GlobalAddTo { d, g, imm } => {
+                let v = ru32(u32_(globals[g as usize]).wrapping_add(imm as u32));
+                globals[g as usize] = v;
+                r[d as u16 as usize] = v;
+            }
+            Op::I32GlobalSetAddR { g, a, imm } => globals[g as usize] = ru32(u32_(r[a as u16 as usize]).wrapping_add(imm as u32)),
             Op::I32AddShlRR { d, a, b, sh } => reg!(d, u32_, ru32, r[a as u16 as usize], r[b as u16 as usize], |x, y| x.wrapping_add(y << sh)),
             Op::I32LoadAddR { d, a, imm } => { let ea = u32_(r[a as u16 as usize]).wrapping_add(imm as u32) as usize; let b: [u8; 4] = mem.get(ea..ea + 4).ok_or("out of bounds memory access")?.try_into().unwrap(); r[d as u16 as usize] = u32::from_le_bytes(b) as u64; }
             Op::I64LoadAddR { d, a, imm } => { let ea = u32_(r[a as u16 as usize]).wrapping_add(imm as u32) as usize; let b: [u8; 8] = mem.get(ea..ea + 8).ok_or("out of bounds memory access")?.try_into().unwrap(); r[d as u16 as usize] = u64::from_le_bytes(b); }
