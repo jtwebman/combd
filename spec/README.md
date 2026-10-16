@@ -115,6 +115,20 @@ more known-bad versions must fail:
 | trust a wiped peer's tail for an epoch it may have lost | NoLostAckedWrite |
 | a wiped peer doesn't relearn its fence | NoLostAckedWrite |
 
+**Read leases.** A peer that takes an entry (or an empty round) promises
+its epoch: a fence for a newer epoch must wait the promise out. Once every
+peer has promised its epoch, the owner holds a lease and answers reads with
+no round. Time enters only as one assumption, `Expire`: a promise lapses
+only after the owner's lease has ended (the owner trusts less than was
+promised, counted from before it was made). New invariant, `NoStaleRead`: a
+read under a lease sees every acknowledged write. 95.9 million states, no
+errors. Two more known-bad versions must fail:
+
+| Bug | Caught by |
+|---|---|
+| a fence ignores a peer's promise | NoStaleRead |
+| a promise lapses while the owner still trusts it | NoStaleRead |
+
 The peers are interchangeable, and so are the writes, so TLC checks one of
 each set of mirror-image states (`SYMMETRY`); that's sound for invariants,
 which is all we check.

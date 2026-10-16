@@ -1561,6 +1561,60 @@ granting to its own node until it hears the new epoch (more than `max`
 until then); the manager is wherever the first ask came from, with no
 placement preference; `on_manager_loss = "stop"` has no test of its own.
 
+## Read leases: reads with no round trip
+
+Every read used to wait for a round to its object's peers, the proof that
+no newer owner had taken over. On one LAN that's under a millisecond; on
+the arena's fleet (New York, Frankfurt, Singapore) it was up to 230 ms per
+read, and every match tick and every input over a socket is a read. A
+matchmaker call took 0.75 to 0.9 s, and 74 to 82% of a bot's game ticks
+had no fresh input from it.
+
+The obvious lease (an owner trusts its last round for a while) isn't safe:
+an owner cut off from the node that takes over, but not from its peers,
+would keep answering from stale memory after a newer owner's writes. So
+**the peers grant it**. A peer that acknowledges an owner's append promises
+that epoch half a lease, by its own clock: a fence for a newer epoch gets
+"not yet" (`PeerRes::Wait`) until then, and a store holds off every fence
+that long after it starts (it can't remember what it promised). The owner
+answers reads alone until the oldest of its peers' acknowledged sends plus
+three quarters of the promise (room for clocks a fifth apart), renewing
+past half. A takeover can take up to half a lease longer.
+
+**Checked three ways.**
+- The simulator (each node's clock up to 10% fast or slow) runs with leases
+  on: 48,000 seeds across splits, lost disks, and a lost node, every
+  invariant held, and over half of all reads used the lease. Its read check
+  ("a read sees every write acknowledged before it was sent") catches both
+  known-bad versions: peers that break their promise, and an owner that
+  trusts 150% of it.
+- TLA+: promises, leases, and the one clock assumption (a promise lapses only
+  after the owner's lease has ended) are in `Replication.tla`, with a new
+  invariant, `NoStaleRead`. 95.9 million states, no errors; both known-bad
+  versions break `NoStaleRead`.
+- The Docker cluster's kill, freeze, lost-disk, and split runs kept every
+  object right.
+
+**Rolled out in two steps,** because an older peer promises nothing: peers
+always promise; owners trust leases only with `COMBD_READ_LEASE=1`, set on
+the arena once every node ran the new version.
+
+**On the arena** (a bot on this laptop against the match's own bot):
+
+| | before | with leases |
+|---|---|---|
+| a player's ticks with no fresh input | 74 to 82% | 12.7% |
+| ping (WebSocket, through the match; the network's is ~75 ms) | 435 to 529 ms | 149 ms |
+| late ticks | 1.4 to 2.1% | 0.4% |
+| a matchmaker call, server time | 750 to 900 ms | 160 ms |
+
+Found on the way: forwarding gave up after a 1 s floor, too short for a
+fresh object's start (a few bucket calls, about 250 ms each to R2 in
+Europe): new matches failed with "owner didn't answer". The floor is 5 s
+now (a dead owner is found by its silence). The bucket client keeps
+connections now (40 ms a call to R2 from Oregon: its edge is near, most of
+the 250 ms is R2 itself).
+
 ## Postgres through combd: how fast
 
 `pg_bench` (not run by default: `cargo test --release -- --ignored pg_bench

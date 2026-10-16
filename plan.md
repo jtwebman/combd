@@ -1153,8 +1153,12 @@ master key file; write-only API; opened only in a node's memory). Uploads
 are batched (10 s or 1 MB while every peer is up: 12 to 56x fewer bucket
 writes on the Docker cluster). Postgres pools are fleet-wide (one manager,
 named by the catalog; members near their callers; at max the nearest free
-one over the wire; tested on three nodes with a real database). Next: the
-multi-region demo on DigitalOcean, with Terraform.
+one over the wire; tested on three nodes with a real database). The
+multi-region demo runs on DigitalOcean (Terraform, continuous deploy).
+Reads take a lease from their peers (spec, simulator, and fleet), so a read
+no longer waits a round trip to the farthest peer. Next: deploys that never
+end a running game (old objects finish on the old version), then
+snapshot-and-restore for hot upgrades and moving objects.
 ponytail: heartbeats go all to all; a leader or gossip
 if fleets get very large.
 
