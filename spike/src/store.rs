@@ -442,6 +442,32 @@ fn encode_pages(page: u32, size: u32, pages: &BTreeMap<u32, Vec<u8>>) -> Vec<u8>
     out
 }
 
+/// The database file as one entry: every page and its size, the way `seal`
+/// writes one. Restored on its own (`restore`), it is the whole object.
+/// `None` for an empty one.
+pub fn image(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let file = std::fs::read(path)?;
+    // The page size, from the header (1 means 65536).
+    let page = match file.get(16..18).map(|b| u16::from_be_bytes([b[0], b[1]])) {
+        Some(1) => 65536usize,
+        Some(n) if (512..=32768).contains(&n) && n.is_power_of_two() => n as usize,
+        _ => return Ok(None),
+    };
+    if file.len() % page != 0 {
+        return Err(std::io::Error::other("database isn't whole pages"));
+    }
+    let n = file.len() / page;
+    let mut out = Vec::with_capacity(12 + n * (4 + page));
+    for v in [page as u32, n as u32, n as u32] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for (i, p) in file.chunks(page).enumerate() {
+        out.extend_from_slice(&(i as u32 + 1).to_le_bytes());
+        out.extend_from_slice(p);
+    }
+    Ok(Some(out))
+}
+
 /// D2: build a database file from sealed segments, in order, from nothing.
 pub fn restore(path: &Path, segs: &[Vec<u8>]) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
@@ -689,6 +715,53 @@ mod tests {
         assert!(max < 2 * CHECKPOINT_PAGES as u64 * page, "WAL grew to {max} bytes");
         eprintln!("largest WAL: {max} bytes");
         assert!(q(&db, "SELECT count(*) FROM t").contains("[[400]]"));
+    }
+
+    /// An image (the restored file as one entry) restores the same database
+    /// on its own, and later entries go on top of it as on the long list.
+    #[test]
+    fn an_image_restores_like_its_segments() {
+        let (d, db) = db();
+        let mut segs = vec![db.seal().unwrap()];
+        q(&db, "CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)");
+        let put = |db: &Db, round: usize| {
+            db.begin().unwrap();
+            for i in 0..20 {
+                let sql = format!("{{\"q\":\"INSERT OR REPLACE INTO t VALUES (?, ?)\",\"p\":[{}, \"v{round}-{}\"]}}", (round * 7 + i) % 97, "x".repeat(round * 40));
+                db.exec_json(sql.as_bytes());
+            }
+            db.commit().unwrap();
+        };
+        for round in 0..20 {
+            put(&db, round);
+            segs.push(db.seal().unwrap());
+        }
+        // Restored from the long list, then imaged before anything opens it.
+        let first = d.0.join("first.sqlite");
+        restore(&first, &segs).unwrap();
+        let img = image(&first).unwrap().expect("an image");
+        // More writes after, as the next epoch's uploads.
+        let mut later = vec![];
+        for round in 20..30 {
+            put(&db, round);
+            later.push(db.seal().unwrap());
+        }
+        let want = q(&db, "SELECT k, v FROM t ORDER BY k");
+        let long = d.0.join("long.sqlite");
+        restore(&long, &[segs.clone(), later.clone()].concat()).unwrap();
+        let short = d.0.join("short.sqlite");
+        restore(&short, &[vec![img.clone()], later].concat()).unwrap();
+        assert_eq!(std::fs::read(&long).unwrap(), std::fs::read(&short).unwrap(), "image + later isn't the long list");
+        let rows = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap()["rows"].clone();
+        assert_eq!(rows(&q(&Db::open(&short).unwrap(), "SELECT k, v FROM t ORDER BY k")), rows(&want));
+        // The image alone is what was restored.
+        let alone = d.0.join("alone.sqlite");
+        restore(&alone, &[img]).unwrap();
+        assert_eq!(std::fs::read(&alone).unwrap(), std::fs::read(&first).unwrap());
+        // Nothing there: no image.
+        let empty = d.0.join("empty.sqlite");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(image(&empty).unwrap().is_none());
     }
 
     /// D2: pages sealed from the WAL rebuild the same database, through

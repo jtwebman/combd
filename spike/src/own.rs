@@ -31,6 +31,9 @@
 //!   started from, in order.
 //! - `obj/o/e<E>/s<N>`: an upload of epoch E: its entries up to entry N.
 //! - `obj/o/e<E>/t`: what the peers had of the previous epoch past its uploads.
+//! - `obj/o/e<E>/i`: an image: the object as epoch E's owner restored it from
+//!   its manifest, as one entry. The next owner starts from it instead of
+//!   the manifest's keys (compaction: a manifest only ever grows).
 //!
 //! Liveness is over the wire, not the bucket: every node sends every other a
 //! small heartbeat a few times a lease (`Event::Heard`), and a node not heard
@@ -235,7 +238,9 @@ pub enum Effect {
     Peer { op: OpId, node: Node, call: PeerCall },
     Answer { req: ReqId, ans: Answer },
     /// Build the object from these segments, in order, from nothing.
-    Restore { obj: Obj, act: Act, segs: Vec<String> },
+    /// `image`: once restored, write the object as one entry there (the list
+    /// is long), for the next owner to start from.
+    Restore { obj: Obj, act: Act, segs: Vec<String>, image: Option<String> },
     /// Run a request, in order, after the ones before it.
     Run { obj: Obj, act: Act, req: ReqId },
     /// Hand over the changes made since the last seal.
@@ -463,6 +468,12 @@ fn seg_key(o: Obj, e: u32, upto: u64) -> String {
 fn tail_key(o: Obj, e: u32) -> String {
     format!("obj/{o:032x}/e{e:08}/t")
 }
+pub fn image_key(o: Obj, e: u32) -> String {
+    format!("obj/{o:032x}/e{e:08}/i")
+}
+
+/// A restore from this many segments or more writes an image (each is a GET).
+pub const COMPACT_SEGS: usize = 16;
 /// The epoch and the part (`m`, `t`, or `s...`) of an object key.
 pub fn parse_key(o: Obj, k: &str) -> Option<(u32, &str)> {
     let rest = k.strip_prefix(&format!("obj/{o:032x}/e"))?;
@@ -663,6 +674,8 @@ pub struct Core {
     /// Read leases: how long after a round all peers acknowledged a read may
     /// be answered without another (0: every read waits for a round).
     lease_trust_ms: u64,
+    /// A restore from this many segments writes an image (`COMPACT_SEGS`).
+    compact_segs: usize,
     next_op: OpId,
     next_act: Act,
     ops: HashMap<OpId, Wait>,
@@ -697,6 +710,7 @@ impl Core {
             upload_ms: 0,
             upload_bytes: 1 << 20,
             lease_trust_ms: 0,
+            compact_segs: COMPACT_SEGS,
             next_op: 0,
             next_act: 0,
             ops: HashMap::new(),
@@ -727,6 +741,12 @@ impl Core {
     /// by up to a fifth.
     pub fn read_lease(mut self, promise_ms: u64) -> Core {
         self.lease_trust_ms = if self.bugs.lease_overtrust { promise_ms * 3 / 2 } else { promise_ms * 3 / 4 };
+        self
+    }
+
+    /// Write an image after a restore from `n` segments or more.
+    pub fn compact_at(mut self, n: usize) -> Core {
+        self.compact_segs = n;
         self
     }
 
@@ -1235,56 +1255,20 @@ impl Core {
                 }
             }
             (Wait::List(o, e), Res::Listed(keys)) => self.history(o, e, keys, None),
-            (Wait::PrevManifest(o, e, segs, uploaded, q), Res::Got(Some((Val::Manifest(m), _)))) => {
-                let mut base = m;
-                base.extend(segs);
-                // A fenced peer's tail of q, if any (no fence: nothing to add).
-                let trust_wiped = self.bugs.trust_wiped;
-                let st = self.st(o);
-                let tails = match st.fence.as_mut().filter(|f| f.epoch == e) {
-                    None => vec![],
-                    Some(f) => match f.replies[..f.listed].iter().position(|(born, _)| trust_wiped || q > *born) {
-                        Some(i) => std::mem::take(&mut f.replies[i].1),
-                        // None of them can speak for q: they lost their disk
-                        // since. Wait for the other peers, then list again.
-                        None if f.out > 0 => {
-                            f.waiting = true;
-                            return;
-                        }
-                        None if f.listed < f.replies.len() => {
-                            f.listed = f.replies.len();
-                            return self.call(Wait::List(o, e), Call::List(obj_prefix(o)));
-                        }
-                        None => return self.drop_obj(o),
-                    },
-                };
-                self.st(o).fence = None;
-                // What that peer had of q past its uploads.
-                let more: Vec<Vec<u8>> = tails
-                    .into_iter()
-                    .find(|t| t.epoch == q)
-                    .filter(|t| t.from <= uploaded)
-                    .map(|t| t.ents.into_iter().skip((uploaded - t.from) as usize).collect())
-                    .unwrap_or_default();
-                if more.is_empty() {
-                    return self.write_manifest(o, e, base);
-                }
-                self.stats.tail_entries += more.len() as u64;
-                let cond = self.write_once();
-                self.call(Wait::TailSeg(o, e, base), Call::Put(tail_key(o, e), Val::Seg(frame(&more)), cond));
-            }
+            (Wait::PrevManifest(o, e, segs, uploaded, q), Res::Got(Some((Val::Manifest(m), _)))) => self.from_prev(o, e, m, segs, uploaded, q),
             (Wait::TailSeg(o, e, mut base), Res::Put(Ok(_))) => {
                 base.push(tail_key(o, e));
                 self.write_manifest(o, e, base);
             }
             (Wait::Manifest(o, e), Res::Put(Ok(_))) => {
                 let segs = self.pending_base.remove(&(o, e)).unwrap_or_default();
+                let image = (segs.len() >= self.compact_segs).then(|| image_key(o, e));
                 self.next_act += 1;
                 let act = self.next_act;
                 let st = self.st(o);
                 st.act = act;
                 st.epoch = e;
-                self.out.push(Effect::Restore { obj: o, act, segs });
+                self.out.push(Effect::Restore { obj: o, act, segs, image });
             }
 
             // ---- 3. serve ----
@@ -1411,10 +1395,53 @@ impl Core {
         }
     }
 
+    /// The base for epoch `e` from epoch q: what q started from (`m`: its
+    /// manifest's keys, or its image), q's uploads, and a fenced peer's
+    /// tail of q.
+    fn from_prev(&mut self, o: Obj, e: u32, m: Vec<String>, segs: Vec<String>, uploaded: u64, q: u32) {
+        let mut base = m;
+        base.extend(segs);
+        // A fenced peer's tail of q, if any (no fence: nothing to add).
+        let trust_wiped = self.bugs.trust_wiped;
+        let st = self.st(o);
+        let tails = match st.fence.as_mut().filter(|f| f.epoch == e) {
+            None => vec![],
+            Some(f) => match f.replies[..f.listed].iter().position(|(born, _)| trust_wiped || q > *born) {
+                Some(i) => std::mem::take(&mut f.replies[i].1),
+                // None of them can speak for q: they lost their disk
+                // since. Wait for the other peers, then list again.
+                None if f.out > 0 => {
+                    f.waiting = true;
+                    return;
+                }
+                None if f.listed < f.replies.len() => {
+                    f.listed = f.replies.len();
+                    return self.call(Wait::List(o, e), Call::List(obj_prefix(o)));
+                }
+                None => return self.drop_obj(o),
+            },
+        };
+        self.st(o).fence = None;
+        // What that peer had of q past its uploads.
+        let more: Vec<Vec<u8>> = tails
+            .into_iter()
+            .find(|t| t.epoch == q)
+            .filter(|t| t.from <= uploaded)
+            .map(|t| t.ents.into_iter().skip((uploaded - t.from) as usize).collect())
+            .unwrap_or_default();
+        if more.is_empty() {
+            return self.write_manifest(o, e, base);
+        }
+        self.stats.tail_entries += more.len() as u64;
+        let cond = self.write_once();
+        self.call(Wait::TailSeg(o, e, base), Call::Put(tail_key(o, e), Val::Seg(frame(&more)), cond));
+    }
+
     /// From a listing: the last epoch q before `e` with a manifest, plus q's
     /// uploads. `early`: this is the wrong, before-the-CAS version.
     fn history(&mut self, o: Obj, e: u32, keys: Vec<String>, early: Option<Option<String>>) {
         let mut manifests = vec![];
+        let mut images = HashSet::new();
         let mut segs: BTreeMap<u32, Vec<String>> = BTreeMap::new();
         for k in &keys {
             match parse_key(o, k) {
@@ -1422,6 +1449,9 @@ impl Core {
                 // have dropped what we'd need. Stop.
                 Some((ep, "m")) if ep > e && early.is_none() => return self.drop_obj(o),
                 Some((ep, "m")) if ep < e => manifests.push(ep),
+                Some((ep, "i")) if ep < e => {
+                    images.insert(ep);
+                }
                 Some((ep, part)) if ep < e && part.starts_with('s') => segs.entry(ep).or_default().push(k.clone()),
                 _ => {}
             }
@@ -1442,6 +1472,11 @@ impl Core {
         let ups = segs.remove(&q).unwrap_or_default();
         // Uploads go one at a time, in order: the last one says how many.
         let uploaded = ups.last().and_then(|k| parse_key(o, k)?.1[1..].parse().ok()).unwrap_or(0);
+        // q's image is what q restored from its manifest: start there instead
+        // (and skip reading the manifest).
+        if early.is_none() && images.contains(&q) {
+            return self.from_prev(o, e, vec![image_key(o, q)], ups, uploaded, q);
+        }
         let w = match early {
             Some(etag) => Wait::EarlyManifest(o, etag, e, ups),
             None => Wait::PrevManifest(o, e, ups, uploaded, q),

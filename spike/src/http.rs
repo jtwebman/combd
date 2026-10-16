@@ -228,7 +228,10 @@ struct FleetShared {
 enum Job {
     Call { op: own::OpId, call: own::Call, back: usize },
     /// Fetch an object's segments, and its alarm index entries.
-    Fetch { obj: own::Obj, act: Act, segs: Vec<String>, back: usize },
+    Fetch { obj: own::Obj, act: Act, segs: Vec<String>, image: Option<String>, back: usize },
+    /// Write an object's image (write-once), for the next owner to start
+    /// from. No answer: without it, the next one reads the long way.
+    Image { key: String, entry: Vec<u8> },
     /// Move an object's alarm index entry from `old` to `new` (due times).
     Index { name: String, obj: own::Obj, old: Option<i64>, new: Option<i64>, back: usize },
     /// The due alarms in the index.
@@ -322,7 +325,7 @@ enum Msg {
     /// Fleet mode: a bucket call's result.
     Bucket { op: own::OpId, res: own::Res },
     /// Fleet mode: an object's segments, for a restore, and its alarm index entries.
-    Fetched { obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64> },
+    Fetched { obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>, image: Option<String> },
     /// Fleet mode: an alarm index move finished.
     Indexed { name: String, new: Option<i64>, ok: bool },
     /// Fleet mode: due alarms from the index: (name, due).
@@ -1261,9 +1264,17 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
             let Ok(job) = rx.lock().unwrap().recv() else { return };
             let (back, msg) = match job {
                 Job::Call { op, call, back } => (back, Msg::Bucket { op, res: crate::fleet::run_call(&s3, &call) }),
-                Job::Fetch { obj, act, segs, back } => {
+                Job::Fetch { obj, act, segs, image, back } => {
                     let index = s3.list(&alarm_prefix(obj)).unwrap_or_default().iter().filter_map(|k| k.rsplit('/').next()?.parse().ok()).collect();
-                    (back, Msg::Fetched { obj, act, data: crate::fleet::fetch(&s3, &segs), index })
+                    (back, Msg::Fetched { obj, act, data: crate::fleet::fetch(&s3, &segs), index, image })
+                }
+                Job::Image { key, entry } => {
+                    match s3.put(&key, &own::frame(&[entry]), &crate::s3::Cond::IfAbsent) {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) => eprintln!("{key}: an image is there already"),
+                        Err(e) => eprintln!("{key}: image not written: {e}"),
+                    }
+                    continue;
                 }
                 Job::Index { name, obj, old, new, back } => {
                     // The new entry first, then the old one goes: never a moment with neither.
@@ -1576,7 +1587,7 @@ impl<E: Engine> Loop<'_, E> {
                     self.kick_sync(&obj);
                 }
                 Msg::Bucket { op, res } => self.core_on(own::Event::Reply { op, res }),
-                Msg::Fetched { obj, act, data, index } => self.fetched(obj, act, data, index),
+                Msg::Fetched { obj, act, data, index, image } => self.fetched(obj, act, data, index, image),
                 Msg::Indexed { name, new, ok } => {
                     if let Some(o) = self.objects.get_mut(&name) {
                         o.index_busy = false;
@@ -3197,7 +3208,7 @@ impl<E: Engine> Loop<'_, E> {
                     }
                 }
             }
-            Effect::Restore { obj, act, segs } => self.job(Job::Fetch { obj, act, segs, back: self.me }),
+            Effect::Restore { obj, act, segs, image } => self.job(Job::Fetch { obj, act, segs, image, back: self.me }),
             Effect::Peer { op, node, call } => {
                 let f = self.sh.fleet.as_ref().unwrap();
                 let id = f.next_id.fetch_add(1, Relaxed);
@@ -3219,7 +3230,7 @@ impl<E: Engine> Loop<'_, E> {
     }
 
     /// An object's segments arrived: rebuild its database, then serve.
-    fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>) {
+    fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>, image: Option<String>) {
         let Some(name) = self.names.get(&obj).cloned() else { return };
         let path = store::path_for(&self.sh.cfg.data, &name);
         // Its folder; durability here comes from the peers and the bucket.
@@ -3227,7 +3238,16 @@ impl<E: Engine> Loop<'_, E> {
         if self.remove_object(&name).is_some() {
             self.sh.stats.objects_live.fetch_sub(1, Relaxed);
         }
-        let db = data.and_then(|segs| store::restore(&path, &segs).map_err(|e| e.to_string())).and_then(|()| Db::open(&path).map_err(|e| e.to_string()));
+        let restored = data.and_then(|segs| store::restore(&path, &segs).map_err(|e| e.to_string()));
+        // The image: the file as restored, before anything runs on it.
+        if let (Ok(()), Some(key)) = (&restored, image) {
+            match store::image(&path) {
+                Ok(Some(entry)) => self.job(Job::Image { key, entry }),
+                Ok(None) => {}
+                Err(e) => eprintln!("object {name:?}: no image: {e}"),
+            }
+        }
+        let db = restored.and_then(|()| Db::open(&path).map_err(|e| e.to_string()));
         let ok = match db {
             Ok(db) => {
                 self.sh.stats.objects_live.fetch_add(1, Relaxed);

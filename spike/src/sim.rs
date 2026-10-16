@@ -338,7 +338,8 @@ impl Sim {
             node,
             core: {
                 let (ms, bytes) = self.s.uploads.unwrap();
-                let c = Core::new(node, self.s.bugs).replicate((0..self.s.nodes).collect(), self.s.replicas).uploads(ms, bytes);
+                // Images early, so they happen a lot.
+                let c = Core::new(node, self.s.bugs).replicate((0..self.s.nodes).collect(), self.s.replicas).uploads(ms, bytes).compact_at(3);
                 if self.s.lease { c.read_lease(PROMISE_MS) } else { c }
             },
             alive: true,
@@ -686,7 +687,7 @@ impl Sim {
                 let changes = encode(&std::mem::take(&mut d.unsealed));
                 self.at(0, Msg::Proc(p, Event::Sealed { obj, act, changes }));
             }
-            Effect::Restore { obj, act, segs } => {
+            Effect::Restore { obj, act, segs, image } => {
                 // Segments are write-once, so reading them all now is the same
                 // as reading them one by one later.
                 let mut history = vec![];
@@ -696,6 +697,11 @@ impl Sim {
                         Some(ws) => history.extend(ws),
                         None => ok = false,
                     }
+                }
+                // The image, as restored (and sometimes not written: a crash,
+                // a lost PUT), so loads from it and without it both happen.
+                if let Some(k) = image.filter(|_| ok && self.rng.chance(0.7)) {
+                    self.apply(&Call::Put(k, Val::Seg(crate::own::frame(&[encode(&history)])), Cond::IfAbsent));
                 }
                 self.procs[p].data.insert(obj, Data { history, unsealed: vec![] });
                 let d = self.latency();
