@@ -2088,7 +2088,7 @@ cells.
    30,497 checks pass, plus differential fuzzing against Wasmtime.
 2. ~~Register-based interpreter, toward the 5x target.~~ Done (rounds 2 and
    3): 4x to 10x behind Wasmtime now. Next there: f64 constants as operands
-   (a third of JS fib's ops are still constant loads), and bigger fused ops.
+   (about a quarter of JS fib's ops are still constant loads), and bigger fused ops.
 3. One reserved memory region for all cells (audited FFI crate), to get past
    the per-process map limit.
 4. A real Linux x86 server with pinned threads.
