@@ -113,8 +113,8 @@ node in front of combd.
 2. Make the bucket and its key: `wrangler r2 bucket create combd-arena`,
    then an R2 API token with Object Read & Write on it.
 3. `cp cloud/terraform.tfvars.example cloud/terraform.tfvars` and fill it in.
-4. `DIGITALOCEAN_TOKEN=... CLOUDFLARE_API_TOKEN=... cloud/up.sh`. The
-   Cloudflare token needs Zone: DNS Edit, Zone: Load Balancers Edit, and
-   Account: Load Balancing: Monitors and Pools Edit.
+4. Put a DigitalOcean token and a Cloudflare API token in it too (the
+   Cloudflare one needs Zone: DNS Edit, Zone: Load Balancers Edit, and
+   Account: Load Balancing: Monitors and Pools Edit), then `cloud/up.sh`.
 5. `cloud/deploy.sh` deploys again after a change; `cloud/down.sh` takes it
    all down (about $18 a month while it's up, plus the load balancer).

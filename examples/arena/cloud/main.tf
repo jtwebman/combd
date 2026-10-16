@@ -9,8 +9,8 @@
 #   ./up.sh     secrets, then terraform apply, then deploy the game
 #   ./down.sh   terraform destroy (the bucket stays: empty it to delete it)
 #
-# DIGITALOCEAN_TOKEN and CLOUDFLARE_API_TOKEN come from the environment; the
-# rest from terraform.tfvars (see terraform.tfvars.example).
+# Everything, tokens too, comes from terraform.tfvars (gitignored; see
+# terraform.tfvars.example). Provider settings never go in the state.
 
 terraform {
   required_version = ">= 1.5"
@@ -22,8 +22,12 @@ terraform {
   }
 }
 
-provider "digitalocean" {}
-provider "cloudflare" {}
+provider "digitalocean" {
+  token = var.do_token
+}
+provider "cloudflare" {
+  api_token = var.cloudflare_api_token
+}
 provider "acme" {
   server_url = "https://acme-v02.api.letsencrypt.org/directory"
 }
@@ -47,6 +51,14 @@ variable "image" {
 }
 variable "admin_cidr" {
   description = "Who may reach SSH and the admin API: your IP, as a.b.c.d/32"
+}
+variable "do_token" {
+  description = "DigitalOcean API token (write)"
+  sensitive   = true
+}
+variable "cloudflare_api_token" {
+  description = "Cloudflare API token: Zone DNS Edit, Zone Load Balancers Edit, Account Load Balancing Monitors and Pools Edit"
+  sensitive   = true
 }
 variable "cloudflare_account_id" {}
 variable "r2_bucket" {
@@ -104,9 +116,9 @@ resource "acme_certificate" "arena" {
   common_name               = local.host
   subject_alternative_names = ["*.${local.host}"]
   key_type                  = "P256"
-  # CF_DNS_API_TOKEN from the environment (up.sh sets it).
   dns_challenge {
     provider = "cloudflare"
+    config   = { CF_DNS_API_TOKEN = var.cloudflare_api_token }
   }
 }
 

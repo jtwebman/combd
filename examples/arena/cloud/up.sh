@@ -1,12 +1,9 @@
 #!/bin/sh
 # The arena on DigitalOcean: make the fleet's secrets (once), create
 # everything with Terraform, wait for the nodes, and deploy the game.
-#   DIGITALOCEAN_TOKEN=... CLOUDFLARE_API_TOKEN=... ./up.sh
+#   ./up.sh   (everything it needs is in terraform.tfvars)
 set -e
 cd "$(dirname "$0")"
-: "${DIGITALOCEAN_TOKEN:?set DIGITALOCEAN_TOKEN}" "${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN}"
-# The certificate's DNS challenge uses the same Cloudflare token.
-export CF_DNS_API_TOKEN="$CLOUDFLARE_API_TOKEN"
 [ -f terraform.tfvars ] || { echo "copy terraform.tfvars.example to terraform.tfvars and fill it in"; exit 1; }
 BIN=../../../spike/target/release/combd-spike
 [ -x $BIN ] || (cd ../../../spike && cargo build --release)

@@ -1,4 +1,6 @@
-# Copy to terraform.tfvars (gitignored) and fill in.
+# Copy to terraform.tfvars (gitignored, chmod 600) and fill in.
+do_token              = "dop_v1_..."      # DigitalOcean, API, Tokens: write access
+cloudflare_api_token  = "..."             # Cloudflare, API Tokens: Zone DNS Edit, Zone Load Balancers Edit, Account Load Balancing Monitors and Pools Edit
 domain                = "combd.dev"       # a zone on your Cloudflare account
 name                  = "arena"           # arena.example.com, n0.arena.example.com, ...
 regions               = ["nyc3", "fra1", "sgp1"]
