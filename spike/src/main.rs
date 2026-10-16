@@ -1883,7 +1883,21 @@ mod tests {
         assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 42), false);
         assert_eq!(lock("/do/acct/pg/s", "pg_advisory_unlock", 42), true);
         assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 42), true);
-        assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 42), true, "a pooled lock must not outlive its statement");
+        // A pooled statement's session is reset with the next statement on
+        // its connection, or alone within a moment: a lock it took is gone by then.
+        assert!(eventually(100, || lock("/do/other/pg/q", "pg_try_advisory_lock", 42) == serde_json::json!(true)), "a pooled lock must not outlive its statement by more than a moment");
+        // Cached statements that went stale are prepared again: a table
+        // altered under one, and the user deallocating everything.
+        let star = format!("SELECT * FROM {t} WHERE k = 1");
+        let row = |r: serde_json::Value| r[0].as_array().cloned().unwrap_or_default();
+        let before = row(rows(&q("/api/pg/q", &star, serde_json::json!([]))));
+        assert_eq!(before[1], "other");
+        q("/api/pg/q", &format!("ALTER TABLE {t} ADD COLUMN extra int DEFAULT 7"), serde_json::json!([]));
+        let raw = q("/api/pg/q", &star, serde_json::json!([]));
+        let after = row(rows(&raw));
+        assert_eq!((after.len(), after.last().cloned()), (before.len() + 1, Some(serde_json::json!(7))), "{raw:?}");
+        q("/api/pg/q", "DEALLOCATE ALL", serde_json::json!([]));
+        assert_eq!(row(rows(&q("/api/pg/q", &star, serde_json::json!([])))), after);
         // 6. A crash releases the object's session and its locks.
         lock("/do/acct/pg/s", "pg_advisory_lock", 43);
         assert_eq!(http(port, "POST", "/do/acct/pg/crash", "").0, 500);
@@ -2900,7 +2914,7 @@ callers = ["api"]
     #[ignore]
     fn pg_bench() {
         const MAX: usize = 8;
-        const THREADS: usize = 16;
+        let threads: usize = std::env::var("PG_BENCH_CLIENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
         const SECS: f64 = 4.0;
         let Some(f) = pg_fleet(MAX) else { return };
         let table = format!("bench_{}", std::process::id());
@@ -2910,9 +2924,9 @@ callers = ["api"]
         let ins = format!("INSERT INTO {table} (n, s) VALUES ($1, $2)");
         let upd = format!("UPDATE {table} SET n = n + 1 WHERE id = $1");
         let report = |name: &str, (ops, p50, p99, bad): (f64, f64, f64, usize)| eprintln!("{name:<44} {ops:>8.0} ops/s   p50 {p50:>6.2} ms   p99 {p99:>6.2} ms{}", if bad > 0 { format!("   {bad} failed") } else { String::new() });
-        eprintln!("--- {THREADS} clients, a pool of {MAX}, {SECS} s each, 10,000 rows");
+        eprintln!("--- {threads} clients, a pool of {MAX}, {SECS} s each, 10,000 rows");
         // Plain HTTP to a cell, no database: what the web side costs.
-        report("HTTP only (GET /hello), node 0", load(SECS, THREADS, |_, _| http_to(f.nodes[0], "data.test", "GET", "/hello", "").0 == 200));
+        report("HTTP only (GET /hello), node 0", load(SECS, threads, |_, _| http_to(f.nodes[0], "data.test", "GET", "/hello", "").0 == 200));
         // Postgres itself: one connection per thread, no HTTP.
         for (name, sql) in [("get", &get), ("insert", &ins), ("update", &upd)] {
             let conns: Vec<_> = (0..MAX).map(|_| std::sync::Mutex::new(postgres::Client::connect(&f.pg_url, postgres::NoTls).unwrap())).collect();
@@ -2926,6 +2940,11 @@ callers = ["api"]
             });
             report(&format!("Postgres direct, {MAX} connections: {name}"), r);
         }
+        // One round trip, the floor under everything: one connection, then eight.
+        for n in [1, MAX] {
+            let conns: Vec<_> = (0..n).map(|_| std::sync::Mutex::new(postgres::Client::connect(&f.pg_url, postgres::NoTls).unwrap())).collect();
+            report(&format!("Postgres round trip (SELECT 1), {n} connection(s)"), load(SECS, n, |t, _| conns[t].lock().unwrap().simple_query("SELECT 1").is_ok()));
+        }
         // Through combd.
         let op = |name: &'static str, sql: String| {
             move |port: u16, rng: &mut sim::Rng| {
@@ -2936,9 +2955,9 @@ callers = ["api"]
         };
         for (name, sql) in [("get", get.clone()), ("insert", ins.clone()), ("update", upd.clone())] {
             let o = op(name, sql);
-            report(&format!("combd, manager's node: {name}"), load(SECS, THREADS, |_, rng| o(f.nodes[0], rng)));
-            report(&format!("combd, another node: {name}"), load(SECS, THREADS, |_, rng| o(f.nodes[1], rng)));
-            report(&format!("combd, all three nodes: {name}"), load(SECS, THREADS, |t, rng| o(f.nodes[t % 3], rng)));
+            report(&format!("combd, manager's node: {name}"), load(SECS, threads, |_, rng| o(f.nodes[0], rng)));
+            report(&format!("combd, another node: {name}"), load(SECS, threads, |_, rng| o(f.nodes[1], rng)));
+            report(&format!("combd, all three nodes: {name}"), load(SECS, threads, |t, rng| o(f.nodes[t % 3], rng)));
         }
         let n: i64 = c.query_one(&format!("SELECT count(*) FROM {table}"), &[]).unwrap().get(0);
         eprintln!("--- {n} rows at the end");

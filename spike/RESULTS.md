@@ -1564,34 +1564,59 @@ placement preference; `on_manager_loss = "stop"` has no test of its own.
 ## Postgres through combd: how fast
 
 `pg_bench` (not run by default: `cargo test --release -- --ignored pg_bench
---nocapture`): three nodes on one laptop (nothing else running), a real
-Postgres, a pool of 8, 16 clients, 4 s each, 10,000 rows, by primary key.
+--nocapture`; `PG_BENCH_CLIENTS` sets the clients, 64 by default): three
+nodes on one laptop with nothing else running, a real Postgres (in Docker
+Desktop), a pool of 8, 4 s each, 10,000 rows, by primary key.
 
 | | ops/s | p50 |
 |---|---|---|
-| HTTP only, no database (`GET /hello`) | 7,350 | 2.1 ms |
-| Postgres direct, 8 connections: get / insert / update | 8,374 / 7,178 / 7,072 | 0.9 to 1.1 ms |
-| combd, manager's node: get / insert / update | 3,397 / 3,466 / 3,412 | 4.4 to 4.5 ms |
-| combd, another node | 2,952 / 2,991 / 3,034 | 5.0 to 5.3 ms |
-| combd, all three nodes | 3,044 / 3,265 / 3,235 | 4.8 to 5.1 ms |
+| HTTP only, no database (`GET /hello`) | 7,432 | 8.5 ms (64 clients) |
+| Postgres round trip (`SELECT 1`), 1 / 8 connections | 3,962 / 18,551 | 0.24 / 0.42 ms |
+| Postgres direct, 8 connections: get / insert / update | 8,428 / 6,851 / 6,752 | 0.9 to 1.1 ms |
+| combd, manager's node: get / insert / update | 4,543 / 4,580 / 4,762 | |
+| combd, another node | 3,886 / 3,948 / 3,934 | |
+| combd, all three nodes | 4,035 / 4,124 / 4,118 | |
 
-The first run found a third of the time in the reset after each pooled
-statement: `ROLLBACK`, then `DISCARD ALL`, two round trips. Most leases
-never open a transaction, and the pieces of `DISCARD ALL` can run in the
-same string as the `ROLLBACK`, so it's one round trip now (checked clean in
-an open, an aborted, and no transaction: settings, temp tables, prepared
-statements, advisory locks). That took combd from about 3,000 to 3,400 a
-second.
+It started at about 3,000 a second. The limit was never the event loops (six
+a node instead of two changed nothing) or the clients (64 instead of 16 only
+made the wait longer): it's how long each of the 8 connections is busy per
+statement, and that's round trips to Postgres (0.42 ms each here, under
+load). A pooled statement took three: prepare, execute, and the reset after
+it. Direct takes two. In order:
+- **The reset was two round trips** (`ROLLBACK`, then `DISCARD ALL`). It's
+  one string now: `ROLLBACK` and the pieces of `DISCARD ALL` (which itself
+  won't run in the implicit transaction a multi-statement string gets),
+  checked clean in an open, an aborted, and no transaction. About +12%.
+- **A statement cache per connection:** a statement it has seen skips the
+  prepare. The reset now deallocates only the holder's own `PREPARE`s, so
+  the cache survives it. A cached statement gone stale (its table altered,
+  or the user deallocated everything) is prepared again, once; the test
+  that checks this found the first version never recognized the error.
+  About +15%.
+- **The reset waits for the next statement** and goes out with it, back to
+  back, one round trip (the connection's thread drives the async client
+  for that). If no statement comes within 2 ms, it goes alone, so nothing
+  the last holder left (an open transaction, an advisory lock) is held much
+  past its lease: the guarantee is now "released within a moment", not "at
+  release". About +20%.
+- **A node keeps the members it gets** and lends them to its own next asks
+  with no word to the manager; it hands one back after 5 s unused, or when
+  the manager recalls it because another node's asks wait at max. On one
+  laptop the manager is microseconds away, so this changed little here;
+  across regions it takes a round trip to the manager (230 ms New York to
+  Singapore) off every statement.
 
-What's left: each connection is busy about 2.3 ms per statement through
-combd against 1 ms direct. Every pooled statement is its own lease, so it
-asks the manager, waits for the grant, runs, and resets, and between two
-statements the connection sits idle while that goes around. On one laptop
-the manager is microseconds away (another node costs about 12%); across
-regions it would be a round trip to the manager on every statement (about
-230 ms New York to Singapore). Next: let a node keep a member for its own
-asks while it has them, so the manager is only asked when a node needs
-more, or another needs one back.
+What's left: a connection is busy about 1.3 ms per statement through
+combd against 0.9 ms direct, most of it Postgres doing the reset's ten
+statements along with the real one. A faster client can't help much: the
+same client does two round trips in 0.94 ms direct, against a 0.84 ms
+floor. Not done: the reset could skip what can't have changed, if the
+server ever says so cheaply.
+
+ponytail: when a node's own members are gone at max, it borrows another
+node's free one over the wire for every statement (members never move);
+fine on one laptop, slow across regions. Starting one locally, in place of
+a far free one, is the fix when that shows up.
 
 ## Upload batching
 

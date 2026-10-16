@@ -190,6 +190,8 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2 0.10.9",
+ "tokio",
+ "tokio-postgres",
  "toml",
  "wasm-smith",
  "wasmparser 0.261.0",

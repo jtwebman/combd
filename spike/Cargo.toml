@@ -50,6 +50,10 @@ arbitrary = { version = "1", optional = true }
 # Hand-written AOT cases (`aot-cases/*.wat`) for the fuzz batch.
 wat = { version = "1", optional = true }
 postgres = { version = "0.19", features = ["with-serde_json-1"] }
+# A member's connection, async inside its own thread: a deferred reset goes
+# out with the next statement, one round trip (the versions postgres uses).
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 # An app's manifest: combd.toml, combd.yaml, or combd.json.
 toml = "1"
 serde_yaml_ng = "0.10"

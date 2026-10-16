@@ -9,6 +9,11 @@
 //! deadline. A member that sits free for `idle_ms` is stopped. A member
 //! started on the asker's node is reused by askers on that node first, then
 //! by the nearest one.
+//!
+//! A node may keep a member it was given for its own next asks (they never
+//! reach the core): to the core it stays busy. When asks wait at max, the
+//! core recalls the nearest kept member, and its node hands it back once its
+//! current lease is done.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -33,6 +38,8 @@ pub enum Out {
     /// The ask waited too long.
     Fail { ask: u64 },
     Stop { member: u64 },
+    /// Asks are waiting: hand member `member` back when its lease is done.
+    Recall { member: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -51,6 +58,8 @@ struct Member {
     since: u64,
     /// While it starts: the ask it's for.
     ask: Option<Ask>,
+    /// Asked back from its node (`Out::Recall`), not back yet.
+    recalled: bool,
 }
 
 struct Ask {
@@ -111,6 +120,7 @@ impl Core {
             Some(m) if matches!(m.st, St::Busy | St::Resetting) => {
                 m.st = St::Free;
                 m.since = now;
+                m.recalled = false;
                 self.pump(now)
             }
             Some(_) => vec![],
@@ -149,6 +159,11 @@ impl Core {
         out
     }
 
+    /// The asker was served some other way (its node had a member free).
+    pub fn cancel(&mut self, ask: u64) {
+        self.queue.retain(|a| a.id != ask);
+    }
+
     pub fn gone(&mut self, now: u64, member: u64) -> Vec<Out> {
         self.members.remove(&member);
         self.pump(now)
@@ -170,7 +185,8 @@ impl Core {
     fn pump(&mut self, now: u64) -> Vec<Out> {
         let mut out = vec![];
         let mut i = 0;
-        let mut soon = self.members.values().filter(|m| m.st == St::Resetting).count();
+        // Members about to be free: resetting, or recalled from a node.
+        let mut soon = self.members.values().filter(|m| m.st == St::Resetting || (m.recalled && m.st == St::Busy)).count();
         while i < self.queue.len() {
             let a = &self.queue[i];
             if now >= a.deadline {
@@ -197,8 +213,15 @@ impl Core {
                 let id = self.next;
                 let a = self.queue.remove(i).unwrap();
                 out.push(Out::Start { ask: a.id, member: id, node: a.node });
-                self.members.insert(id, Member { node: a.node, st: St::Starting, since: now, ask: Some(a) });
+                self.members.insert(id, Member { node: a.node, st: St::Starting, since: now, ask: Some(a), recalled: false });
             } else {
+                // At max: ask the nearest other node keeping a member to hand
+                // it back (the asker's own node serves it from its own).
+                let back = self.members.iter().filter(|(_, m)| m.st == St::Busy && !m.recalled && m.node != a.node).min_by_key(|(&id, m)| (dist(m.node).unwrap_or(u64::MAX), id)).map(|(&id, _)| id);
+                if let Some(id) = back {
+                    self.members.get_mut(&id).unwrap().recalled = true;
+                    out.push(Out::Recall { member: id });
+                }
                 i += 1;
             }
         }
@@ -267,6 +290,29 @@ mod tests {
         assert_eq!(p.live(), 0);
         assert!(p.tick(500).is_empty());
         assert_eq!(p.tick(1005), vec![Out::Start { ask: 1, member: 2, node: 0 }]);
+    }
+
+    #[test]
+    fn at_max_kept_members_are_recalled_one_per_waiting_ask() {
+        let mut p = Core::new(Cfg { max: 2, ..CFG });
+        for (ask, node) in [(1, 10), (2, 20)] {
+            p.ask(0, ask, node, vec![]);
+            p.started(0, ask, true, false);
+        }
+        // Node 30 asks twice at max: the nearest kept member first, then the other.
+        assert_eq!(p.ask(1, 3, 30, vec![(20, 1), (10, 5)]), vec![Out::Recall { member: 2 }]);
+        assert_eq!(p.ask(1, 4, 30, vec![(20, 1), (10, 5)]), vec![Out::Recall { member: 1 }]);
+        // A third ask waits: nothing left to recall. Nor from the asker's
+        // own node: it serves that from its own.
+        assert!(p.ask(1, 5, 30, vec![]).is_empty());
+        assert!(p.ask(1, 6, 10, vec![]).is_empty());
+        // Member 2 comes back: the first ask gets it, and the last one in
+        // line can wait on it next.
+        assert_eq!(p.free(2, 2), vec![Out::Grant { ask: 3, member: 2 }, Out::Recall { member: 2 }]);
+        // Ask 4 was served elsewhere: cancelled, member 1 back goes to ask 5.
+        p.cancel(4);
+        p.cancel(6);
+        assert_eq!(p.free(3, 1), vec![Out::Grant { ask: 5, member: 1 }]);
     }
 
     #[test]
