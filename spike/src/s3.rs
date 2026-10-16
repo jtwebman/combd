@@ -253,7 +253,10 @@ impl S3 {
             }
         }
         let mut body = vec![];
-        if head {
+        // These have no body, whatever the headers say (a DELETE's 204 has no
+        // length: read "to the end", it waited out the socket's timeout on a
+        // kept connection, and every delete failed).
+        if head || status == 204 || status == 304 || (100..200).contains(&status) {
         } else if chunked {
             loop {
                 line.clear();
