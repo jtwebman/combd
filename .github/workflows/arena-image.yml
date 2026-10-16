@@ -5,7 +5,7 @@ name: arena image
 on:
   push:
     branches: [main]
-    paths: [spike/**, guest/**, guest-ev/**, examples/arena/**, .github/workflows/arena-image.yml]
+    paths: [spike/**, guest/**, guest-ev/**, examples/arena/**, "!examples/arena/cloud/**", "!examples/arena/**/*.md", .github/workflows/arena-image.yml]
   workflow_dispatch:
 permissions:
   contents: read
