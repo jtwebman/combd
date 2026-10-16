@@ -10,4 +10,4 @@ r2_bucket             = "combd-arena"     # wrangler r2 bucket create combd-aren
 r2_key                = "..."             # R2, Manage API tokens: Object Read & Write, this bucket
 r2_secret             = "..."
 acme_email            = "you@example.com" # Let's Encrypt's account
-load_balancer         = true              # false: no Load Balancing add-on, round robin DNS instead
+load_balancer         = false             # true: Cloudflare Load Balancing (paid) for the page too

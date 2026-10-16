@@ -80,8 +80,8 @@ variable "acme_email" {
   description = "Let's Encrypt account email (it may send notices there)"
 }
 variable "load_balancer" {
-  description = "Cloudflare Load Balancing (a paid add-on). Off: arena.<domain> is the three nodes, round robin."
-  default     = true
+  description = "Cloudflare Load Balancing (a paid add-on): the page itself from the nearest node. Off: arena.<domain> is the nodes, round robin; the game still plays on the nearest (it measures)."
+  default     = false
 }
 
 locals {

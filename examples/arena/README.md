@@ -101,8 +101,10 @@ on games until we've checked what it does.
 
 `cloud/` runs the same game on one DigitalOcean droplet per region (New
 York, Frankfurt, Singapore by default), with an R2 bucket and one name,
-`arena.<your domain>`, that Cloudflare answers with the nearest healthy
-node (DNS only, so a player's ping is to the node itself). Each node also
+`arena.<your domain>` (the nodes, round robin; with `load_balancer = true`,
+Cloudflare's paid load balancer answers with the nearest one). The game
+plays on the nearest node either way: the page measures its round trip to
+each, and the matchmaker picks by those. Each node also
 has its own name, `n0.arena.<domain>` and so on. HTTPS throughout (a
 `.dev` name must have it): Terraform gets a Let's Encrypt certificate for
 the name and `*.name` through a DNS challenge, and Caddy serves it on each
