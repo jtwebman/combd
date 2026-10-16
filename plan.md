@@ -1202,6 +1202,21 @@ neighbor's delay. If guaranteed ticks are ever wanted, a realtime class:
 On a quiet Linux box that typically holds jitter well under 1 ms. Not
 needed for the arena, which says plainly it isn't a game engine.
 
+**Stretch: microseconds.** Doable on Linux with the whole stack tuned: an
+isolated core (`isolcpus`, `nohz_full`, `rcu_nocbs`); busy-waiting on the
+cycle counter instead of sleeping (waking alone can cost 50+ us); no page
+faults or allocation in the tick (`mlockall`, cells touched before the
+match, per-tick arenas); no system calls in the tick (sends batched
+after it); compiled code; `PREEMPT_RT`, and no CPU frequency scaling or
+deep sleep states. Tuned machines show worst cases in the low tens of us
+(`cyclictest`), single digits with busy polling on isolated cores. Not on
+macOS. It doesn't help players over the internet (their round trips wobble
+by milliseconds); it pays off for deterministic simulation, fairness
+between many matches on one core, and latency-critical work. Proof: a
+jitter histogram of tick start times (p50, p99, p99.99, worst) on a quiet
+Linux VM, with and without load on the other cores; aim for p99.99 under
+10 us.
+
 ## Build order (when we do build)
 
 0. **DONE 2026-10-13. Spike: the engine race.** Results in
