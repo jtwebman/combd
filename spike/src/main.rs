@@ -3263,9 +3263,10 @@ callers = ["api"]
         let eng = || interp::Interp { max_pages: 16384 };
         let (port, stop, t) = do_server(eng(), cfg(&dir.0, 2));
         let fired = |port: u16, o: &str| http(port, "GET", &format!("/do/{o}/alarms"), "").1;
-        assert_eq!(http(port, "POST", "/do/a1/alarm", "100").0, 200);
+        // Far enough ahead that a busy machine can't let it fire before we look.
+        assert_eq!(http(port, "POST", "/do/a1/alarm", "1500").0, 200);
         assert_eq!(fired(port, "a1"), r#"{"fired":0,"pending":true}"#);
-        assert!(eventually(2000, || fired(port, "a1") == r#"{"fired":1,"pending":false}"#), "{}", fired(port, "a1"));
+        assert!(eventually(5000, || fired(port, "a1") == r#"{"fired":1,"pending":false}"#), "{}", fired(port, "a1"));
         // The handler crashes on its first try: rolled back, then retried.
         assert_eq!(http(port, "POST", "/do/a2/alarm-crash", "50").0, 200);
         assert!(eventually(3000, || fired(port, "a2") == r#"{"fired":1,"pending":false}"#), "{}", fired(port, "a2"));
