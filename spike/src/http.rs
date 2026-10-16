@@ -202,6 +202,8 @@ struct Shared {
 /// Fleet mode: what the loops share.
 struct FleetShared {
     cfg: FleetCfg,
+    /// This process's boot number, in its heartbeats.
+    boot: u64,
     /// Bucket work, done by a pool of threads.
     jobs: Mutex<Sender<Job>>,
     /// The wire to other nodes (mTLS).
@@ -313,6 +315,8 @@ enum Msg {
     AlarmsDue { due: Vec<(String, i64)> },
     /// Fleet mode: another node forwarded us a request.
     WireIn { conn: usize, id: u64, name: String, req: String },
+    /// Fleet mode: a heartbeat from `node`.
+    Heard { node: own::Node },
     /// Fleet mode: the answer to a request we forwarded.
     WireReply { id: u64, reply: (u16, String) },
     /// Fleet mode: the answer to a peer call (`None`: lost).
@@ -1007,10 +1011,7 @@ where
                         let mut fleet: Vec<own::Node> = f.cfg.peers.keys().copied().chain([f.cfg.node]).collect();
                         fleet.sort();
                         fleet.dedup();
-                        let mut c = Core::with_lease(f.cfg.node, own::Bugs::default(), f.cfg.lease_ms).replicate(fleet, f.cfg.replicas);
-                        // Loop 0 keeps the node's lease alive.
-                        c.renews = me == 0;
-                        c
+                        Core::with_lease(f.cfg.node, own::Bugs::default(), f.cfg.lease_ms).replicate(fleet, f.cfg.replicas)
                     }),
                     freqs: HashMap::new(),
                     next_req: 0,
@@ -1124,17 +1125,63 @@ struct Loop<'a, E: Engine> {
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
-/// Never two nodes with one id: they'd fight over everything it owns. A
-/// live node renews its heartbeat every third of a lease, so if this id's
-/// moves while we watch for half a lease, someone else is using it.
-pub fn node_id_free(s3: &crate::s3::S3, node: own::Node, lease_ms: u64) -> Result<(), String> {
-    let beat = || s3.get(&own::lease_key(node)).ok().flatten().map(|(_, etag)| etag);
-    let before = beat();
-    std::thread::sleep(Duration::from_millis(lease_ms / 2));
-    if before.is_some() && beat() != before {
-        return Err(format!("node id {node} is already in use by a running node: give this one another COMBD_NODE"));
+/// Never two nodes with one id: they'd fight over everything it owns. So
+/// before a node serves, it asks every peer when it last heard this id, and
+/// from which process (`boot`). Heard lately from another process: someone
+/// else has the id, or this node's last process only just died. Wait for it
+/// to go quiet (a restart takes up to a lease longer); still heard after
+/// three leases, it's a live duplicate: don't start.
+/// ponytail: the check's own short-lived wire stays (one thread, idle).
+pub fn node_id_free(fc: &FleetCfg, boot: u64) -> Result<(), String> {
+    let peers: Vec<own::Node> = fc.peers.keys().copied().filter(|&n| n != fc.node).collect();
+    if peers.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    struct Ask(Mutex<Sender<(u16, String)>>);
+    impl wire::Sink for Ask {
+        fn forward(&self, _: usize, _: u64, _: String, _: String) {}
+        fn reply(&self, _: usize, _: u64, reply: (u16, String)) {
+            let _ = self.0.lock().unwrap().send(reply);
+        }
+        fn peer(&self, _: usize, _: u64, _: own::PeerCall) {}
+        fn peer_reply(&self, _: usize, _: u64, _: Option<own::PeerRes>) {}
+        fn ws_push(&self, _: String, _: u64, _: u8, _: Vec<u8>) {}
+        fn ws_lost(&self, _: String, _: u64) {}
+        fn catalog(&self, _: u64, _: Vec<u8>) {}
+        fn heartbeat(&self, _: own::Node, _: u64) {}
+    }
+    let tls = match (&fc.wire_certs, fc.insecure) {
+        (Some(dir), _) => Some(wire::load_tls(dir, fc.node)?),
+        (None, true) => None,
+        (None, false) => return Err("the wire needs certificates (COMBD_WIRE_CERTS) or COMBD_WIRE_INSECURE=1".into()),
+    };
+    let (tx, rx) = channel();
+    let w = wire::start(0, fc.peers.clone(), tls, Ask(Mutex::new(tx))).map_err(|e| format!("the wire: {e}"))?;
+    let t = Instant::now();
+    loop {
+        for &p in &peers {
+            w.send(p, Frame::Forward { id: rand_u64(), name: "_combd/node".into(), req: fc.node.to_string() }, 0);
+        }
+        let mut busy = false;
+        let deadline = Instant::now() + Duration::from_millis((fc.lease_ms / 3).max(200));
+        while let Ok((200, body)) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            busy |= v["boot"].as_u64().is_some_and(|b| b != boot) && v["ms"].as_u64().is_some_and(|ms| ms < fc.lease_ms);
+        }
+        if !busy {
+            return Ok(());
+        }
+        if t.elapsed() > Duration::from_millis(fc.lease_ms * 3) {
+            return Err(format!("node id {} is already in use by a running node: give this one another COMBD_NODE", fc.node));
+        }
+        std::thread::sleep(Duration::from_millis(fc.lease_ms / 3));
+    }
+}
+
+fn rand_u64() -> u64 {
+    let mut b = [0u8; 8];
+    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
+    u64::from_le_bytes(b)
 }
 
 fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize, data: &std::path::Path, catalog: Option<Arc<crate::catnode::CatNode>>) -> FleetShared {
@@ -1144,7 +1191,8 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
         std::process::exit(1);
     }
     println!("combd     node {} in a fleet, bucket {} passed the storage test", fc.node, fc.s3.host);
-    if let Err(e) = node_id_free(&fc.s3, fc.node, fc.lease_ms) {
+    let boot = rand_u64();
+    if let Err(e) = node_id_free(&fc, boot) {
         eprintln!("combd     {e}");
         std::process::exit(1);
     }
@@ -1227,13 +1275,20 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
         std::process::exit(1);
     });
     let (ptx, prx) = channel();
-    let sink = LoopSink { loops: loops.to_vec(), threads, peer_store: ptx.clone(), catalog: catalog.clone() };
+    let heard: Arc<Mutex<HashMap<own::Node, (u64, Instant)>>> = Arc::default();
+    let wire_cell: Arc<std::sync::OnceLock<Wire>> = Arc::default();
+    let sink = LoopSink { loops: loops.to_vec(), threads, peer_store: ptx.clone(), catalog: catalog.clone(), heard: heard.clone(), wire: wire_cell.clone() };
     let wire = wire::start(fc.wire_port, fc.peers.clone(), tls, sink).expect("start the wire");
     // The catalog started first (deploys are read before serving); now it
     // can push.
     if let Some(c) = &catalog {
         let _ = c.wire.set(wire.clone());
     }
+    let _ = wire_cell.set(wire.clone());
+    // Heartbeats go from loop 0's own tick (`heartbeat`), not a thread of
+    // their own: if the event loops stop or stall, so do the heartbeats, and
+    // the other nodes take over. (A thread of its own kept a stopped node
+    // "alive" forever.)
     let (w, ls, s3) = (wire.clone(), loops.to_vec(), fc.s3.clone());
     let learn = move |obj| match s3.get(&own::own_key(obj)) {
         Ok(Some((b, _))) => match own::Val::decode(&own::own_key(obj), &b) {
@@ -1261,6 +1316,7 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
     }
     FleetShared {
         cfg: fc,
+        boot,
         jobs: Mutex::new(tx),
         wire,
         peer_store: Mutex::new(ptx),
@@ -1334,10 +1390,13 @@ impl<E: Engine> Loop<'_, E> {
                     self.core_on(own::Event::Reply { op, res: own::Res::Lost });
                 }
                 // Every loop ticks its core (to retry quiet peers); only
-                // loop 0's renews the node's lease.
+                // loop 0 sends the node's heartbeats.
                 let renew = self.sh.fleet.as_ref().map_or(own::RENEW_MS, |f| f.cfg.lease_ms / 3);
                 if self.last_tick.elapsed() >= Duration::from_millis(renew) {
                     self.last_tick = Instant::now();
+                    if self.me == 0 {
+                        self.heartbeat();
+                    }
                     self.core_on(own::Event::Tick);
                 }
                 if self.me == 0 && self.last_scan.elapsed() >= ALARM_SCAN {
@@ -1466,6 +1525,11 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Msg::AlarmsDue { due } => self.alarms_due(due),
                 Msg::WireIn { conn, id, name, req } => self.submit(Origin::Wire(conn, id), name, req),
+                Msg::Heard { node } => {
+                    if self.core.is_some() {
+                        self.core_on(own::Event::Heard { node });
+                    }
+                }
                 Msg::WireReply { id, reply } => {
                     if let Some((origin, node, sent, _)) = self.wire_out.remove(&id) {
                         self.measured(node, sent.elapsed());
@@ -2947,6 +3011,15 @@ impl<E: Engine> Loop<'_, E> {
     }
 
     /// Hand the core an event, then do what it says.
+    /// "This node is alive", to every peer. From loop 0's tick, so a node
+    /// whose loops stop or stall goes quiet, and gets taken over.
+    fn heartbeat(&self) {
+        let f = self.sh.fleet.as_ref().unwrap();
+        for &p in f.cfg.peers.keys().filter(|&&p| p != f.cfg.node) {
+            f.wire.push(p, Frame::Heartbeat { node: f.cfg.node, boot: f.boot });
+        }
+    }
+
     fn core_on(&mut self, ev: own::Event) {
         let now = self.core_now();
         let core = self.core.as_mut().expect("fleet mode");
@@ -3265,10 +3338,26 @@ struct LoopSink {
     threads: usize,
     peer_store: Sender<(own::PeerCall, PeerBack)>,
     catalog: Option<Arc<crate::catnode::CatNode>>,
+    /// When each node was last heard from, and from which process.
+    heard: Arc<Mutex<HashMap<own::Node, (u64, Instant)>>>,
+    /// This node's wire, once it's up (to answer "who has node N?").
+    wire: Arc<std::sync::OnceLock<Wire>>,
 }
 
 impl wire::Sink for LoopSink {
     fn forward(&self, conn: usize, id: u64, name: String, req: String) {
+        // A node starting up asks when we last heard its id (`node_id_free`).
+        if name == "_combd/node" {
+            let n: own::Node = req.trim().parse().unwrap_or(u32::MAX);
+            let body = match self.heard.lock().unwrap().get(&n) {
+                Some((boot, at)) => serde_json::json!({ "boot": boot, "ms": at.elapsed().as_millis() as u64 }).to_string(),
+                None => "{}".into(),
+            };
+            if let Some(w) = self.wire.get() {
+                w.reply(conn, Frame::Reply { id, status: 200, body });
+            }
+            return;
+        }
         let (tx, waker) = &self.loops[owner(&name, self.threads)];
         let _ = tx.send(Msg::WireIn { conn, id, name, req });
         let _ = waker.wake();
@@ -3299,6 +3388,13 @@ impl wire::Sink for LoopSink {
     fn catalog(&self, seq: u64, entry: Vec<u8>) {
         if let Some(c) = &self.catalog {
             c.push(seq, &entry);
+        }
+    }
+    fn heartbeat(&self, node: own::Node, boot: u64) {
+        self.heard.lock().unwrap().insert(node, (boot, Instant::now()));
+        for (tx, waker) in &self.loops {
+            let _ = tx.send(Msg::Heard { node });
+            let _ = waker.wake();
         }
     }
 }

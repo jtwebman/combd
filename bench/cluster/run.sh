@@ -16,6 +16,7 @@ SECS=${SECS:-15}
 THREADS=${THREADS:-32}
 OBJECTS=${OBJECTS:-50}
 IMG=${IMG:-combd-spike-aot}
+# ENGINE=interp with IMG=combd-arena (examples/arena/Dockerfile) skips the AOT image.
 SILO=pgsty/silo:RELEASE.2026-09-16T00-00-00Z
 NET=combd-fleet
 PEERS=0=node0:7100,1=node1:7100,2=node2:7100
@@ -36,7 +37,7 @@ node() { # n
         -e COMBD_NODE=$1 -e COMBD_PEERS=$PEERS -e COMBD_THREADS=1 -e COMBD_DATA=/data -e COMBD_LEASE_MS=${LEASE_MS:-3000} \
         -e COMBD_REPLICAS=${REPLICAS:-0} \
         -e COMBD_S3=http://s3:9000 -e COMBD_S3_KEY=combd -e COMBD_S3_SECRET=combd-secret-key \
-        $IMG ./target/release/combd-spike serve aot rust 8080 >/dev/null
+        $IMG ./target/release/combd-spike serve ${ENGINE:-aot} rust 8080 >/dev/null
 }
 
 load() { # label

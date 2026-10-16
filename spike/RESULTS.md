@@ -1432,6 +1432,44 @@ their process and on disk as `room/r1`, and 404s), `routes_pick_the_most_
 specific`, and the parser fuzzer now runs every mangled request through a
 manifest's routes too.
 
+## Heartbeats over the wire, not the bucket
+
+A node used to prove it was alive by renewing `lease/<node>` in the bucket
+every third of a lease: a read and a write each time, about $0.14 a node a
+day on S3 ($140 a day at 1,000 nodes), the biggest steady bucket cost. Now
+loop 0 sends every peer a tiny `Heartbeat` frame each tick (node and boot
+number), and a node's cores record when they last heard each other node.
+An object whose owner hasn't been heard from for a lease, by the
+observer's own clock, can be taken over; a node never heard from is timed
+from the core's own start, so a node that just booted doesn't take
+everything. Liveness only: the ownership spec already lets any process
+claim at any time, so no proof changed.
+
+The heartbeats come from the event loop itself, not a thread of their own:
+the first version had a thread, and the real-node test caught it: a node
+whose loops had stopped kept "beating", so nobody ever took over its
+objects. The simulator couldn't have seen that (its processes have no
+threads).
+
+The duplicate-id check moved too (it read heartbeats in the bucket): a
+starting node asks every peer, over the wire, when it last heard its id and
+from which boot. Heard lately from another boot: it waits for that one to
+go quiet (a restart takes up to a lease longer), and after three leases of
+it, refuses: it's a live duplicate.
+
+**The simulator** now sends heartbeats through its network (lost, late, or
+cut by a split like anything else), can lose a node for good (`loss`), and
+checks liveness: once the faults stop, a probe per object must get a write
+acknowledged. A new known-bad version, `assume_alive` (everyone counts as
+heard from, always), is caught at once when a node is lost, and passes
+every safety check when none is, as it must (safety never rested on
+liveness). D2 and D3, with splits, lost disks, and a lost node: 8,000 seeds,
+every invariant held. One thing changed: false deaths (and so takeovers)
+are rarer now that liveness doesn't ride a lossy, slow bucket (0.68
+takeovers a run, from over 1), so the bug that needs a takeover while a
+peer's disk is gone (`wipe_forgets_fence`) takes about 7,000 seeds to show
+instead of under 5,000. Its test searches up to 20,000.
+
 ## The catalog in the nodes: deploys and vars
 
 Every fleet node runs the catalog (`spike/src/catnode.rs`): a thread around

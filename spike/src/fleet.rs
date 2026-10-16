@@ -108,13 +108,16 @@ pub enum Frame {
     /// One way: the catalog's entry at slot `seq` (`catalog.rs`), pushed to
     /// every node after its write.
     Catalog { seq: u64, entry: Vec<u8> },
+    /// One way: "node `node` is alive", sent to every peer a few times a
+    /// lease. `boot` tells one process of a node from another.
+    Heartbeat { node: u32, boot: u64 },
 }
 
 impl Frame {
     pub fn id(&self) -> u64 {
         match self {
             Frame::Forward { id, .. } | Frame::Reply { id, .. } | Frame::Peer { id, .. } | Frame::PeerReply { id, .. } => *id,
-            Frame::WsPush { .. } | Frame::Catalog { .. } => 0,
+            Frame::WsPush { .. } | Frame::Catalog { .. } | Frame::Heartbeat { .. } => 0,
         }
     }
 }
@@ -252,6 +255,11 @@ impl Frame {
                 b.extend_from_slice(&id.to_le_bytes());
                 encode_res(res, &mut b);
             }
+            Frame::Heartbeat { node, boot } => {
+                b.push(7);
+                b.extend_from_slice(&boot.to_le_bytes());
+                b.extend_from_slice(&node.to_le_bytes());
+            }
             Frame::Catalog { seq, entry } => {
                 b.push(6);
                 b.extend_from_slice(&seq.to_le_bytes());
@@ -318,6 +326,11 @@ impl Frame {
             }
             // `id` holds the slot here.
             6 => Ok(Frame::Catalog { seq: id, entry: b[9..].to_vec() }),
+            // `id` holds the boot here.
+            7 => match b.get(9..) {
+                Some(n) if n.len() == 4 => Ok(Frame::Heartbeat { node: u32::from_le_bytes(n.try_into().unwrap()), boot: id }),
+                _ => Err(bad("bad heartbeat")),
+            },
             _ => Err(bad("unknown frame kind")),
         }
     }
@@ -590,6 +603,7 @@ mod tests {
             Frame::PeerReply { id: 4, res: PeerRes::Refused },
             Frame::WsPush { name: "room".into(), sock: 77, op: 2, payload: vec![0, 255, 7] },
             Frame::Catalog { seq: 42, entry: b"{\"id\":1}".to_vec() },
+            Frame::Heartbeat { node: 7, boot: u64::MAX },
             Frame::PeerReply { id: 5, res: PeerRes::Tails { born: 4, tails: vec![Tail { epoch: 2, from: 7, ents: vec![vec![3; 5]] }] } },
         ] {
             let b = f.encode();

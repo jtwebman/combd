@@ -1145,9 +1145,10 @@ one the trap that trimming sets: a deleted slot is empty again). The
 simulator found a seventh (a reader meeting a trimmed slot); the spec has
 it now (58.2 million states). **In the nodes (2026-10-15):** deploys and
 vars are on it, a deploy reaches every node in about 25 ms, and two
-racing deploys can't share a domain. Next: node heartbeats over the wire
-(the ownership core and its simulator), secrets on the catalog, then kill
-and split tests on real nodes.
+racing deploys can't share a domain. Heartbeats are over the wire now (no
+per-node bucket writes), with a liveness check and a lost node in the
+simulator. Next: secrets on the catalog. ponytail: heartbeats go all to
+all; a leader or gossip if fleets get very large.
 
 **The data path's cost, found while pricing this:** D3 uploads a busy
 object's writes as fast as the bucket answers (one upload in flight at a

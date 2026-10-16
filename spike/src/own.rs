@@ -28,9 +28,14 @@
 //! - `obj/o/e<E>/s<N>`: an upload of epoch E: its entries up to entry N.
 //! - `obj/o/e<E>/t`: what the peers had of the previous epoch past its uploads.
 //!
-//! And per node `n`: `lease/n`, a heartbeat the node bumps. A node that hasn't
-//! bumped it for `LEASE_MS`, by the *observer's* clock, can be taken over.
-//! Leases are for liveness only: safety holds with any clocks.
+//! Liveness is over the wire, not the bucket: every node sends every other a
+//! small heartbeat a few times a lease (`Event::Heard`), and a node not heard
+//! from for `LEASE_MS`, by the *observer's* clock, can be taken over (one
+//! never heard from is timed from this core's own start, so a node that just
+//! booted doesn't take everything). It was a heartbeat in the bucket, which
+//! cost a bucket write per node every third of a lease. Leases are for
+//! liveness only: safety holds with any clocks, and any process may claim
+//! at any time (`spec/Ownership.tla`), so this changes no proof.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -46,9 +51,8 @@ pub type OpId = u64;
 pub type Act = u64;
 
 /// How long a node may go without a heartbeat before others take over, in
-/// the simulator. Real nodes set it (`COMBD_LEASE_MS`): it must be several
-/// times the worst round trip to the bucket, and shorter means more bucket
-/// writes (one per node per third of a lease).
+/// the simulator. Real nodes set it (`COMBD_LEASE_MS`): several times the
+/// worst round trip between nodes, and heartbeats go every third of it.
 pub const LEASE_MS: u64 = 1000;
 pub const RENEW_MS: u64 = 200;
 
@@ -188,8 +192,10 @@ pub enum Event {
     /// The executor rebuilt the object from its segments (or couldn't).
     Restored { obj: Obj, act: Act, ok: bool },
     Reply { op: OpId, res: Res },
-    /// Time passes: renew our lease, retry peers that went quiet.
+    /// Time passes: retry peers that went quiet.
     Tick,
+    /// A heartbeat from `node` (over the wire).
+    Heard { node: Node },
     /// Let an idle object go (eviction). Ignored unless nothing is running,
     /// waiting, or not yet uploaded. The next request claims it again.
     Release { obj: Obj },
@@ -244,6 +250,10 @@ pub struct Bugs {
     pub trust_wiped: bool,
     /// D3: a wiped peer doesn't relearn its fence from the bucket.
     pub wipe_forgets_fence: bool,
+    /// Liveness: every node counts as heard from, always (so nothing is ever
+    /// taken over). Safety holds anyway; the simulator's liveness check must
+    /// catch it.
+    pub assume_alive: bool,
 }
 
 /// A node's peer store: the entries it keeps for other nodes' objects. The
@@ -395,7 +405,6 @@ fn mix(mut z: u64) -> u64 {
 #[derive(Clone, Debug)]
 enum Wait {
     ReadRec(Obj),
-    OwnerLease(Obj, Rec, String),
     Cas(Obj, u32),
     ReadBack(Obj, u32),
     /// Only with `Bugs::load_before_cas`: the history, read before the CAS.
@@ -415,19 +424,17 @@ enum Wait {
     Prove(Obj, u32, u64, u64),
     /// Marking the record sealed; nothing waits on it.
     SealRec,
-    LeaseRead,
-    LeaseWrite(u64),
 }
 
 impl Wait {
     fn obj(&self) -> Option<Obj> {
         use Wait::*;
         match self {
-            ReadRec(o) | OwnerLease(o, ..) | Cas(o, _) | ReadBack(o, _) | EarlyList(o, ..) | EarlyManifest(o, ..) | Fence(o, _)
+            ReadRec(o) | Cas(o, _) | ReadBack(o, _) | EarlyList(o, ..) | EarlyManifest(o, ..) | Fence(o, _)
             | List(o, _) | PrevManifest(o, ..) | TailSeg(o, ..) | Manifest(o, _) | Upload(o, ..) | Append(o, ..) | Prove(o, ..) => {
                 Some(*o)
             }
-            SealRec | LeaseRead | LeaseWrite(_) => None,
+            SealRec => None,
         }
     }
 }
@@ -550,8 +557,6 @@ pub struct CoreStats {
 
 pub struct Core {
     pub node: Node,
-    /// Whether this core keeps the node's lease alive (one per node does).
-    pub renews: bool,
     bugs: Bugs,
     lease_ms: u64,
     /// Every node, and how many peers each object gets (0: D2).
@@ -563,11 +568,10 @@ pub struct Core {
     objs: BTreeMap<Obj, ObjSt>,
     /// The segment list of a manifest being written, until it's written.
     pending_base: HashMap<(Obj, u32), Vec<String>>,
-    /// Our heartbeat: the value we last wrote, and whether a renew is out.
-    lease: u64,
-    renewing: bool,
-    /// Other nodes' heartbeats as we last saw them: (value, when it changed, by our clock).
-    seen: HashMap<Node, (u64, u64)>,
+    /// When we last heard from each node (our clock), and when this core
+    /// started (a node never heard from counts from then).
+    heard: HashMap<Node, u64>,
+    born: Option<u64>,
     /// Who owned an object when we last checked, and when (our clock). For
     /// routing only: a fresh hint skips the bucket and redirects at once.
     hints: HashMap<Obj, (Node, u64)>,
@@ -585,7 +589,6 @@ impl Core {
     pub fn with_lease(node: Node, bugs: Bugs, lease_ms: u64) -> Core {
         Core {
             node,
-            renews: true,
             bugs,
             lease_ms,
             fleet: vec![],
@@ -595,9 +598,8 @@ impl Core {
             ops: HashMap::new(),
             objs: BTreeMap::new(),
             pending_base: HashMap::new(),
-            lease: 0,
-            renewing: false,
-            seen: HashMap::new(),
+            heard: HashMap::new(),
+            born: None,
             hints: HashMap::new(),
             stats: CoreStats::default(),
             now: 0,
@@ -671,12 +673,12 @@ impl Core {
 
     pub fn on(&mut self, now: u64, ev: Event) -> Vec<Effect> {
         self.now = now;
+        self.born.get_or_insert(now);
         match ev {
+            Event::Heard { node } => {
+                self.heard.insert(node, now);
+            }
             Event::Tick => {
-                if self.renews && !self.renewing {
-                    self.renewing = true;
-                    self.call(Wait::LeaseRead, Call::Get(lease_key(self.node)));
-                }
                 let live: Vec<Obj> = self.objs.iter().filter(|(_, st)| matches!(st.phase, Phase::Serving(_))).map(|(&o, _)| o).collect();
                 let lease_ms = self.lease_ms;
                 for o in live {
@@ -948,20 +950,6 @@ impl Core {
 
     fn reply(&mut self, now: u64, w: Wait, res: Res) {
         match (w, res) {
-            // ---- the lease ----
-            (Wait::LeaseRead, Res::Got(v)) => {
-                let cur = match v {
-                    Some((Val::Lease(n), _)) => n,
-                    _ => 0,
-                };
-                let next = cur.max(self.lease) + 1;
-                self.call(Wait::LeaseWrite(next), Call::Put(lease_key(self.node), Val::Lease(next), Cond::Any));
-            }
-            (Wait::LeaseWrite(n), Res::Put(Ok(_))) => {
-                self.lease = n;
-                self.renewing = false;
-            }
-            (Wait::LeaseRead | Wait::LeaseWrite(_), _) => self.renewing = false,
             (Wait::SealRec, _) => {}
 
             // ---- 1. claim ----
@@ -979,31 +967,20 @@ impl Core {
                     // It stepped down: no lease to wait out.
                     self.cas(o, Some(etag), r.epoch + 1);
                 } else {
-                    let n = r.node;
-                    self.call(Wait::OwnerLease(o, r, etag), Call::Get(lease_key(n)));
-                }
-            }
-            (Wait::OwnerLease(o, r, etag), Res::Got(v)) => {
-                let beat = match v {
-                    Some((Val::Lease(n), _)) => n,
-                    _ => 0,
-                };
-                // A heartbeat that changed is fresh; one that hasn't changed
-                // for LEASE_MS of our own time means the node is gone.
-                let e = self.seen.entry(r.node).or_insert((beat, now));
-                if e.0 != beat {
-                    *e = (beat, now);
-                }
-                if now.saturating_sub(e.1) >= self.lease_ms {
-                    self.cas(o, Some(etag), r.epoch + 1);
-                } else {
-                    self.hints.insert(o, (r.node, now));
-                    let st = self.st(o);
-                    st.phase = Phase::Idle;
-                    let rs: Vec<ReqId> = st.waiting.drain(..).collect();
-                    for q in rs {
-                        self.answer(q, Answer::Redirect(r.node));
+                    // Heard from lately: it's alive, ask there. Silent for a
+                    // whole lease of our own time: it's gone, take over.
+                    let last = if self.bugs.assume_alive { now } else { self.heard.get(&r.node).copied().unwrap_or(self.born.unwrap_or(now)) };
+                    if now.saturating_sub(last) < self.lease_ms {
+                        self.hints.insert(o, (r.node, now));
+                        let st = self.st(o);
+                        st.phase = Phase::Idle;
+                        let rs: Vec<ReqId> = st.waiting.drain(..).collect();
+                        for q in rs {
+                            self.answer(q, Answer::Redirect(r.node));
+                        }
+                        return;
                     }
+                    self.cas(o, Some(etag), r.epoch + 1);
                 }
             }
             (Wait::Cas(o, e), Res::Put(Ok(etag))) => {

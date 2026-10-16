@@ -751,18 +751,21 @@ fn main_with(args: &[&str]) {
                 Some("seal_early") => bugs.seal_early = true,
                 Some("trust_wiped") => bugs.trust_wiped = true,
                 Some("wipe_forgets_fence") => bugs.wipe_forgets_fence = true,
+                Some("assume_alive") => bugs.assume_alive = true,
                 _ => {}
             }
             let replicas = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
             let t = Instant::now();
             // Extra faults, any of: `splits` (network splits), `only-splits`
-            // (splits and no other faults), `wipes` (a lost disk).
+            // (splits and no other faults), `wipes` (a lost disk), `loss` (a
+            // node lost for good).
             let more = args.get(4..).unwrap_or_default();
+            let loss = more.contains(&"loss");
             let only = more.contains(&"only-splits");
             let splits = only || more.contains(&"splits");
             let wipes = more.contains(&"wipes");
             let (stats, bad) = sim::run_with(seeds, &|| {
-                let mut s = sim::Settings { replicas, bugs, splits, wipes, ..Default::default() };
+                let mut s = sim::Settings { replicas, bugs, splits, wipes, loss, ..Default::default() };
                 if only {
                     (s.lost, s.crash, s.freeze) = (0.0, 0.0, 0.0);
                 }
@@ -2617,9 +2620,12 @@ callers = ["api"]
         let want = if mine.0 == 200 { "{\"value\":\"x\"}" } else { "{\"value\":\"y\"}" };
         everywhere("race.test", "/env/V", want);
         // A second node 1 would fight the first over everything it owns:
-        // it must see the id is taken, and not start.
-        assert!(http::node_id_free(&bucket, 1, 1000).unwrap_err().contains("node id 1 is already in use"));
-        assert!(http::node_id_free(&bucket, 7, 1000).is_ok(), "a new id is free");
+        // its peers have been hearing the first one's heartbeats, so it must
+        // see the id is taken (after waiting three leases), and not start.
+        let twin = fleet::FleetCfg { node: 1, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: 0, wire_certs: Some(certs.clone()), insecure: false };
+        let t = Instant::now();
+        assert!(http::node_id_free(&twin, 12345).unwrap_err().contains("node id 1 is already in use"));
+        assert!(t.elapsed() >= Duration::from_secs(3), "it waits for a just-restarted node to go quiet first: {:?}", t.elapsed());
         // Taken down: gone everywhere; the other app stays.
         assert_eq!(api(&token, "DELETE", "/v1/apps/acme/shop", b"").0, 200);
         for &p in &nodes {

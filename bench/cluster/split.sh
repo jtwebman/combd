@@ -16,6 +16,7 @@ SECS=${SECS:-15}
 THREADS=${THREADS:-32}
 OBJECTS=${OBJECTS:-50}
 IMG=${IMG:-combd-spike-aot}
+# ENGINE=interp with IMG=combd-arena (examples/arena/Dockerfile) skips the AOT image.
 SILO=pgsty/silo:RELEASE.2026-09-16T00-00-00Z
 PEERS=0=w0:7100,1=w1:7100,2=w2:7100
 NODES=node0:8080,node1:8080,node2:8080
@@ -37,7 +38,7 @@ node() { # n: create it, join all three networks, then start it
         -e COMBD_NODE=$1 -e COMBD_PEERS=$PEERS -e COMBD_THREADS=1 -e COMBD_DATA=/data -e COMBD_LEASE_MS=${LEASE_MS:-3000} \
         -e COMBD_REPLICAS=${REPLICAS:-0} \
         -e COMBD_S3=http://s3:9000 -e COMBD_S3_KEY=combd -e COMBD_S3_SECRET=combd-secret-key \
-        $IMG ./target/release/combd-spike serve aot rust 8080 >/dev/null
+        $IMG ./target/release/combd-spike serve ${ENGINE:-aot} rust 8080 >/dev/null
     docker network connect combd-bucket node$1
     docker network connect --alias w$1 combd-wire node$1
     docker start node$1 >/dev/null

@@ -14,7 +14,11 @@
 //! - clocks run fast or slow, by up to 10%,
 //! - processes crash, and their supervisor starts a new one,
 //! - processes freeze; the supervisor may start a new one, and the frozen
-//!   one later wakes up still thinking it owns things.
+//!   one later wakes up still thinking it owns things,
+//! - heartbeats between nodes (how they tell who's alive) go the same way
+//!   as everything else: lost, late, or cut by a split,
+//! - with `loss`, one node dies for good partway through: what it owned must
+//!   be taken over.
 //!
 //! Each process also plays the executor: it keeps an object's data (a list
 //! of writes), seals segments, and restores from them, through the bucket,
@@ -25,7 +29,9 @@
 //! An oracle checks every run: one writer per epoch, no lost acknowledged
 //! write, no history rewrite (the invariants in `spec/Ownership.tla` and
 //! `spec/Replication.tla`), and
-//! that a read sees every write acknowledged before the read was sent.
+//! that a read sees every write acknowledged before the read was sent. And
+//! liveness: once the faults stop, every object takes a write (a probe per
+//! object), so a node that never takes over a dead one's objects is caught.
 
 use crate::own::*;
 use std::collections::{BTreeMap, HashMap};
@@ -73,12 +79,14 @@ pub struct Settings {
     /// One node's disk is lost (once per run, at a crash): its peer store
     /// comes back wiped.
     pub wipes: bool,
+    /// One node dies for good, partway through.
+    pub loss: bool,
     pub bugs: Bugs,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, bugs: Bugs::default() }
+        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, bugs: Bugs::default() }
     }
 }
 
@@ -202,7 +210,14 @@ pub struct Sim {
     answered_by: HashMap<(Obj, u32), Vec<usize>>,
     /// (object, epoch) -> the longest history any answer showed.
     proven: HashMap<(Obj, u32), Vec<W>>,
+    /// The node lost for good, if one was.
+    gone: Option<Node>,
+    /// After the faults: has each object taken a write yet?
+    probes: BTreeMap<Obj, bool>,
 }
+
+/// Probe clients (one per object, after the faults) have ids from here.
+const PROBE: u32 = 1_000_000;
 
 fn is_prefix(a: &[W], b: &[W]) -> bool {
     a.len() <= b.len() && b[..a.len()] == *a
@@ -244,9 +259,16 @@ impl Sim {
             acked: HashMap::new(),
             answered_by: HashMap::new(),
             proven: HashMap::new(),
+            gone: None,
+            probes: BTreeMap::new(),
         };
         for n in 0..sim.s.nodes {
             sim.spawn(n);
+        }
+        // After the faults: one probe per object, until it takes a write.
+        let t = sim.s.duration + 2000;
+        for o in 0..sim.s.objects {
+            sim.at(t, Msg::ClientNext(PROBE + o));
         }
         if sim.s.splits {
             let t = 500 + sim.rng.below(3000);
@@ -316,7 +338,25 @@ impl Sim {
             }
             self.step(m)?;
         }
-        self.check_bucket()
+        self.check_bucket()?;
+        // Liveness: every object took a write once the faults stopped.
+        if let Some((o, _)) = self.probes.iter().find(|(_, done)| !**done) {
+            return Err(format!("object {o} never took a write after the faults stopped (lost node: {:?})", self.gone));
+        }
+        Ok(())
+    }
+
+    /// A probe's next try: a new write, to some node that's still there.
+    fn probe(&mut self, client: u32) {
+        let obj = (client - PROBE) as Obj;
+        if *self.probes.entry(obj).or_insert(false) {
+            return;
+        }
+        let nodes: Vec<Node> = (0..self.s.nodes).filter(|&n| Some(n) != self.gone).collect();
+        let node = nodes[self.rng.below(nodes.len() as u64) as usize];
+        self.next_w += 1;
+        let w = self.next_w;
+        self.client_send(client, Some((obj, Some(w), node)));
     }
 
     fn step(&mut self, m: Msg) -> Result<(), String> {
@@ -331,6 +371,29 @@ impl Sim {
                     self.at(next, Msg::Tick(p));
                 }
                 self.deliver(p, Event::Tick);
+                // Heartbeats to every other node, over the network: lost,
+                // late, or cut like any other message. A frozen process
+                // sends nothing.
+                if !self.procs[p].frozen {
+                    let node = self.procs[p].node;
+                    for m in (0..self.s.nodes).filter(|&m| m != node) {
+                        let Some(&q) = self.current.get(&m) else { continue };
+                        if self.cut(Some(node), Some(m)) || (self.faulty() && self.rng.chance(self.s.lost)) {
+                            continue;
+                        }
+                        let d = self.peer_latency();
+                        self.at(d, Msg::Proc(q, Event::Heard { node }));
+                    }
+                }
+                // One node lost for good, partway through.
+                if self.s.loss && self.gone.is_none() && self.faulty() && self.now > self.s.duration / 3 && self.rng.chance(0.02) {
+                    let n = self.procs[p].node;
+                    self.gone = Some(n);
+                    for q in self.procs.iter_mut().filter(|q| q.node == n) {
+                        q.alive = false;
+                    }
+                    return Ok(());
+                }
                 self.maybe_fault(p);
                 // Eviction: now and then, let an object go.
                 if self.rng.chance(0.02) {
@@ -368,6 +431,7 @@ impl Sim {
                 }
             }
             Msg::Client(req, ans, p) => self.client_answer(req, ans, p)?,
+            Msg::ClientNext(c) if c >= PROBE => self.probe(c),
             Msg::ClientNext(c) => self.client_send(c, None),
             Msg::ClientTimeout(req) => {
                 if let Some(pd) = self.pending.remove(&req) {
@@ -375,6 +439,7 @@ impl Sim {
                     self.at(1, Msg::ClientNext(pd.client));
                 }
             }
+            Msg::Restart(n) if Some(n) == self.gone => {}
             Msg::Restart(n) => self.spawn(n),
             Msg::Split => {
                 if self.faulty() {
@@ -606,6 +671,9 @@ impl Sim {
     fn client_answer(&mut self, req: ReqId, ans: Answer, p: usize) -> Result<(), String> {
         let saw = self.procs[p].saw.remove(&req);
         let Some(pd) = self.pending.remove(&req) else { return Ok(()) }; // timed out already
+        if pd.client >= PROBE && matches!(ans, Answer::Done { .. }) {
+            self.probes.insert(pd.obj, true);
+        }
         match ans {
             Answer::Done { epoch } => {
                 let history = saw.ok_or_else(|| format!("request {req} answered without being run"))?;
@@ -794,8 +862,29 @@ mod tests {
         assert!(bad.is_none(), "{bad:?}");
         assert!(s.wipes > 150 && s.fences > 500, "{s:?}");
         for (name, bugs) in [("trust_wiped", Bugs { trust_wiped: true, ..Bugs::default() }), ("wipe_forgets_fence", Bugs { wipe_forgets_fence: true, ..Bugs::default() })] {
-            let (_, bad) = run_with(0..5000, &|| Settings { replicas: 2, wipes: true, bugs, ..Settings::default() });
-            assert!(bad.is_some(), "{name} was not caught in 5,000 seeds");
+            // Heartbeats made false deaths (and so takeovers) rarer, and these
+            // need a takeover while a peer's disk is gone: up to 20,000 seeds
+            // (the first failure stops it).
+            let (_, bad) = run_with(0..20_000, &|| Settings { replicas: 2, wipes: true, bugs, ..Settings::default() });
+            assert!(bad.is_some(), "{name} was not caught in 20,000 seeds");
+        }
+    }
+
+    /// Liveness, with heartbeats over the network: a node lost for good has
+    /// its objects taken over, so every object takes a write once the
+    /// faults stop. With the known-bad version that hears everyone forever,
+    /// safety still holds (it never rested on liveness), and the probe
+    /// catches it.
+    #[test]
+    fn a_lost_node_is_taken_over() {
+        for replicas in [0, 2] {
+            let (_, bad) = run_with(0..300, &|| Settings { replicas, loss: true, splits: true, ..Settings::default() });
+            assert!(bad.is_none(), "replicas {replicas}: {bad:?}");
+            let alive = Bugs { assume_alive: true, ..Bugs::default() };
+            let (_, bad) = run_with(0..300, &|| Settings { replicas, loss: true, bugs: alive, ..Settings::default() });
+            assert!(bad.is_some_and(|(_, why)| why.contains("never took a write")), "assume_alive wasn't caught");
+            let (_, bad) = run_with(0..100, &|| Settings { replicas, bugs: alive, ..Settings::default() });
+            assert!(bad.is_none(), "with nobody lost, it's only liveness: safety must hold: {bad:?}");
         }
     }
 
