@@ -296,6 +296,11 @@ macOS, this morning's binary against tonight's, interleaved, best of 5:
 | Rust GET /api/users/42 | 4.84 us | 4.87 us | 1.4 us |
 | Rust POST /api/orders | 53.0 us | **46.7 us** | 5.7 us |
 
+On the arena's own nodes (DigitalOcean, one shared x86 vCPU), this morning's
+image against tonight's, best of 3: fib 30 160 to **104 ms**, sieve 925 to
+**742 ms**, sort 1,721 to **1,080 ms**. The gain is bigger on x86 (20% to 37%),
+which has half the registers to keep the loop's state in.
+
 JS compute is **1.9x faster**; Rust compute and the JS API 8% to 17%; Rust
 API requests are about the same (except POST, 12%). Every time the hot loop
 grew, the Rust compute rows paid a few percent back in register allocation
