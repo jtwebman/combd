@@ -37,8 +37,10 @@ serde = { version = "1", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
-# The bucket client: SigV4 signing.
+# The bucket client: SigV4 signing, and Mozilla's root certificates for
+# HTTPS buckets (S3, R2).
 sha2 = "0.10"
+webpki-roots = "1"
 hmac = "0.12"
 # Secrets: AES-256-GCM (rustls already brings it).
 ring = "0.17"

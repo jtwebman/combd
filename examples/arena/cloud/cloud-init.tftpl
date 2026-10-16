@@ -1,0 +1,34 @@
+#cloud-config
+# One arena node: Docker, the fleet's files, and combd. Secrets arrive here
+# (user data is readable only from the droplet itself) and stay root-only.
+package_update: true
+packages:
+  - docker.io
+write_files:
+  - path: /etc/combd/certs/ca.pem
+    encoding: b64
+    content: ${base64encode(ca)}
+  - path: /etc/combd/certs/node${node}.pem
+    encoding: b64
+    content: ${base64encode(cert)}
+  - path: /etc/combd/certs/node${node}.key
+    permissions: "0600"
+    encoding: b64
+    content: ${base64encode(key)}
+  - path: /etc/combd/tokens
+    permissions: "0600"
+    encoding: b64
+    content: ${base64encode(tokens)}
+  - path: /etc/combd/master.key
+    permissions: "0600"
+    encoding: b64
+    content: ${base64encode(master)}
+  - path: /etc/combd/env
+    permissions: "0600"
+    encoding: b64
+    content: ${base64encode(env)}
+runcmd:
+  # A little swap: 1 GB is tight for combd, Docker, and the OS together.
+  - fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  - systemctl enable --now docker
+  - docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro ${image} ./target/release/combd-spike serve-fleet interp 80

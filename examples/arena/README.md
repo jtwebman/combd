@@ -96,3 +96,22 @@ Say what's different, and only what we've checked:
 Multiplayer games on Durable Objects aren't new (Cloudflare's own demos do
 it), so don't claim they can't be done elsewhere. Don't compare with celld
 on games until we've checked what it does.
+
+## Around the world (DigitalOcean and Cloudflare)
+
+`cloud/` runs the same game on one DigitalOcean droplet per region (New
+York, Frankfurt, Singapore by default), with an R2 bucket and one name,
+`arena.<your domain>`, that Cloudflare answers with the nearest healthy
+node (DNS only, so a player's ping is to the node itself). Each node also
+has its own name, `n0.arena.<domain>` and so on.
+
+1. GitHub builds the image (`.github/workflows/arena-image.yml`) on each
+   push; make the `combd-arena` package public once so droplets can pull it.
+2. Make the bucket and its key: `wrangler r2 bucket create combd-arena`,
+   then an R2 API token with Object Read & Write on it.
+3. `cp cloud/terraform.tfvars.example cloud/terraform.tfvars` and fill it in.
+4. `DIGITALOCEAN_TOKEN=... CLOUDFLARE_API_TOKEN=... cloud/up.sh`. The
+   Cloudflare token needs Zone: DNS Edit, Zone: Load Balancers Edit, and
+   Account: Load Balancing: Monitors and Pools Edit.
+5. `cloud/deploy.sh` deploys again after a change; `cloud/down.sh` takes it
+   all down (about $18 a month while it's up, plus the load balancer).

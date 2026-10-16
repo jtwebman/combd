@@ -1,9 +1,11 @@
 //! A small S3 client: just what D2 needs. Get, put with conditions
 //! (`If-None-Match: *`, `If-Match: <etag>`), list, and make a bucket, signed
-//! with SigV4, over plain HTTP/1.1.
+//! with SigV4, over HTTP/1.1, or HTTPS for a bucket like S3 or R2
+//! (`COMBD_S3=https://...`, checked against Mozilla's root certificates).
 //!
-//! ponytail: no TLS and one connection per call. Fine for a bucket on the
-//! same network; real S3 needs TLS and a keep-alive pool.
+//! ponytail: one connection per call (a TLS handshake each time). Fine
+//! while bucket calls are rare (claims, catalog writes, batched uploads); a
+//! keep-alive pool when a far bucket makes them slow.
 //!
 //! `check` is the startup storage test: before a node serves, it proves the
 //! bucket really honors conditional writes, including when 16 writers race.
@@ -18,12 +20,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct S3 {
-    /// `host:port`
+    /// `host` or `host:port`, as signed.
     pub host: String,
+    /// HTTPS.
+    pub tls: bool,
     pub bucket: String,
     pub key: String,
     pub secret: String,
     pub region: String,
+}
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// HTTPS: Mozilla's root certificates, made once.
+fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    static C: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        let c = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider())).with_safe_default_protocol_versions().expect("TLS versions").with_root_certificates(roots).with_no_client_auth();
+        std::sync::Arc::new(c)
+    })
+    .clone()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,7 +107,8 @@ impl S3 {
     pub fn from_env() -> Option<S3> {
         let url = std::env::var("COMBD_S3").ok()?;
         Some(S3 {
-            host: url.trim_start_matches("http://").trim_end_matches('/').to_string(),
+            tls: url.starts_with("https://"),
+            host: url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string(),
             bucket: std::env::var("COMBD_S3_BUCKET").unwrap_or_else(|_| "combd".into()),
             key: std::env::var("COMBD_S3_KEY").unwrap_or_default(),
             secret: std::env::var("COMBD_S3_SECRET").unwrap_or_default(),
@@ -130,7 +149,8 @@ impl S3 {
         use std::net::ToSocketAddrs;
         let mut s = None;
         let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "the bucket's name doesn't resolve");
-        for a in self.host.to_socket_addrs()? {
+        let addr = if self.host.contains(':') { self.host.clone() } else { format!("{}:{}", self.host, if self.tls { 443 } else { 80 }) };
+        for a in addr.to_socket_addrs()? {
             match TcpStream::connect_timeout(&a, Duration::from_secs(2)) {
                 Ok(c) => {
                     s = Some(c);
@@ -139,10 +159,16 @@ impl S3 {
                 Err(e) => last = e,
             }
         }
-        let mut s = s.ok_or(last)?;
+        let s = s.ok_or(last)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         s.set_write_timeout(Some(Duration::from_secs(5)))?;
         s.set_nodelay(true)?;
+        let mut s: Box<dyn ReadWrite> = if self.tls {
+            let name = rustls::pki_types::ServerName::try_from(self.host.split(':').next().unwrap_or_default().to_string()).map_err(std::io::Error::other)?;
+            Box::new(rustls::StreamOwned::new(rustls::ClientConnection::new(tls_config(), name).map_err(std::io::Error::other)?, s))
+        } else {
+            Box::new(s)
+        };
         let target = if qs.is_empty() { uri } else { format!("{uri}?{qs}") };
         let mut req = format!("{method} {target} HTTP/1.1\r\nauthorization: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n", body.len());
         for (k, v) in &hs {
@@ -151,6 +177,7 @@ impl S3 {
         req.push_str("\r\n");
         s.write_all(req.as_bytes())?;
         s.write_all(body)?;
+        s.flush()?;
         let mut r = BufReader::new(s);
         let mut line = String::new();
         r.read_line(&mut line)?;
@@ -189,7 +216,12 @@ impl S3 {
             body.resize(n, 0);
             r.read_exact(&mut body)?;
         } else {
-            r.read_to_end(&mut body)?;
+            // To the end: a TLS server that closes without saying so is the end too.
+            if let Err(e) = r.read_to_end(&mut body) {
+                if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                    return Err(e);
+                }
+            }
         }
         Ok(Resp { status, etag, body })
     }
@@ -200,12 +232,15 @@ impl S3 {
 
     pub fn make_bucket(&self) -> Io<()> {
         let r = self.send("PUT", "", &[], &[], b"")?;
-        // 409: it's already there.
+        // 409: it's already there. 403: this key may not make buckets (an R2
+        // key scoped to one), fine if the bucket's there and it can read it.
         if r.status == 200 || r.status == 409 {
-            Ok(())
-        } else {
-            Err(Self::fail("make bucket", &r))
+            return Ok(());
         }
+        if r.status == 403 && self.send("GET", "", &[("list-type", "2"), ("max-keys", "1")], &[], b"").is_ok_and(|l| l.status == 200) {
+            return Ok(());
+        }
+        Err(Self::fail("make bucket", &r))
     }
 
     /// The object and its etag, or `None` if it isn't there.
@@ -330,6 +365,17 @@ fn unxml(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// HTTPS for real: AWS refuses made-up keys, but only after the TLS
+    /// handshake and its certificate check. Needs the internet:
+    /// `cargo test --release -- --ignored over_https`.
+    #[test]
+    #[ignore]
+    fn a_bucket_over_https() {
+        let b = S3 { host: "s3.amazonaws.com".into(), tls: true, bucket: "combd-tls-check-does-not-exist".into(), key: "AKIAEXAMPLE".into(), secret: "nope".into(), region: "us-east-1".into() };
+        let e = b.get("k").err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("HTTP 403") || e.contains("HTTP 404") || e.contains("HTTP 301"), "a refusal over TLS, not a TLS failure: {e}");
+    }
+
     use super::*;
 
     /// Against a real bucket: `COMBD_S3=http://localhost:9000 COMBD_S3_KEY=.. COMBD_S3_SECRET=..`.
