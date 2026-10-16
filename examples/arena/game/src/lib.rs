@@ -584,8 +584,6 @@ fn finish(m: &mut Match, winner: Option<usize>, now: u64) {
     m.phase = Phase::Over;
     m.over_at = now;
     ended(m);
-    let who = winner.map_or("draw".to_string(), |w| m.players[w].clone());
-    sql("INSERT OR REPLACE INTO meta (k, v) VALUES ('winner', ?)", &[json!(who)]);
     for side in 0..2 {
         let result = match winner {
             None => "draw",
@@ -611,8 +609,6 @@ fn matchbox(method: &str, path: &str, body: &str) -> String {
             SPARE.with(|s| s.set(None));
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let s = |k: &str, i: usize| v[k][i].as_str().unwrap_or("").to_string();
-            sql("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)", &[]);
-            sql("INSERT OR REPLACE INTO meta (k, v) VALUES ('players', ?)", &[json!(format!("{} vs {}", s("players", 0), s("players", 1)))]);
             if s("players", 0) == s("players", 1) {
                 return err(400, "a player can't play themselves");
             }
