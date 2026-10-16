@@ -217,6 +217,10 @@ fn encode_res(res: &PeerRes, b: &mut Vec<u8>) {
             b.push(4);
             b.extend_from_slice(&ms.to_le_bytes());
         }
+        PeerRes::Kept(n) => {
+            b.push(5);
+            b.extend_from_slice(&n.to_le_bytes());
+        }
         PeerRes::Tails { born, tails: ts } => {
             b.push(3);
             b.extend_from_slice(&born.to_le_bytes());
@@ -235,6 +239,7 @@ fn decode_res(r: &mut Rd) -> Option<PeerRes> {
         1 => PeerRes::Have(r.u64()?),
         2 => PeerRes::Refused,
         4 => PeerRes::Wait(r.u64()?),
+        5 => PeerRes::Kept(r.u64()?),
         3 => {
             let born = r.u32()?;
             let n = r.u32()?;
@@ -683,6 +688,7 @@ mod tests {
             Frame::Heartbeat { node: 7, boot: u64::MAX },
             Frame::Pool { body: b"{}".to_vec() },
             Frame::PeerReply { id: 9, res: PeerRes::Wait(1500) },
+            Frame::PeerReply { id: 10, res: PeerRes::Kept(7) },
             Frame::PeerReply { id: 5, res: PeerRes::Tails { born: 4, tails: vec![Tail { epoch: 2, from: 7, ents: vec![vec![3; 5]] }] } },
         ] {
             let b = f.encode();

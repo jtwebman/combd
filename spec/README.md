@@ -130,6 +130,13 @@ states, no errors. Two more known-bad versions must fail:
 | a fence ignores a peer's promise | NoStaleRead |
 | a promise lapses while the owner still trusts it | NoStaleRead |
 
+A peer that has told a newer owner's fence to wait renews the older epoch's
+promise no more (in the code, it answers `Kept`), so an old owner that keeps
+going can't hold a takeover off forever. That needs no change here: `Renew`
+may always not happen, so fewer renewals are behaviors this spec already
+checks, and `GetLease` already asks for every peer's promise. (The model
+checks safety only; the simulator checks that a takeover then happens.)
+
 The peers are interchangeable, and so are the writes, so TLC checks one of
 each set of mirror-image states (`SYMMETRY`); that's sound for invariants,
 which is all we check.

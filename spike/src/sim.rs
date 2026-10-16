@@ -110,15 +110,12 @@ pub struct Settings {
     pub beats: bool,
     /// Peer round trips in this range, ms (`None`: 1 to 5, a data center).
     pub peer_ms: Option<(u64, u64)>,
-    /// Check that a write gets in soon after the faults stop. Off only where
-    /// a known livelock is (see `beats_keep_reads_under_the_lease`).
-    pub liveness: bool,
     pub bugs: Bugs,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, lease: true, uploads: None, beats: false, peer_ms: None, liveness: true, bugs: Bugs::default() }
+        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, lease: true, uploads: None, beats: false, peer_ms: None, bugs: Bugs::default() }
     }
 }
 
@@ -409,7 +406,7 @@ impl Sim {
             return Err(format!("object {o} never took a write after the faults stopped (lost node: {:?})", self.gone));
         }
         // And soon: the worst seen is about 4 s (a takeover, then a write).
-        if self.s.liveness && self.stats.probe_ms > 10 * crate::own::LEASE_MS {
+        if self.stats.probe_ms > 10 * crate::own::LEASE_MS {
             return Err(format!("a write took {} ms to get in after the faults stopped (lost node: {:?})", self.stats.probe_ms, self.gone));
         }
         Ok(())
@@ -998,7 +995,11 @@ mod tests {
         let (s, bad) = run_with(0..300, &|| Settings { replicas: 2, splits: true, wipes: true, ..Settings::default() });
         assert!(bad.is_none(), "{bad:?}");
         assert!(s.lease_reads > s.reads_done / 4, "the lease should answer many reads: {s:?}");
-        for (name, bugs) in [("lease_no_promise", Bugs { lease_no_promise: true, ..Bugs::default() }), ("lease_overtrust", Bugs { lease_overtrust: true, ..Bugs::default() })] {
+        for (name, bugs) in [
+            ("lease_no_promise", Bugs { lease_no_promise: true, ..Bugs::default() }),
+            ("lease_overtrust", Bugs { lease_overtrust: true, ..Bugs::default() }),
+            ("lease_trusts_kept", Bugs { lease_trusts_kept: true, ..Bugs::default() }),
+        ] {
             let (_, bad) = run_with(0..2000, &|| Settings { replicas: 2, splits: true, bugs, ..Settings::default() });
             assert!(bad.as_ref().is_some_and(|(_, why)| why.contains("missed write")), "{name} wasn't caught: {bad:?}");
         }
@@ -1009,21 +1010,20 @@ mod tests {
     /// waited for a round, every beat queued behind it and the lease was
     /// never used again (found on the arena's fleet: pings of 400 to 1,000 ms).
     ///
-    /// The liveness check is off here: an old owner that keeps renewing its
-    /// lease with a peer holds off a newer owner's fence there (a peer
-    /// extends its promise on every append), so a takeover can wait as long
-    /// as the old owner keeps going (seed 113: 15 s). Safety holds. Fixing it
-    /// changes the protocol (a peer with a newer fence waiting stops
-    /// promising, and says so), so it goes through the spec first.
+    ///
+    /// And a takeover isn't held off by an old owner that keeps renewing: a
+    /// peer with a newer owner's fence waiting stops promising the older
+    /// epoch (`Kept`), so the wait ends. Before, it lasted as long as the old
+    /// owner kept going (seed 113: 15 s for a write to get in).
     #[test]
     fn beats_keep_reads_under_the_lease() {
-        let far = || Settings { replicas: 2, beats: true, peer_ms: Some((100, 250)), liveness: false, ..Settings::default() };
+        let far = || Settings { replicas: 2, beats: true, peer_ms: Some((100, 250)), ..Settings::default() };
         let (s, bad) = run_with(0..300, &far);
         assert!(bad.is_none(), "{bad:?}");
         assert!(s.lease_reads > s.reads_done / 2, "the lease should answer most reads: {s:?}");
         let (_, bad) = run_with(0..300, &|| Settings { splits: true, wipes: true, ..far() });
         assert!(bad.is_none(), "{bad:?}");
-        // Near peers: the liveness check holds too.
+        // Near peers, with splits.
         let (_, bad) = run_with(0..500, &|| Settings { replicas: 2, beats: true, splits: true, ..Settings::default() });
         assert!(bad.is_none(), "{bad:?}");
     }

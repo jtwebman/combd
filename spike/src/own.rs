@@ -176,6 +176,9 @@ pub enum PeerRes {
     /// Not yet: this store promised the object's owner it wouldn't be fenced
     /// for this many more ms (a read lease, see `PeerStore::handle_at`).
     Wait(u64),
+    /// As `Have`, but with no promise: a newer owner's fence is waiting here,
+    /// so this store stops renewing the older epoch's lease.
+    Kept(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -273,6 +276,8 @@ pub struct Bugs {
     pub lease_no_promise: bool,
     /// Read lease: the owner trusts its lease longer than peers promised.
     pub lease_overtrust: bool,
+    /// Read lease: the owner counts a `Kept` (no promise) as a promise.
+    pub lease_trusts_kept: bool,
 }
 
 /// A node's peer store: the entries it keeps for other nodes' objects. The
@@ -299,6 +304,10 @@ pub struct PeerStore {
     /// Promises made, per object: (epoch, until). In memory only: a
     /// restart is covered by `started`.
     held: HashMap<Obj, (u32, u64)>,
+    /// A newer owner told to wait, per object: (its epoch, until). Older
+    /// epochs get no more promises meanwhile, so the wait ends. It lapses
+    /// (an owner that gave up), and a fence that's still waiting renews it.
+    wants: HashMap<Obj, (u32, u64)>,
     started: Option<u64>,
     /// The bug switch `lease_no_promise`, for tests only.
     pub ignores_promise: bool,
@@ -322,6 +331,7 @@ impl PeerStore {
     /// is forgotten, so it holds off every fence for a lease.
     pub fn started(&mut self, now: u64) {
         self.held.clear();
+        self.wants.clear();
         self.started = Some(now);
     }
 
@@ -334,6 +344,8 @@ impl PeerStore {
                 let held = self.held.get(obj).filter(|h| *epoch > h.0).map_or(0, |h| h.1);
                 let until = held.max(started + self.promise_ms);
                 if now < until {
+                    let w = self.wants.entry(*obj).or_insert((0, 0));
+                    *w = (w.0.max(*epoch), now + 2 * self.promise_ms);
                     return PeerRes::Wait(until - now);
                 }
             }
@@ -343,7 +355,10 @@ impl PeerStore {
             _ => None,
         };
         let res = self.handle(call);
-        if let (Some((obj, epoch)), PeerRes::Have(_), true) = (append, &res, self.promise_ms > 0) {
+        if let (Some((obj, epoch)), PeerRes::Have(n), true) = (append, &res, self.promise_ms > 0) {
+            if self.wants.get(&obj).is_some_and(|&(e, until)| e > epoch && now < until) {
+                return PeerRes::Kept(*n);
+            }
             self.held.insert(obj, (epoch, now + self.promise_ms));
         }
         res
@@ -1281,16 +1296,22 @@ impl Core {
                 self.kick(o);
             }
             (Wait::Append(o, e, i, round, sent), res) => {
+                let trusts_kept = self.bugs.lease_trusts_kept;
                 let Some(s) = self.serving_in(o, e) else { return };
                 let p = &mut s.peers[i];
                 p.busy = false;
                 match res {
-                    Res::Peer(PeerRes::Have(n)) => {
+                    Res::Peer(r @ (PeerRes::Have(_) | PeerRes::Kept(_))) => {
+                        let (PeerRes::Have(n) | PeerRes::Kept(n)) = r else { unreachable!() };
                         // One call in flight per peer: its answer is the truth.
                         p.have = n;
                         p.round = p.round.max(round);
                         p.down = false;
-                        p.acked_at = Some(p.acked_at.map_or(sent, |a| a.max(sent)));
+                        // Kept: it has them, but promised nothing (a newer
+                        // owner waits there), so the lease can't count on it.
+                        if matches!(r, PeerRes::Have(_)) || trusts_kept {
+                            p.acked_at = Some(p.acked_at.map_or(sent, |a| a.max(sent)));
+                        }
                     }
                     // Fenced: a newer owner has it.
                     Res::Peer(PeerRes::Refused) => return self.drop_obj(o),

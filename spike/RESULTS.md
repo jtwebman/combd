@@ -2113,15 +2113,16 @@ cells.
 
 ## Next
 
-0. **A takeover can wait on an old owner that keeps renewing its lease.** A
-   peer extends its promise on every append, and a fence for a newer epoch
-   waits out the promise, so an old owner that still reaches a peer (a
-   one-sided split, a stalled process that wakes) holds off a newer owner
-   there for as long as it keeps renewing. Safety holds; clients routed to
-   the newer owner wait (simulator, objects beating with peers far away:
-   `combd-spike sim 113..114 none 2 beats far`, 15 s). Fix: a peer with a
-   newer fence waiting stops promising the old epoch, and says so in its
-   answer (or the old owner over-trusts its lease); spec it in TLA+ first.
+0. ~~**A takeover can wait on an old owner that keeps renewing its lease.**~~
+   Fixed: a peer that has told a newer owner's fence to wait stops promising
+   the older epoch, and answers its appends with `Kept` (it has them, no
+   promise), which the owner doesn't count toward its lease. The wait then
+   ends within a lease. Simulator, objects beating with peers far away:
+   seed 113's takeover went from 15.3 s to 1.9 s, and 280,000 seeds across
+   every fault mix hold every invariant, liveness included; the owner
+   counting `Kept` as a promise (`lease_trusts_kept`) is caught. The spec
+   needs no change: peers renewing less is a subset of what it checks, and
+   it already models an owner's lease as needing every peer's promise.
 1. ~~Run the official Wasm spec test suite against the interpreter.~~ Done:
    30,497 checks pass, plus differential fuzzing against Wasmtime.
 2. ~~Register-based interpreter, toward the 5x target.~~ Done (rounds 2 and
