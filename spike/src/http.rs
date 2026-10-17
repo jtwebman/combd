@@ -328,7 +328,7 @@ enum Msg {
     /// Fleet mode: an object's segments, for a restore, and its alarm index entries.
     Fetched { obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>, image: Option<String> },
     /// An object's image is written.
-    Imaged { obj: own::Obj, act: Act },
+    Imaged { obj: own::Obj, act: Act, key: String },
     /// Fleet mode: an alarm index move finished.
     Indexed { name: String, new: Option<i64>, ok: bool },
     /// Fleet mode: due alarms from the index: (name, due).
@@ -497,6 +497,8 @@ struct Task<E: Engine> {
 
 /// A Durable Object in memory.
 struct Object<E: Engine> {
+    /// An image taken at a seal, until the core says to put it.
+    image: Option<(String, Vec<u8>)>,
     /// The warm cell, when no request is using it. `None` after a crash.
     cell: Option<Cell<E>>,
     db: Arc<Mutex<Db>>,
@@ -530,6 +532,7 @@ struct Object<E: Engine> {
 impl<E: Engine> Object<E> {
     fn new(db: Db) -> Object<E> {
         Object {
+            image: None,
             new_dirs: vec![],
             cell: None,
             db: Arc::new(Mutex::new(db)),
@@ -1272,7 +1275,7 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
                     (back, Msg::Fetched { obj, act, data: crate::fleet::fetch(&s3, &segs), index, image })
                 }
                 Job::Image { obj, act, key, entry, back } => match s3.put(&key, &own::frame(&[entry]), &crate::s3::Cond::IfAbsent) {
-                    Ok(Ok(_)) => (back, Msg::Imaged { obj, act }),
+                    Ok(Ok(_)) => (back, Msg::Imaged { obj, act, key }),
                     Ok(Err(_)) => {
                         eprintln!("{key}: an image is there already");
                         continue;
@@ -1594,7 +1597,7 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Msg::Bucket { op, res } => self.core_on(own::Event::Reply { op, res }),
                 Msg::Fetched { obj, act, data, index, image } => self.fetched(obj, act, data, index, image),
-                Msg::Imaged { obj, act } => self.core_on(own::Event::Imaged { obj, act }),
+                Msg::Imaged { obj, act, key } => self.core_on(own::Event::Imaged { obj, act, key }),
                 Msg::Indexed { name, new, ok } => {
                     if let Some(o) = self.objects.get_mut(&name) {
                         o.index_busy = false;
@@ -3186,12 +3189,27 @@ impl<E: Engine> Loop<'_, E> {
                 let (name, cell_req) = (fr.name.clone(), fr.cell_req.clone());
                 self.submit(Origin::Fleet(req), name, cell_req);
             }
-            Effect::Seal { obj, act } => {
+            Effect::Seal { obj, act, image } => {
                 let Some(name) = self.names.get(&obj).cloned() else { return };
-                let Some(o) = self.objects.get(&name) else { return };
+                let Some(o) = self.objects.get_mut(&name) else { return };
                 let changes = {
                     let db = o.db.lock().unwrap();
                     let c = db.seal();
+                    // An image as of this seal, if asked and nothing's running
+                    // (else none this time; the core asks again later).
+                    // ponytail: read on the loop, the whole file; a big object
+                    // stalls its loop that long every compact_segs uploads.
+                    o.image = match (&c, image) {
+                        (Ok(_), Some(key)) if !o.busy => match db.image_now() {
+                            Ok(Some(entry)) => Some((key, entry)),
+                            Ok(None) => None,
+                            Err(e) => {
+                                eprintln!("object {name:?}: no image: {e}");
+                                None
+                            }
+                        },
+                        _ => None,
+                    };
                     // Checkpoint right after a seal, never mid-request.
                     if c.is_ok() && !o.busy && db.wants_checkpoint() {
                         let _ = db.checkpoint_local();
@@ -3215,6 +3233,12 @@ impl<E: Engine> Loop<'_, E> {
                         eprintln!("object {name:?}: seal failed: {e}");
                         self.remove_object(&name);
                     }
+                }
+            }
+            Effect::PutImage { obj, act } => {
+                let Some(name) = self.names.get(&obj).cloned() else { return };
+                if let Some((key, entry)) = self.objects.get_mut(&name).and_then(|o| o.image.take()) {
+                    self.job(Job::Image { obj, act, key, entry, back: self.me });
                 }
             }
             Effect::Restore { obj, act, segs, image } => self.job(Job::Fetch { obj, act, segs, image, back: self.me }),

@@ -418,6 +418,17 @@ impl Db {
         Ok(encode_pages(page as u32, size, &pages))
     }
 
+    /// Right after a `seal`: the database as one entry (`image`), as of that
+    /// seal. Checkpoints first, and gives up (`None`) if the WAL didn't empty
+    /// (a reader or a transaction held it): the file alone wouldn't be all.
+    pub fn image_now(&self) -> std::io::Result<Option<Vec<u8>>> {
+        self.checkpoint_local().map_err(std::io::Error::other)?;
+        if std::fs::metadata(&self.wal_path).is_ok_and(|m| m.len() > 0) {
+            return Ok(None);
+        }
+        image(&self.path)
+    }
+
     /// D2: copy the WAL into the database file and empty it. No fsync: in D2
     /// the local file is a cache, rebuilt from the bucket after a restart.
     /// Only right after a `seal`.

@@ -774,6 +774,7 @@ fn main_with(args: &[&str]) {
                 Some("lease_overtrust") => bugs.lease_overtrust = true,
                 Some("lease_trusts_kept") => bugs.lease_trusts_kept = true,
                 Some("gc_unproven") => bugs.gc_unproven = true,
+                Some("gc_newest_image") => bugs.gc_newest_image = true,
                 _ => {}
             }
             let replicas = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -1629,9 +1630,9 @@ mod tests {
         assert_eq!(ok(b, "GET", "/do/ev/count", ""), "{\"count\":2}");
     }
 
-    /// Compaction on a real node: an object with 20 segments, let go and
-    /// back, writes an image and deletes what it replaced; back again, it
-    /// starts from the image, with every write.
+    /// Compaction on a real node: an object with 20 uploads, let go and back
+    /// (an image, mid-epoch or at the restore, and the deletes); back again,
+    /// it starts from the image, with every write.
     #[test]
     fn fleet_compaction() {
         let Some(base) = s3::S3::from_env() else {
@@ -1672,16 +1673,65 @@ mod tests {
             ok("POST", "/do/cmp/incr");
         }
         let keys = |part: &str| s3.list("obj/").unwrap().into_iter().filter(|k| k.rsplit('/').next().is_some_and(|p| p.starts_with(part))).count();
-        assert!(keys("s") >= 20, "{} segments", keys("s"));
-        // Let go, then back: from 20 segments, so an image, then the deletes.
+        // Let go, then back.
         assert!(eventually(5000, || stat(p, "evictions") >= 1));
         assert_eq!(ok("GET", "/do/cmp/count"), "{\"count\":20}");
-        assert!(eventually(5000, || keys("i") == 1 && stat(p, "gc_deleted") >= 20), "images {}, deleted {}", keys("i"), stat(p, "gc_deleted"));
+        assert!(eventually(5000, || keys("i") >= 1 && stat(p, "gc_deleted") >= 16), "images {}, deleted {}", keys("i"), stat(p, "gc_deleted"));
         assert!(keys("s") < 5, "{} segments left", keys("s"));
         // Back once more: from the image, with every write.
         ok("POST", "/do/cmp/incr");
         assert!(eventually(5000, || stat(p, "evictions") >= 2));
         assert_eq!(ok("GET", "/do/cmp/count"), "{\"count\":21}");
+    }
+
+    /// Compaction while an object stays up: every so many uploads, an image
+    /// as of an entry, and the segments it holds go, with no restore.
+    #[test]
+    fn fleet_compaction_while_up() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 1).unwrap();
+        let s3 = s3::S3 { bucket: test_bucket(), ..base };
+        let wport = free_ports(1)[0];
+        let fc = fleet::FleetCfg {
+            node: 0,
+            lease_ms: 1000,
+            replicas: 0,
+            s3: s3.clone(),
+            peers: HashMap::from([(0, format!("127.0.0.1:{wport}"))]),
+            wire_port: wport,
+            wire_certs: Some(dir.0.join("certs")),
+            insecure: false,
+            upload_ms: 0,
+            upload_bytes: 1 << 20,
+            read_lease: true,
+        };
+        let c = http::Config { idle: Duration::from_millis(1500), fleet: Some(fc), ..cfg(&dir.0.join("d0"), 1) };
+        let (p, _, _) = do_server(interp::Interp { max_pages: 16384 }, c);
+        let ok = |method: &str, path: &str| -> String {
+            for _ in 0..100 {
+                let (c, r) = http(p, method, path, "");
+                if c == 200 {
+                    return r;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("{method} {path} never answered 200");
+        };
+        let keys = |part: &str| s3.list("obj/").unwrap().into_iter().filter(|k| k.rsplit('/').next().is_some_and(|p| p.starts_with(part))).count();
+        // One upload per write, the object up the whole time.
+        for _ in 0..40 {
+            ok("POST", "/do/up/incr");
+        }
+        assert!(eventually(5000, || stat(p, "gc_deleted") >= 16), "deleted {}, images {}, segments {}", stat(p, "gc_deleted"), keys("i"), keys("s"));
+        assert_eq!(stat(p, "evictions"), 0, "it was let go: not the case under test");
+        assert!(keys("i") >= 1 && keys("s") < 30, "images {}, segments {}", keys("i"), keys("s"));
+        // Let go and back: from the image and what came after, every write.
+        assert!(eventually(5000, || stat(p, "evictions") >= 1));
+        assert_eq!(ok("GET", "/do/up/count"), "{\"count\":40}");
     }
 
     /// D3 on real nodes: three nodes, two peers per object. Writes are

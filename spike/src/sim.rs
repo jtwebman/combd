@@ -196,6 +196,8 @@ const PROMISE_MS: u64 = LEASE_MS / 2;
 struct Data {
     history: Vec<W>,
     unsealed: Vec<W>,
+    /// An image taken at a seal, until it's put.
+    image: Option<(String, Vec<u8>)>,
 }
 
 struct Proc {
@@ -684,9 +686,11 @@ impl Sim {
                 let proof = !self.beats.contains(&req);
                 self.at(0, Msg::Proc(p, Event::Ran { obj, act, req, changed: write.is_some(), proof }));
             }
-            Effect::Seal { obj, act } => {
+            Effect::Seal { obj, act, image } => {
                 let d = self.procs[p].data.entry(obj).or_default();
                 let changes = encode(&std::mem::take(&mut d.unsealed));
+                // As of this entry: everything run so far.
+                d.image = image.map(|k| (k, encode(&d.history)));
                 self.at(0, Msg::Proc(p, Event::Sealed { obj, act, changes }));
             }
             Effect::Restore { obj, act, segs, image } => {
@@ -703,14 +707,24 @@ impl Sim {
                 // The image, as restored (and sometimes not written: a crash,
                 // a lost PUT), so loads from it and without it both happen.
                 if let Some(k) = image.filter(|_| ok && self.rng.chance(0.7)) {
-                    if let Res::Put(Ok(_)) = self.apply(&Call::Put(k, Val::Seg(crate::own::frame(&[encode(&history)])), Cond::IfAbsent)) {
+                    if let Res::Put(Ok(_)) = self.apply(&Call::Put(k.clone(), Val::Seg(crate::own::frame(&[encode(&history)])), Cond::IfAbsent)) {
                         let d = self.latency();
-                        self.at(d, Msg::Proc(p, Event::Imaged { obj, act }));
+                        self.at(d, Msg::Proc(p, Event::Imaged { obj, act, key: k }));
                     }
                 }
-                self.procs[p].data.insert(obj, Data { history, unsealed: vec![] });
+                self.procs[p].data.insert(obj, Data { history, unsealed: vec![], image: None });
                 let d = self.latency();
                 self.at(d, Msg::Proc(p, Event::Restored { obj, act, ok }));
+            }
+            Effect::PutImage { obj, act } => {
+                // Sometimes never written (a crash, a lost PUT).
+                let img = self.procs[p].data.get_mut(&obj).and_then(|d| d.image.take()).filter(|_| self.rng.chance(0.7));
+                if let Some((k, w)) = img {
+                    if let Res::Put(Ok(_)) = self.apply(&Call::Put(k.clone(), Val::Seg(crate::own::frame(&[w])), Cond::IfAbsent)) {
+                        let d = self.latency();
+                        self.at(d, Msg::Proc(p, Event::Imaged { obj, act, key: k }));
+                    }
+                }
             }
             Effect::Drop { obj } => {
                 self.procs[p].data.remove(&obj);
@@ -863,20 +877,29 @@ impl Sim {
     /// owner deleted what that one replaced). The newest manifest is always
     /// checked in full, so a delete of something it needs is still caught.
     fn check_bucket(&self) -> Result<(), String> {
-        let mut images: HashMap<Obj, Vec<u32>> = HashMap::new();
+        // Each epoch's newest image (`i`, or `i<N>`: after its first N entries).
+        let mut images: HashMap<Obj, BTreeMap<u32, (u64, String)>> = HashMap::new();
         for k in self.bucket.keys() {
-            if let Some((o, e)) = parse_part(k, "i") {
-                images.entry(o).or_default().push(e);
+            if let Some((o, e, n)) = parse_image(k) {
+                let best = images.entry(o).or_default().entry(e).or_insert((n, k.clone()));
+                if n >= best.0 {
+                    *best = (n, k.clone());
+                }
             }
         }
         for (k, (v, _)) in &self.bucket {
             let Val::Manifest(segs) = v else { continue };
             let Some((o, e)) = parse_manifest(k) else { continue };
-            let imaged = images.get(&o).map_or(&[][..], |v| v.as_slice());
-            if imaged.iter().any(|&i| i > e) {
+            let imaged = images.get(&o);
+            if imaged.is_some_and(|m| m.range(e + 1..).next().is_some()) {
                 continue;
             }
-            let m = if imaged.contains(&e) { self.expand(&[image_key(o, e)]) } else { self.expand(segs) };
+            // An image holds what the epoch started from, then its own first
+            // entries: what was acknowledged before it is in there, in order.
+            let m = match imaged.and_then(|m| m.get(&e)) {
+                Some((_, k)) => self.expand(std::slice::from_ref(k)),
+                None => self.expand(segs),
+            };
             for (&w, &(wo, we, _)) in &self.acked {
                 if wo == o && we < e && !m.contains(&w) {
                     return Err(format!("lost write {w}: acknowledged in object {o} epoch {we}, missing from epoch {e}"));
@@ -894,6 +917,18 @@ impl Sim {
 
 fn parse_manifest(k: &str) -> Option<(Obj, u32)> {
     parse_part(k, "m")
+}
+
+/// An image key's object, epoch, and entries (`i`: 0, `i<N>`: N).
+fn parse_image(k: &str) -> Option<(Obj, u32, u64)> {
+    let rest = k.strip_prefix("obj/")?;
+    let (o, _) = rest.split_once('/')?;
+    let o = Obj::from_str_radix(o, 16).ok()?;
+    match parse_key(o, k)? {
+        (e, "i") => Some((o, e, 0)),
+        (e, p) if p.starts_with('i') => Some((o, e, p[1..].parse().ok()?)),
+        _ => None,
+    }
 }
 
 /// An object key's object and epoch, if its part is `part` (`m`, `i`).
@@ -1075,12 +1110,18 @@ mod tests {
             ("ack_one", 2, Bugs { ack_one: true, ..Bugs::default() }),
             ("no_fence", 2, Bugs { no_fence: true, ..Bugs::default() }),
             ("trunc_early", 2, Bugs { trunc_early: true, ..Bugs::default() }),
-            ("seal_early", 2, Bugs { seal_early: true, ..Bugs::default() }),
         ];
+        // Stepping down with entries only on the peers: rare (about one seed
+        // in 5,000), so many seeds, with slow uploads to leave entries there.
+        let (_, bad) = run_with(0..20000, &|| Settings { replicas: 2, uploads: Some((5000, 1 << 20)), bugs: Bugs { seal_early: true, ..Bugs::default() }, ..Settings::default() });
+        assert!(bad.is_some(), "seal_early wasn't caught");
         // Compaction that deletes before proving it still owns the object
         // (a race with a newer owner's load: splits make it common).
         let (_, bad) = run_with(0..3000, &|| Settings { replicas: 2, splits: true, bugs: Bugs { gc_unproven: true, ..Bugs::default() }, ..Settings::default() });
         assert!(bad.as_ref().is_some_and(|(_, why)| why.contains("lost write")), "gc_unproven wasn't caught: {bad:?}");
+        // Deletes that lean on a newer, unproven image than their round proved.
+        let (_, bad) = run_with(0..8000, &|| Settings { replicas: 2, splits: true, bugs: Bugs { gc_newest_image: true, ..Bugs::default() }, ..Settings::default() });
+        assert!(bad.is_some(), "gc_newest_image wasn't caught");
         for (name, replicas, bugs) in cases {
             let (_, bad) = run_many(0..6000, replicas, bugs);
             assert!(bad.is_some(), "{name} was not caught in 6,000 seeds");

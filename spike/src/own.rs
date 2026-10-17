@@ -34,6 +34,8 @@
 //! - `obj/o/e<E>/i`: an image: the object as epoch E's owner restored it from
 //!   its manifest, as one entry. The next owner starts from it instead of
 //!   the manifest's keys (compaction: a manifest only ever grows).
+//! - `obj/o/e<E>/i<N>`: an image after E's first N entries, for an object that
+//!   stays up a long time. Written only once those entries are uploaded.
 //!
 //! Liveness is over the wire, not the bucket: every node sends every other a
 //! small heartbeat a few times a lease (`Event::Heard`), and a node not heard
@@ -213,7 +215,7 @@ pub enum Event {
     Restored { obj: Obj, act: Act, ok: bool },
     /// The image `Restore` asked for is written: once ownership is proven
     /// again, older epochs' keys can go.
-    Imaged { obj: Obj, act: Act },
+    Imaged { obj: Obj, act: Act, key: String },
     Reply { op: OpId, res: Res },
     /// Time passes: retry peers that went quiet.
     Tick,
@@ -250,7 +252,11 @@ pub enum Effect {
     /// Run a request, in order, after the ones before it.
     Run { obj: Obj, act: Act, req: ReqId },
     /// Hand over the changes made since the last seal.
-    Seal { obj: Obj, act: Act },
+    /// `image`: take an image as of this entry, to put at that key once the
+    /// entries up to it are uploaded (`PutImage`).
+    Seal { obj: Obj, act: Act, image: Option<String> },
+    /// The image `Seal` took: put it now (its entries are uploaded).
+    PutImage { obj: Obj, act: Act },
     /// Forget the object's state: we don't own it now.
     Drop { obj: Obj },
 }
@@ -292,6 +298,9 @@ pub struct Bugs {
     /// Compaction: delete older epochs' keys as soon as the image is
     /// written, with no proof that we still own the object.
     pub gc_unproven: bool,
+    /// Compaction: delete by the newest image the listing shows, not the one
+    /// the round proved (a later one may be unproven).
+    pub gc_newest_image: bool,
 }
 
 /// A node's peer store: the entries it keeps for other nodes' objects. The
@@ -480,6 +489,17 @@ fn tail_key(o: Obj, e: u32) -> String {
 pub fn image_key(o: Obj, e: u32) -> String {
     format!("obj/{o:032x}/e{e:08}/i")
 }
+/// An image after epoch `e`'s first `n` entries.
+fn image_key_at(o: Obj, e: u32, n: u64) -> String {
+    format!("obj/{o:032x}/e{e:08}/i{n:012}")
+}
+/// The entries an image or segment part (`i`, `i<N>`, `s<N>`) covers.
+fn part_upto(part: &str) -> Option<u64> {
+    match part {
+        "i" => Some(0),
+        _ => part.get(1..)?.parse().ok(),
+    }
+}
 
 /// A restore from this many segments or more writes an image (each is a GET).
 pub const COMPACT_SEGS: usize = 16;
@@ -525,7 +545,7 @@ enum Wait {
     SealRec,
     /// Compaction: listing an object to delete what its image replaced, and
     /// the deletes. Nothing waits on them.
-    GcList(Obj, u32),
+    GcList(Obj, u32, u64),
     GcDelete,
 }
 
@@ -577,7 +597,7 @@ struct Pend {
     reqs: Vec<ReqId>,
     /// Compaction waits on this round: once it's proven, we still own the
     /// object after our image was written.
-    gc: bool,
+    gc: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -604,6 +624,12 @@ struct Serve {
     /// never overlap.
     upload_wait: bool,
     retry_upto: Option<u64>,
+    /// Uploads since the last image (compaction: one every `compact_segs`).
+    since_image: usize,
+    /// An image taken as of this entry, put once it's uploaded; and the
+    /// upload that must end right there (segments never straddle an image).
+    image_at: Option<u64>,
+    cut: Option<u64>,
     /// Rounds count up; every new `Pend` gets the next one.
     round: u64,
     proving: bool,
@@ -899,23 +925,26 @@ impl Core {
                     s.since.get_or_insert(now);
                     s.ents.push_back(changes);
                     s.round += 1;
-                    s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs, gc: false });
+                    s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs, gc: None });
                     self.flush(obj);
                     self.kick(obj);
                 }
             }
             Event::Restored { obj, act, ok } => self.restored(obj, act, ok),
-            Event::Imaged { obj, act } => {
+            Event::Imaged { obj, act, key } => {
                 let unproven = self.bugs.gc_unproven;
+                // Which image: what the deletes may lean on is this one, once
+                // proven, never one that came after.
+                let Some(n) = parse_key(obj, &key).and_then(|(_, part)| part_upto(part)) else { return std::mem::take(&mut self.out) };
                 if let Some(s) = self.serving(obj, act) {
                     if unproven {
                         let e = s.epoch;
-                        self.gc_list(obj, e);
+                        self.gc_list(obj, e, n);
                     } else {
                         // A round to prove we still own it, now that the image
                         // is there (see `gc_list`).
                         s.round += 1;
-                        s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs: vec![], gc: true });
+                        s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs: vec![], gc: Some(n) });
                         self.kick(obj);
                     }
                 }
@@ -978,6 +1007,9 @@ impl Core {
             flush: false,
             upload_wait: false,
             retry_upto: None,
+            since_image: 0,
+            image_at: None,
+            cut: None,
             round: 0,
             proving: false,
             proof: (0, 0),
@@ -1024,7 +1056,7 @@ impl Core {
     /// Turn what has run into an entry (a seal), or, for reads only, into a
     /// wait for the next confirmation.
     fn flush(&mut self, o: Obj) {
-        let (now, trust, ack_one) = (self.now, self.lease_trust_ms, self.bugs.ack_one);
+        let (now, trust, ack_one, compact) = (self.now, self.lease_trust_ms, self.bugs.ack_one, self.compact_segs);
         let Phase::Serving(s) = &mut self.st(o).phase else { return };
         if s.sealing.is_some() || s.batch.is_empty() {
             return;
@@ -1039,7 +1071,16 @@ impl Core {
         if std::mem::take(&mut s.dirty) {
             s.sealing = Some(reqs);
             let act = s.act;
-            self.out.push(Effect::Seal { obj: o, act });
+            // A long-lived object's uploads pile up too: every so often, an
+            // image as of this entry.
+            let image = (s.since_image >= compact && s.image_at.is_none()).then(|| {
+                let n = s.made + 1;
+                s.since_image = 0;
+                s.image_at = Some(n);
+                s.cut = Some(n);
+                image_key_at(o, s.epoch, n)
+            });
+            self.out.push(Effect::Seal { obj: o, act, image });
         } else if now < lease && {
             // Every entry made so far is acknowledged, as a write's answer
             // needs: then nothing a read saw can be lost.
@@ -1057,19 +1098,19 @@ impl Core {
             if lease - now < trust / 2 {
                 s.round += 1;
             }
-            let gc = s.pends.iter().any(|p| p.gc);
+            let gc = s.pends.iter().filter_map(|p| p.gc).max();
             let waiting: Vec<ReqId> = s.pends.drain(..).flat_map(|p| p.reqs).collect();
             self.stats.lease_reads += (waiting.len() + reqs.len()) as u64;
             for r in waiting.into_iter().chain(reqs) {
                 self.answer(r, Answer::Done { epoch });
             }
-            if gc {
-                self.gc_list(o, epoch);
+            if let Some(n) = gc {
+                self.gc_list(o, epoch, n);
             }
             self.kick(o);
         } else {
             s.round += 1;
-            s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs, gc: false });
+            s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs, gc: None });
             self.kick(o);
         }
     }
@@ -1119,7 +1160,11 @@ impl Core {
             if s.retry_upto.is_none() {
                 s.since = None;
             }
-            let upto = s.retry_upto.unwrap_or(s.made);
+            let upto = match (s.retry_upto, s.cut) {
+                (Some(r), _) => r,
+                (None, Some(c)) if c > s.uploaded => c.min(s.made),
+                _ => s.made,
+            };
             let seg = Val::Seg(frame(s.ents.iter().take((upto - s.uploaded) as usize)));
             let retry = s.retry_upto.is_some();
             calls.push((Wait::Upload(o, e, upto, retry), Call::Put(seg_key(o, e, upto), seg, Cond::IfAbsent)));
@@ -1151,7 +1196,7 @@ impl Core {
         let ack_one = self.bugs.ack_one;
         let Phase::Serving(s) = &mut self.st(o).phase else { return };
         let e = s.epoch;
-        let (mut done, mut by, mut gc) = (vec![], (0, 0), false);
+        let (mut done, mut by, mut gc) = (vec![], (0, 0), None);
         while let Some(f) = s.pends.front() {
             let ok = |p: &PeerSt| p.round >= f.round && p.have >= f.need;
             let by_peers = !s.peers.is_empty() && if ack_one { s.peers.iter().any(ok) } else { s.peers.iter().all(ok) };
@@ -1165,7 +1210,7 @@ impl Core {
                 by.1 += 1;
             }
             let p = s.pends.pop_front().unwrap();
-            gc |= p.gc;
+            gc = gc.max(p.gc);
             done.extend(p.reqs);
         }
         self.stats.peer_acks += by.0;
@@ -1173,8 +1218,8 @@ impl Core {
         for r in done {
             self.answer(r, Answer::Done { epoch: e });
         }
-        if gc {
-            self.gc_list(o, e);
+        if let Some(n) = gc {
+            self.gc_list(o, e, n);
         }
     }
 
@@ -1309,12 +1354,26 @@ impl Core {
                 self.write_manifest(o, e, base);
             }
             // Compaction: what our image replaced goes.
-            (Wait::GcList(o, e), Res::Listed(keys)) => {
-                // Our image must be there (it is: we were told it's written).
-                if !keys.contains(&image_key(o, e)) {
+            (Wait::GcList(o, e, n), Res::Listed(keys)) => {
+                // The proven image, which must be there.
+                if !keys.contains(&if n == 0 { image_key(o, e) } else { image_key_at(o, e, n) }) {
                     return;
                 }
-                let old: Vec<String> = keys.into_iter().filter(|k| parse_key(o, k).is_some_and(|(ep, _)| ep < e)).take(GC_MAX).collect();
+                let n = if self.bugs.gc_newest_image {
+                    keys.iter().filter_map(|k| parse_key(o, k).filter(|&(ep, p)| ep == e && p.starts_with('i')).and_then(|(_, p)| part_upto(p))).max().unwrap_or(n)
+                } else {
+                    n
+                };
+                // Older epochs' keys, and our own segments and images it holds.
+                let old: Vec<String> = keys
+                    .into_iter()
+                    .filter(|k| match parse_key(o, k) {
+                        Some((ep, _)) if ep < e => true,
+                        Some((ep, part)) if ep == e && (part.starts_with('s') || part.starts_with('i')) => part_upto(part).is_some_and(|u| u < n || (u == n && part.starts_with('s'))),
+                        _ => false,
+                    })
+                    .take(GC_MAX)
+                    .collect();
                 for k in old {
                     self.call(Wait::GcDelete, Call::Delete(k));
                 }
@@ -1343,6 +1402,16 @@ impl Core {
                 s.retry_upto = None;
                 s.bytes -= s.ents.drain(..(upto - s.uploaded) as usize).map(|e| e.len()).sum::<usize>();
                 s.uploaded = upto;
+                s.since_image += 1;
+                if s.cut.is_some_and(|c| c <= upto) {
+                    s.cut = None;
+                }
+                // The image's entries are all in the bucket now: it may go up.
+                if s.image_at.is_some_and(|n| n <= upto) {
+                    s.image_at = None;
+                    let act = s.act;
+                    self.out.push(Effect::PutImage { obj: o, act });
+                }
                 self.kick(o);
             }
             (Wait::Append(o, e, i, round, sent), res) => {
@@ -1508,8 +1577,9 @@ impl Core {
     /// image holds everything our manifest named. Only a stale claimer, still
     /// loading from before us, could miss a key, and its restore then fails
     /// (safe: it's stale).
-    fn gc_list(&mut self, o: Obj, e: u32) {
-        self.call(Wait::GcList(o, e), Call::List(obj_prefix(o)));
+    /// `n`: the image this round proved (`i`: 0, `i<N>`: N).
+    fn gc_list(&mut self, o: Obj, e: u32, n: u64) {
+        self.call(Wait::GcList(o, e, n), Call::List(obj_prefix(o)));
     }
 
     /// From a listing: the last epoch q before `e` with a manifest, plus q's
@@ -1519,7 +1589,7 @@ impl Core {
             self.crowded.insert((o, e));
         }
         let mut manifests = vec![];
-        let mut images = HashSet::new();
+        let mut images: HashMap<u32, u64> = HashMap::new();
         let mut segs: BTreeMap<u32, Vec<String>> = BTreeMap::new();
         for k in &keys {
             match parse_key(o, k) {
@@ -1527,8 +1597,11 @@ impl Core {
                 // have dropped what we'd need. Stop.
                 Some((ep, "m")) if ep > e && early.is_none() => return self.drop_obj(o),
                 Some((ep, "m")) if ep < e => manifests.push(ep),
-                Some((ep, "i")) if ep < e => {
-                    images.insert(ep);
+                Some((ep, part)) if ep < e && part.starts_with('i') => {
+                    if let Some(n) = part_upto(part) {
+                        let best = images.entry(ep).or_insert(n);
+                        *best = (*best).max(n);
+                    }
                 }
                 Some((ep, part)) if ep < e && part.starts_with('s') => segs.entry(ep).or_default().push(k.clone()),
                 _ => {}
@@ -1548,12 +1621,15 @@ impl Core {
         }
         let Some(&q) = manifests.iter().max() else { return start(self, vec![]) };
         let ups = segs.remove(&q).unwrap_or_default();
-        // Uploads go one at a time, in order: the last one says how many.
+        // Uploads go one at a time, in order: the last one says how many
+        // (or q's newest image, if compaction took the segments it holds).
         let uploaded = ups.last().and_then(|k| parse_key(o, k)?.1[1..].parse().ok()).unwrap_or(0);
         // q's image is what q restored from its manifest: start there instead
         // (and skip reading the manifest).
-        if early.is_none() && images.contains(&q) {
-            return self.from_prev(o, e, vec![image_key(o, q)], ups, uploaded, q);
+        if let (None, Some(&n)) = (&early, images.get(&q)) {
+            let key = if n == 0 { image_key(o, q) } else { image_key_at(o, q, n) };
+            let after: Vec<String> = ups.into_iter().filter(|k| parse_key(o, k).and_then(|(_, p)| part_upto(p)).is_some_and(|u| u > n)).collect();
+            return self.from_prev(o, e, vec![key], after, uploaded.max(n), q);
         }
         let w = match early {
             Some(etag) => Wait::EarlyManifest(o, etag, e, ups),
