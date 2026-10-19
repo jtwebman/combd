@@ -181,7 +181,7 @@ impl Client {
         }
         let r = (|| -> std::io::Result<(u16, String)> {
             let s = self.s.as_mut().unwrap();
-            write!(s.get_mut(), "{method} {path} HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\n\r\n")?;
+            write!(s.get_mut(), "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n")?;
             let mut line = String::new();
             s.read_line(&mut line)?;
             let status = line.get(9..12).and_then(|c| c.parse().ok()).ok_or_else(|| std::io::Error::other("bad status"))?;
@@ -1536,7 +1536,7 @@ mod tests {
 
     /// One HTTP request on its own connection: (status, body).
     fn http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
-        http_to(port, "x", method, path, body)
+        http_to(port, "localhost", method, path, body)
     }
 
     fn http_to(port: u16, host: &str, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -1811,7 +1811,7 @@ mod tests {
             use std::io::{Read, Write};
             let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            write!(s, "GET {path} HTTP/1.1\r\nhost: x\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").unwrap();
+            write!(s, "GET {path} HTTP/1.1\r\nhost: localhost\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").unwrap();
             let mut head = vec![];
             let mut b = [0u8; 1];
             while !head.ends_with(b"\r\n\r\n") {
@@ -3113,7 +3113,7 @@ callers = ["api"]
         let raw = |path: &str| {
             use std::io::{Read, Write};
             let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-            write!(s, "GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").unwrap();
+            write!(s, "GET {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n").unwrap();
             let mut out = String::new();
             s.read_to_string(&mut out).unwrap();
             out

@@ -631,6 +631,97 @@ callback at a time; requests interleave only where the cell waits.
   queued requests at once (N is its choice: ask for 10 with 2 waiting, get
   2), for one transaction and one fsync, with an answer for each.
 
+### Socket processes: one per WebSocket (2026-10-19)
+
+A WebSocket is long-lived and stateful, so it gets a process of its own,
+the way Erlang gives every connection one. A process with `socket = true`
+and a route (`/ws`) starts a new instance, a **session**, for each socket
+that connects there. The client never names it, and it ends when the socket
+closes. It gets the same events an object does (`WSOPEN`, `WSMSG`, `WSBIN`,
+`WSCLOSE`) and runs the app's code for that one user: what they watch,
+their rate limit, later their auth.
+
+**Why it's cheap here.** An object claims ownership in the bucket because
+two nodes could both try to run it. A session can't have that problem: its
+id is the socket's (`<org>/<app>/<process>/~<socket>`), made fresh, and it
+lives only on the loop that holds the connection. So it needs no bucket, no
+ownership, and no forwarding of its own messages, and it starts at once. It
+has no SQLite: what must last goes to an object.
+
+**Reaching one.** Other processes `call` or `send` it by id, where its
+`callers` allow. The socket id says which node and loop hold it (the bits
+are already there), so the host sends straight there, with no lookup. A
+message to a session that's gone is dropped (a call gets 410); it never
+starts one. Only a socket can.
+
+**Hibernation: memory follows what it keeps.** Most sockets sit idle, and a
+live cell costs tens of KB. A session idle for `hibernate_ms` is asked for
+its state (`HIBERNATE`, answered `200 <state>`), and its cell goes; the
+host keeps only those bytes. The next event starts a fresh cell and hands
+them back first (`WAKE`, read with `ws_msg`). A viewer that keeps a socket
+id and two ints costs about 24 bytes plus the socket; one that answers
+anything but 200 stays warm. That's the goal of a BEAM process (about
+2.7 KB). Each process sets how it works:
+
+| Setting | What it does | Default |
+|---|---|---|
+| `hibernate_ms` | idle time before the cell goes; `0`: after every event (a state machine: state in, event, state out) | 5000 |
+| `state_kb` | the most a hibernating session keeps | 4 |
+| `memory_kb` | the ceiling its memory may grow to (any process; past it, the cell crashes) | the engine's |
+
+**Push straight to the socket.** Waking a session just to pass bytes along
+wastes a cell start per message. So `send` with `"ws": text` (no path)
+writes to a session's socket without running it: the session does the
+control (what to watch, the client's own messages), its sources do the data.
+A watching viewer never runs. That's Phoenix's fastlane, in our shape. The
+same `callers` rule decides who may.
+
+**Subscriptions are the app's.** An object that pushes to sessions keeps
+their ids, and sessions renew what they watch on a beat; the object forgets
+ids that stop renewing, so a node that dies without closing its sessions
+leaves nothing behind. combd adds no topics.
+
+**What Cloudflare and celld do instead.** Both send an upgrade to a
+stateless Worker, which picks an object (`stub.fetch`) that takes the
+socket; a socket belongs to one object. Per-user logic means an object per
+user (a full one, with its cost) or a Worker pinned for the socket's life
+(no hibernation). celld pipes the bytes to the owner node; neither has
+pub/sub. Phoenix does what we do (a process per socket and per channel),
+and learned that sending every broadcast through every subscriber's
+process is slow at large fan-out ("fastlane": encode once, write to the
+sockets).
+
+**Next, once it works:** one message per node, not per subscriber (an
+object sending one change to 500 sessions on 3 nodes sends 3 wire frames;
+each node fans out to its own), and a load test that holds N idle
+connections and measures memory per connection.
+
+### Lighter cells: toward a BEAM process (2026-10-19)
+
+A real app's cell is 74 to 81 KB on Linux x86 (the arena's). Most of it is
+copied, not used: each cell starts by copying the module's static data
+(35 to 60 KB in our examples) into its own memory, and Wasm memory never
+shrinks, so a cell keeps whatever its worst request needed. An Erlang
+process starts at 2.7 KB because code and constants are shared and its
+heap grows and shrinks. The plan:
+1. **Pools shrink.** Warm worker cells idle past `COMBD_IDLE_MS` go (the
+   newest stays), and a deploy drops the old version's.
+2. **Caps.** `memory_kb` on a process: past it, the cell crashes with a
+   clear error. Socket processes default low.
+3. **A shared starting image.** Each cell maps the module's starting
+   memory copy-on-write, so static data costs once per module, not once
+   per cell, and a cell starts by mapping, not copying.
+4. **Reset per request.** A classic worker cell snaps back to the image
+   after each request: memory never creeps, and nothing one request left
+   can reach the next. (Event cells share on purpose; they reset only when
+   idle, if at all.)
+5. **One reserved region** for every cell's memory, past Linux's map limit.
+
+3 to 5 need `mmap`, so they go in one small audited FFI crate. A live
+cell's floor is a page or two of stack and heap plus the interpreter's
+state, so about 8 to 12 KB; a hibernated session is under 1 KB of host
+state. Measured before and after, every step.
+
 ### Settings: the manifest, environments, vars, and secrets
 
 An app's settings live in one manifest shipped with its code: `combd.toml`,

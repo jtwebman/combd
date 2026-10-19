@@ -554,6 +554,13 @@ impl<E: Engine> Object<E> {
     }
 }
 
+/// A burst leaves a pool as big as it was: keep only what's been used in
+/// the last `idle` (the newest stays, warm for the next request).
+fn trim_idle<T>(pool: &mut Vec<(T, Instant)>, idle: Duration) {
+    let stale = pool.iter().take(pool.len().saturating_sub(1)).take_while(|(_, at)| at.elapsed() >= idle).count();
+    pool.drain(..stale);
+}
+
 /// A parsed request.
 enum Req {
     /// A WebSocket handshake for an object: name, path, `sec-websocket-key`.
@@ -1126,8 +1133,9 @@ struct Loop<'a, E: Engine> {
     me: usize,
     inbox: Receiver<Msg>,
     poll: Poll,
-    /// Warm cells, per process.
-    pools: Vec<Vec<Cell<E>>>,
+    /// Warm worker cells per process, and when each was put back (the
+    /// newest last). The sweep trims ones idle too long (`trim_idle`).
+    pools: Vec<Vec<(Cell<E>, Instant)>>,
     tasks: VecDeque<Task<E>>,
     objects: HashMap<String, Object<E>>,
     /// Alarms of objects this loop owns: (due, name). Entries can be stale;
@@ -2355,7 +2363,7 @@ impl<E: Engine> Loop<'_, E> {
                         }
                     }
                     if !self.app.procs[cell.proc].retired {
-                        self.pools[cell.proc].push(cell);
+                        self.pools[cell.proc].push((cell, Instant::now()));
                     }
                     split_answer(&a)
                 }
@@ -2585,6 +2593,9 @@ impl<E: Engine> Loop<'_, E> {
         self.last_sweep = Instant::now();
         self.retire_cells();
         let idle = self.sh.cfg.idle;
+        for pool in &mut self.pools {
+            trim_idle(pool, idle);
+        }
         // Database handles keep an object here until they've been idle for
         // their pool's `session_idle_ms`; then they close, and it can leave.
         let handles = &self.pg_handles;
@@ -2772,7 +2783,7 @@ impl<E: Engine> Loop<'_, E> {
         if self.ev_mode[p] {
             return self.ev_request(origin, p, req);
         }
-        let mut cell = match self.pools[p].pop() {
+        let mut cell = match self.pools[p].pop().map(|(c, _)| c) {
             Some(cell) => cell,
             None => fresh(self.eng, &self.app, p, &self.environ_for(p))?,
         };
@@ -2907,7 +2918,7 @@ impl<E: Engine> Loop<'_, E> {
             }
             let mut first = fresh(self.eng, &self.app, p, &self.environ_for(p))?;
             self.ev_mode[p] = first.vm.has_export("on_request");
-            self.pools[p].push(first);
+            self.pools[p].push((first, Instant::now()));
         }
         Ok(())
     }
@@ -3789,6 +3800,18 @@ mod tests {
 
     /// Any client could send this: `hlen + clen` wrapped past usize::MAX,
     /// and slicing the body panicked the event loop.
+    #[test]
+    fn idle_pooled_cells_go_but_the_newest_stays() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(120);
+        let mut pool = vec![(1, old), (2, old), (3, now), (4, now)];
+        trim_idle(&mut pool, Duration::from_secs(60));
+        assert_eq!(pool.iter().map(|x| x.0).collect::<Vec<_>>(), [3, 4], "the idle ones go");
+        let mut pool = vec![(1, old), (2, old)];
+        trim_idle(&mut pool, Duration::from_secs(60));
+        assert_eq!(pool.iter().map(|x| x.0).collect::<Vec<_>>(), [2], "the newest stays, however old");
+    }
+
     #[test]
     fn a_huge_content_length_is_refused() {
         for v in ["18446744073709551615", "18446744073709551000", "99999999999999999999999", "-1"] {
