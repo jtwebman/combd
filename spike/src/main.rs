@@ -558,7 +558,16 @@ fn density<E: Engine>(name: &str, eng: &E, prog: &E::Program) {
 fn ws_hold(host: &str, port: u16, path: &str, n: usize, msg: &str, pid: &str) {
     use std::io::{Read, Write};
     let rss = || std::fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())).unwrap_or(0);
-    let before = rss();
+    // What the server's allocator has out, in KB (its stats).
+    let heap = || {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "GET /_combd/stats HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        let body = out.split("\r\n\r\n").nth(1).unwrap_or("{}");
+        serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| v["heap_in_use"].as_u64()).unwrap_or(0) / 1024
+    };
+    let (before, heap_before) = (rss(), heap());
     let mut held = Vec::with_capacity(n);
     for i in 0..n {
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -585,7 +594,7 @@ fn ws_hold(host: &str, port: u16, path: &str, n: usize, msg: &str, pid: &str) {
     }
     // Let them settle (hibernate), then measure again.
     std::thread::sleep(Duration::from_secs(5));
-    println!("ws-hold: {n} sockets, settled: {:.2} KB/socket (server {} KB, {} KB before)", (rss() - before) as f64 / n as f64, rss(), before);
+    println!("ws-hold: {n} sockets, settled: {:.2} KB/socket (server {} KB, {} KB before); heap in use {:.2} KB/socket", (rss() - before) as f64 / n as f64, rss(), before, (heap() - heap_before) as f64 / n as f64);
 }
 
 fn fresh_bench(wasm: &str, n: usize, rest: &[&str]) {
@@ -643,6 +652,11 @@ fn density_app(wasm: &str, n: usize, rest: &[&str]) {
         }
     }
     let served = (t.elapsed(), pss_kb());
+    // What the host would keep if each went to sleep now (`hibernate = "auto"`).
+    let frozen: Vec<usize> = cells.iter().filter_map(|(vm, _)| vm.freeze()).map(|f| f.len()).collect();
+    if !frozen.is_empty() {
+        println!("  frozen:   {:>6} bytes/cell", frozen.iter().sum::<usize>() / frozen.len());
+    }
     let per = |kb: u64| (kb - before) as f64 / n as f64;
     println!("density-app {wasm}: {n} cells");
     println!("  started:  {:>6.1} KB/cell  {:>6.1} us/cell", per(spawned.1), us(spawned.0) / n as f64);
@@ -1535,6 +1549,27 @@ mod tests {
             let new = eng.spawn(&prog).unwrap();
             assert_eq!(new.read(0, len).unwrap(), expected, "a fresh cell saw old memory");
             assert!(new.read(len, 1).is_none());
+        }
+    }
+
+    /// A cell frozen when idle is the bytes it changed; thawed, it goes on
+    /// where it was, and the two never share.
+    #[test]
+    fn a_frozen_cell_thaws_where_it_was() {
+        let eng = interp::Interp { max_pages: 16384 };
+        let prog = eng.load(&wasm()).unwrap();
+        let mut vm = eng.spawn(&prog).unwrap();
+        for _ in 0..3 {
+            request(&mut vm, "api GET /api/hits", &mut HostState::default()).unwrap();
+        }
+        let saved = vm.freeze().expect("an idle cell freezes");
+        // What it changed: its 100 users (built once, kept), and the heap.
+        assert!(saved.len() < 16 * 1024, "{} bytes", saved.len());
+        let mut back = eng.thaw(&prog, &saved).unwrap();
+        assert_eq!(request(&mut back, "api GET /api/hits", &mut HostState::default()).unwrap(), "200 {\"hits\":4}");
+        assert_eq!(request(&mut vm, "api GET /api/hits", &mut HostState::default()).unwrap(), "200 {\"hits\":4}", "the original goes its own way");
+        for cut in [1, 3, 5, 9] {
+            assert!(eng.thaw(&prog, &saved[..saved.len() - cut]).is_err(), "a freeze cut short by {cut} is refused");
         }
     }
 
@@ -3078,13 +3113,24 @@ callers = ["api"]
 
     /// The million checkboxes: a session (a `ws` process) per socket,
     /// asleep between events, its chunks' changes going straight to its
-    /// socket without waking it, the count, and sessions that end.
+    /// socket without waking it, the count, and sessions that end. Asleep
+    /// the app's way (it keeps its own state) and the host's (it keeps what
+    /// the cell changed).
     #[test]
     fn million_one_session_per_socket() {
+        million_sessions("app");
+    }
+
+    #[test]
+    fn million_sessions_frozen_by_the_host() {
+        million_sessions("auto");
+    }
+
+    fn million_sessions(sleep: &str) {
         let app = store::tempdir::Dir::new();
         std::fs::create_dir(app.0.join("modules")).unwrap();
         // Asleep after every event, so every event wakes it.
-        let m = std::fs::read_to_string(format!("{MILLION}/combd.toml")).unwrap().replace("hibernate_ms = 2000", "hibernate_ms = 0");
+        let m = std::fs::read_to_string(format!("{MILLION}/combd.toml")).unwrap().replace("hibernate_ms = 2000", "hibernate_ms = 0").replace("hibernate = \"app\"", &format!("hibernate = \"{sleep}\"")).replace("state_kb = 1", "state_kb = 16");
         std::fs::write(app.0.join("combd.toml"), m).unwrap();
         for f in ["million.wasm", "viewer.wasm"] {
             std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");

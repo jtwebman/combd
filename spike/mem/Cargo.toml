@@ -3,7 +3,7 @@ name = "combd-mem"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Cells' linear memory, copy-on-write from their module's starting image. The interpreter's only unsafe code."
+description = "Cells' linear memory, copy-on-write from their module's starting image, and a heap count: combd's unsafe code outside the AOT tier."
 
 [dependencies]
 libc = "0.2"

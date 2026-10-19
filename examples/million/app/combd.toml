@@ -10,12 +10,13 @@ module = "million"
 routes = ["/", "/api/count"]
 
 # One per WebSocket: what its page looks at, and the page's sets. Asleep
-# after 2 s idle, it's just its socket and ~30 bytes of state; the chunks'
-# changes go straight to its socket and never wake it.
+# after 2 s idle, it's just its socket and ~30 bytes of state (it keeps its
+# own: "app"); the chunks' changes go straight to its socket and never wake it.
 [ws.viewer]
 module = "viewer"
 routes = ["/ws"]
 hibernate_ms = 2000
+hibernate = "app"
 state_kb = 1
 memory_kb = 512
 callers = ["chunk"]

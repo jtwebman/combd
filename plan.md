@@ -666,6 +666,7 @@ anything but 200 stays warm. That's the goal of a BEAM process (about
 | Setting | What it does | Default |
 |---|---|---|
 | `hibernate_ms` | idle time before the cell goes; `0`: after every event (a state machine: state in, event, state out) | 5000 |
+| `hibernate` | `auto`: the host freezes the cell (what it changed against the image), no app code; `app`: `HIBERNATE`/`WAKE`; `off` | `auto` |
 | `state_kb` | the most a hibernating session keeps | 4 |
 | `memory_kb` | the ceiling its memory may grow to (any process; past it, the cell crashes) | the engine's |
 

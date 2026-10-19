@@ -54,7 +54,7 @@ use crate::engine::{CellVm, Engine, Outcome};
 use crate::fleet::{DiskPeers, FleetCfg, Frame};
 use crate::wire::{self, Wire};
 use crate::own::{self, Act, Core, Effect};
-use crate::app::{App, Hit, Router};
+use crate::app::{App, Hit, Router, Sleep};
 use crate::host::{now_ms, AsyncOp, EvAction, HostState, WsOut};
 use crate::store::{self, AlarmIndex, Db};
 use mio::net::{TcpListener, TcpStream};
@@ -487,6 +487,16 @@ fn fresh<E: Engine>(eng: &E, app: &App<E::Program>, proc: usize, environ: &Arc<V
     Ok(Cell { vm, st, proc })
 }
 
+/// A cell again, from what `CellVm::freeze` kept. It doesn't run the
+/// module's initializer: that would undo the state it just got back.
+fn thawed<E: Engine>(eng: &E, app: &App<E::Program>, proc: usize, environ: &Arc<Vec<Vec<u8>>>, frozen: &[u8]) -> std::io::Result<Cell<E>> {
+    let mut vm = eng.thaw(&app.progs[app.procs[proc].prog], frozen).map_err(std::io::Error::other)?;
+    if let Some(pages) = app.procs[proc].memory_pages {
+        vm.cap_memory(pages).map_err(std::io::Error::other)?;
+    }
+    Ok(Cell { vm, st: HostState { environ: environ.clone(), ..HostState::default() }, proc })
+}
+
 /// A request in flight.
 struct Task<E: Engine> {
     origin: Origin,
@@ -567,8 +577,10 @@ impl<E: Engine> Object<E> {
 struct Session<E: Engine> {
     sock: u64,
     proc: usize,
-    /// `None`: not started, or hibernating (then `state` is what it kept).
+    /// `None`: not started, or hibernating: then `frozen` is what its cell
+    /// changed (`hibernate = "auto"`), or `state` what the app kept.
     cell: Option<Cell<E>>,
+    frozen: Option<Vec<u8>>,
     state: Option<Vec<u8>>,
     busy: bool,
     /// The event it's running (`WSMSG`, `HIBERNATE`, ...).
@@ -2340,6 +2352,9 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }
         }
+        if let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut).filter(|c| c.rbuf.is_empty() && c.rbuf.capacity() > IDLE_BUF) {
+            c.rbuf = Vec::new();
+        }
         self.settle(id)
     }
 
@@ -2375,7 +2390,7 @@ impl<E: Engine> Loop<'_, E> {
         c.busy = true;
         c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: Default::default(), open: false, gone: false, inflight: 0 });
         self.local_socks.insert(sock, who);
-        self.sessions.insert(name.clone(), Session { sock, proc: p, cell: None, state: None, busy: false, running: String::new(), waiting: VecDeque::new(), last_used: Instant::now() });
+        self.sessions.insert(name.clone(), Session { sock, proc: p, cell: None, frozen: None, state: None, busy: false, running: String::new(), waiting: VecDeque::new(), last_used: Instant::now() });
         self.sh.stats.sessions_live.fetch_add(1, Relaxed);
         self.submit(Origin::Socket(who, sock, true), name, format!("do WSOPEN {path} {sock}"));
     }
@@ -2405,6 +2420,27 @@ impl<E: Engine> Loop<'_, E> {
                     continue; // asleep already, or more to do first
                 }
                 (origin, req, vec![])
+            } else if let Some(frozen) = s.frozen.take() {
+                // Frozen by the host: the same cell again, where it was.
+                self.sh.stats.sessions_hibernated.fetch_sub(1, Relaxed);
+                self.sh.stats.sessions_woken.fetch_add(1, Relaxed);
+                let proc = s.proc;
+                match thawed(self.eng, &self.app, proc, &self.environ_for(proc), &frozen) {
+                    Ok(cell) => {
+                        self.sessions.get_mut(name).unwrap().cell = Some(cell);
+                        (origin, req, vec![])
+                    }
+                    Err(e) => {
+                        eprintln!("session {name:?}: can't thaw: {e}");
+                        let _ = self.deliver(origin, (500, "{\"error\":\"the session was lost\"}".into()));
+                        let sock = self.sessions.get(name).map(|s| s.sock);
+                        self.remove_session(name);
+                        if let Some(sock) = sock {
+                            let _ = self.ws_local(name, sock, 8, &1011u16.to_be_bytes());
+                        }
+                        return;
+                    }
+                }
             } else if let Some(state) = s.state.take() {
                 s.waiting.push_front((origin, req));
                 self.sh.stats.sessions_hibernated.fetch_sub(1, Relaxed);
@@ -2462,7 +2498,7 @@ impl<E: Engine> Loop<'_, E> {
     /// to sleep; a crash, a close, or a refused handshake ends it.
     fn session_finish(&mut self, name: &str, cell: Cell<E>, answer: Result<String, String>, mut ws: Vec<WsOut>) -> Option<((u16, String), Vec<WsOut>)> {
         let p = &self.app.procs[cell.proc];
-        let (hibernate, state_max) = (p.hibernate, p.state_max);
+        let (hibernate, sleep, state_max) = (p.hibernate, p.sleep, p.state_max);
         let s = self.sessions.get_mut(name)?;
         s.busy = false;
         s.last_used = Instant::now();
@@ -2475,6 +2511,7 @@ impl<E: Engine> Loop<'_, E> {
             }
         };
         let gone = !ok || method == "WSCLOSE" || (method == "WSOPEN" && reply.0 != 101);
+        let mut freeze = false;
         if ok && method == "HIBERNATE" && reply.0 == 200 && reply.1.len() <= state_max {
             // Its cell goes; what it kept is all that's left.
             s.state = Some(reply.1.clone().into_bytes());
@@ -2486,7 +2523,11 @@ impl<E: Engine> Loop<'_, E> {
             s.cell = Some(cell);
             // `hibernate_ms = 0`: asleep after every event.
             if hibernate.is_zero() && !gone && method != "HIBERNATE" && s.waiting.is_empty() && !self.ticks.contains_key(name) {
-                s.waiting.push_back((Origin::Discard, HIBERNATE.into()));
+                match sleep {
+                    Sleep::App => s.waiting.push_back((Origin::Discard, HIBERNATE.into())),
+                    Sleep::Auto => freeze = true,
+                    Sleep::Off => {}
+                }
             }
         }
         if !ok && self.local_socks.contains_key(&s.sock) {
@@ -2494,17 +2535,35 @@ impl<E: Engine> Loop<'_, E> {
         }
         if gone {
             self.remove_session(name);
+        } else if freeze {
+            self.freeze_session(name);
         } else {
             self.session_next(name);
         }
         Some((reply, ws))
     }
 
+    /// The host puts an idle session to sleep: it keeps what the cell
+    /// changed (up to `state_kb`), and the cell goes. Too big, or an engine
+    /// that can't: it stays warm.
+    fn freeze_session(&mut self, name: &str) {
+        let max = self.sessions.get(name).map_or(0, |s| self.app.procs[s.proc].state_max);
+        let Some(s) = self.sessions.get_mut(name).filter(|s| !s.busy && s.waiting.is_empty()) else { return };
+        let Some(cell) = s.cell.take() else { return };
+        match cell.vm.freeze() {
+            Some(f) if f.len() <= max => {
+                s.frozen = Some(f);
+                self.sh.stats.sessions_hibernated.fetch_add(1, Relaxed);
+            }
+            _ => s.cell = Some(cell),
+        }
+    }
+
     /// A session ends: what waits for it gets 410.
     fn remove_session(&mut self, name: &str) {
         let Some(s) = self.sessions.remove(name) else { return };
         self.sh.stats.sessions_live.fetch_sub(1, Relaxed);
-        if s.state.is_some() {
+        if s.state.is_some() || s.frozen.is_some() {
             self.sh.stats.sessions_hibernated.fetch_sub(1, Relaxed);
         }
         self.ticks.remove(name);
@@ -2849,14 +2908,18 @@ impl<E: Engine> Loop<'_, E> {
             if !socks.contains_key(&s.sock) {
                 ended.push(n.clone());
             } else if s.cell.is_some() && !ticks.contains_key(n) && s.last_used.elapsed() >= procs[s.proc].hibernate {
-                sleepy.push(n.clone());
+                sleepy.push((n.clone(), procs[s.proc].sleep));
             }
         }
         for n in ended {
             self.remove_session(&n);
         }
-        for n in sleepy {
-            self.session_submit(Origin::Discard, n, HIBERNATE.into());
+        for (n, sleep) in sleepy {
+            match sleep {
+                Sleep::App => self.session_submit(Origin::Discard, n, HIBERNATE.into()),
+                Sleep::Auto => self.freeze_session(&n),
+                Sleep::Off => {}
+            }
         }
     }
 
@@ -2973,7 +3036,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"heap_in_use\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -2999,6 +3062,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.sessions_live.load(Relaxed),
                     s.sessions_hibernated.load(Relaxed),
                     s.sessions_woken.load(Relaxed),
+                    combd_mem::heap_in_use(),
                     s.ev_instances.load(Relaxed),
                     s.ev_requests.load(Relaxed)
                 );
@@ -4055,8 +4119,16 @@ fn flush(c: &mut Conn) -> bool {
     }
     c.wbuf.clear();
     c.wpos = 0;
+    // An idle connection keeps only small buffers: one big message once
+    // (a snapshot) shouldn't cost every socket that much for good.
+    if c.wbuf.capacity() > IDLE_BUF {
+        c.wbuf = Vec::new();
+    }
     false
 }
+
+/// The most a connection's empty buffers keep between messages.
+const IDLE_BUF: usize = 1024;
 
 #[cfg(test)]
 mod tests {

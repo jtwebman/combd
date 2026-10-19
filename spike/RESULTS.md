@@ -2097,8 +2097,9 @@ plus buffers. So an idle combd connection is at BEAM's scale already: the
 socket, the session's host record, its ~30 bytes of state, and the chunk's
 subscription entry. The "settled" rise is most likely heap left behind by
 the cells that ran during the burst (glibc keeps small freed blocks, so
-RSS can't tell). Releasing a connection's grown buffers once empty didn't
-move it (4.10 to 4.11 KB), so that change was dropped.
+RSS can't tell). (A first try at releasing a connection's grown buffers
+seemed to do nothing, 4.10 to 4.11 KB, and was dropped; RSS was the wrong
+measure: see below, where it's worth 1.6 KB a connection.)
 
 For scale: eieio's One Million Checkboxes peaked at over 20,000 unique
 visitors an hour (he gives no concurrent count), on 8 worker VMs, an nginx
@@ -2154,6 +2155,34 @@ mappings (the image, its own pages, the rest of its reservation), so
 Linux's map limit (`vm.max_map_count`) is reached at a third as many live
 cells as before; hibernated sessions have none. One region for every cell
 (the next item on the list) fixes both.
+
+**Down to BEAM's size: 2.24 KB a connection.** Two things, measured with
+glibc's own count of heap in use (`heap_in_use` in `/_combd/stats`), since
+RSS keeps freed memory and can't tell:
+1. **The host freezes idle sessions** (`hibernate = "auto"`, the default
+   for ws): an idle cell is kept as what differs from its module's image,
+   its globals, and any changed table, and thawed into a fresh cell on the
+   next event, with no app code. For a wasm-ld module (it exports
+   `__data_end` and `__heap_base`, with nothing below where global 0, the
+   stack pointer, starts) the dead stack below the stack pointer is left
+   out. Run headers are LEB128. A frozen viewer: 1,141 bytes (1.8 KB before
+   leaving out the stack and shortening the headers). A freeze cut short
+   anywhere is refused (it says how many runs it holds).
+2. **A connection gives back big buffers once they're empty** (over 1 KB):
+   each socket here was sent a 3.9 KB snapshot, and kept a buffer that size.
+
+20,000 sockets, Linux, one loop, `hibernate_ms = 0`:
+
+| Viewer | Heap in use per socket | RSS per socket |
+|---|---|---|
+| keeps its own state (`hibernate = "app"`, 30 bytes), before | 3.89 KB | 3.78 KB |
+| the same, with the buffers given back | **2.24 KB** | 2.20 KB |
+| frozen by the host (`"auto"`, no app code), before | 4.92 KB | 4.80 KB |
+| the same, with the buffers given back | **3.22 KB** | 3.11 KB |
+
+An Erlang process starts at 2.7 KB. Here a whole connection (the socket,
+its session, its state, the chunk's entry for it) is 2.24 KB, and it stays
+sandboxed, preemptible, and its own crash.
 
 **A fresh cell for every request** (`fresh = true` on an http process):
 nothing one request leaves can reach the next. It costs what a new cell

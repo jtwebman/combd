@@ -167,6 +167,15 @@ pub struct Module {
     /// The starting memory every cell maps copy-on-write (`combd-mem`).
     /// `None`: no data, or a segment that doesn't fit (spawn refuses it).
     image: Option<Arc<combd_mem::Image>>,
+    /// The image's bytes, to tell what a cell changed (`Vm::freeze`).
+    start: Vec<u8>,
+    /// Linked by wasm-ld with the stack first (Rust's, C's, and Zig's
+    /// default): global 0 is the stack pointer, and memory below where it
+    /// starts holds nothing but the stack. Below it, an idle cell's bytes are
+    /// dead, so a freeze leaves them out. Told by the globals wasm-ld exports.
+    stack_first: bool,
+    /// `__data_end` and `__heap_base`, if it exports them.
+    layout: [Option<u32>; 2],
     exports: HashMap<String, u32>,
 }
 
@@ -253,6 +262,9 @@ pub fn load(wasm: &[u8]) -> Result<Module, String> {
                 for g in r {
                     let g = g.map_err(e)?;
                     let val = const_val(&g.init_expr, &m.globals)?;
+                    if m.globals.is_empty() {
+                        m.stack_first = g.ty.mutable && g.ty.content_type == wasmparser::ValType::I32;
+                    }
                     m.globals.push(val);
                 }
             }
@@ -261,6 +273,13 @@ pub fn load(wasm: &[u8]) -> Result<Module, String> {
                     let x = x.map_err(e)?;
                     if x.kind == ExternalKind::Func {
                         m.exports.insert(x.name.to_string(), x.index);
+                    }
+                    if x.kind == ExternalKind::Global {
+                        match x.name {
+                            "__data_end" => m.layout[0] = Some(x.index),
+                            "__heap_base" => m.layout[1] = Some(x.index),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -316,7 +335,14 @@ pub fn load(wasm: &[u8]) -> Result<Module, String> {
     }
     if fits {
         m.image = combd_mem::Image::new(&start).map_err(|x| format!("memory image: {x}"))?;
+        m.start = start;
     }
+    // wasm-ld's globals, and nothing it starts with below where the stack begins.
+    let at = |g: Option<u32>| g.and_then(|g| m.globals.get(g as usize)).map(|&v| v & 0xffff_ffff);
+    m.stack_first &= match (m.globals.first().map(|&v| v & 0xffff_ffff), at(m.layout[0]), at(m.layout[1])) {
+        (Some(sp), Some(data_end), Some(heap)) => sp > 0 && data_end >= sp && heap >= data_end && m.active.iter().all(|&(_, off)| off as u64 >= sp),
+        _ => false,
+    };
     Ok(m)
 }
 
@@ -1146,6 +1172,12 @@ impl Engine for Interp {
         load(wasm).map(Arc::new)
     }
 
+    fn thaw(&self, m: &Arc<Module>, saved: &[u8]) -> Result<Vm, String> {
+        let mut vm = self.spawn(m)?;
+        vm.apply(saved).ok_or("not a frozen cell of this module")?;
+        Ok(vm)
+    }
+
     fn spawn(&self, m: &Arc<Module>) -> Result<Vm, String> {
         let (min, max) = m.mem;
         if min > self.max_pages {
@@ -1298,6 +1330,143 @@ impl CellVm for Vm {
 
     fn snapshot(&self) -> Option<Vm> {
         Some(self.clone())
+    }
+
+    /// Its size in pages, its globals, its segments' state, its tables if
+    /// they changed, then how many runs of memory differ from the module's
+    /// image (zeros past it), and each: how far past the last one it starts
+    /// and its length (LEB128), then its bytes. Below the stack pointer an
+    /// idle cell's memory is dead (`stack_first`): it's left out.
+    fn freeze(&self) -> Option<Vec<u8>> {
+        if self.state != State::Idle || !self.frames.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        let put = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
+        put(&mut out, (self.mem.len() / PAGE) as u32);
+        for g in &self.globals {
+            out.extend(g.to_le_bytes());
+        }
+        out.extend(self.dropped.iter().map(|&d| d as u8));
+        if self.tables == self.m.tables {
+            out.push(0);
+        } else {
+            out.push(1);
+            for t in &self.tables {
+                put(&mut out, t.len() as u32);
+                for e in t {
+                    put(&mut out, e.unwrap_or(u32::MAX));
+                }
+            }
+        }
+        // Differences closer than this are one run: a run costs 8 bytes.
+        const GAP: usize = 8;
+        let (mem, base) = (self.mem.bytes(), &self.m.start[..]);
+        let dead = if self.m.stack_first { (self.globals[0] as u32 as usize).min(mem.len()) } else { 0 };
+        let was = |j: usize| base.get(j).copied().unwrap_or(0);
+        let differs = |j: usize, x: u8| j >= dead && x != was(j);
+        let (mut runs, mut n, mut end) = (Vec::new(), 0u32, 0usize);
+        // Page by page, with a fast check for the pages it never changed.
+        for (p, page) in mem.chunks(4096).enumerate() {
+            let at = p * 4096;
+            if at + page.len() <= dead {
+                continue;
+            }
+            // The page the stack pointer is in goes byte by byte.
+            let same = at >= dead
+                && match base.get(at..at + page.len()) {
+                    Some(b) => page == b,
+                    None if at >= base.len() => page.iter().all(|&x| x == 0),
+                    None => page.iter().enumerate().all(|(k, &x)| x == was(at + k)),
+                };
+            if same {
+                continue;
+            }
+            let mut k = 0;
+            while k < page.len() {
+                if !differs(at + k, page[k]) {
+                    k += 1;
+                    continue;
+                }
+                let (from, mut last) = (k, k);
+                while k < page.len() && k - last <= GAP {
+                    if differs(at + k, page[k]) {
+                        last = k;
+                    }
+                    k += 1;
+                }
+                leb(&mut runs, at + from - end);
+                leb(&mut runs, last + 1 - from);
+                runs.extend_from_slice(&page[from..=last]);
+                end = at + last + 1;
+                n += 1;
+            }
+        }
+        put(&mut out, n);
+        out.extend(runs);
+        Some(out)
+    }
+}
+
+/// An unsigned LEB128 number.
+fn leb(out: &mut Vec<u8>, mut v: usize) {
+    while v >= 0x80 {
+        out.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+impl Vm {
+    /// Undo `freeze` on a fresh cell of the same module. `None`: it isn't one.
+    fn apply(&mut self, mut b: &[u8]) -> Option<()> {
+        fn cut<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            let (head, rest) = (b.get(..n)?, b.get(n..)?);
+            *b = rest;
+            Some(head)
+        }
+        fn u32_of(b: &mut &[u8]) -> Option<usize> {
+            Some(u32::from_le_bytes(cut(b, 4)?.try_into().unwrap()) as usize)
+        }
+        let pages = u32_of(&mut b)?;
+        if pages > self.max_pages as usize {
+            return None;
+        }
+        if pages * PAGE > self.mem.len() {
+            self.mem.grow(pages * PAGE).ok()?;
+        }
+        for g in self.globals.iter_mut() {
+            *g = u64::from_le_bytes(cut(&mut b, 8)?.try_into().unwrap());
+        }
+        for d in self.dropped.iter_mut() {
+            *d = cut(&mut b, 1)?[0] != 0;
+        }
+        if cut(&mut b, 1)?[0] == 1 {
+            for t in self.tables.iter_mut() {
+                let n = u32_of(&mut b)?;
+                *t = (0..n).map(|_| u32_of(&mut b).map(|e| (e != u32::MAX as usize).then_some(e as u32))).collect::<Option<_>>()?;
+            }
+        }
+        fn leb_of(b: &mut &[u8]) -> Option<usize> {
+            let mut v = 0usize;
+            for shift in (0..35).step_by(7) {
+                let x = cut(b, 1)?[0];
+                v |= ((x & 0x7f) as usize) << shift;
+                if x < 0x80 {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        let mut end = 0usize;
+        for _ in 0..u32_of(&mut b)? {
+            let off = end.checked_add(leb_of(&mut b)?)?;
+            let len = leb_of(&mut b)?;
+            let bytes = cut(&mut b, len)?;
+            self.mem.bytes_mut().get_mut(off..off.checked_add(len)?)?.copy_from_slice(bytes);
+            end = off + len;
+        }
+        b.is_empty().then_some(())
     }
 }
 

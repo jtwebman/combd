@@ -174,6 +174,19 @@ fn reserve(n: usize) -> io::Result<*mut u8> {
     Ok(p as *mut u8)
 }
 
+/// Bytes the allocator has handed out and not had back (glibc only: 0
+/// elsewhere). Unlike RSS, it doesn't count memory freed but kept.
+pub fn heap_in_use() -> u64 {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: a plain query with no arguments.
+        let m = unsafe { libc::mallinfo2() };
+        (m.uordblks + m.hblkhd) as u64
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

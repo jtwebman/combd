@@ -28,6 +28,10 @@ pub trait Engine {
     fn load(&self, wasm: &[u8]) -> Result<Self::Program, String>;
     /// Make a fresh cell from a loaded program.
     fn spawn(&self, program: &Self::Program) -> Result<Self::Vm, String>;
+    /// A cell again, from what `CellVm::freeze` kept.
+    fn thaw(&self, _program: &Self::Program, _saved: &[u8]) -> Result<Self::Vm, String> {
+        Err("this engine can't thaw a cell".into())
+    }
 }
 
 pub trait CellVm {
@@ -53,6 +57,11 @@ pub trait CellVm {
     /// Whether the module exports `name` (event cells export `on_request`).
     fn has_export(&mut self, _name: &str) -> bool {
         false
+    }
+    /// An idle cell, as little as it takes to make it again (`Engine::thaw`):
+    /// what differs from a fresh one. `None`: it's busy, or the engine can't.
+    fn freeze(&self) -> Option<Vec<u8>> {
+        None
     }
     /// Lower the most this cell's memory may grow to (`memory_kb`), in
     /// pages. `Err`: it already starts bigger. Engines that fix the limit
