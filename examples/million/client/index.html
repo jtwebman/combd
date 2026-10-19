@@ -9,7 +9,7 @@
   @media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #eee; --dim: #999; --line: #333; --accent: #6d9cff; } }
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
-  header { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; padding: 6px 8px; }
+  header { position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; padding: 6px 8px; background: var(--bg); border-bottom: 1px solid var(--line); }
   h1 { font-size: 16px; margin: 0; }
   .dim { color: var(--dim); }
   a { color: var(--accent); }
@@ -25,6 +25,7 @@
 <header>
   <h1>One Million Checkboxes</h1>
   <span class="dim">on <a href="https://github.com/jtwebman/combd">combd</a>. Checking a box checks it for everyone.</span>
+  <span id="at" class="dim"></span>
   <label>Go to box <input id="jump" type="number" min="1" max="1000000" inputmode="numeric"></label>
 </header>
 <div id="space"></div>
@@ -32,7 +33,7 @@
 <script>
 const TOTAL = 1_000_000, CHUNK = 15_625, SIZE = 26;
 const space = document.getElementById("space");
-const status = document.getElementById("status");
+const status = document.getElementById("status"), at = document.getElementById("at");
 // chunk number -> { ws, bits (Uint8Array, once it's here) }
 const chunks = new Map();
 const pool = [];
@@ -75,9 +76,13 @@ function draw() {
   cols = Math.max(1, Math.floor(width / SIZE));
   const step = width / cols;
   space.style.height = Math.ceil(TOTAL / cols) * SIZE + "px";
-  const top = scrollY - space.offsetTop;
+  // The bar stays on top, so what shows of the boxes starts at scrollY
+  // (in their own coordinates) and is the window less the bar.
+  const top = scrollY, bottom = scrollY + innerHeight - space.offsetTop;
+  const shown = [Math.floor(top / SIZE) * cols + 1, Math.min(TOTAL, Math.ceil(bottom / SIZE) * cols)];
+  at.textContent = `Boxes ${shown.map((n) => n.toLocaleString()).join(" – ")}`;
   const first = Math.max(0, Math.floor(top / SIZE) - 2);
-  const last = Math.min(Math.ceil(TOTAL / cols), Math.ceil((top + innerHeight) / SIZE) + 2);
+  const last = Math.min(Math.ceil(TOTAL / cols), Math.ceil(bottom / SIZE) + 2);
   const lo = first * cols, hi = Math.min(TOTAL, last * cols);
   const want = new Set();
   for (let n = Math.floor(lo / CHUNK); n <= Math.floor((hi - 1) / CHUNK); n++) want.add(n);
@@ -106,7 +111,9 @@ space.addEventListener("change", (e) => {
 
 document.getElementById("jump").addEventListener("change", (e) => {
   const i = Math.min(TOTAL, Math.max(1, +e.target.value || 1)) - 1;
-  scrollTo(0, space.offsetTop + Math.floor(i / cols) * SIZE);
+  // The bar stays on top, as tall as the space above the boxes: this puts
+  // the row just under it.
+  scrollTo(0, Math.floor(i / cols) * SIZE);
 });
 
 let queued = false;
