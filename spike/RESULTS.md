@@ -2073,6 +2073,59 @@ Safe Rust can't expose leftover memory at all (that takes `unsafe`, which is
 banned). The test `fresh_cells_never_see_old_memory` fills dead cells with a
 pattern and checks that new cells never see it.
 
+## A session per WebSocket: what a connection costs (2026-10-19)
+
+A `[ws.x]` process starts a session per socket, in memory on the loop that
+holds it, with no bucket (`plan.md`, "Socket processes"). Idle past
+`hibernate_ms`, it keeps only the bytes it hands back and its cell goes;
+objects push to its socket without waking it.
+
+**Idle connections, measured** (`ws-hold`: N real sockets to one server,
+each sending one message, then the server's RSS; Linux in Docker, one
+event loop, the million app, each socket watching chunk 0 and sent its
+3.9 KB snapshot):
+
+| 20,000 sockets | Server memory per socket |
+|---|---|
+| `hibernate_ms = 2000`, while connecting (viewers awake) | up to 45 KB |
+| `hibernate_ms = 2000`, settled (all asleep) | **4.1 KB** |
+| `hibernate_ms = 0`, while connecting | 2.8 to 3.0 KB |
+| `hibernate_ms = 0`, settled | **3.8 KB** |
+
+An Erlang process starts at 2.7 KB; a Phoenix connection is a few of them
+plus buffers. So an idle combd connection is at BEAM's scale already: the
+socket, the session's host record, its ~30 bytes of state, and the chunk's
+subscription entry. The "settled" rise is most likely heap left behind by
+the cells that ran during the burst (glibc keeps small freed blocks, so
+RSS can't tell). Releasing a connection's grown buffers once empty didn't
+move it (4.10 to 4.11 KB), so that change was dropped.
+
+For scale: eieio's One Million Checkboxes peaked at over 20,000 unique
+visitors an hour (he gives no concurrent count), on 8 worker VMs, an nginx
+box, and a 4-CPU, 32 GB Redis. 20,000 sockets held open at once here take
+about 80 MB on one core. That's idle sockets only: fan-out under load (his
+millions of checks an hour, pushed to thousands of watchers) is the next
+measurement, with bots.
+
+**Live cells, measured** (`density-app`: N cells of a real module,
+started, then sent real requests; Linux in Docker):
+
+| Module | Started | After real work |
+|---|---|---|
+| million `viewer` (its own small module: 64 KB stack, 13 KB of data) | 20.9 KB | 41.2 KB (its 4 events) |
+| million `web` (serves the page) | 41.0 KB | 109.7 KB (one page) |
+| arena `lobby` | 65.2 KB | 163.6 KB (one page) |
+
+At the start it's mostly the module's static data, copied into every cell
+(13 KB for the viewer is 4 pages of 4 KB; the interpreter's own state is
+about 5 KB). After work it's stack and heap pages that a warm cell keeps,
+since Wasm memory never shrinks. Those are the next two steps: a shared
+copy-on-write starting image, and a reset after each request for workers.
+
+(macOS, with 16 KB pages and its own calloc, gave 1.1 to 1.3 MB per web
+cell after one page: grown memory is copied into a new buffer, and reused
+blocks get zeroed by hand. The Linux numbers are the ones to compare.)
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A

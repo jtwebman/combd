@@ -549,6 +549,72 @@ fn density<E: Engine>(name: &str, eng: &E, prog: &E::Program) {
     );
 }
 
+fn ws_hold(host: &str, port: u16, path: &str, n: usize, msg: &str, pid: &str) {
+    use std::io::{Read, Write};
+    let rss = || std::fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())).unwrap_or(0);
+    let before = rss();
+    let mut held = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "GET {path} HTTP/1.1\r\nhost: {host}\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").unwrap();
+        let mut head = vec![];
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(s.read(&mut b).unwrap() == 1, "socket {i}: closed in the handshake");
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"), "socket {i}: {}", String::from_utf8_lossy(&head));
+        // One masked text frame (a client must mask).
+        let p = msg.as_bytes();
+        let mut f = vec![0x81, 0x80 | 126, (p.len() >> 8) as u8, p.len() as u8, 0, 0, 0, 0];
+        if p.len() < 126 {
+            f = vec![0x81, 0x80 | p.len() as u8, 0, 0, 0, 0];
+        }
+        f.extend_from_slice(p); // the mask is 0: the payload stays as is
+        s.write_all(&f).unwrap();
+        held.push(s);
+        if (i + 1) % (n / 4).max(1) == 0 {
+            println!("  {:>7} sockets: server {:>7} KB, {:>5.2} KB/socket", i + 1, rss(), (rss() - before) as f64 / (i + 1) as f64);
+        }
+    }
+    // Let them settle (hibernate), then measure again.
+    std::thread::sleep(Duration::from_secs(5));
+    println!("ws-hold: {n} sockets, settled: {:.2} KB/socket (server {} KB, {} KB before)", (rss() - before) as f64 / n as f64, rss(), before);
+}
+
+fn density_app(wasm: &str, n: usize, rest: &[&str]) {
+    let eng = interp::Interp { max_pages: 16384 };
+    let prog = eng.load(&std::fs::read(wasm).unwrap()).unwrap();
+    let environ: Vec<Vec<u8>> = rest.iter().filter_map(|a| a.strip_prefix("env=")).map(|e| e.as_bytes().to_vec()).collect();
+    let reqs: Vec<&str> = rest.iter().copied().filter(|a| !a.starts_with("env=")).collect();
+    let environ = std::sync::Arc::new(environ);
+    let before = rss_kb();
+    let t = Instant::now();
+    let mut cells: Vec<_> = (0..n)
+        .map(|_| {
+            let mut vm = eng.spawn(&prog).unwrap();
+            let mut st = HostState { environ: environ.clone(), ..HostState::default() };
+            init(&mut vm, &mut st).unwrap();
+            (vm, st)
+        })
+        .collect();
+    let spawned = (t.elapsed(), rss_kb());
+    let t = Instant::now();
+    for (vm, st) in &mut cells {
+        for r in &reqs {
+            if let Err(e) = request(vm, r, st) {
+                panic!("{r}: {e}");
+            }
+            st.ws_out.clear();
+        }
+    }
+    let served = (t.elapsed(), rss_kb());
+    let per = |kb: u64| (kb - before) as f64 / n as f64;
+    println!("density-app {wasm}: {n} cells");
+    println!("  started:  {:>6.1} KB/cell  {:>6.1} us/cell", per(spawned.1), us(spawned.0) / n as f64);
+    println!("  served {} requests each: {:>6.1} KB/cell  {:>6.1} us/cell", reqs.len(), per(served.1), us(served.0) / n as f64);
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Neighbor {
     /// No other work on the thread.
@@ -674,6 +740,13 @@ fn main_with(args: &[&str]) {
                 }
             }
         }
+        // Memory per cell of a real module, after real requests:
+        // `density-app <module.wasm> <n> [env=K=V]... [request]...`.
+        ["density-app", wasm, n, ref rest @ ..] => density_app(wasm, n.parse().unwrap(), rest),
+        // Hold `n` WebSockets open on a server, each after one message, and
+        // print the server's memory per socket: `ws-hold <host> <port>
+        // <path> <n> <message> <server pid>`.
+        ["ws-hold", host, port, path, n, msg, pid] => ws_hold(host, port.parse().unwrap(), path, n.parse().unwrap(), msg, pid),
         ["compute", "native"] => compute_native(),
         ["api-bench", "native"] => api_bench_native(),
         ["api-bench", e] => main_with(&["api-bench", e, "rust"]),
