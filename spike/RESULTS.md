@@ -2126,6 +2126,35 @@ copy-on-write starting image, and a reset after each request for workers.
 cell after one page: grown memory is copied into a new buffer, and reused
 blocks get zeroed by hand. The Linux numbers are the ones to compare.)
 
+**A shared starting image** (`combd-mem`, the interpreter's only `unsafe`
+code): a module's data segments are written once, at load, into an
+in-memory file (memfd; an unlinked temp file on macOS), and every cell maps
+it copy-on-write. Pages a cell only reads stay shared; its first write to
+a page copies that page. Growth stays inside a reservation (address space,
+not RAM). Memory is now measured as PSS (a page shared by N cells counts
+1/N; RSS would count it N times). Linux, same runs as above:
+
+| Module | Started, before / after | After real work, before / after | Start time |
+|---|---|---|---|
+| million `viewer` | 20.9 / **0.9 KB** | 41.4 / **25.2 KB** | 9.6 / 2.1 us |
+| million `web` | 41.0 / **1.0 KB** | 120.2 / **28.7 KB** | 10.9 / 2.3 us |
+| arena `lobby` | 65.2 / **1.2 KB** | 177.2 / **72.9 KB** | 20.0 / 2.3 us |
+
+A fresh cell is now about 1 KB, under a BEAM process's 2.7 KB. Serving the
+page the first time got much faster too (million 394 to 16 us a cell,
+arena 436 to 62): the page is read from shared pages, not from copies just
+written. What a cell keeps after work is pages it really wrote (stack,
+heap): reset per request is the next step for workers. On macOS (busy
+laptop, alternating builds) a bare spawn is slower, 1.5 to 3.6 us (the
+mmap calls), but a fresh cell serving its first hello is faster (156 to
+115 to 130 us), and so is a crash restart (155 to 110 us); compute is the
+same within noise. The spec testsuite (30,497 pass, 0 fail) and 20,000
+differential fuzz seeds against Wasmtime agree. A cell is now two or three
+mappings (the image, its own pages, the rest of its reservation), so
+Linux's map limit (`vm.max_map_count`) is reached at a third as many live
+cells as before; hibernated sessions have none. One region for every cell
+(the next item on the list) fixes both.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A

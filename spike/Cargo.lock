@@ -169,12 +169,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "combd-mem"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "combd-spike"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
  "combd-aot",
  "combd-guest",
+ "combd-mem",
  "corosensei",
  "hmac 0.12.1",
  "httparse",

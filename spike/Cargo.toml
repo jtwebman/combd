@@ -24,6 +24,9 @@ fuzz = ["wasmtime", "dep:wasm-smith", "dep:arbitrary", "dep:wat"]
 [dependencies]
 combd-guest = { path = "../guest" }
 combd-aot = { path = "aot", optional = true, default-features = false }
+# Cells' memory, copy-on-write from their module's image: the interpreter's
+# only unsafe code.
+combd-mem = { path = "mem" }
 corosensei = { version = "0.3.4", optional = true }
 wasmparser = "0.261"
 # The HTTP front: epoll/kqueue event loop and hyper's request parser.

@@ -163,7 +163,10 @@ pub struct Module {
     mem: (u32, Option<u32>), // min and max pages
     tables: Vec<Vec<Option<u32>>>,
     data: Vec<Vec<u8>>,
-    active: Vec<(u32, u32)>, // (segment, offset) copied in at spawn
+    active: Vec<(u32, u32)>, // (segment, offset): in `image`, or copied in at spawn
+    /// The starting memory every cell maps copy-on-write (`combd-mem`).
+    /// `None`: no data, or a segment that doesn't fit (spawn refuses it).
+    image: Option<Arc<combd_mem::Image>>,
     exports: HashMap<String, u32>,
 }
 
@@ -296,6 +299,23 @@ pub fn load(wasm: &[u8]) -> Result<Module, String> {
         for (slot, f) in slots.iter_mut().zip(funcs) {
             *slot = (f != u32::MAX).then_some(f);
         }
+    }
+    // What the data segments put in memory, once for every cell.
+    let mut start = vec![];
+    let mut fits = true;
+    for &(seg, off) in &m.active {
+        let (d, off) = (&m.data[seg as usize], off as usize);
+        if off + d.len() > m.mem.0 as usize * PAGE {
+            fits = false;
+            break;
+        }
+        if start.len() < off + d.len() {
+            start.resize(off + d.len(), 0);
+        }
+        start[off..off + d.len()].copy_from_slice(d);
+    }
+    if fits {
+        m.image = combd_mem::Image::new(&start).map_err(|x| format!("memory image: {x}"))?;
     }
     Ok(m)
 }
@@ -1132,12 +1152,14 @@ impl Engine for Interp {
             return Err("initial memory over the limit".into());
         }
         let max_pages = max.unwrap_or(u32::MAX).min(self.max_pages);
-        let mut mem = LinMem::new(min as usize * PAGE);
+        let mut mem = combd_mem::Mem::new(m.image.as_ref(), min as usize * PAGE).map_err(|x| format!("memory: {x}"))?;
         let mut dropped = vec![false; m.data.len()];
         for &(seg, offset) in &m.active {
-            let data = &m.data[seg as usize];
-            let to = mem.buf[..mem.len].get_mut(offset as usize..offset as usize + data.len()).ok_or("data segment out of bounds")?;
-            to.copy_from_slice(data);
+            if m.image.is_none() {
+                let data = &m.data[seg as usize];
+                let to = mem.bytes_mut().get_mut(offset as usize..offset as usize + data.len()).ok_or("data segment out of bounds")?;
+                to.copy_from_slice(data);
+            }
             dropped[seg as usize] = true;
         }
         Ok(Vm {
@@ -1173,54 +1195,9 @@ enum State {
     Poisoned,
 }
 
-/// A cell's linear memory. New space always comes from a fresh zeroed
-/// allocation (calloc), so the OS only hands out a page when the cell first
-/// writes to it.
-///
-/// ponytail: growing past the buffer doubles it and copies. Real mmap
-/// reservation (like Wasmtime) needs `unsafe`; keep it for the audited FFI crate.
-pub struct LinMem {
-    buf: Vec<u8>,
-    len: usize,
-}
-
-/// Copy granularity: Apple Silicon's page size.
-const CHUNK: usize = 16 * 1024;
-/// macOS zeroes smaller calloc blocks by hand, which touches every page.
-/// From 1 MiB up it hands out lazy zero pages, even when reusing memory.
+/// Fresh zeroed allocations from 1 MiB up get lazy zero pages (macOS zeroes
+/// smaller calloc blocks by hand, which touches every page).
 const MIN_CAP: usize = 1 << 20;
-
-impl LinMem {
-    fn new(len: usize) -> Self {
-        LinMem { buf: vec![0; len.max(MIN_CAP)], len }
-    }
-
-    /// A fresh zeroed buffer of `cap` bytes holding the live bytes. All-zero
-    /// chunks are skipped, so pages the cell never wrote stay untouched.
-    fn copy_into(&self, cap: usize) -> Vec<u8> {
-        let mut nb = vec![0u8; cap];
-        for (i, c) in self.buf[..self.len].chunks(CHUNK).enumerate() {
-            if c.iter().any(|&b| b != 0) {
-                nb[i * CHUNK..i * CHUNK + c.len()].copy_from_slice(c);
-            }
-        }
-        nb
-    }
-
-    /// Caller has already checked `new_len <= max`.
-    fn grow(&mut self, new_len: usize, max: usize) {
-        if new_len > self.buf.len() {
-            self.buf = self.copy_into(new_len.max(self.buf.len() * 2).min(max));
-        }
-        self.len = new_len;
-    }
-}
-
-impl Clone for LinMem {
-    fn clone(&self) -> Self {
-        LinMem { buf: self.copy_into(self.buf.len()), len: self.len }
-    }
-}
 
 /// One cell. Everything in it is plain data.
 #[derive(Clone)]
@@ -1232,7 +1209,7 @@ pub struct Vm {
     pc: u32,
     fp: u32,
     sp: u32,
-    mem: LinMem,
+    mem: combd_mem::Mem,
     max_pages: u32,
     globals: Vec<u64>,
     tables: Vec<Vec<Option<u32>>>,
@@ -1289,11 +1266,11 @@ impl CellVm for Vm {
     }
 
     fn read(&self, ptr: u32, len: u32) -> Option<Vec<u8>> {
-        self.mem.buf[..self.mem.len].get(ptr as usize..(ptr as usize).checked_add(len as usize)?).map(<[u8]>::to_vec)
+        self.mem.bytes().get(ptr as usize..(ptr as usize).checked_add(len as usize)?).map(<[u8]>::to_vec)
     }
 
     fn write(&mut self, ptr: u32, bytes: &[u8]) -> bool {
-        match self.mem.buf[..self.mem.len].get_mut(ptr as usize..ptr as usize + bytes.len()) {
+        match self.mem.bytes_mut().get_mut(ptr as usize..ptr as usize + bytes.len()) {
             Some(to) => {
                 to.copy_from_slice(bytes);
                 true
@@ -1311,7 +1288,7 @@ impl CellVm for Vm {
     }
 
     fn cap_memory(&mut self, pages: u32) -> Result<(), String> {
-        let have = self.mem.len / PAGE;
+        let have = self.mem.len() / PAGE;
         if have > pages as usize {
             return Err(format!("memory_kb {} is under this module's starting memory ({} KB): give it more, or build it smaller (a Rust module's 1 MB stack: -C link-arg=-zstack-size=65536)", pages as usize * 64, have * 64));
         }
@@ -1408,7 +1385,7 @@ const I64R: (f64, f64) = (-9223372036854775808.0, 9223372036854775808.0);
 const U64R: (f64, f64) = (0.0, 18446744073709551616.0);
 
 /// Room for `need` slots. A new buffer is a fresh zeroed allocation (lazy
-/// pages, see `LinMem`), so a frame's window costs memory only where it's
+/// pages, see `MIN_CAP`), so a frame's window costs memory only where it's
 /// used; only the `live` slots move.
 fn grow_stack(sv: &mut Vec<u64>, need: usize, live: usize) {
     if sv.len() < need {
@@ -1988,7 +1965,7 @@ impl Vm {
         let mut fp = *sfp as usize;
         let mut sp = *ssp as usize;
         let lm = mem;
-        let mut mem: &mut [u8] = &mut lm.buf[..lm.len];
+        let mut mem: &mut [u8] = lm.bytes_mut();
         // Plain slices keep pointer and length in registers. Re-slice after any resize.
         let mut s: &mut [u64] = &mut sv[..];
 
@@ -2108,9 +2085,10 @@ impl Vm {
                     if new > *max_pages as u64 {
                         push!(u32::MAX as u64);
                     } else {
-                        lm.grow(new as usize * PAGE, *max_pages as usize * PAGE);
-                        mem = &mut lm.buf[..lm.len];
-                        push!(old as u64);
+                        // Out of address space or RAM is a failed grow, as Wasm says.
+                        let grew = lm.grow(new as usize * PAGE).is_ok();
+                        mem = lm.bytes_mut();
+                        push!(if grew { old as u64 } else { u32::MAX as u64 });
                     }
                 }
                 Op::MemoryCopy => {

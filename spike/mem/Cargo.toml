@@ -1,0 +1,9 @@
+[package]
+name = "combd-mem"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Cells' linear memory, copy-on-write from their module's starting image. The interpreter's only unsafe code."
+
+[dependencies]
+libc = "0.2"

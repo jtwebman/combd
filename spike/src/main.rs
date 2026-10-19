@@ -466,6 +466,12 @@ fn rss_kb() -> u64 {
     String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
 }
 
+/// Linux: proportional memory, where a page shared by N mappings counts
+/// 1/N (RSS would count it N times). Elsewhere: RSS.
+fn pss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/smaps_rollup").ok().and_then(|s| s.lines().find(|l| l.starts_with("Pss:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok())).unwrap_or_else(rss_kb)
+}
+
 fn us(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
 }
@@ -588,7 +594,7 @@ fn density_app(wasm: &str, n: usize, rest: &[&str]) {
     let environ: Vec<Vec<u8>> = rest.iter().filter_map(|a| a.strip_prefix("env=")).map(|e| e.as_bytes().to_vec()).collect();
     let reqs: Vec<&str> = rest.iter().copied().filter(|a| !a.starts_with("env=")).collect();
     let environ = std::sync::Arc::new(environ);
-    let before = rss_kb();
+    let before = pss_kb();
     let t = Instant::now();
     let mut cells: Vec<_> = (0..n)
         .map(|_| {
@@ -598,7 +604,7 @@ fn density_app(wasm: &str, n: usize, rest: &[&str]) {
             (vm, st)
         })
         .collect();
-    let spawned = (t.elapsed(), rss_kb());
+    let spawned = (t.elapsed(), pss_kb());
     let t = Instant::now();
     for (vm, st) in &mut cells {
         for r in &reqs {
@@ -608,7 +614,7 @@ fn density_app(wasm: &str, n: usize, rest: &[&str]) {
             st.ws_out.clear();
         }
     }
-    let served = (t.elapsed(), rss_kb());
+    let served = (t.elapsed(), pss_kb());
     let per = |kb: u64| (kb - before) as f64 / n as f64;
     println!("density-app {wasm}: {n} cells");
     println!("  started:  {:>6.1} KB/cell  {:>6.1} us/cell", per(spawned.1), us(spawned.0) / n as f64);
