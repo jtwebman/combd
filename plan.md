@@ -705,16 +705,17 @@ shrinks, so a cell keeps whatever its worst request needed. An Erlang
 process starts at 2.7 KB because code and constants are shared and its
 heap grows and shrinks. The plan:
 1. **Pools shrink.** Warm worker cells idle past `COMBD_IDLE_MS` go (the
-   newest stays), and a deploy drops the old version's.
-2. **Caps.** `memory_kb` on a process: past it, the cell crashes with a
-   clear error. Socket processes default low.
+   newest stays). Built 2026-10-19.
+2. **Caps.** `memory_kb` on a process: past it, a grow fails; one under
+   the module's start is refused at deploy. Built 2026-10-19 (interpreter).
 3. **A shared starting image.** Each cell maps the module's starting
    memory copy-on-write, so static data costs once per module, not once
-   per cell, and a cell starts by mapping, not copying.
-4. **Reset per request.** A classic worker cell snaps back to the image
-   after each request: memory never creeps, and nothing one request left
-   can reach the next. (Event cells share on purpose; they reset only when
-   idle, if at all.)
+   per cell, and a cell starts by mapping, not copying. Built 2026-10-19
+   (`combd-mem`): a new cell is about 1 KB, down from 21 to 65.
+4. **A fresh cell per request, opt-in** (`fresh = true` on http): nothing
+   one request left can reach the next. Built 2026-10-19; measured at 4x
+   to 25x the time of a warm cell (page faults, and caches rebuilt), so
+   warm stays the default and idle trimming bounds the creep.
 5. **One reserved region** for every cell's memory, past Linux's map limit.
 
 3 to 5 need `mmap`, so they go in one small audited FFI crate. A live

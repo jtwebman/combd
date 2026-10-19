@@ -158,6 +158,11 @@ pub mod api {
                 };
                 format!("201 {}", serde_json::to_string(&r).unwrap())
             }
+            // Requests this instance has served: 1 every time in a fresh cell.
+            ("GET", ["api", "hits"]) => {
+                static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                format!("200 {{\"hits\":{}}}", HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
+            }
             // CPU-heavy on purpose: the bad neighbor in fairness tests.
             ("GET", ["api", "fib", n]) => {
                 let n: u32 = n.parse::<u32>().unwrap_or(0).min(40);

@@ -37,6 +37,9 @@ pub struct Proc {
     /// holds the socket; idle past `hibernate`, it keeps up to `state_max`
     /// bytes and its cell goes.
     pub socket: bool,
+    /// http: a fresh cell for every request, so nothing one leaves reaches
+    /// the next (and no warm cache either).
+    pub fresh: bool,
     pub hibernate: Duration,
     pub state_max: usize,
     /// `memory_kb`, in Wasm pages: the most a cell may grow to.
@@ -118,7 +121,7 @@ pub struct AppDir<'a> {
 impl<P> App<P> {
     /// One program, the old routes.
     pub fn single(prog: P, max_concurrent: usize) -> App<P> {
-        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, hibernate: Duration::ZERO, state_max: 0, memory_pages: None, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
+        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, state_max: 0, memory_pages: None, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
         let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default(), pools: vec![] };
         App { progs: vec![Arc::new(prog)], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
     }
@@ -217,6 +220,7 @@ impl<P> App<P> {
                     prog,
                     durable,
                     socket: p.settings["socket"].as_bool() == Some(true),
+                    fresh: p.settings.get("fresh").and_then(serde_json::Value::as_bool) == Some(true),
                     hibernate: Duration::from_millis(n("hibernate_ms")),
                     state_max: n("state_kb") as usize * 1024,
                     memory_pages: p.settings.get("memory_kb").and_then(serde_json::Value::as_u64).map(|kb| kb.div_ceil(64) as u32),

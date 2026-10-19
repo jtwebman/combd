@@ -2571,7 +2571,8 @@ impl<E: Engine> Loop<'_, E> {
                             }
                         }
                     }
-                    if !self.app.procs[cell.proc].retired {
+                    // `fresh`: the next request starts from the module's image.
+                    if !self.app.procs[cell.proc].retired && !self.app.procs[cell.proc].fresh {
                         self.pools[cell.proc].push((cell, Instant::now()));
                     }
                     split_answer(&a)

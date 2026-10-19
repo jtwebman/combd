@@ -171,6 +171,7 @@ fn schema(kind: &str) -> Option<&'static str> {
             r#"
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
             max_concurrent = { type = "int", min = 1, max = 1000, default = 32 }
+            fresh = { type = "bool", default = false }
             "memory_kb?" = { type = "int", min = 64, max = 4194304 }
             "#
         }
@@ -193,6 +194,7 @@ fn schema(kind: &str) -> Option<&'static str> {
             r#"
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
             max_concurrent = { type = "int", min = 1, max = 1000, default = 32 }
+            fresh = { type = "bool", default = false }
             durable = { type = "bool", default = false }
             socket = { type = "bool", default = false }
             hibernate_ms = { type = "int", min = 0, max = 86400000, default = 5000 }

@@ -2155,6 +2155,19 @@ Linux's map limit (`vm.max_map_count`) is reached at a third as many live
 cells as before; hibernated sessions have none. One region for every cell
 (the next item on the list) fixes both.
 
+**A fresh cell for every request** (`fresh = true` on an http process):
+nothing one request leaves can reach the next. It costs what a new cell
+pays, page faults for every page it touches plus whatever the app builds
+on start, so it's opt-in, not the default (Linux, `fresh-bench`):
+
+| Request | Warm cell | Fresh cell each time |
+|---|---|---|
+| the test guest, `GET /api/users/42` (it builds 100 users at start) | 5.2 us | 131 us |
+| million's page | 4.3 us | 24.7 us |
+
+Warm cells stay the default, as Cloudflare's isolates do: apps keep
+caches in them. Memory creep is bounded by the idle trim instead.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A

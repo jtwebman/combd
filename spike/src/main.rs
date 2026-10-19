@@ -588,6 +588,34 @@ fn ws_hold(host: &str, port: u16, path: &str, n: usize, msg: &str, pid: &str) {
     println!("ws-hold: {n} sockets, settled: {:.2} KB/socket (server {} KB, {} KB before)", (rss() - before) as f64 / n as f64, rss(), before);
 }
 
+fn fresh_bench(wasm: &str, n: usize, rest: &[&str]) {
+    let eng = interp::Interp { max_pages: 16384 };
+    let prog = eng.load(&std::fs::read(wasm).unwrap()).unwrap();
+    let environ = std::sync::Arc::new(rest.iter().filter_map(|a| a.strip_prefix("env=")).map(|e| e.as_bytes().to_vec()).collect::<Vec<_>>());
+    let req = rest.iter().copied().find(|a| !a.starts_with("env=")).expect("a request");
+    let cell = || {
+        let mut vm = eng.spawn(&prog).unwrap();
+        let mut st = HostState { environ: environ.clone(), ..HostState::default() };
+        init(&mut vm, &mut st).unwrap();
+        (vm, st)
+    };
+    for round in 0..2 {
+        let (mut vm, mut st) = cell();
+        let t = Instant::now();
+        for _ in 0..n {
+            request(&mut vm, req, &mut st).unwrap();
+        }
+        let warm = t.elapsed();
+        let t = Instant::now();
+        for _ in 0..n {
+            let (mut vm, mut st) = cell();
+            request(&mut vm, req, &mut st).unwrap();
+        }
+        let fresh = t.elapsed();
+        println!("fresh-bench round {round}: warm {:>7.2} us/request, fresh cell each {:>7.2} us/request", us(warm) / n as f64, us(fresh) / n as f64);
+    }
+}
+
 fn density_app(wasm: &str, n: usize, rest: &[&str]) {
     let eng = interp::Interp { max_pages: 16384 };
     let prog = eng.load(&std::fs::read(wasm).unwrap()).unwrap();
@@ -753,6 +781,9 @@ fn main_with(args: &[&str]) {
         // print the server's memory per socket: `ws-hold <host> <port>
         // <path> <n> <message> <server pid>`.
         ["ws-hold", host, port, path, n, msg, pid] => ws_hold(host, port.parse().unwrap(), path, n.parse().unwrap(), msg, pid),
+        // A warm cell against a fresh one for every request: `fresh-bench
+        // <module.wasm> <n> [env=K=V]... <request>`.
+        ["fresh-bench", wasm, n, ref rest @ ..] => fresh_bench(wasm, n.parse().unwrap(), rest),
         ["compute", "native"] => compute_native(),
         ["api-bench", "native"] => api_bench_native(),
         ["api-bench", e] => main_with(&["api-bench", e, "rust"]),
@@ -2454,6 +2485,10 @@ routes = ["admin.test/hello"]
 [http.api]
 module = "classic"
 routes = ["/api/*"]
+[http.fresh]
+module = "classic"
+routes = ["fresh.test/api/*"]
+fresh = true
 [durable.room]
 module = "classic"
 routes = ["/room/:id/*"]
@@ -2477,6 +2512,10 @@ routes = ["/room/:id/*"]
         assert_eq!(http(port, "GET", "/sleep/20", ""), (200, "{\"slept\":20}".into()));
         // A classic worker on its routes.
         assert_eq!(http(port, "GET", "/api/users/42", "").0, 200);
+        // A warm worker keeps its instance's state; a `fresh` one never does.
+        assert_eq!((http(port, "GET", "/api/hits", "").1, http(port, "GET", "/api/hits", "").1), ("{\"hits\":1}".into(), "{\"hits\":2}".into()));
+        let fresh = || http_to(port, "fresh.test", "GET", "/api/hits", "").1;
+        assert_eq!((fresh(), fresh()), ("{\"hits\":1}".into(), "{\"hits\":1}".into()));
         // Objects, scoped to their process.
         for n in 1..=2 {
             assert_eq!(http(port, "POST", "/room/r1/incr", ""), (200, format!("{{\"count\":{n}}}")));
