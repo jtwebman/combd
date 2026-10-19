@@ -634,8 +634,8 @@ callback at a time; requests interleave only where the cell waits.
 ### Socket processes: one per WebSocket (2026-10-19)
 
 A WebSocket is long-lived and stateful, so it gets a process of its own,
-the way Erlang gives every connection one. A process with `socket = true`
-and a route (`/ws`) starts a new instance, a **session**, for each socket
+the way Erlang gives every connection one. A `[ws.*]` process with a
+route (`/ws`) starts a new instance, a **session**, for each socket
 that connects there. The client never names it, and it ends when the socket
 closes. It gets the same events an object does (`WSOPEN`, `WSMSG`, `WSBIN`,
 `WSCLOSE`) and runs the app's code for that one user: what they watch,
@@ -731,8 +731,9 @@ every environment:
 - `[vars]` and `[secrets]` declare every env var, typed. No default means
   required; `?` means optional. Secrets map to a secret's name and never
   have defaults. Processes read both as normal env vars.
-- `[processes.*]` set a kind's settings, which the kind declares and types;
-  `[pools.*]` are generic (a member process plus settings). `"$NAME"`
+- A process's type is its table (`[http.*]`, `[ws.*]`, `[durable.*]`,
+  `[pool.*]`), and each type declares and types its settings; `module`
+  names its code (or a built-in, `combd:postgres`). `"$NAME"`
   references must match types exactly. Any mismatch and nothing starts.
 
 **Environments live in the control plane, not the file.** Teams make one

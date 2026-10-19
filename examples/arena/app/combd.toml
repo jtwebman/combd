@@ -25,26 +25,23 @@ SPECTATE_DELAY_MS = 10000
 "DRAIN_KEY?" = "drain-key"
 
 # The page, and the join and poll API.
-[processes.lobby]
-kind = "game"
+[http.lobby]
+module = "game"
 routes = ["/", "/api/*"]
 
 # One matchmaker for everyone: pairs players who are close to each other.
-[processes.matchmaker]
-kind = "game"
-durable = true
+[durable.matchmaker]
+module = "game"
 # Itself too: it notes a new match after answering, as a message to itself.
 callers = ["lobby", "match", "matchmaker"]
 
 # One object per match: the game, 20 ticks a second, over WebSockets.
-[processes.match]
-kind = "game"
-durable = true
+[durable.match]
+module = "game"
 routes = ["/match/:id/*"]
 callers = ["matchmaker"]
 
 # One object per player: wins and losses.
-[processes.player]
-kind = "game"
-durable = true
+[durable.player]
+module = "game"
 callers = ["lobby", "match"]

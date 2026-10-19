@@ -17,14 +17,21 @@
 //! PG_MAIN_URL = { secret = "pg-url", type = "url" }   # env var -> secret name
 //! "SIGNING_KEY?" = "jwt-key"                          # secrets never have defaults
 //!
-//! [processes.pg-conn]
-//! kind = "combd:postgres"
+//! # A process's type is its table: http, ws, durable, or pool.
+//! [http.api]
+//! module = "shop"                             # modules/shop.wasm
+//! routes = ["shop.example.com/api/*"]
+//!
+//! [durable.cart]
+//! module = "shop"
+//! routes = ["/cart/:id/*"]
+//!
+//! [pool.main]                                 # code names it: {"db": "main"}
+//! module = "combd:postgres"
 //! url = "$PG_MAIN_URL"
 //! connection.timeout_ms = 3000
-//!
-//! [pools.main]
-//! member = "pg-conn"
 //! max = "$PG_MAX"
+//! callers = ["api", "cart"]
 //! ```
 //!
 //! Types: `string` (with an optional `pattern`), `int` (i64), `float` (f64),
@@ -93,6 +100,22 @@ pub struct Process {
     pub callers: Vec<String>,
 }
 
+impl Process {
+    /// Its table: `http`, `ws`, `durable`, or `pool` (a pool's connection).
+    pub fn ty(&self) -> &'static str {
+        let on = |k: &str| self.settings.get(k) == Some(&Json::Bool(true));
+        if self.kind.starts_with("combd:") {
+            "pool"
+        } else if on("durable") {
+            "durable"
+        } else if on("socket") {
+            "ws"
+        } else {
+            "http"
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct Pool {
     pub settings: BTreeMap<String, Json>,
@@ -143,12 +166,38 @@ fn schema(kind: &str) -> Option<&'static str> {
             statement_timeout_ms = { type = "int", min = 1, max = 3600000, default = 5000 }
             "#
         }
-        // What every process of the app's own kinds takes.
+        // What each type takes, of the app's own processes.
+        "combd:http" => {
+            r#"
+            timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
+            max_concurrent = { type = "int", min = 1, max = 1000, default = 32 }
+            "memory_kb?" = { type = "int", min = 64, max = 4194304 }
+            "#
+        }
+        "combd:ws" => {
+            r#"
+            timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
+            hibernate_ms = { type = "int", min = 0, max = 86400000, default = 5000 }
+            state_kb = { type = "int", min = 1, max = 1024, default = 4 }
+            "memory_kb?" = { type = "int", min = 64, max = 4194304 }
+            "#
+        }
+        "combd:durable" => {
+            r#"
+            timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
+            "memory_kb?" = { type = "int", min = 64, max = 4194304 }
+            "#
+        }
+        // All of them, with how it runs: what the host reads.
         "combd:user" => {
             r#"
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
             max_concurrent = { type = "int", min = 1, max = 1000, default = 32 }
             durable = { type = "bool", default = false }
+            socket = { type = "bool", default = false }
+            hibernate_ms = { type = "int", min = 0, max = 86400000, default = 5000 }
+            state_kb = { type = "int", min = 1, max = 1024, default = 4 }
+            "memory_kb?" = { type = "int", min = 64, max = 4194304 }
             "#
         }
         "combd:pool" => {
@@ -165,6 +214,9 @@ fn schema(kind: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+/// A process's type is its table: `[http.web]`, `[ws.viewer]`, ...
+const TYPES: [&str; 4] = ["http", "ws", "durable", "pool"];
 
 /// Kinds a pool can hand out.
 const POOLABLE: [&str; 1] = ["combd:postgres"];
@@ -267,8 +319,8 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
         None => return Err(vec!["want a table at the top".into()]),
     };
     for k in top.keys() {
-        if !["app", "vars", "secrets", "processes", "pools"].contains(&k.as_str()) {
-            errs.push(format!("{k}: unknown section (app, vars, secrets, processes, pools)"));
+        if !["app", "vars", "secrets"].contains(&k.as_str()) && !TYPES.contains(&k.as_str()) {
+            errs.push(format!("{k}: unknown section (app, vars, secrets, {})", TYPES.join(", ")));
         }
     }
     let table = |k: &str, errs: &mut Vec<String>| -> Map<String, Json> {
@@ -325,9 +377,22 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
         errs.push(format!("{n} is in both [vars] and [secrets]: pick one"));
     }
     let names: BTreeMap<String, Spec> = vars.iter().chain(&secrets).map(|(k, v)| (k.clone(), v.clone())).collect();
-    let procs = table("processes", &mut errs);
-    // The app's own processes: the only ones that can call, or hold a lease.
-    let user = |n: &str| procs.get(n).and_then(|p| p.get("kind")).and_then(Json::as_str).is_some_and(|k| !k.starts_with("combd:"));
+    // Processes, a table per type: [http.x], [ws.x], [durable.x], [pool.x].
+    // A name is one process, whatever its type.
+    let mut procs: BTreeMap<String, (&str, Json)> = BTreeMap::new();
+    for ty in TYPES {
+        for (n, p) in table(ty, &mut errs) {
+            match procs.get(&n) {
+                Some((other, _)) => errs.push(format!("{ty}.{n}: {other}.{n} has that name already: a name is one process")),
+                None if !p.is_object() => errs.push(format!("{ty}.{n}: want a table")),
+                None => {
+                    procs.insert(n, (ty, p));
+                }
+            }
+        }
+    }
+    // The app's own processes: the only ones that can call, or use a pool.
+    let user = |n: &str| procs.get(n).is_some_and(|(ty, _)| *ty != "pool");
     let names_of = |at: &str, v: Option<Json>, errs: &mut Vec<String>| -> Vec<String> {
         let Some(v) = v else { return vec![] };
         let Some(list) = v.as_array().and_then(|a| a.iter().map(|x| x.as_str().map(String::from)).collect::<Option<Vec<_>>>()) else {
@@ -338,42 +403,57 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
             if !procs.contains_key(n) {
                 errs.push(format!("{at}: no process {n:?}"));
             } else if !user(n) {
-                errs.push(format!("{at}: {n} is a built-in kind; only the app's own processes can do this"));
+                errs.push(format!("{at}: {n} is a pool; only the app's own processes can do this"));
             }
         }
         list
     };
     let mut processes = BTreeMap::new();
+    let mut pools = BTreeMap::new();
     let mut seen_routes: BTreeMap<String, String> = BTreeMap::new();
-    for (pname, p) in &procs {
-        let at = format!("processes.{pname}");
+    for (pname, (ty, p)) in &procs {
+        let at = format!("{ty}.{pname}");
         if !ident(pname) {
             errs.push(format!("{at}: use lowercase letters, digits, - and _ in names"));
         }
         let mut flat = BTreeMap::new();
         flatten("", p, &mut flat);
-        let kind = flat.remove("kind").and_then(|k| k.as_str().map(String::from)).unwrap_or_default();
+        let module = flat.remove("module").and_then(|k| k.as_str().map(String::from)).unwrap_or_default();
         let (routes_v, callers_v) = (flat.remove("routes"), flat.remove("callers"));
-        let builtin = kind.starts_with("combd:");
-        if builtin {
-            if schema(&kind).is_none() || !POOLABLE.contains(&kind.as_str()) {
-                errs.push(format!("{at}.kind {kind:?}: not a built-in kind (so far: combd:postgres)"));
+        let callers = names_of(&format!("{at}.callers"), callers_v, &mut errs);
+        if *ty == "pool" {
+            if !POOLABLE.contains(&module.as_str()) {
+                errs.push(format!("{at}.module {module:?}: a pool hands out a built-in kind (so far: combd:postgres)"));
                 continue;
             }
-            if routes_v.is_some() || callers_v.is_some() {
-                errs.push(format!("{at}: {kind} is reached through a pool, so it takes no routes or callers"));
+            if routes_v.is_some() {
+                errs.push(format!("{at}.routes: a pool is reached by its callers, not routes"));
             }
-        } else if !ident(&kind) {
-            errs.push(format!("{at}.kind {kind:?}: name one of the app's modules (modules/<kind>.wasm), or a built-in combd: kind"));
+            if callers.is_empty() {
+                errs.push(format!("{at}.callers: required: which processes may use it"));
+            }
+            // Its connections' settings and its own, in one table.
+            let conn = settings_of(&module);
+            let mut both = settings_of("combd:pool");
+            both.remove("member");
+            both.extend(conn.clone());
+            check_settings(&at, &both, &flat, &names, &mut errs);
+            let (mine, mut theirs): (BTreeMap<_, _>, BTreeMap<_, _>) = flat.into_iter().partition(|(k, _)| conn.contains_key(k));
+            theirs.insert("member".into(), Json::String(pname.clone()));
+            processes.insert(pname.clone(), Process { kind: module, settings: mine, routes: vec![], callers: vec![] });
+            pools.insert(pname.clone(), Pool { settings: theirs, owners: callers });
             continue;
-        } else if !has_module(&kind) {
-            errs.push(format!("{at}.kind: no module modules/{kind}.wasm"));
         }
-        let schema_kind = if builtin { kind.as_str() } else { "combd:user" };
-        check_settings(&at, &settings_of(schema_kind), &flat, &names, &mut errs);
-        let durable = flat.get("durable") == Some(&Json::Bool(true));
-        if durable && flat.contains_key("max_concurrent") {
-            errs.push(format!("{at}.max_concurrent: a durable object takes one event at a time"));
+        if !ident(&module) {
+            errs.push(format!("{at}.module {module:?}: name one of the app's modules (modules/<module>.wasm)"));
+            continue;
+        } else if !has_module(&module) {
+            errs.push(format!("{at}.module: no module modules/{module}.wasm"));
+        }
+        check_settings(&at, &settings_of(&format!("combd:{ty}")), &flat, &names, &mut errs);
+        let durable = *ty == "durable";
+        if *ty == "ws" && routes_v.is_none() {
+            errs.push(format!("{at}.routes: a ws process starts when a socket connects: give it a route"));
         }
         let mut routes = vec![];
         if let Some(v) = routes_v {
@@ -397,41 +477,17 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
                 }
             }
         }
-        let callers = names_of(&format!("{at}.callers"), callers_v, &mut errs);
-        processes.insert(pname.clone(), Process { kind, settings: flat, routes, callers });
-    }
-    let mut pools = BTreeMap::new();
-    for (name, p) in table("pools", &mut errs) {
-        let at = format!("pools.{name}");
-        if !ident(&name) {
-            errs.push(format!("{at}: use lowercase letters, digits, - and _ in names"));
-        }
-        let mut flat = BTreeMap::new();
-        flatten("", &p, &mut flat);
-        let owners_v = flat.remove("owners");
-        if owners_v.is_none() {
-            errs.push(format!("{at}.owners: required: which processes may hold a lease"));
-        }
-        let owners = names_of(&format!("{at}.owners"), owners_v, &mut errs);
-        check_settings(&at, &settings_of("combd:pool"), &flat, &names, &mut errs);
-        if let Some(m) = flat.get("member").and_then(Json::as_str) {
-            match processes.get(m) {
-                Some(p) if POOLABLE.contains(&p.kind.as_str()) => {}
-                Some(p) => errs.push(format!("{at}.member: {m} is {}, which a pool can't hand out", p.kind)),
-                None => errs.push(format!("{at}.member: no process {m:?}")),
-            }
-        }
-        pools.insert(name, Pool { settings: flat, owners });
+        // How it runs, as the host reads it.
+        flat.insert("durable".into(), Json::Bool(durable));
+        flat.insert("socket".into(), Json::Bool(*ty == "ws"));
+        processes.insert(pname.clone(), Process { kind: module, settings: flat, routes, callers });
     }
     // Nothing declared that nothing can reach.
-    for (n, p) in &processes {
-        let reachable = if p.kind.starts_with("combd:") {
-            pools.values().any(|pool| pool.settings.get("member").and_then(Json::as_str) == Some(n))
-        } else {
-            !p.routes.is_empty() || !p.callers.is_empty()
-        };
-        if !reachable && !p.kind.is_empty() {
-            errs.push(format!("processes.{n}: nothing can reach it ({})", if p.kind.starts_with("combd:") { "no pool hands it out" } else { "no routes, and no callers" }));
+    for (n, (ty, _)) in &procs {
+        if let Some(p) = processes.get(n).filter(|_| *ty != "pool") {
+            if p.routes.is_empty() && p.callers.is_empty() {
+                errs.push(format!("{ty}.{n}: nothing can reach it (no routes, and no callers)"));
+            }
         }
     }
     for p in processes.values() {
@@ -919,10 +975,10 @@ impl Manifest {
             .iter()
             .map(|(n, p)| {
                 let kind = if p.kind.starts_with("combd:") { p.kind.as_str() } else { "combd:user" };
-                (n.clone(), Process { settings: fill(&format!("processes.{n}"), kind, &p.settings, &mut errs), ..p.clone() })
+                (n.clone(), Process { settings: fill(&format!("{}.{n}", p.ty()), kind, &p.settings, &mut errs), ..p.clone() })
             })
             .collect();
-        let pools = self.pools.iter().map(|(n, p)| (n.clone(), Pool { settings: fill(&format!("pools.{n}"), "combd:pool", &p.settings, &mut errs), owners: p.owners.clone() })).collect();
+        let pools = self.pools.iter().map(|(n, p)| (n.clone(), Pool { settings: fill(&format!("pool.{n}"), "combd:pool", &p.settings, &mut errs), owners: p.owners.clone() })).collect();
         if !errs.is_empty() {
             return Err(errs.join("\n  "));
         }
@@ -968,20 +1024,17 @@ STARTS = { type = "datetime", default = 2026-10-15T08:00:00Z }
 PG_MAIN_URL = { secret = "pg-url", type = "url" }
 "SIGNING_KEY?" = "jwt-key"
 
-[processes.api]
-kind = "api"
+[http.api]
+module = "api"
 routes = ["shop.example.com/api/*"]
 timeout_ms = 10000
 
-[processes.pg-conn]
-kind = "combd:postgres"
+[pool.main]
+module = "combd:postgres"
 url = "$PG_MAIN_URL"
 connection.timeout_ms = 3000
-
-[pools.main]
-member = "pg-conn"
-owners = ["api"]
 max = "$PG_MAX"
+callers = ["api"]
 "#;
 
     const YAML: &str = r#"
@@ -995,14 +1048,15 @@ vars:
 secrets:
   PG_MAIN_URL: { secret: pg-url, type: url }
   SIGNING_KEY?: jwt-key
-processes:
-  api: { kind: api, routes: [shop.example.com/api/*], timeout_ms: 10000 }
-  pg-conn:
-    kind: combd:postgres
+http:
+  api: { module: api, routes: [shop.example.com/api/*], timeout_ms: 10000 }
+pool:
+  main:
+    module: combd:postgres
     url: $PG_MAIN_URL
     connection: { timeout_ms: 3000 }
-pools:
-  main: { member: pg-conn, owners: [api], max: $PG_MAX }
+    max: $PG_MAX
+    callers: [api]
 "#;
 
     const JSON: &str = r#"{
@@ -1015,11 +1069,8 @@ pools:
     "STARTS": {"type": "datetime", "default": "2026-10-15T08:00:00Z"}
   },
   "secrets": {"PG_MAIN_URL": {"secret": "pg-url", "type": "url"}, "SIGNING_KEY?": "jwt-key"},
-  "processes": {
-    "api": {"kind": "api", "routes": ["shop.example.com/api/*"], "timeout_ms": 10000},
-    "pg-conn": {"kind": "combd:postgres", "url": "$PG_MAIN_URL", "connection": {"timeout_ms": 3000}}
-  },
-  "pools": {"main": {"member": "pg-conn", "owners": ["api"], "max": "$PG_MAX"}}
+  "http": {"api": {"module": "api", "routes": ["shop.example.com/api/*"], "timeout_ms": 10000}},
+  "pool": {"main": {"module": "combd:postgres", "url": "$PG_MAIN_URL", "connection": {"timeout_ms": 3000}, "max": "$PG_MAX", "callers": ["api"]}}
 }"#;
 
     fn env(vars: &[(&str, Json)], secrets: &[(&str, &str)]) -> EnvValues {
@@ -1058,11 +1109,12 @@ pools:
         assert_eq!(pool.owners, ["api"]);
         let pool = &pool.settings;
         assert_eq!((pool["max"].clone(), pool["on_manager_loss"].clone(), pool["wait_ms"].clone()), (100.into(), "finish".into(), 5000.into()));
-        let pg = &r.processes["pg-conn"];
+        let pg = &r.processes["main"];
         let (kind, pg) = (&pg.kind, &pg.settings);
         assert_eq!((kind.as_str(), pg["url"].as_str(), pg["connection.timeout_ms"].as_i64(), pg["connection.retries"].as_i64()), ("combd:postgres", Some("postgres://db/x"), Some(3000), Some(3)));
         let api = &r.processes["api"];
         assert_eq!((api.settings["timeout_ms"].as_i64(), api.settings["max_concurrent"].as_i64(), api.settings["durable"].as_bool()), (Some(10000), Some(32), Some(false)));
+        assert_eq!((api.ty(), pg_ty(r)), ("http", "pool"));
         assert_eq!(api.routes[0].host.as_deref(), Some("shop.example.com"));
         assert_eq!(api.routes[0].segs, [Seg::Lit("api".into()), Seg::Rest]);
         let environ: BTreeMap<_, _> = r.environ.iter().cloned().collect();
@@ -1070,6 +1122,10 @@ pools:
         assert_eq!(environ["LOG_LEVEL"], "info");
         assert_eq!(environ["PG_MAIN_URL"], "postgres://db/x");
         assert!(!environ.contains_key("MY_FLAG") && !environ.contains_key("SIGNING_KEY"), "unset optionals aren't set");
+    }
+
+    fn pg_ty(r: &Resolved) -> &'static str {
+        r.processes["main"].ty()
     }
 
     fn errors(manifest: &str) -> String {
@@ -1095,17 +1151,15 @@ T = { type = "datetime", default = "2026-02-30T00:00:00Z" }
 [secrets]
 S = { secret = "s", default = "leak" }
 PORT = "port"
-[processes.pg]
-kind = "combd:postgres"
+[pool.pg]
+module = "combd:postgres"
 url = "$NOPE"
 statement_timeout_ms = "$PORT"
 connection.timeout_ms = 0
 colour = "red"
-[processes.x]
-kind = "mysql"
-[pools.p]
-member = "missing"
 on_manager_loss = "panic"
+[http.x]
+module = "mysql"
 [extra]
 "#,
         );
@@ -1121,12 +1175,12 @@ on_manager_loss = "panic"
             "vars.T: default: \"2026-02-30T00:00:00Z\"",
             "secrets.S: secrets never have defaults",
             "PORT is in both [vars] and [secrets]",
-            "processes.pg.url: $NOPE isn't declared",
-            "processes.pg.connection.timeout_ms: 0 is outside 1 to 600000",
-            "processes.pg.colour: unknown setting",
-            "processes.x.kind: no module modules/mysql.wasm",
-            "pools.p.member: no process \"missing\"",
-            "pools.p.on_manager_loss: \"panic\": one of finish, stop",
+            "pool.pg.url: $NOPE isn't declared",
+            "pool.pg.connection.timeout_ms: 0 is outside 1 to 600000",
+            "pool.pg.colour: unknown setting",
+            "pool.pg.on_manager_loss: \"panic\": one of finish, stop",
+            "pool.pg.callers: required",
+            "http.x.module: no module modules/mysql.wasm",
             "extra: unknown section",
         ] {
             assert!(e.contains(want), "missing {want:?} in:\n{e}");
@@ -1135,23 +1189,23 @@ on_manager_loss = "panic"
 
     #[test]
     fn references_must_be_the_same_type_and_set() {
-        let base = "[app]\nname = \"a\"\n[processes.api]\nkind = \"api\"\nroutes = [\"/*\"]\n[processes.pg]\nkind = \"combd:postgres\"\nurl = \"postgres://x\"\n";
+        let base = "[app]\nname = \"a\"\n[http.api]\nmodule = \"api\"\nroutes = [\"/*\"]\n";
+        let pool = "[pool.p]\nmodule = \"combd:postgres\"\nurl = \"postgres://x\"\ncallers = [\"api\"]\n";
         // An int var into a url setting: no conversions.
-        assert!(errors(&format!("{base}[vars]\nU = 5\n[pools.p]\nmember = \"pg\"\nowners = [\"api\"]\nmax = \"$U\"\nwait_ms = \"$W\"\n")).contains("pools.p.wait_ms: $W isn't declared"));
-        assert!(errors(&format!("{base}[vars]\nF = 1.5\n[pools.p]\nmember = \"pg\"\nowners = [\"api\"]\nmax = \"$F\"\n")).contains("pools.p.max: wants int, $F is float"));
+        assert!(errors(&format!("{base}[vars]\nU = 5\n{pool}max = \"$U\"\nwait_ms = \"$W\"\n")).contains("pool.p.wait_ms: $W isn't declared"));
+        assert!(errors(&format!("{base}[vars]\nF = 1.5\n{pool}max = \"$F\"\n")).contains("pool.p.max: wants int, $F is float"));
         // An optional var can't fill a required setting.
-        let m = "[app]\nname = \"a\"\n[secrets]\n\"U?\" = { secret = \"u\", type = \"url\" }\n[processes.pg]\nkind = \"combd:postgres\"\nurl = \"$U\"\n";
-        // (It's unreachable too; the check we want is still there.)
-        assert!(errors(m).contains("processes.pg.url: needs a value, and $U is optional"));
+        let m = "[app]\nname = \"a\"\n[secrets]\n\"U?\" = { secret = \"u\", type = \"url\" }\n[pool.pg]\nmodule = \"combd:postgres\"\nurl = \"$U\"\n";
+        assert!(errors(m).contains("pool.pg.url: needs a value, and $U is optional"));
         // A var's own limits may be wider: the environment's value is checked
         // against the setting's too, before anything starts.
-        let m = load(&dir(&[("combd.toml", &format!("{base}[vars]\nM = {{ type = \"int\" }}\n[pools.p]\nmember = \"pg\"\nowners = [\"api\"]\nmax = \"$M\"\n"))]).0).unwrap().unwrap();
-        assert!(m.resolve(&env(&[("M", 0.into())], &[])).unwrap_err().contains("pools.p.max: 0 is outside 1 to 10000"));
+        let m = load(&dir(&[("combd.toml", &format!("{base}[vars]\nM = {{ type = \"int\" }}\n{pool}max = \"$M\"\n"))]).0).unwrap().unwrap();
+        assert!(m.resolve(&env(&[("M", 0.into())], &[])).unwrap_err().contains("pool.p.max: 0 is outside 1 to 10000"));
         assert!(m.resolve(&env(&[], &[])).unwrap_err().contains("M: required"));
         assert!(m.resolve(&env(&[("M", "lots".into())], &[])).unwrap_err().contains("M: want int"));
         assert!(m.resolve(&env(&[("M", 4.into()), ("N", 1.into())], &[])).unwrap_err().contains("N: not declared"));
         // `$$` is a literal dollar.
-        let m = load(&dir(&[("combd.toml", "[app]\nname = \"a\"\n[processes.pg]\nkind = \"combd:postgres\"\nurl = \"$$x://y\"\n[processes.api]\nkind = \"api\"\nroutes = [\"/\"]\n[pools.p]\nmember = \"pg\"\nowners = [\"api\"]\n")]).0).unwrap_err();
+        let m = load(&dir(&[("combd.toml", &format!("{base}[pool.p]\nmodule = \"combd:postgres\"\nurl = \"$$x://y\"\ncallers = [\"api\"]\n"))]).0).unwrap_err();
         assert!(m.contains("\"$x://y\": want a URL"), "{m}");
     }
 
@@ -1160,80 +1214,96 @@ on_manager_loss = "panic"
         let ok = r#"
 [app]
 name = "shop"
-[processes.api]
-kind = "api"
+[http.api]
+module = "api"
 routes = ["shop.example.com/api/*", "/health"]
-[processes.admin-api]
-kind = "admin"
+[http.admin-api]
+module = "admin"
 routes = ["admin.example.com/*"]
-[processes.image-maker]
-kind = "imager"
+[http.image-maker]
+module = "imager"
 callers = ["api", "admin-api"]
 timeout_ms = 120000
-[processes.room]
-kind = "api"
-durable = true
+[durable.room]
+module = "api"
 routes = ["/room/:id/*"]
-[processes.pg-conn]
-kind = "combd:postgres"
+[ws.chat]
+module = "api"
+routes = ["/chat"]
+hibernate_ms = 0
+callers = ["room"]
+[pool.pg-pool]
+module = "combd:postgres"
 url = "postgres://x"
-[pools.pg-pool]
-member = "pg-conn"
-owners = ["api", "admin-api"]
+callers = ["api", "admin-api"]
 "#;
         let m = load(&dir(&[("combd.toml", ok)]).0).unwrap().unwrap();
         assert_eq!(m.processes["image-maker"].callers, ["api", "admin-api"]);
         assert!(m.processes["image-maker"].routes.is_empty(), "internal only");
         assert_eq!(m.processes["room"].routes[0].segs, [Seg::Lit("room".into()), Seg::Param("id".into()), Seg::Rest]);
+        assert_eq!(["api", "room", "chat", "pg-pool"].map(|n| m.processes[n].ty()), ["http", "durable", "ws", "pool"]);
+        assert_eq!((m.pools["pg-pool"].owners.as_slice(), m.pools["pg-pool"].settings["member"].as_str()), (&["api".to_string(), "admin-api".to_string()][..], Some("pg-pool")), "a pool is its own member");
         let e = errors(
             r#"
 [app]
 name = "shop"
-[processes.api]
-kind = "api"
+[http.api]
+module = "api"
 routes = ["/a/:x", "/a/:y", "Bad.Host/x", "/x/*/y", "/q/:x/:x", "no-slash", "/sp ace"]
 callers = ["nobody"]
-[processes.lonely]
-kind = "admin"
-[processes.ghost]
-kind = "nomodule"
+[http.lonely]
+module = "admin"
+[http.ghost]
+module = "nomodule"
 routes = ["/g"]
-[processes.obj]
-kind = "api"
-durable = true
+[http.slow]
+module = "api"
+routes = ["/slow"]
+hibernate_ms = 5
+[durable.obj]
+module = "api"
 max_concurrent = 4
 routes = ["/obj/:name"]
-[processes.pg-conn]
-kind = "combd:postgres"
+[ws.api]
+module = "api"
+routes = ["/ws"]
+[ws.nowhere]
+module = "api"
+state_kb = 0
+[pool.pg]
+module = "combd:postgres"
 url = "postgres://x"
 routes = ["/pg"]
-[processes.pg-unused]
-kind = "combd:postgres"
+callers = ["pg2", "missing"]
+[pool.pg2]
+module = "combd:postgres"
 url = "postgres://x"
-[pools.a]
-member = "pg-conn"
-[pools.b]
-member = "pg-conn"
-owners = ["pg-unused", "missing"]
+callers = ["lonely"]
+[pool.mysql]
+module = "combd:mysql"
+callers = ["ghost"]
 "#,
         );
         for want in [
-            "processes.api.routes: \"/a/:y\" is the same route as one of api's",
+            "http.api.routes: \"/a/:y\" is the same route as one of api's",
             "\"Bad.Host/x\": \"Bad.Host\": want a lowercase host name",
             "\"/x/*/y\": * goes only at the end",
             "\"/q/:x/:x\": :x twice",
             "\"no-slash\": want host/path or /path",
             "\"/sp ace\"",
-            "processes.api.callers: no process \"nobody\"",
-            "processes.lonely: nothing can reach it",
-            "processes.ghost.kind: no module modules/nomodule.wasm",
-            "processes.obj.max_concurrent: a durable object takes one event at a time",
-            "processes.obj.routes: \"/obj/:name\": a durable object's route names it with :id",
-            "processes.pg-conn: combd:postgres is reached through a pool, so it takes no routes or callers",
-            "processes.pg-unused: nothing can reach it (no pool hands it out)",
-            "pools.a.owners: required",
-            "pools.b.owners: pg-unused is a built-in kind",
-            "pools.b.owners: no process \"missing\"",
+            "http.api.callers: no process \"nobody\"",
+            "http.lonely: nothing can reach it",
+            "http.ghost.module: no module modules/nomodule.wasm",
+            "http.slow.hibernate_ms: unknown setting",
+            "durable.obj.max_concurrent: unknown setting",
+            "durable.obj.routes: \"/obj/:name\": a durable object's route names it with :id",
+            "ws.api: http.api has that name already",
+            "ws.nowhere.routes: a ws process starts when a socket connects",
+            "ws.nowhere.state_kb: 0 is outside 1 to 1024",
+            "pool.pg.routes: a pool is reached by its callers, not routes",
+            "pool.pg.callers: pg2 is a pool",
+            "pool.pg.callers: no process \"missing\"",
+            "pool.mysql.module \"combd:mysql\": a pool hands out a built-in kind",
         ] {
             assert!(e.contains(want), "missing {want:?} in:\n{e}");
         }

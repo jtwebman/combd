@@ -5,13 +5,12 @@ name = "million"
 domains = ["million.combd.dev", "million.localhost"]
 
 # The page.
-[processes.web]
-kind = "million"
+[http.web]
+module = "million"
 routes = ["/"]
 
 # One object per 15,625 boxes (64 in all): the bits, and the WebSockets of
 # everyone looking at them.
-[processes.chunk]
-kind = "million"
-durable = true
+[durable.chunk]
+module = "million"
 routes = ["/c/:id/*"]

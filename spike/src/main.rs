@@ -2320,12 +2320,11 @@ vars:
   "MY_FLAG?": { type: bool }
 secrets:
   PG_URL: { secret: pg-url, type: url }
-processes:
-  api: { kind: api, routes: ["/*"] }
-  other: { kind: api, routes: ["other.test/*"] }
-  pg-conn: { kind: "combd:postgres", url: $PG_URL, connection: { retries: 0 } }
-pools:
-  main: { member: pg-conn, owners: [api], max: $PG_MAX, wait_ms: 2000 }
+http:
+  api: { module: api, routes: ["/*"] }
+  other: { module: api, routes: ["other.test/*"] }
+pool:
+  main: { module: "combd:postgres", url: $PG_URL, connection: { retries: 0 }, callers: [api], max: $PG_MAX, wait_ms: 2000 }
 "#).unwrap();
         std::fs::create_dir(app.0.join("modules")).unwrap();
         std::fs::copy(GUEST_EV, manifest::module_path(&app.0, "api")).unwrap();
@@ -2344,7 +2343,7 @@ pools:
             assert!(http(port, "POST", "/pg/q", "{\"q\":\"SELECT 41 + 1\"}").1.contains("[[42]]"));
             // Only the pool's owners may use it.
             let (_, body) = http_to(port, "other.test", "POST", "/pg/q", "{\"q\":\"SELECT 1\"}");
-            assert!(body.contains("denied: other isn't an owner of pool main"), "{body}");
+            assert!(body.contains("denied: other isn't one of pool main's callers"), "{body}");
         }
         // A mistake in the environment: nothing starts.
         std::fs::write(app.0.join("combd.dev.toml"), "[vars]\nREGION = \"Not Valid\"\n").unwrap();
@@ -2364,18 +2363,17 @@ pools:
         std::fs::write(app.0.join("combd.toml"), r#"
 [app]
 name = "shop"
-[processes.edge]
-kind = "ev"
+[http.edge]
+module = "ev"
 routes = ["/hello", "/sleep/*"]
-[processes.admin]
-kind = "ev"
+[http.admin]
+module = "ev"
 routes = ["admin.test/hello"]
-[processes.api]
-kind = "classic"
+[http.api]
+module = "classic"
 routes = ["/api/*"]
-[processes.room]
-kind = "classic"
-durable = true
+[durable.room]
+module = "classic"
 routes = ["/room/:id/*"]
 "#).unwrap();
         std::fs::create_dir(app.0.join("modules")).unwrap();
@@ -2420,22 +2418,21 @@ routes = ["/room/:id/*"]
         std::fs::write(app.0.join("combd.toml"), r#"
 [app]
 name = "shop"
-[processes.front]
-kind = "ev"
+[http.front]
+module = "ev"
 routes = ["/call", "/send"]
-[processes.sleeper]
-kind = "ev"
+[http.sleeper]
+module = "ev"
 callers = ["front"]
-[processes.worker]
-kind = "classic"
+[http.worker]
+module = "classic"
 callers = ["front", "room"]
-[processes.room]
-kind = "classic"
-durable = true
+[durable.room]
+module = "classic"
 routes = ["/room/:id/*"]
 callers = ["front", "room"]
-[processes.admin]
-kind = "classic"
+[http.admin]
+module = "classic"
 routes = ["/admin/*"]
 "#).unwrap();
         std::fs::create_dir(app.0.join("modules")).unwrap();
@@ -2505,16 +2502,15 @@ name = "{app}"
 domains = ["{app}.{org}.test"]
 [vars]
 TENANT = {{ type = "string" }}
-[processes.api]
-kind = "ev"
+[http.api]
+module = "ev"
 routes = ["/env/*", "/call", "/send", "/pg/q"]
-[processes.worker]
-kind = "classic"
+[http.worker]
+module = "classic"
 routes = ["/api/*"]
 callers = ["api"]
-[processes.room]
-kind = "classic"
-durable = true
+[durable.room]
+module = "classic"
 routes = ["/room/:id/*"]
 callers = ["api"]
 "#)
@@ -2526,7 +2522,7 @@ callers = ["api"]
             let mut m = manifest(org, app);
             // One app has a pool; the others must never reach it.
             if (org.as_str(), app.as_str()) == ("acme", "shop") {
-                m = m.replace("[processes.room]", "[processes.pg-conn]\nkind = \"combd:postgres\"\nurl = \"postgres://nobody@127.0.0.1:1/x\"\n[pools.main]\nmember = \"pg-conn\"\nowners = [\"api\"]\n[processes.room]");
+                m = m.replace("[durable.room]", "[pool.main]\nmodule = \"combd:postgres\"\nurl = \"postgres://nobody@127.0.0.1:1/x\"\ncallers = [\"api\"]\n[durable.room]");
             }
             std::fs::write(d.join("combd.toml"), m).unwrap();
             std::fs::write(d.join("combd.dev.toml"), format!("[vars]\nTENANT = \"{org}/{app}\"\n")).unwrap();
@@ -2570,7 +2566,7 @@ callers = ["api"]
             // Never another app's pool.
             if (org.as_str(), app.as_str()) != ("acme", "shop") {
                 let (_, body) = http_to(port, &h, "POST", "/pg/q", "{\"q\":\"SELECT 1\"}");
-                assert!(body.contains("isn't an owner of pool main"), "{org}/{app}: {body}");
+                assert!(body.contains("isn't one of pool main's callers"), "{org}/{app}: {body}");
             }
         }
         // Only its domains: an unknown host, or another app's path, is a 404.
@@ -2734,7 +2730,7 @@ callers = ["api"]
             std::fs::create_dir_all(d.join("modules")).unwrap();
             std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
             std::fs::copy(GUEST, manifest::module_path(&d, "classic")).unwrap();
-            std::fs::write(d.join("combd.toml"), format!("[app]\nname = \"shop\"\n[vars]\nVERSION = \"{n}\"\n[processes.api]\nkind = \"{api_kind}\"\nroutes = {api_routes}\n[processes.edge]\nkind = \"ev\"\nroutes = [\"/env/*\", \"/sleep/*\"]\n[processes.room]\nkind = \"classic\"\ndurable = true\nroutes = [\"/room/:id/*\"]\n")).unwrap();
+            std::fs::write(d.join("combd.toml"), format!("[app]\nname = \"shop\"\n[vars]\nVERSION = \"{n}\"\n[http.api]\nmodule = \"{api_kind}\"\nroutes = {api_routes}\n[http.edge]\nmodule = \"ev\"\nroutes = [\"/env/*\", \"/sleep/*\"]\n[durable.room]\nmodule = \"classic\"\nroutes = [\"/room/:id/*\"]\n")).unwrap();
             d
         };
         let (v1, v2) = (v(1, "ev", "[\"/hello\"]"), v(2, "classic", "[\"/api/*\"]"));
@@ -2818,7 +2814,7 @@ callers = ["api"]
             std::fs::create_dir_all(d.join("modules")).unwrap();
             std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
             std::fs::copy(GUEST, manifest::module_path(&d, "classic")).unwrap();
-            std::fs::write(d.join("combd.toml"), format!("[app]\nname = \"{name}\"\ndomains = [\"{domain}\"]\n[vars]\n{vars}\n[processes.api]\nkind = \"ev\"\nroutes = {routes}\n[processes.room]\nkind = \"classic\"\ndurable = true\nroutes = [\"/room/:id/*\"]\n")).unwrap();
+            std::fs::write(d.join("combd.toml"), format!("[app]\nname = \"{name}\"\ndomains = [\"{domain}\"]\n[vars]\n{vars}\n[http.api]\nmodule = \"ev\"\nroutes = {routes}\n[durable.room]\nmodule = \"classic\"\nroutes = [\"/room/:id/*\"]\n")).unwrap();
             deploy::bundle(&d).unwrap()
         };
         let deploy = |name: &str, b: &[u8]| -> Result<String, String> {
@@ -2922,7 +2918,7 @@ callers = ["api"]
             let d = src.0.join("data");
             std::fs::create_dir_all(d.join("modules")).unwrap();
             std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
-            std::fs::write(d.join("combd.toml"), "[app]\nname = \"data\"\ndomains = [\"data.test\"]\n[secrets]\nPG = { secret = \"pg-url\", type = \"url\" }\n[processes.api]\nkind = \"ev\"\nroutes = [\"/pg/q\"]\n[processes.pg-conn]\nkind = \"combd:postgres\"\nurl = \"$PG\"\n[pools.main]\nmember = \"pg-conn\"\nowners = [\"api\"]\nmax = 2\n").unwrap();
+            std::fs::write(d.join("combd.toml"), "[app]\nname = \"data\"\ndomains = [\"data.test\"]\n[secrets]\nPG = { secret = \"pg-url\", type = \"url\" }\n[http.api]\nmodule = \"ev\"\nroutes = [\"/pg/q\"]\n[pool.main]\nmodule = \"combd:postgres\"\nurl = \"$PG\"\ncallers = [\"api\"]\nmax = 2\n").unwrap();
             assert_eq!(api(&token, "PUT", "/v1/apps/acme/data/secrets/pg-url", pg_url.as_bytes()).0, 200);
             deploy("data", &deploy::bundle(&d).unwrap()).unwrap_or_else(|e| panic!("{e}"));
             for &p in &nodes {
@@ -3239,7 +3235,7 @@ callers = ["api"]
         let src = store::tempdir::Dir::new();
         std::fs::create_dir_all(src.0.join("modules")).unwrap();
         std::fs::copy(GUEST_EV, manifest::module_path(&src.0, "ev")).unwrap();
-        std::fs::write(src.0.join("combd.toml"), format!("[app]\nname = \"data\"\ndomains = [\"data.test\"]\n[vars]\nPG = {{ type = \"url\" }}\n[processes.api]\nkind = \"ev\"\nroutes = [\"/pg/q\", \"/hello\"]\n[processes.pg-conn]\nkind = \"combd:postgres\"\nurl = \"$PG\"\n[pools.main]\nmember = \"pg-conn\"\nowners = [\"api\"]\nmax = {max}\nwait_ms = 20000\n")).unwrap();
+        std::fs::write(src.0.join("combd.toml"), format!("[app]\nname = \"data\"\ndomains = [\"data.test\"]\n[vars]\nPG = {{ type = \"url\" }}\n[http.api]\nmodule = \"ev\"\nroutes = [\"/pg/q\", \"/hello\"]\n[pool.main]\nmodule = \"combd:postgres\"\nurl = \"$PG\"\ncallers = [\"api\"]\nmax = {max}\nwait_ms = 20000\n")).unwrap();
         let api = |method: &str, path: &str, body: &[u8]| admin::request(&format!("http://127.0.0.1:{admin_port}"), None, &token, method, path, body).unwrap();
         assert_eq!(api("PUT", "/v1/apps/acme/data/vars", serde_json::json!({ "PG": url }).to_string().as_bytes()).0, 200);
         let (code, v) = api("PUT", "/v1/apps/acme/data", &deploy::bundle(&src.0).unwrap());
@@ -3453,7 +3449,7 @@ callers = ["api"]
             let d = root.0.join(org).join(app);
             std::fs::create_dir_all(d.join("modules")).unwrap();
             std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
-            std::fs::write(d.join("combd.toml"), format!("[app]\nname = \"{app}\"\n{domains}\n[processes.api]\nkind = \"ev\"\nroutes = [\"/*\"]\n")).unwrap();
+            std::fs::write(d.join("combd.toml"), format!("[app]\nname = \"{app}\"\n{domains}\n[http.api]\nmodule = \"ev\"\nroutes = [\"/*\"]\n")).unwrap();
             (org.to_string(), d)
         };
         let eng = interp::Interp { max_pages: 16384 };

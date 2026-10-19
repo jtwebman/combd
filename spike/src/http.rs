@@ -2949,13 +2949,13 @@ impl<E: Engine> Loop<'_, E> {
         Arc::new(e)
     }
 
-    /// May process `proc` lease from pool `pool`? Its `owners` decide (with
+    /// May process `proc` lease from pool `pool`? Its `callers` decide (with
     /// no manifest, anyone may).
     fn may_lease(&self, proc: usize, pool: &str) -> Result<(), String> {
         if self.app.router.legacy || self.app.procs[proc].owns.iter().any(|p| p == pool) {
             return Ok(());
         }
-        Err(format!("denied: {} isn't an owner of pool {pool}", self.app.procs[proc].name))
+        Err(format!("denied: {} isn't one of pool {pool}'s callers", self.app.procs[proc].name))
     }
 
     /// A `call` is answered: tell whoever waits (once; a late answer is dropped).
