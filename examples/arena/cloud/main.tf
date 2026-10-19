@@ -79,6 +79,10 @@ variable "do_project" {
 variable "acme_email" {
   description = "Let's Encrypt account email (it may send notices there)"
 }
+variable "apps" {
+  description = "More apps on the same nodes, each at <app>.<domain>: in the certificate, and a name for each (all the nodes, round robin)"
+  default     = ["million"]
+}
 variable "load_balancer" {
   description = "Cloudflare Load Balancing (a paid add-on): the page itself from the nearest node. Off: arena.<domain> is the nodes, round robin; the game still plays on the nearest (it measures)."
   default     = false
@@ -86,6 +90,7 @@ variable "load_balancer" {
 
 locals {
   host    = "${var.name}.${var.domain}"
+  apps    = [for a in var.apps : "${a}.${var.domain}"]
   secrets = "${path.module}/.secrets"
   nodes   = { for i, r in var.regions : tostring(i) => r }
   peers   = join(",", [for i, r in var.regions : "${i}=n${i}.${local.host}:7100"])
@@ -101,7 +106,8 @@ data "cloudflare_zone" "zone" {
   name = var.domain
 }
 
-# The certificate: arena.<domain> and *.arena.<domain>, for every node.
+# The certificate: arena.<domain>, *.arena.<domain>, and the other apps'
+# names, for every node. Running nodes get a new one from tls.sh.
 resource "tls_private_key" "acme" {
   algorithm   = "ECDSA"
   ecdsa_curve = "P256"
@@ -115,8 +121,11 @@ resource "acme_registration" "me" {
 resource "acme_certificate" "arena" {
   account_key_pem           = acme_registration.me.account_key_pem
   common_name               = local.host
-  subject_alternative_names = ["*.${local.host}"]
+  subject_alternative_names = concat(["*.${local.host}"], local.apps)
   key_type                  = "P256"
+  # A replaced certificate isn't revoked: running nodes serve it until
+  # tls.sh gives them the new one.
+  revoke_certificate_on_destroy = false
   dns_challenge {
     provider = "cloudflare"
     config   = { CF_DNS_API_TOKEN = var.cloudflare_api_token }
@@ -171,7 +180,7 @@ resource "digitalocean_droplet" "node" {
     master   = file("${local.secrets}/master.key")
     tls_cert = "${acme_certificate.arena.certificate_pem}${acme_certificate.arena.issuer_pem}"
     tls_key  = acme_certificate.arena.private_key_pem
-    host     = local.host
+    sites    = join(", ", concat([local.host, "*.${local.host}"], local.apps))
     update   = file("${path.module}/combd-update.sh")
   })
   # Running nodes keep what they started with: a change here is for new
@@ -292,6 +301,17 @@ resource "cloudflare_load_balancer" "arena" {
   steering_policy  = "proximity"
 }
 
+# The other apps: each name is all the nodes, round robin.
+resource "cloudflare_record" "app" {
+  for_each = { for p in setproduct(var.apps, keys(digitalocean_droplet.node)) : "${p[0]}-${p[1]}" => { app = p[0], ip = digitalocean_droplet.node[p[1]].ipv4_address } }
+  zone_id  = data.cloudflare_zone.zone.id
+  name     = each.value.app
+  content  = each.value.ip
+  type     = "A"
+  proxied  = false
+  ttl      = 60
+}
+
 # No load balancer: the name is all three nodes, round robin.
 resource "cloudflare_record" "arena" {
   for_each = var.load_balancer ? {} : digitalocean_droplet.node
@@ -309,4 +329,9 @@ output "host" {
 
 output "nodes" {
   value = { for k, d in digitalocean_droplet.node : "n${k}.${local.host}" => "${d.ipv4_address} (${d.region})" }
+}
+
+# Every name Caddy answers (tls.sh).
+output "sites" {
+  value = join(", ", concat([local.host, "*.${local.host}"], local.apps))
 }

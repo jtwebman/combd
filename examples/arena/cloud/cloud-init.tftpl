@@ -33,7 +33,7 @@ write_files:
     content: ${base64encode(tls_key)}
   - path: /etc/caddy/Caddyfile
     content: |
-      ${host}, *.${host} {
+      ${sites} {
         tls /etc/caddy/cert.pem /etc/caddy/key.pem
         # While combd restarts (a new image), hold requests and retry
         # instead of answering 502.

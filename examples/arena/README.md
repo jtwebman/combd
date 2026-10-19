@@ -85,7 +85,9 @@ answers every state.
 
 Say what's different, and only what we've checked:
 - **Placement by measured latency.** Each player's browser times every
-  node; the match runs on the node best for both. Cloudflare's Durable
+  node; the match runs on the node best for both, and two players too far
+  apart for a fair game (`MAX_RTT_MS`, 150 ms for the worse off) aren't
+  matched at all. Cloudflare's Durable
   Objects take a coarse region hint; this picks the node, from what the two
   players measured.
 - **Your own machines**, one small binary, any language that compiles to
@@ -125,3 +127,9 @@ node in front of combd.
    game; a change to combd itself also moves each node to the new image
    (about 40 MB), one at a time, while Caddy holds requests until it's back
    (a few seconds). A change to docs alone does nothing.
+7. Other apps share the nodes: each in `apps` (in `cloud/main.tf`; the
+   million checkboxes by default) gets `<app>.<domain>` in the certificate
+   and DNS. Running nodes keep the certificate they started with, so after
+   a `terraform apply` that changes it (a new app, or a renewal),
+   `cloud/tls.sh` gives every node the new one and reloads Caddy. With more
+   than one app on the nodes, each names its domains in its manifest.

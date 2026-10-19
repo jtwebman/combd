@@ -1,12 +1,20 @@
 # Arena: a real-time 1 vs 1 game on combd. One module, four processes.
 [app]
 name = "arena"
+# Other apps share its nodes, so it names its own: the one name, and each
+# node's (a match plays on the node best for both players). One per node in
+# cloud/terraform.tfvars. Locally: localhost.
+domains = ["arena.combd.dev", "n0.arena.combd.dev", "n1.arena.combd.dev", "n2.arena.combd.dev", "localhost"]
 
 [vars]
 # How long a pause (or a dropped player) may last before the other wins.
 PAUSE_MS = 30000
 # How long a match lasts: then more kills wins, and a tie is a draw.
 MATCH_MS = 180000
+# The worst round trip (ms) a match may start with, for the worse off of the
+# two players on the node best for both. Farther apart: no match, however
+# long they wait (a bot is still there).
+MAX_RTT_MS = 150
 # How far behind live spectators watch. They see everything, walls or not,
 # so live would let a player watch their own match to see through walls.
 SPECTATE_DELAY_MS = 10000
