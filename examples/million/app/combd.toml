@@ -1,0 +1,17 @@
+# One Million Checkboxes on combd. One module, two processes.
+[app]
+name = "million"
+# Locally, browsers send million.localhost to 127.0.0.1.
+domains = ["million.combd.dev", "million.localhost"]
+
+# The page.
+[processes.web]
+kind = "million"
+routes = ["/"]
+
+# One object per 15,625 boxes (64 in all): the bits, and the WebSockets of
+# everyone looking at them.
+[processes.chunk]
+kind = "million"
+durable = true
+routes = ["/c/:id/*"]

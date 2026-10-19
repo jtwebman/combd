@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One Million Checkboxes</title>
+<style>
+  :root { --bg: #fff; --fg: #111; --dim: #666; --line: #ddd; --accent: #2a6df4; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #eee; --dim: #999; --line: #333; --accent: #6d9cff; } }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; padding: 6px 8px; }
+  h1 { font-size: 16px; margin: 0; }
+  .dim { color: var(--dim); }
+  a { color: var(--accent); }
+  label { margin-left: auto; }
+  input[type=number] { width: 7em; font: inherit; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px; }
+  #space { position: relative; margin: 0 4px; }
+  #status { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 4px 10px; border-radius: 4px; }
+  #status:empty { display: none; }
+  #space input { position: absolute; margin: 0; width: 20px; height: 20px; accent-color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>One Million Checkboxes</h1>
+  <span class="dim">on <a href="https://github.com/jtwebman/combd">combd</a>. Checking a box checks it for everyone.</span>
+  <label>Go to box <input id="jump" type="number" min="1" max="1000000" inputmode="numeric"></label>
+</header>
+<div id="space"></div>
+<div id="status" role="status"></div>
+<script>
+const TOTAL = 1_000_000, CHUNK = 15_625, SIZE = 26;
+const space = document.getElementById("space");
+const status = document.getElementById("status");
+// chunk number -> { ws, bits (Uint8Array, once it's here) }
+const chunks = new Map();
+const pool = [];
+let cols = 1;
+
+const on = (i) => { const c = chunks.get(Math.floor(i / CHUNK)); const j = i % CHUNK; return c?.bits ? (c.bits[j >> 3] >> (j & 7)) & 1 : null; };
+
+function open(n) {
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/c/${n}/ws`);
+  const c = { ws, bits: null };
+  chunks.set(n, c);
+  ws.onopen = () => ws.send(JSON.stringify({ t: "hi" }));
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.t === "all") {
+      c.bits = new Uint8Array(m.bits.match(/../g).map((h) => parseInt(h, 16)));
+    } else if ((m.t === "set" || m.t === "slow") && c.bits) {
+      c.bits[m.i >> 3] = m.v ? c.bits[m.i >> 3] | (1 << (m.i & 7)) : c.bits[m.i >> 3] & ~(1 << (m.i & 7));
+      if (m.t === "slow") say("Slow down a little.");
+    }
+    draw();
+  };
+  ws.onclose = () => {
+    if (chunks.get(n) !== c) return;
+    chunks.delete(n);
+    // Still on screen: try again in a moment.
+    setTimeout(draw, 1000);
+  };
+}
+
+let sayTimer;
+function say(s) { status.textContent = s; clearTimeout(sayTimer); sayTimer = setTimeout(() => (status.textContent = ""), 2000); }
+
+// The page is the boxes, edge to edge, and only the rows on screen exist.
+// The columns are however many fit, spread to fill the width, so the same
+// box sits somewhere else on every screen: a picture drawn on one is noise
+// on the next.
+function draw() {
+  const width = space.clientWidth;
+  cols = Math.max(1, Math.floor(width / SIZE));
+  const step = width / cols;
+  space.style.height = Math.ceil(TOTAL / cols) * SIZE + "px";
+  const top = scrollY - space.offsetTop;
+  const first = Math.max(0, Math.floor(top / SIZE) - 2);
+  const last = Math.min(Math.ceil(TOTAL / cols), Math.ceil((top + innerHeight) / SIZE) + 2);
+  const lo = first * cols, hi = Math.min(TOTAL, last * cols);
+  const want = new Set();
+  for (let n = Math.floor(lo / CHUNK); n <= Math.floor((hi - 1) / CHUNK); n++) want.add(n);
+  for (const [n, c] of chunks) if (!want.has(n)) { chunks.delete(n); c.ws.close(); }
+  for (const n of want) if (!chunks.has(n)) open(n);
+  for (let k = 0; k < hi - lo; k++) {
+    const i = lo + k;
+    let b = pool[k];
+    if (!b) { b = pool[k] = document.createElement("input"); b.type = "checkbox"; space.append(b); }
+    const v = on(i);
+    b.hidden = false;
+    b.dataset.i = i;
+    b.title = b.ariaLabel = `Box ${i + 1}`;
+    b.checked = v === 1;
+    b.disabled = v === null;
+    b.style.transform = `translate(${(i % cols) * step + (step - 20) / 2}px, ${Math.floor(i / cols) * SIZE + 3}px)`;
+  }
+  for (let k = hi - lo; k < pool.length; k++) pool[k].hidden = true;
+}
+
+space.addEventListener("change", (e) => {
+  const i = +e.target.dataset.i, c = chunks.get(Math.floor(i / CHUNK));
+  if (c?.ws.readyState !== WebSocket.OPEN) { draw(); return; }
+  c.ws.send(JSON.stringify({ t: "set", i: i % CHUNK, v: e.target.checked }));
+});
+
+document.getElementById("jump").addEventListener("change", (e) => {
+  const i = Math.min(TOTAL, Math.max(1, +e.target.value || 1)) - 1;
+  scrollTo(0, space.offsetTop + Math.floor(i / cols) * SIZE);
+});
+
+let queued = false;
+const later = () => { if (!queued) { queued = true; requestAnimationFrame(() => { queued = false; draw(); }); } };
+addEventListener("scroll", later, { passive: true });
+addEventListener("resize", later);
+draw();
+</script>
+</body>
+</html>
