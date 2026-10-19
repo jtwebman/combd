@@ -1285,6 +1285,45 @@ startup storage test runs against any backend, so a store that can't
 really do compare-and-swap is never used. The catalog code is built on
 this from the start; the bucket code moves behind it then.
 
+## The contract: a spec anyone can build, combd one way to run it (2026-10-19)
+
+The patterns here aren't combd's; they're what most backends already are.
+A durable object is a service with one owner and its own state, reached by
+HTTP, gRPC, or a WebSocket. A ws process is a connection with its own
+logic. A pool is shared access to a database. Events can ride SQS,
+Postgres, Redis, or anything with at-least-once delivery. So the contract
+gets written down on its own, and combd is the reference runtime, not the
+only one. An app written to it runs on any runtime that passes the suite.
+
+**What the contract is:**
+- **The manifest:** the types (`http`, `ws`, `durable`, `pool`), their
+  settings, `callers`, routes, domains, vars, and secrets. Already strict
+  and typed: it becomes a published schema.
+- **What each type promises:** `durable` has one owner at a time, its
+  writes are on disk before anything it said leaves (the output gate), and
+  an acknowledged write is never lost; `ws` is one instance per socket,
+  events in order, gone when the socket is; `http` keeps nothing between
+  requests; `call` answers once, `send` goes only if the sender succeeds.
+- **The host API:** `sql`, `call`, `send`, `ws_send`, alarms, ticks,
+  `pg_query`, `now_ms`, hibernation. Today it's raw imports with JSON;
+  for the contract it becomes one WIT file, so any language's bindings
+  come from it.
+- **The conformance suite:** black-box tests over HTTP and WebSockets,
+  plus the crash and split tests (kill the owner, cut the network), that
+  any runtime can run. Most of our integration tests already only talk to
+  a server; they're the start of it. The TLA+ specs state the promises
+  formally.
+
+**Other ways to run it**, for whoever wants to build them: on AWS, http as
+Lambda, a durable object as an ECS task that holds a DynamoDB lease (the
+owner), events on SQS; on plain VMs, Docker containers, Postgres advisory
+locks for ownership, and Redis streams for events. Each trades something
+(a Lambda can't hold a socket, so ws needs a connection service like API
+Gateway's), and the suite says what still holds.
+
+**When:** after v0.1. The WIT file and the suite come out of what we
+already have; the schema is the manifest code written down.
+
 ## Maybe later: realtime objects (guaranteed ticks)
 
 combd is fair, not realtime: every request gets a slice (about 50 us) in
