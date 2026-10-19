@@ -300,9 +300,16 @@ fn best_node(a: &BTreeMap<u64, u64>, b: &BTreeMap<u64, u64>) -> Option<(u64, u64
 }
 
 /// How far apart two players may be and still be matched: 80 ms, plus 25 ms
-/// for each second the one who's waited longer has waited.
-fn fair_enough(score: u64, waited_ms: u64) -> bool {
-    score <= 80 + 25 * waited_ms / 1000
+/// for each second the one who's waited longer has waited, but never past
+/// `max` (`MAX_RTT_MS`): a pair that far apart isn't a fair game, however
+/// long they wait.
+fn fair_enough(score: u64, waited_ms: u64, max: u64) -> bool {
+    score <= max.min(80 + 25 * waited_ms / 1000)
+}
+
+/// The worst round trip a match may start with (`MAX_RTT_MS`, 150 ms).
+fn max_rtt_ms() -> u64 {
+    env("MAX_RTT_MS").and_then(|v| v.parse().ok()).unwrap_or(150)
 }
 
 /// Pair whoever can be paired: the closest pair first, each pair close
@@ -312,6 +319,7 @@ fn pair_all(mm: &mut Mm, now: u64) {
     if mm.draining {
         return;
     }
+    let max = max_rtt_ms();
     loop {
         let mut best: Option<(u64, usize, usize, u64)> = None;
         for i in 0..mm.queue.len() {
@@ -322,7 +330,7 @@ fn pair_all(mm: &mut Mm, now: u64) {
                 }
                 let Some((node, score)) = best_node(&a.rtt, &b.rtt) else { continue };
                 let waited = now.saturating_sub(a.since.min(b.since));
-                if fair_enough(score, waited) && best.is_none_or(|x| score < x.0) {
+                if fair_enough(score, waited, max) && best.is_none_or(|x| score < x.0) {
                     best = Some((score, i, j, node));
                 }
             }
@@ -402,7 +410,7 @@ fn matchmaker(method: &str, path: &str, body: &str) -> String {
                 match mm.ready.remove(ticket) {
                     Some(a) => ok(json!({ "match": a.m, "node": a.node, "token": a.token, "side": a.side, "rtt": a.rtt })),
                     None if mm.queue.iter().any(|w| w.ticket == ticket) => ok(json!({ "waiting": true, "queue": mm.queue.len() })),
-                    None => err(404, "no such ticket (it waited too long?): join again"),
+                    None => err(404, "no one close enough to you came along in a minute: join again, or play a bot"),
                 }
             }
             // From an earlier version's beat: stop it.
@@ -899,5 +907,17 @@ mod cell {
         let out = Box::into_raw(answer.into_bytes().into_boxed_slice());
         let len = out.len() as u64;
         ((out as *mut u8 as u64) << 32) | len
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fair_enough;
+
+    #[test]
+    fn far_players_never_match() {
+        assert!(fair_enough(80, 0, 150) && !fair_enough(81, 0, 150));
+        assert!(fair_enough(130, 2000, 150), "the bar drops with waiting");
+        assert!(!fair_enough(151, 59_000, 150), "but never past the cap");
     }
 }
