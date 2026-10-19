@@ -1310,6 +1310,15 @@ impl CellVm for Vm {
         self.m.exports.contains_key(name)
     }
 
+    fn cap_memory(&mut self, pages: u32) -> Result<(), String> {
+        let have = self.mem.len / PAGE;
+        if have > pages as usize {
+            return Err(format!("memory_kb {} is under this module's starting memory ({} KB): give it more, or build it smaller (a Rust module's 1 MB stack: -C link-arg=-zstack-size=65536)", pages as usize * 64, have * 64));
+        }
+        self.max_pages = self.max_pages.min(pages);
+        Ok(())
+    }
+
     fn snapshot(&self) -> Option<Vm> {
         Some(self.clone())
     }

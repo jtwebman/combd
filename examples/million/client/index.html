@@ -25,6 +25,7 @@
 <header>
   <h1>One Million Checkboxes</h1>
   <span class="dim">on <a href="https://github.com/jtwebman/combd">combd</a>. Checking a box checks it for everyone.</span>
+  <span id="count"></span>
   <span id="at" class="dim"></span>
   <label>Go to box <input id="jump" type="number" min="1" max="1000000" inputmode="numeric"></label>
 </header>
@@ -34,35 +35,41 @@
 const TOTAL = 1_000_000, CHUNK = 15_625, SIZE = 26;
 const space = document.getElementById("space");
 const status = document.getElementById("status"), at = document.getElementById("at");
-// chunk number -> { ws, bits (Uint8Array, once it's here) }
-const chunks = new Map();
+// The chunks being watched: chunk number -> its bits, once they're here.
+const bits = new Map();
 const pool = [];
-let cols = 1;
+let cols = 1, ws = null, watching = "", sentAt = 0, range = [0, 0];
 
-const on = (i) => { const c = chunks.get(Math.floor(i / CHUNK)); const j = i % CHUNK; return c?.bits ? (c.bits[j >> 3] >> (j & 7)) & 1 : null; };
+const on = (i) => { const b = bits.get(Math.floor(i / CHUNK)), j = i % CHUNK; return b ? (b[j >> 3] >> (j & 7)) & 1 : null; };
+const put = (n, j, v) => { const b = bits.get(n); if (b) b[j >> 3] = v ? b[j >> 3] | (1 << (j & 7)) : b[j >> 3] & ~(1 << (j & 7)); };
 
-function open(n) {
-  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/c/${n}/ws`);
-  const c = { ws, bits: null };
-  chunks.set(n, c);
-  ws.onopen = () => ws.send(JSON.stringify({ t: "hi" }));
+// One socket for the page. It says what's on screen; the server sends the
+// boxes there, then every change to them.
+function connect() {
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  ws.onopen = () => { watching = ""; tell(); };
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
-    if (m.t === "all") {
-      c.bits = new Uint8Array(m.bits.match(/../g).map((h) => parseInt(h, 16)));
-    } else if ((m.t === "set" || m.t === "slow") && c.bits) {
-      c.bits[m.i >> 3] = m.v ? c.bits[m.i >> 3] | (1 << (m.i & 7)) : c.bits[m.i >> 3] & ~(1 << (m.i & 7));
-      if (m.t === "slow") say("Slow down a little.");
-    }
+    if (m.t === "all") bits.set(m.n, new Uint8Array(m.bits.match(/../g).map((h) => parseInt(h, 16))));
+    else if (m.t === "set") put(m.n, m.i, m.v);
+    else if (m.t === "slow") { put(Math.floor(m.i / CHUNK), m.i % CHUNK, !on(m.i)); say("Slow down a little."); }
     draw();
   };
-  ws.onclose = () => {
-    if (chunks.get(n) !== c) return;
-    chunks.delete(n);
-    // Still on screen: try again in a moment.
-    setTimeout(draw, 1000);
-  };
+  ws.onclose = () => { bits.clear(); draw(); setTimeout(connect, 1000); };
 }
+
+// The range, when the chunks on screen change, and every 20 s to keep
+// watching them.
+function tell() {
+  const [lo, hi] = range;
+  const chunks = `${Math.floor(lo / CHUNK)}-${Math.floor((hi - 1) / CHUNK)}`;
+  if (ws?.readyState !== WebSocket.OPEN || (chunks === watching && Date.now() - sentAt < 20_000)) return;
+  if (chunks !== watching) for (const n of bits.keys()) if (n < Math.floor(lo / CHUNK) || n > Math.floor((hi - 1) / CHUNK)) bits.delete(n);
+  ws.send(JSON.stringify({ t: "range", from: lo, to: hi }));
+  watching = chunks;
+  sentAt = Date.now();
+}
+setInterval(tell, 5000);
 
 let sayTimer;
 function say(s) { status.textContent = s; clearTimeout(sayTimer); sayTimer = setTimeout(() => (status.textContent = ""), 2000); }
@@ -84,10 +91,8 @@ function draw() {
   const first = Math.max(0, Math.floor(top / SIZE) - 2);
   const last = Math.min(Math.ceil(TOTAL / cols), Math.ceil(bottom / SIZE) + 2);
   const lo = first * cols, hi = Math.min(TOTAL, last * cols);
-  const want = new Set();
-  for (let n = Math.floor(lo / CHUNK); n <= Math.floor((hi - 1) / CHUNK); n++) want.add(n);
-  for (const [n, c] of chunks) if (!want.has(n)) { chunks.delete(n); c.ws.close(); }
-  for (const n of want) if (!chunks.has(n)) open(n);
+  range = [lo, hi];
+  tell();
   for (let k = 0; k < hi - lo; k++) {
     const i = lo + k;
     let b = pool[k];
@@ -104,9 +109,10 @@ function draw() {
 }
 
 space.addEventListener("change", (e) => {
-  const i = +e.target.dataset.i, c = chunks.get(Math.floor(i / CHUNK));
-  if (c?.ws.readyState !== WebSocket.OPEN) { draw(); return; }
-  c.ws.send(JSON.stringify({ t: "set", i: i % CHUNK, v: e.target.checked }));
+  const i = +e.target.dataset.i;
+  if (ws?.readyState !== WebSocket.OPEN || on(i) === null) { draw(); return; }
+  put(Math.floor(i / CHUNK), i % CHUNK, e.target.checked);
+  ws.send(JSON.stringify({ t: "set", i, v: e.target.checked }));
 });
 
 document.getElementById("jump").addEventListener("change", (e) => {
@@ -116,11 +122,22 @@ document.getElementById("jump").addEventListener("change", (e) => {
   scrollTo(0, Math.floor(i / cols) * SIZE);
 });
 
+// How many are checked, across the million.
+async function count() {
+  try {
+    const r = await (await fetch("/api/count")).json();
+    if (typeof r.checked === "number") document.getElementById("count").textContent = `${r.checked.toLocaleString()} checked`;
+  } catch {}
+}
+setInterval(count, 5000);
+
 let queued = false;
 const later = () => { if (!queued) { queued = true; requestAnimationFrame(() => { queued = false; draw(); }); } };
 addEventListener("scroll", later, { passive: true });
 addEventListener("resize", later);
 draw();
+connect();
+count();
 </script>
 </body>
 </html>

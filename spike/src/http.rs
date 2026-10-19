@@ -176,6 +176,11 @@ struct Stats {
     ws_messages: AtomicU64,
     /// Handshakes another loop accepted and handed to the object's loop.
     ws_handoffs: AtomicU64,
+    /// Socket processes' sessions, how many of them are hibernating, and
+    /// how many times one has woken.
+    sessions_live: AtomicU64,
+    sessions_hibernated: AtomicU64,
+    sessions_woken: AtomicU64,
     /// Event cells: instances started, and requests they took.
     ev_instances: AtomicU64,
     ev_requests: AtomicU64,
@@ -474,6 +479,9 @@ impl<E: Engine> Cell<E> {
 
 fn fresh<E: Engine>(eng: &E, app: &App<E::Program>, proc: usize, environ: &Arc<Vec<Vec<u8>>>) -> std::io::Result<Cell<E>> {
     let mut vm = eng.spawn(&app.progs[app.procs[proc].prog]).map_err(std::io::Error::other)?;
+    if let Some(pages) = app.procs[proc].memory_pages {
+        vm.cap_memory(pages).map_err(std::io::Error::other)?;
+    }
     let mut st = HostState { environ: environ.clone(), ..HostState::default() };
     crate::init(&mut vm, &mut st).map_err(std::io::Error::other)?;
     Ok(Cell { vm, st, proc })
@@ -554,6 +562,24 @@ impl<E: Engine> Object<E> {
     }
 }
 
+/// A socket process's instance: one per WebSocket, on the loop that holds
+/// the connection. In memory only: no bucket, no storage, no output gate.
+struct Session<E: Engine> {
+    sock: u64,
+    proc: usize,
+    /// `None`: not started, or hibernating (then `state` is what it kept).
+    cell: Option<Cell<E>>,
+    state: Option<Vec<u8>>,
+    busy: bool,
+    /// The event it's running (`WSMSG`, `HIBERNATE`, ...).
+    running: String,
+    waiting: VecDeque<(Origin, String)>,
+    last_used: Instant,
+}
+
+/// What the host asks a session that's idle past `hibernate_ms`.
+const HIBERNATE: &str = "do HIBERNATE /";
+
 /// A burst leaves a pool as big as it was: keep only what's been used in
 /// the last `idle` (the newest stays, warm for the next request).
 fn trim_idle<T>(pool: &mut Vec<(T, Instant)>, idle: Duration) {
@@ -565,6 +591,9 @@ fn trim_idle<T>(pool: &mut Vec<(T, Instant)>, idle: Duration) {
 enum Req {
     /// A WebSocket handshake for an object: name, path, `sec-websocket-key`.
     Upgrade(String, String, String),
+    /// A WebSocket handshake on a socket process's route: process, path,
+    /// `sec-websocket-key`. It starts a session.
+    Session(usize, String, String),
     /// A worker process's request.
     Cell(usize, String),
     Object(String, String),
@@ -606,8 +635,17 @@ fn parse_uuid(s: &str) -> Option<String> {
 
 /// The loop that owns an object.
 fn owner(name: &str, threads: usize) -> usize {
+    // A session lives on the loop that holds its socket, and its id says which.
+    if let Some(sock) = session_sock(name) {
+        return ((sock >> 28) & 0xff) as usize % threads;
+    }
     let h = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
     (h % threads as u64) as usize
+}
+
+/// A session's socket id, from its name (`<org>/<app>/<process>/~<socket>`).
+fn session_sock(name: &str) -> Option<u64> {
+    name.rsplit('/').next()?.strip_prefix('~')?.parse().ok()
 }
 
 /// One program, the old fixed routes, no manifest.
@@ -841,7 +879,7 @@ fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, kn
     }
     // Take down what's gone, then each change on its own: one app that
     // won't load is skipped (and tried again next time), not the rest.
-    let mut next = now.with_apps(&[], &gone, |w| eng.load(w).map_err(|e| e.to_string()))?;
+    let mut next = now.with_apps(&[], &gone, |w| eng.load(w).map_err(|e| e.to_string())).and_then(|a| check_caps(eng, a))?;
     for g in &gone {
         known.remove(g);
     }
@@ -852,7 +890,7 @@ fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, kn
                 return Err(format!("its manifest says it's {:?}", m.app));
             }
             let a = crate::app::AppDir { org: &c.org, dir: &c.dir, resolved: &r, app: &m.app, domains: &m.domains };
-            next.with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string()))
+            next.with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string())).and_then(|a| check_caps(eng, a))
         });
         match one {
             Ok(n) => {
@@ -898,7 +936,7 @@ pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::c
             return Err(format!("its manifest says it's {:?}, not {app:?}", m.app));
         }
         let a = crate::app::AppDir { org, dir: &dir, resolved: &r, app: &m.app, domains: &m.domains };
-        live.now().with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string()))?;
+        live.now().with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string())).and_then(|a| check_caps(eng, a))?;
         Ok(m.domains.clone())
     })();
     let _ = std::fs::remove_dir_all(&dir);
@@ -916,9 +954,21 @@ pub fn deploy_dir<E: Engine>(eng: &E, live: &Live<E::Program>, org: &str, dir: &
     let m = crate::manifest::load(dir).map_err(|e| format!("{at}: {e}"))?.ok_or(format!("{at}: no manifest"))?;
     let r = m.resolve(&crate::manifest::load_dev(dir).map_err(|e| format!("{at}: {e}"))?).map_err(|e| format!("{at}: {e}"))?;
     let a = crate::app::AppDir { org, dir, resolved: &r, app: &m.app, domains: &m.domains };
-    let next = live.now().with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string()))?;
+    let next = live.now().with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string())).and_then(|a| check_caps(eng, a))?;
     live.swap(next);
     Ok(())
+}
+
+/// A `memory_kb` under what its module starts with could never start a
+/// cell: the app is refused here, with why, not at its first request.
+fn check_caps<E: Engine>(eng: &E, app: App<E::Program>) -> Result<App<E::Program>, String> {
+    for p in app.procs.iter().filter(|p| !p.retired) {
+        if let Some(pages) = p.memory_pages {
+            let mut vm = eng.spawn(&app.progs[p.prog])?;
+            vm.cap_memory(pages).map_err(|e| format!("{}/{}: {e}", app.tenants[p.tenant].key(), p.name))?;
+        }
+    }
+    Ok(app)
 }
 
 /// One app in `dir` (org `local`), ready to serve.
@@ -938,7 +988,7 @@ pub fn load_apps<E: Engine>(eng: &E, apps: &[(String, std::path::PathBuf)]) -> R
         loaded.push((org.clone(), dir.clone(), m, r));
     }
     let list: Vec<crate::app::AppDir> = loaded.iter().map(|(org, dir, m, r)| crate::app::AppDir { org, dir, resolved: r, app: &m.app, domains: &m.domains }).collect();
-    let app = App::from_apps(&list, |w| eng.load(w).map_err(|e| e.to_string()))?;
+    let app = App::from_apps(&list, |w| eng.load(w).map_err(|e| e.to_string())).and_then(|a| check_caps(eng, a))?;
     let pools: Vec<crate::pg::PoolCfg> = loaded.iter().flat_map(|(org, _, m, r)| crate::pg::PgCfg::from_manifest(r, &format!("{org}/{}", m.app)).map(|c| c.pools).unwrap_or_default()).collect();
     Ok((app, (!pools.is_empty()).then_some(crate::pg::PgCfg { pools })))
 }
@@ -1094,6 +1144,7 @@ where
                     last_scan: Instant::now(),
                     last_tick: Instant::now(),
                     local_socks: HashMap::new(),
+                    sessions: HashMap::new(),
                     next_sock: 0,
                     boot: {
                         let mut b = [0u8; 8];
@@ -1169,6 +1220,8 @@ struct Loop<'a, E: Engine> {
     /// WebSocket connections this loop holds: socket id -> connection. They
     /// stay while their object is out of memory, or runs on another node.
     local_socks: HashMap<u64, Who>,
+    /// Socket processes' sessions on this loop, by name.
+    sessions: HashMap<String, Session<E>>,
     next_sock: u64,
     /// Random bits for socket ids, so a restart never reuses one.
     boot: u64,
@@ -2048,6 +2101,9 @@ impl<E: Engine> Loop<'_, E> {
         };
         match op {
             DbOp::Call(_) => unreachable!("handled above"),
+            DbOp::Open(_) if t.obj.as_ref().is_some_and(|n| self.sessions.contains_key(n)) => {
+                return self.db_resume(t, interp, 0, fail("pg_open: a socket process uses pooled queries (pg_query with no handle)".into()));
+            }
             DbOp::Open(req) => {
                 let proc = t.cell.proc;
                 let Some(b) = binding(&req).filter(|b| pools.has(&self.app.pool_key(proc, b))) else { return self.db_resume(t, interp, 0, fail("pg_open: name a database binding (\"db\")".into())) };
@@ -2292,16 +2348,169 @@ impl<E: Engine> Loop<'_, E> {
     /// In fleet mode the object may run on another node; its events go there
     /// like any request, and the connection stays here.
     fn upgrade(&mut self, id: usize, name: String, path: String, key: String) {
+        let sock = self.new_sock();
         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return };
         let who = (id, c.gen);
-        self.next_sock += 1;
-        // Unique across the fleet and across restarts: node, boot, loop, count.
-        let node = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node) as u64;
-        let sock = (node & 0x7ff) << 52 | (self.boot & 0xffff) << 36 | (self.me as u64 & 0xff) << 28 | (self.next_sock & 0xfff_ffff);
         c.busy = true; // no more HTTP on this connection
         c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: Default::default(), open: false, gone: false, inflight: 0 });
         self.local_socks.insert(sock, who);
         self.submit(Origin::Socket(who, sock, true), name, format!("do WSOPEN {path} {sock}"));
+    }
+
+    /// A new socket id. Unique across the fleet and across restarts: node,
+    /// boot, loop, count.
+    fn new_sock(&mut self) -> u64 {
+        self.next_sock += 1;
+        let node = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node) as u64;
+        (node & 0x7ff) << 52 | (self.boot & 0xffff) << 36 | (self.me as u64 & 0xff) << 28 | (self.next_sock & 0xfff_ffff)
+    }
+
+    /// A handshake on a socket process's route: a new session for it, on
+    /// this loop, named for the socket (`do WSOPEN <path> <id>`; 101 accepts).
+    fn open_session(&mut self, id: usize, p: usize, path: String, key: String) {
+        let sock = self.new_sock();
+        let name = self.app.object_name(p, &format!("~{sock}"));
+        let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return };
+        let who = (id, c.gen);
+        c.busy = true;
+        c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: Default::default(), open: false, gone: false, inflight: 0 });
+        self.local_socks.insert(sock, who);
+        self.sessions.insert(name.clone(), Session { sock, proc: p, cell: None, state: None, busy: false, running: String::new(), waiting: VecDeque::new(), last_used: Instant::now() });
+        self.sh.stats.sessions_live.fetch_add(1, Relaxed);
+        self.submit(Origin::Socket(who, sock, true), name, format!("do WSOPEN {path} {sock}"));
+    }
+
+    /// An event for a session: now, or after the ones ahead of it. One
+    /// that's gone gets 410; only a socket starts one.
+    fn session_submit(&mut self, origin: Origin, name: String, req: String) {
+        let Some(s) = self.sessions.get_mut(&name) else {
+            let _ = self.deliver(origin, (410, "{\"error\":\"that session is gone\"}".into()));
+            return;
+        };
+        s.waiting.push_back((origin, req));
+        self.session_next(&name);
+    }
+
+    /// Start a session's next event. A hibernating one wakes first, with
+    /// what it kept (`do WAKE / <len>`, the bytes by `ws_msg`).
+    fn session_next(&mut self, name: &str) {
+        loop {
+            let Some(s) = self.sessions.get_mut(name) else { return };
+            if s.busy {
+                return;
+            }
+            let Some((origin, req)) = s.waiting.pop_front() else { return };
+            let (origin, req, ws_in) = if req == HIBERNATE {
+                if s.cell.is_none() || !s.waiting.is_empty() {
+                    continue; // asleep already, or more to do first
+                }
+                (origin, req, vec![])
+            } else if let Some(state) = s.state.take() {
+                s.waiting.push_front((origin, req));
+                self.sh.stats.sessions_hibernated.fetch_sub(1, Relaxed);
+                self.sh.stats.sessions_woken.fetch_add(1, Relaxed);
+                (Origin::Discard, format!("do WAKE / {}", state.len()), state)
+            } else {
+                (origin, req, vec![])
+            };
+            if let Err(reply) = self.run_session(name, origin, req, ws_in) {
+                // Let it crash: the session goes, and so does its socket.
+                let _ = self.deliver(origin, reply);
+                let sock = self.sessions.get(name).map(|s| s.sock);
+                self.remove_session(name);
+                if let Some(sock) = sock {
+                    let _ = self.ws_local(name, sock, 8, &1011u16.to_be_bytes());
+                }
+                return;
+            }
+            return;
+        }
+    }
+
+    /// Begin one event on a session: its warm cell, or a fresh one.
+    fn run_session(&mut self, name: &str, origin: Origin, mut req: String, mut ws_in: Vec<u8>) -> Result<(), (u16, String)> {
+        let (eng, app) = (self.eng, self.app.clone());
+        let proc = app.object_proc(name);
+        if let Some(rest) = req.strip_prefix("do WSBIN ") {
+            let (sock, b64) = rest.split_once(' ').unwrap_or((rest, ""));
+            ws_in = crate::ws::unbase64(b64).unwrap_or_default();
+            req = format!("do WSBIN {sock} {}", ws_in.len());
+        }
+        let environ = self.environ_for(proc);
+        let s = self.sessions.get_mut(name).unwrap();
+        let open = self.local_socks.contains_key(&s.sock);
+        let mut cell = match s.cell.take() {
+            Some(c) => c,
+            None => fresh(eng, &app, proc, &environ).map_err(|e| (500, format!("{{\"error\":{:?}}}", e.to_string())))?,
+        };
+        cell.host().ws_ids = if open { vec![s.sock] } else { vec![] };
+        cell.host().ws_out.clear();
+        cell.host().ws_in = ws_in;
+        if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
+            eprintln!("session {name:?} trapped starting an event: {trap}");
+            return Err((500, String::new()));
+        }
+        s.busy = true;
+        s.last_used = Instant::now();
+        s.running = req.split(' ').nth(1).unwrap_or("").to_string();
+        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open: None, ws_drop: vec![], pg: vec![], ev: None });
+        Ok(())
+    }
+
+    /// A session's event is done. No output gate: it has no storage, so its
+    /// answer and sends go now. A `HIBERNATE` answered `200 <state>` puts it
+    /// to sleep; a crash, a close, or a refused handshake ends it.
+    fn session_finish(&mut self, name: &str, cell: Cell<E>, answer: Result<String, String>, mut ws: Vec<WsOut>) -> Option<((u16, String), Vec<WsOut>)> {
+        let p = &self.app.procs[cell.proc];
+        let (hibernate, state_max) = (p.hibernate, p.state_max);
+        let s = self.sessions.get_mut(name)?;
+        s.busy = false;
+        s.last_used = Instant::now();
+        let method = std::mem::take(&mut s.running);
+        let (reply, ok) = match answer {
+            Ok(a) => (split_answer(&a), true),
+            Err(trap) => {
+                eprintln!("session {name:?} trapped: {trap}");
+                ((500, format!("{{\"error\":{trap:?}}}")), false)
+            }
+        };
+        let gone = !ok || method == "WSCLOSE" || (method == "WSOPEN" && reply.0 != 101);
+        if ok && method == "HIBERNATE" && reply.0 == 200 && reply.1.len() <= state_max {
+            // Its cell goes; what it kept is all that's left.
+            s.state = Some(reply.1.clone().into_bytes());
+            self.sh.stats.sessions_hibernated.fetch_add(1, Relaxed);
+        } else if ok {
+            if method == "HIBERNATE" && reply.0 == 200 {
+                eprintln!("session {name:?}: {} bytes of state is over state_kb, so it stays warm", reply.1.len());
+            }
+            s.cell = Some(cell);
+            // `hibernate_ms = 0`: asleep after every event.
+            if hibernate.is_zero() && !gone && method != "HIBERNATE" && s.waiting.is_empty() && !self.ticks.contains_key(name) {
+                s.waiting.push_back((Origin::Discard, HIBERNATE.into()));
+            }
+        }
+        if !ok && self.local_socks.contains_key(&s.sock) {
+            ws.push(WsOut::Close(s.sock, 1011));
+        }
+        if gone {
+            self.remove_session(name);
+        } else {
+            self.session_next(name);
+        }
+        Some((reply, ws))
+    }
+
+    /// A session ends: what waits for it gets 410.
+    fn remove_session(&mut self, name: &str) {
+        let Some(s) = self.sessions.remove(name) else { return };
+        self.sh.stats.sessions_live.fetch_sub(1, Relaxed);
+        if s.state.is_some() {
+            self.sh.stats.sessions_hibernated.fetch_sub(1, Relaxed);
+        }
+        self.ticks.remove(name);
+        for (origin, _) in s.waiting {
+            let _ = self.deliver(origin, (410, "{\"error\":\"that session is gone\"}".into()));
+        }
     }
 
     /// A new connection, in a free slot.
@@ -2374,6 +2583,9 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }, vec![]));
         };
+        if self.sessions.contains_key(&name) {
+            return self.session_finish(&name, cell, answer, ws);
+        }
         if let Origin::Fleet(req) = origin {
             return self.fleet_finish(name, req, cell, answer, ws, ws_open, ws_drop).map(|r| (r, vec![]));
         }
@@ -2593,9 +2805,7 @@ impl<E: Engine> Loop<'_, E> {
         self.last_sweep = Instant::now();
         self.retire_cells();
         let idle = self.sh.cfg.idle;
-        for pool in &mut self.pools {
-            trim_idle(pool, idle);
-        }
+        self.sweep_cells();
         // Database handles keep an object here until they've been idle for
         // their pool's `session_idle_ms`; then they close, and it can leave.
         let handles = &self.pg_handles;
@@ -2619,6 +2829,33 @@ impl<E: Engine> Loop<'_, E> {
             self.remove_object(&name);
             self.sh.stats.objects_live.fetch_sub(1, Relaxed);
             self.sh.stats.evictions.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// What every sweep does, one node or a fleet: warm worker cells back to
+    /// what's been needed lately, and sessions idle past their
+    /// `hibernate_ms` give up their cell for their state.
+    fn sweep_cells(&mut self) {
+        let idle = self.sh.cfg.idle;
+        for pool in &mut self.pools {
+            trim_idle(pool, idle);
+        }
+        // Those whose socket is gone (they closed it) go.
+        let (procs, ticks, socks) = (&self.app.procs, &self.ticks, &self.local_socks);
+        let mut sleepy = vec![];
+        let mut ended = vec![];
+        for (n, s) in self.sessions.iter().filter(|(_, s)| !s.busy && s.waiting.is_empty()) {
+            if !socks.contains_key(&s.sock) {
+                ended.push(n.clone());
+            } else if s.cell.is_some() && !ticks.contains_key(n) && s.last_used.elapsed() >= procs[s.proc].hibernate {
+                sleepy.push(n.clone());
+            }
+        }
+        for n in ended {
+            self.remove_session(&n);
+        }
+        for n in sleepy {
+            self.session_submit(Origin::Discard, n, HIBERNATE.into());
         }
     }
 
@@ -2735,7 +2972,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -2758,6 +2995,9 @@ impl<E: Engine> Loop<'_, E> {
                     s.sockets_open.load(Relaxed),
                     s.ws_messages.load(Relaxed),
                     s.ws_handoffs.load(Relaxed),
+                    s.sessions_live.load(Relaxed),
+                    s.sessions_hibernated.load(Relaxed),
+                    s.sessions_woken.load(Relaxed),
                     s.ev_instances.load(Relaxed),
                     s.ev_requests.load(Relaxed)
                 );
@@ -2772,6 +3012,9 @@ impl<E: Engine> Loop<'_, E> {
                 let body = serde_json::json!({ "me": me, "nodes": nodes, "version": option_env!("COMBD_VERSION").unwrap_or("dev") }).to_string();
                 self.queue_reply(who, (200, format!("\0access-control-allow-origin: *\0{body}")));
             }
+            Req::Session(p, path, key) if self.app.procs[p].socket => self.open_session(id, p, path, key),
+            Req::Session(..) => self.queue_reply(who, (404, "{\"error\":\"no WebSocket here\"}".into())),
+            Req::Cell(p, _) if self.app.procs[p].socket => self.queue_reply(who, (426, "{\"error\":\"a WebSocket route: upgrade\"}".into())),
             Req::Cell(p, cell_req) => self.run_cell(Origin::Local(who), p, cell_req)?,
             Req::Object(name, cell_req) => self.run_obj(Origin::Local(who), name, cell_req)?,
         }
@@ -2837,6 +3080,9 @@ impl<E: Engine> Loop<'_, E> {
         let body = v["body"].as_str().unwrap_or("");
         let line = |kind: &str| if body.is_empty() { format!("{kind} {method} {path}") } else { format!("{kind} {method} {path} {body}") };
         let timeout = v["timeout_ms"].as_u64().map_or(proc.timeout, |ms| Duration::from_millis(ms).min(proc.timeout));
+        if v.get("ws").is_some() && (to.is_some() || !proc.socket) {
+            return Err("\"ws\" goes straight to a session's socket: send it to a socket process, don't call".into());
+        }
         let origin = match to {
             Some(to) => {
                 self.next_call += 1;
@@ -2845,7 +3091,31 @@ impl<E: Engine> Loop<'_, E> {
             }
             None => Origin::Discard,
         };
-        let r = if proc.durable {
+        let r = if proc.socket {
+            let sock = v["id"].as_str().and_then(|id| id.parse::<u64>().ok()).ok_or(format!("{target} is a socket process: name the session, \"id\""))?;
+            let name = self.app.object_name(t, &format!("~{sock}"));
+            let (node, me) = (Self::sock_node(sock), self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node));
+            match (v["ws"].as_str(), &self.sh.fleet) {
+                // Straight to its socket, without running it.
+                (Some(text), Some(f)) if node != me => {
+                    f.wire.push(node, Frame::WsPush { name, sock, op: 1, payload: text.as_bytes().to_vec() });
+                    Ok(())
+                }
+                (Some(text), _) => match owner(&name, self.sh.cfg.threads) {
+                    l if l == self.me => self.ws_local(&name, sock, 1, text.as_bytes()),
+                    l => {
+                        let (tx, waker) = &self.sh.peers[l];
+                        let _ = tx.send(Msg::WsPush { name, sock, op: 1, payload: text.as_bytes().to_vec() });
+                        waker.wake()
+                    }
+                },
+                (None, Some(_)) if node != me => {
+                    self.forward(node, FReq { origin, name, cell_req: line("do"), hops: 0, act: 0, resp: None, ws: vec![], retries: 0 });
+                    Ok(())
+                }
+                (None, _) => self.run_obj(origin, name, line("do")),
+            }
+        } else if proc.durable {
             let id = v["id"].as_str().filter(|id| !id.is_empty() && !id.contains('/')).ok_or(format!("{target} is durable: name the object, \"id\""))?;
             let name = self.app.object_name(t, id);
             if name.len() > MAX_NAME {
@@ -2916,6 +3186,10 @@ impl<E: Engine> Loop<'_, E> {
             if self.app.procs[p].retired {
                 continue;
             }
+            // A ws process's sessions start their own.
+            if self.app.procs[p].socket {
+                continue;
+            }
             let mut first = fresh(self.eng, &self.app, p, &self.environ_for(p))?;
             self.ev_mode[p] = first.vm.has_export("on_request");
             self.pools[p].push((first, Instant::now()));
@@ -2974,6 +3248,9 @@ impl<E: Engine> Loop<'_, E> {
 
     /// Run a request on an object this loop owns, now or after the ones ahead of it.
     fn submit(&mut self, origin: Origin, name: String, req: String) {
+        if session_sock(&name).is_some() && self.app.procs[self.app.object_proc(&name)].socket {
+            return self.session_submit(origin, name, req);
+        }
         if self.core.is_some() && !matches!(origin, Origin::Fleet(_)) {
             let hops = if matches!(origin, Origin::Wire(..)) { 1 } else { 0 };
             return self.fleet_request(origin, name, req, hops);
@@ -3412,6 +3689,7 @@ impl<E: Engine> Loop<'_, E> {
     fn fleet_sweep(&mut self) {
         self.last_sweep = Instant::now();
         self.retire_cells();
+        self.sweep_cells();
         let idle = self.sh.cfg.idle;
         let gone: Vec<String> = self
             .objects
@@ -3690,7 +3968,14 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
                     _ => Req::Object(name, line("do", &sub)),
                 }
             }
-            Some(Hit::Cell(_)) if upgrade => return Err(()),
+            Some(Hit::Cell(p)) if upgrade => match ws_key {
+                Some(key) if method == "GET" && ws_ok && clen == 0 && !path.contains(char::is_whitespace) => {
+                    let path = path.to_string();
+                    rbuf.drain(..hlen);
+                    return Ok(Some(Req::Session(p, path, key)));
+                }
+                _ => return Err(()),
+            },
             Some(Hit::Cell(p)) => Req::Cell(p, line("api", path)),
             None => Req::NotFound,
         };

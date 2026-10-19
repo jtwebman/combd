@@ -223,7 +223,7 @@ const POOLABLE: [&str; 1] = ["combd:postgres"];
 
 fn settings_of(kind: &str) -> BTreeMap<String, Spec> {
     let t: Json = toml::from_str(schema(kind).unwrap()).unwrap();
-    t.as_object().unwrap().iter().map(|(k, v)| (k.clone(), spec(Side::Setting, k, v).unwrap().1)).collect()
+    t.as_object().unwrap().iter().map(|(k, v)| spec(Side::Setting, k, v).unwrap()).collect()
 }
 
 const FORMATS: [&str; 3] = ["toml", "yaml", "json"];
@@ -1232,6 +1232,7 @@ module = "api"
 routes = ["/chat"]
 hibernate_ms = 0
 callers = ["room"]
+memory_kb = 256
 [pool.pg-pool]
 module = "combd:postgres"
 url = "postgres://x"
@@ -1242,6 +1243,7 @@ callers = ["api", "admin-api"]
         assert!(m.processes["image-maker"].routes.is_empty(), "internal only");
         assert_eq!(m.processes["room"].routes[0].segs, [Seg::Lit("room".into()), Seg::Param("id".into()), Seg::Rest]);
         assert_eq!(["api", "room", "chat", "pg-pool"].map(|n| m.processes[n].ty()), ["http", "durable", "ws", "pool"]);
+        assert_eq!(m.processes["chat"].settings["memory_kb"], 256, "an optional setting, set");
         assert_eq!((m.pools["pg-pool"].owners.as_slice(), m.pools["pg-pool"].settings["member"].as_str()), (&["api".to_string(), "admin-api".to_string()][..], Some("pg-pool")), "a pool is its own member");
         let e = errors(
             r#"

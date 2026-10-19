@@ -1,0 +1,3 @@
+# One per WebSocket, so small: a 64 KB stack, not Rust's usual 1 MB.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=65536"]

@@ -1808,10 +1808,13 @@ mod tests {
     impl Ws {
         /// Connect and handshake; `Err` holds the HTTP answer if refused.
         fn open(port: u16, path: &str) -> Result<Ws, String> {
+            Ws::open_to(port, "localhost", path)
+        }
+        fn open_to(port: u16, host: &str, path: &str) -> Result<Ws, String> {
             use std::io::{Read, Write};
             let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            write!(s, "GET {path} HTTP/1.1\r\nhost: localhost\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").unwrap();
+            write!(s, "GET {path} HTTP/1.1\r\nhost: {host}\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").unwrap();
             let mut head = vec![];
             let mut b = [0u8; 1];
             while !head.ends_with(b"\r\n\r\n") {
@@ -2951,6 +2954,138 @@ callers = ["api"]
             assert!(eventually(10_000, || http_to(p, "shop.test", "GET", "/env/V", "").0 == 404), "node {p} still serves it");
         }
         everywhere("blog.test", "/env/V", "{\"value\":\"blog\"}");
+    }
+
+    const MILLION: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/million/app");
+
+    /// The million checkboxes: a session (a `ws` process) per socket,
+    /// asleep between events, its chunks' changes going straight to its
+    /// socket without waking it, the count, and sessions that end.
+    #[test]
+    fn million_one_session_per_socket() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        // Asleep after every event, so every event wakes it.
+        let m = std::fs::read_to_string(format!("{MILLION}/combd.toml")).unwrap().replace("hibernate_ms = 2000", "hibernate_ms = 0");
+        std::fs::write(app.0.join("combd.toml"), m).unwrap();
+        for f in ["million.wasm", "viewer.wasm"] {
+            std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");
+        }
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, _) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = server_app(eng, cfg(&dir.0, 2), move |_| a);
+        let host = "million.localhost";
+        let json = |w: &mut Ws| serde_json::from_slice::<serde_json::Value>(&w.recv().1).unwrap();
+        let bit = |hex: &str, i: usize| u8::from_str_radix(&hex[i / 8 * 2..i / 8 * 2 + 2], 16).unwrap() >> (i % 8) & 1;
+        assert_eq!(http_to(port, host, "GET", "/ws", "").0, 426, "a ws route wants an upgrade");
+        let (mut a, mut b) = (Ws::open_to(port, host, "/ws").unwrap(), Ws::open_to(port, host, "/ws").unwrap());
+        for w in [&mut a, &mut b] {
+            w.text(r#"{"t":"range","from":0,"to":500}"#);
+            let all = json(w);
+            assert_eq!((all["t"].as_str(), all["n"].as_u64(), all["bits"].as_str().map(str::len)), (Some("all"), Some(0), Some(3908)), "{all}");
+            assert_eq!(bit(all["bits"].as_str().unwrap(), 7), 0);
+        }
+        assert!(eventually(2000, || stat(port, "sessions_live") == 2 && stat(port, "sessions_hibernated") == 2), "both asleep");
+        // A set wakes its own viewer, not the other: the change goes straight to b's socket.
+        let woken = stat(port, "sessions_woken");
+        a.text(r#"{"t":"set","i":7,"v":true}"#);
+        for w in [&mut a, &mut b] {
+            assert_eq!(json(w), serde_json::json!({ "t": "set", "n": 0, "i": 7, "v": true }));
+        }
+        assert!(eventually(2000, || stat(port, "sessions_hibernated") == 2));
+        assert_eq!(stat(port, "sessions_woken"), woken + 1, "only a woke");
+        // A viewer that moves on hears nothing more from where it was.
+        a.text(r#"{"t":"range","from":15625,"to":16000}"#);
+        assert_eq!((json(&mut a)["n"].as_u64()), Some(1));
+        b.text(r#"{"t":"set","i":9,"v":true}"#);
+        assert_eq!(json(&mut b)["i"].as_u64(), Some(9));
+        a.text(r#"{"t":"set","i":15626,"v":true}"#);
+        assert_eq!(json(&mut a), serde_json::json!({ "t": "set", "n": 1, "i": 1, "v": true }), "not chunk 0's box 9");
+        // Too many sets in a second: the rest are refused.
+        for i in 100..130 {
+            b.text(&format!(r#"{{"t":"set","i":{i},"v":true}}"#));
+        }
+        let mut slow = 0;
+        for _ in 100..130 {
+            slow += (json(&mut b)["t"] == "slow") as u32;
+        }
+        assert!(slow >= 10, "{slow} refused");
+        // The count: each chunk tells `boxes` at most once a second.
+        let mut c = Ws::open_to(port, host, "/ws").unwrap();
+        c.text(r#"{"t":"range","from":0,"to":31250}"#);
+        let ones: usize = (0..2).map(|_| { let all = json(&mut c); (0..15625).map(|i| bit(all["bits"].as_str().unwrap(), i) as usize).sum::<usize>() }).sum();
+        assert_eq!(ones, 2 + 30 - slow as usize + 1, "boxes 7 and 9, the sets that got in, and 15626");
+        assert!(eventually(4000, || http_to(port, host, "GET", "/api/count", "").1 == format!("{{\"checked\":{ones}}}")), "{}", http_to(port, host, "GET", "/api/count", "").1);
+        // A closed socket ends its session.
+        drop(a);
+        assert!(eventually(3000, || stat(port, "sessions_live") == 2), "{}", stat(port, "sessions_live"));
+    }
+
+    /// `memory_kb` under what a module starts with could never start a cell:
+    /// the app is refused when it loads (or deploys), with why.
+    #[test]
+    fn a_memory_cap_under_the_module_is_refused() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        let m = std::fs::read_to_string(format!("{MILLION}/combd.toml")).unwrap().replace("memory_kb = 512", "memory_kb = 64");
+        std::fs::write(app.0.join("combd.toml"), m).unwrap();
+        for f in ["million.wasm", "viewer.wasm"] {
+            std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");
+        }
+        let e = http::load_app(&interp::Interp { max_pages: 16384 }, &app.0).err().expect("refused");
+        assert!(e.contains("million/viewer: memory_kb 64 is under this module's starting memory (128 KB)"), "{e}");
+    }
+
+    /// The million checkboxes on three nodes: viewers on different nodes
+    /// watch one chunk; a set on one reaches the others' sockets (straight
+    /// from the chunk's node), and the count adds up on any node.
+    #[test]
+    fn million_across_a_fleet() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::copy(format!("{MILLION}/combd.toml"), app.0.join("combd.toml")).unwrap();
+        for f in ["million.wasm", "viewer.wasm"] {
+            std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");
+        }
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 3).unwrap();
+        let bucket = test_bucket();
+        let wports = free_ports(3);
+        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
+        let nodes: Vec<u16> = (0..3u32)
+            .map(|n| {
+                let fc = fleet::FleetCfg { node: n, lease_ms: 3000, replicas: 2, s3: s3::S3 { bucket: bucket.clone(), ..base.clone() }, peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(dir.0.join("certs")), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true };
+                let eng = interp::Interp { max_pages: 16384 };
+                let (a, pg) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+                let c = http::Config { pg, fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
+                server_app(eng, c, move |_| a).0
+            })
+            .collect();
+        let host = "million.localhost";
+        let json = |w: &mut Ws| serde_json::from_slice::<serde_json::Value>(&w.recv().1).unwrap();
+        // One viewer per node, all on chunk 0. The first may wait for the
+        // fleet to settle (a fresh object's first claim).
+        let mut ws: Vec<Ws> = nodes.iter().map(|&p| Ws::open_to(p, host, "/ws").unwrap()).collect();
+        for w in ws.iter_mut() {
+            w.0.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            w.text(r#"{"t":"range","from":0,"to":500}"#);
+            assert_eq!(json(w)["t"], "all");
+        }
+        for (k, i) in [(0usize, 3u64), (1, 4), (2, 5)] {
+            ws[k].text(&format!(r#"{{"t":"set","i":{i},"v":true}}"#));
+            for w in ws.iter_mut() {
+                assert_eq!(json(w), serde_json::json!({ "t": "set", "n": 0, "i": i, "v": true }), "node {k}'s set, everywhere");
+            }
+        }
+        for &p in &nodes {
+            assert!(eventually(6000, || http_to(p, host, "GET", "/api/count", "").1 == "{\"checked\":3}"), "node {p}: {}", http_to(p, host, "GET", "/api/count", "").1);
+        }
+        assert!(eventually(6000, || nodes.iter().all(|&p| stat(p, "sessions_hibernated") == 1)), "each node's viewer asleep (hibernate_ms = 2000)");
     }
 
     const ARENA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/arena/app");

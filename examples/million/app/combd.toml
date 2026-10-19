@@ -1,16 +1,31 @@
-# One Million Checkboxes on combd. One module, two processes.
+# One Million Checkboxes on combd. Two modules, four processes.
 [app]
 name = "million"
 # Locally, browsers send million.localhost to 127.0.0.1.
 domains = ["million.combd.dev", "million.localhost"]
 
-# The page.
+# The page, and the count of checked boxes.
 [http.web]
 module = "million"
-routes = ["/"]
+routes = ["/", "/api/count"]
 
-# One object per 15,625 boxes (64 in all): the bits, and the WebSockets of
-# everyone looking at them.
+# One per WebSocket: what its page looks at, and the page's sets. Asleep
+# after 2 s idle, it's just its socket and ~30 bytes of state; the chunks'
+# changes go straight to its socket and never wake it.
+[ws.viewer]
+module = "viewer"
+routes = ["/ws"]
+hibernate_ms = 2000
+state_kb = 1
+memory_kb = 512
+callers = ["chunk"]
+
+# One per 15,625 boxes (0 to 63): the bits, and who's watching.
 [durable.chunk]
 module = "million"
-routes = ["/c/:id/*"]
+callers = ["viewer"]
+
+# One: each chunk's count, for the total.
+[durable.boxes]
+module = "million"
+callers = ["chunk", "web"]

@@ -54,6 +54,12 @@ pub trait CellVm {
     fn has_export(&mut self, _name: &str) -> bool {
         false
     }
+    /// Lower the most this cell's memory may grow to (`memory_kb`), in
+    /// pages. `Err`: it already starts bigger. Engines that fix the limit
+    /// when they compile (the AOT tier) ignore it.
+    fn cap_memory(&mut self, _pages: u32) -> Result<(), String> {
+        Ok(())
+    }
     /// A database call this cell is waiting on, for engines that pause
     /// inside a host call (the compiled tier's fibers). The interpreter
     /// leaves it in its `HostState` instead.
