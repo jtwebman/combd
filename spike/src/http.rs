@@ -1021,7 +1021,7 @@ where
             .iter()
             .map(|x| serde_json::json!({ "app": format!("{}/{}", x.org, x.app), "version": x.version, "waiting_s": x.since.elapsed().as_secs(), "failed": x.failed, "builds": compiled_status(self.s3, &x.compiled) }))
             .collect();
-        Ok(serde_json::json!({ "pending": list }))
+        Ok(serde_json::json!({ "pending": list, "builders": builders(self.s3) }))
     }
 
     fn current(&self, org: &str, app: &str) -> Result<Option<String>, String> {
@@ -1225,6 +1225,16 @@ fn compiled_status(s3: &crate::s3::S3, wasms: &[Vec<u8>]) -> Vec<serde_json::Val
 
 #[cfg(not(feature = "aot-lite"))]
 fn compiled_status(_: &crate::s3::S3, _: &[Vec<u8>]) -> Vec<serde_json::Value> {
+    vec![]
+}
+
+#[cfg(feature = "aot-lite")]
+fn builders(s3: &crate::s3::S3) -> Vec<serde_json::Value> {
+    crate::builds::builders(s3)
+}
+
+#[cfg(not(feature = "aot-lite"))]
+fn builders(_: &crate::s3::S3) -> Vec<serde_json::Value> {
     vec![]
 }
 

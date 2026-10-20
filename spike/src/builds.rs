@@ -224,6 +224,20 @@ pub fn status(s3: &S3, wasms: &[Vec<u8>]) -> Vec<serde_json::Value> {
     out
 }
 
+/// The builders that have looked for work: their id, pin, and how long ago.
+pub fn builders(s3: &S3) -> Vec<serde_json::Value> {
+    let now = now_ms();
+    s3.list("_combd/builders/")
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|k| {
+            let (b, _) = s3.get(k).ok()??;
+            let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
+            Some(serde_json::json!({ "id": k.trim_start_matches("_combd/builders/"), "pin": v["pin"], "seen_s": now.saturating_sub(v["at"].as_u64().unwrap_or(0)) / 1000 }))
+        })
+        .collect()
+}
+
 /// A builder: takes jobs for its own pin (it can make no other), one at a
 /// time, until `stop`. `aot` is the combd-aot sources it builds against,
 /// `work` its cargo directory (kept: the runtime compiles once).

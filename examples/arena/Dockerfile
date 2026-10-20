@@ -17,7 +17,10 @@ COPY examples/arena examples/arena
 ARG ARENA_VERSION=dev
 ENV ARENA_VERSION=$ARENA_VERSION COMBD_VERSION=$ARENA_VERSION
 RUN cd guest && cargo build --locked --release --target wasm32-unknown-unknown
-RUN cd spike && cargo build --locked --release --no-default-features
+# With the AOT runtime (no modules built in): a node loads compiled
+# modules' builds, and this stage, published as combd-builder, makes them
+# (the same rustc and sources, so their pins match).
+RUN cd spike && cargo build --locked --release --no-default-features --features aot-lite
 RUN examples/arena/build.sh
 
 FROM debian:bookworm-slim

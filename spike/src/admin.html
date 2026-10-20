@@ -36,6 +36,18 @@
   <th>Node</th><th>Version</th><th>Connections</th><th>Sessions (asleep)</th><th>Memory</th><th>Pressure</th><th>Mailbox refused</th><th>Batched</th>
 </tr></thead><tbody></tbody></table></div>
 
+<h2>Deploys waiting for builds</h2>
+<div class="wrap"><table id="deploys"><thead><tr>
+  <th>App</th><th>Version</th><th>Waiting</th><th>Builds</th>
+</tr></thead><tbody></tbody></table></div>
+<div id="nodeploys" class="dim">None.</div>
+
+<h2>Builders</h2>
+<div class="wrap"><table id="builders"><thead><tr>
+  <th>Builder</th><th>Pin</th><th>Last looked</th>
+</tr></thead><tbody></tbody></table></div>
+<div id="nobuilders" class="dim">None has looked for work.</div>
+
 <h2>Processes <span class="dim">(CPU per core, over the last poll)</span></h2>
 <div class="wrap"><table id="procs"><thead><tr>
   <th>Process</th><th>Engine</th><th>CPU</th><th>Slices/s</th><th>On nodes</th>
@@ -114,6 +126,18 @@ async function poll() {
   for (const [name, a] of [...sum].sort((x, y) => y[1].cpu - x[1].cpu)) {
     row(procs, [name, a.engine ?? "", cpuCell(a.cpu), Math.round(a.slices).toLocaleString(), [...a.nodes].join(" ")]);
   }
+  // Deploys and builders: on the node that took the deploy (this one).
+  const d = await fetch("/v1/deploys", { headers: { authorization: "Bearer " + tok.value } }).then((r) => r.json()).catch(() => ({}));
+  const dt = $("deploys").tBodies[0], bt = $("builders").tBodies[0];
+  dt.replaceChildren(); bt.replaceChildren();
+  for (const p of d.pending || []) {
+    const builds = (p.builds || []).map((b) => `${b.module.slice(0, 8)} ${b.cpu}: ${b.state}`).join("; ");
+    const state = p.failed ? Object.assign(document.createElement("span"), { className: "bad", textContent: "failed: " + p.failed }) : builds || "asking";
+    row(dt, [p.app, p.version.slice(0, 12), Math.round(p.waiting_s) + " s", state]);
+  }
+  $("nodeploys").hidden = (d.pending || []).length > 0;
+  for (const b of d.builders || []) row(bt, [b.id, b.pin, b.seen_s + " s ago"]);
+  $("nobuilders").hidden = (d.builders || []).length > 0;
 }
 poll();
 setInterval(poll, 2000);

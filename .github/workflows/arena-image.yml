@@ -38,6 +38,19 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/combd-arena:latest
             ghcr.io/${{ github.repository_owner }}/combd-arena:${{ github.sha }}
+      # The build stage: the toolchain and sources that made this combd, so
+      # a builder from it makes builds the nodes of this version load.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: examples/arena/Dockerfile
+          target: build
+          push: true
+          build-args: |
+            ARENA_VERSION=${{ github.sha }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/combd-builder:latest
+            ghcr.io/${{ github.repository_owner }}/combd-builder:${{ github.sha }}
   deploy:
     needs: image
     runs-on: [self-hosted, linux, x64, combd-build]
