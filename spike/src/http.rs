@@ -637,6 +637,11 @@ fn fresh<E: Engine>(eng: &E, app: &App<E::Program>, proc: usize, environ: &Arc<V
         vm.cap_memory(pages).map_err(std::io::Error::other)?;
     }
     let mut st = HostState { environ: environ.clone(), ..HostState::default() };
+    // An engine that runs host calls itself (compiled) has its own state:
+    // its env vars go there too, or it sees none.
+    if let Some(h) = vm.host_state() {
+        h.environ = environ.clone();
+    }
     crate::init(&mut vm, &mut st).map_err(std::io::Error::other)?;
     Ok(Cell { vm, st, proc })
 }
@@ -647,6 +652,9 @@ fn thawed<E: Engine>(eng: &E, app: &App<E::Program>, proc: usize, environ: &Arc<
     let mut vm = eng.thaw(&app.progs[app.procs[proc].prog], frozen).map_err(std::io::Error::other)?;
     if let Some(pages) = app.procs[proc].memory_pages {
         vm.cap_memory(pages).map_err(std::io::Error::other)?;
+    }
+    if let Some(h) = vm.host_state() {
+        h.environ = environ.clone();
     }
     Ok(Cell { vm, st: HostState { environ: environ.clone(), ..HostState::default() }, proc })
 }

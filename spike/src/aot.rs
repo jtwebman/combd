@@ -130,7 +130,7 @@ pub fn built(dir: &std::path::Path, wasm: &[u8]) -> Result<&'static Compiled, St
     }
     let path = dir.join(format!("{h:016x}.so"));
     if !path.exists() {
-        return Err(format!("no build for this module yet ({})", path.display()));
+        return Err(format!("no AOT build for this module yet ({})", path.display()));
     }
     let m = combd_load::open(&path)?;
     if m.hash != h {
@@ -149,7 +149,7 @@ impl Engine for Aot {
         if let Some(m) = combd_aot::find(wasm) {
             return Ok(m);
         }
-        let dir = std::env::var_os("COMBD_AOT_DIR").ok_or("no build for this module: none built in, and no COMBD_AOT_DIR")?;
+        let dir = std::env::var_os("COMBD_AOT_DIR").ok_or("no AOT build for this module: none built in, and no COMBD_AOT_DIR")?;
         built(std::path::Path::new(&dir), wasm)
     }
 

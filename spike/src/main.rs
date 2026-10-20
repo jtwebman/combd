@@ -1896,6 +1896,22 @@ mod tests {
         assert!(e.contains("built with") && e.contains("this node is"), "{e}");
     }
 
+    /// A compiled module sees its process's env vars, as an interpreted one
+    /// does (it once saw none: million's compiled web said "no process").
+    #[cfg(feature = "aot")]
+    #[test]
+    fn a_compiled_module_sees_its_env() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::write(app.0.join("combd.toml"), "[app]\nname = \"env\"\n[vars]\nV = \"one\"\n[modules.ev]\nengine = \"compiled\"\n[http.api]\nmodule = \"ev\"\nroutes = [\"/env/*\"]\n").unwrap();
+        std::fs::copy(GUEST_EV, app.0.join("modules/ev.wasm")).unwrap();
+        let eng = both();
+        let (a, _) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = server_app(eng, cfg(&dir.0, 1), move |_| a);
+        assert_eq!(http_to(port, "env.localhost", "GET", "/env/V", ""), (200, "{\"value\":\"one\"}".into()));
+    }
+
     /// A busy object's mailbox fills: what comes past `mailbox` is refused
     /// at once (503, overloaded), not queued, and the object goes on.
     #[test]
