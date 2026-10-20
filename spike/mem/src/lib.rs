@@ -201,6 +201,36 @@ pub fn resident() -> Option<u64> {
     None
 }
 
+/// Raise this process's open-file limit to its ceiling, and say what it is
+/// now. The soft limit is often 1024, and every socket is a file: a node
+/// that holds connections needs the hard limit (Go's runtime raises it the
+/// same way). `None`: it can't tell.
+pub fn raise_fd_limit() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: a struct of ours, the size the call wants.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
+            return None;
+        }
+        let mut want = if r.rlim_max == libc::RLIM_INFINITY { 1 << 20 } else { r.rlim_max };
+        // macOS refuses a soft limit past OPEN_MAX, whatever the hard one says.
+        if cfg!(target_os = "macos") {
+            want = want.min(10240);
+        }
+        if want > r.rlim_cur {
+            let up = libc::rlimit { rlim_cur: want, rlim_max: r.rlim_max };
+            // SAFETY: as above.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &up) } == 0 {
+                r.rlim_cur = want;
+            }
+        }
+        Some(r.rlim_cur as u64)
+    }
+    #[cfg(not(unix))]
+    None
+}
+
 /// This process's cgroup (v2): `0::<path>` in /proc/self/cgroup, under
 /// /sys/fs/cgroup (in a container, its own namespace's root).
 #[cfg(target_os = "linux")]
@@ -324,6 +354,13 @@ mod tests {
                 assert!(m.bytes() == &v[..], "a cell's memory differs from its model");
             }
         }
+    }
+
+    #[test]
+    fn the_open_file_limit_goes_up_to_its_ceiling() {
+        let n = raise_fd_limit().unwrap();
+        assert!(n >= 1024, "{n}");
+        assert_eq!(raise_fd_limit(), Some(n), "and stays");
     }
 
     #[test]

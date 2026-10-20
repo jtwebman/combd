@@ -293,9 +293,11 @@ struct Stats {
     ws_messages: AtomicU64,
     /// Handshakes another loop accepted and handed to the object's loop.
     ws_handoffs: AtomicU64,
-    /// Connections open, and refused (over `max_conns`, or memory pressure).
+    /// Connections open, refused (over `max_conns`, or memory pressure), and
+    /// ones `accept` failed on (out of files).
     conns_open: AtomicU64,
     conns_refused: AtomicU64,
+    accept_failed: AtomicU64,
     /// Memory: what the node uses, and its pressure (`pressure`).
     memory_used: AtomicU64,
     pressure: AtomicU64,
@@ -1188,6 +1190,14 @@ where
     let app = live.now();
     std::fs::create_dir_all(&cfg.data).expect("create the data directory");
     let index = Mutex::new(AlarmIndex::open(&cfg.data).expect("open the alarm index"));
+    // Every connection is a file: the limit goes to its ceiling, and the
+    // connections stay under three quarters of it (objects' storage files,
+    // the wire, and the bucket need the rest), so a full node answers 503
+    // instead of running out.
+    if let Some(fds) = combd_mem::raise_fd_limit() {
+        cfg.max_conns = cfg.max_conns.min(fds * 3 / 4);
+        println!("combd     {fds} files open at most: up to {} connections", cfg.max_conns);
+    }
     let listener = listen(port).unwrap_or_else(|e| panic!("listen on :{port}: {e}"));
     let redirect = cfg.redirect_port.map(|p| listen(p).unwrap_or_else(|e| panic!("listen on :{p}: {e}")));
     let tls = cfg.tls.as_ref().map(|(cert, key)| load_tls(cert, key).unwrap_or_else(|e| panic!("TLS: {e}")));
@@ -1308,6 +1318,7 @@ where
                     sessions: HashMap::new(),
                     last_tls_check: Instant::now(),
                     last_conn_check: Instant::now(),
+                    last_accept_warning: Instant::now(),
                     next_sock: 0,
                     boot: {
                         let mut b = [0u8; 8];
@@ -1389,6 +1400,7 @@ struct Loop<'a, E: Engine> {
     /// its connections' timeouts.
     last_tls_check: Instant,
     last_conn_check: Instant,
+    last_accept_warning: Instant,
     next_sock: u64,
     /// Random bits for socket ids, so a restart never reuses one.
     boot: u64,
@@ -1823,6 +1835,15 @@ impl<E: Engine> Loop<'_, E> {
                     self.sh.stats.conns_open.fetch_add(1, Relaxed);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+                // Out of files (EMFILE, ENFILE): it shouldn't be, under max_conns.
+                Err(e) if matches!(e.raw_os_error(), Some(23 | 24)) => {
+                    self.sh.stats.accept_failed.fetch_add(1, Relaxed);
+                    if self.last_accept_warning.elapsed() >= Duration::from_secs(1) {
+                        self.last_accept_warning = Instant::now();
+                        eprintln!("combd     can't take a connection: {e}");
+                    }
+                    return Ok(());
+                }
                 Err(_) => return Ok(()), // another loop took it, or a transient error
             }
         }
@@ -3338,7 +3359,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3367,6 +3388,7 @@ impl<E: Engine> Loop<'_, E> {
                     combd_mem::heap_in_use(),
                     s.conns_open.load(Relaxed),
                     s.conns_refused.load(Relaxed),
+                    s.accept_failed.load(Relaxed),
                     s.memory_used.load(Relaxed),
                     self.sh.cfg.memory_budget.unwrap_or(0),
                     s.pressure.load(Relaxed),
