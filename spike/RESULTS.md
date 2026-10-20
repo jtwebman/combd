@@ -2197,6 +2197,30 @@ on start, so it's opt-in, not the default (Linux, `fresh-bench`):
 Warm cells stay the default, as Cloudflare's isolates do: apps keep
 caches in them. Memory creep is bounded by the idle trim instead.
 
+## What a node holds: Caddy, HAProxy, or combd alone (2026-10-20)
+
+A node like the arena's (a container capped at 1 GB and one CPU, Linux in
+Docker on an Apple Silicon Mac, so arm64, not the droplets' x86), running
+the million app on one loop, with `ws-load` in another container holding
+N idle WebSockets through TLS (a test CA for `million.localhost`), each
+sent its 3.9 KB snapshot. Memory is the container's cgroup total: every
+process plus the kernel's socket memory, as a node pays for it.
+
+| In front of combd | The node per connection | Where | The most in 1 GB |
+|---|---|---|---|
+| Caddy 2.8.4 (the arena's today) | **~106 KB** | Caddy ~97 KB | **~9,500** (killed for memory at 9,557) |
+| HAProxy 2.6.12 | **~33 KB** | HAProxy ~21 to 23 KB, the kernel ~12 KB (three sockets) | **~28,700** (killed for memory) |
+| HAProxy, `tune.bufsize 4096` | ~33 KB | the same: it's TLS state, not buffers | the same |
+| nothing (combd alone, no TLS) | **6.0 to 6.5 KB** | combd ~2.4 KB, the kernel ~3.9 KB (one socket) | ~160,000 (40,000 held in 236 MB) |
+
+So on the arena's nodes Caddy is the limit, not combd: combd's share of a
+connection behind it is about 3%. HAProxy triples what a node holds;
+combd alone holds about 17 times what it does behind Caddy. Ending TLS in
+combd (`plan.md`, "The edge") adds rustls's state for an idle connection
+to the 6 KB: not measured yet, but a few KB would put a 1 GB node at
+70,000 to 120,000. These are idle connections; fan-out under load is
+another measurement.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A

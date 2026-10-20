@@ -555,6 +555,67 @@ fn density<E: Engine>(name: &str, eng: &E, prog: &E::Program) {
     );
 }
 
+fn ws_load(addr: &str, host: &str, path: &str, n: usize, msg: &str, ca: Option<&str>) {
+    use std::io::{Read, Write};
+    let tls = ca.map(|ca| wire::admin_client(std::path::Path::new(ca)).unwrap());
+    let mut held = Vec::with_capacity(n);
+    let t = Instant::now();
+    for i in 0..n {
+        let tcp = std::net::TcpStream::connect(addr).unwrap_or_else(|e| panic!("socket {i}: {e}"));
+        let open = |s: &mut dyn ReadWrite| -> Result<(), String> {
+            write!(s, "GET {path} HTTP/1.1\r\nhost: {host}\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").map_err(|e| e.to_string())?;
+            let (mut head, mut b) = (vec![], [0u8; 1]);
+            while !head.ends_with(b"\r\n\r\n") {
+                if s.read(&mut b).map_err(|e| e.to_string())? == 0 {
+                    return Err("closed in the handshake".into());
+                }
+                head.push(b[0]);
+            }
+            if !head.starts_with(b"HTTP/1.1 101") {
+                return Err(String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_string());
+            }
+            // One masked text frame (a client must mask; a zero mask keeps it as is).
+            let p = msg.as_bytes();
+            let mut f = if p.len() < 126 { vec![0x81, 0x80 | p.len() as u8] } else { vec![0x81, 0x80 | 126, (p.len() >> 8) as u8, p.len() as u8] };
+            f.extend_from_slice(&[0, 0, 0, 0]);
+            f.extend_from_slice(p);
+            s.write_all(&f).map_err(|e| e.to_string())?;
+            s.flush().map_err(|e| e.to_string())
+        };
+        let r = match &tls {
+            // The TLS state goes once the message is out: the socket stays
+            // open, and the server holds an idle connection, as measured.
+            Some(cfg) => {
+                let name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+                let mut s = rustls::StreamOwned::new(rustls::ClientConnection::new(cfg.clone(), name).unwrap(), tcp);
+                let r = open(&mut s);
+                held.push(s.into_parts().1);
+                r
+            }
+            None => {
+                let mut s = tcp;
+                let r = open(&mut s);
+                held.push(s);
+                r
+            }
+        };
+        if let Err(e) = r {
+            println!("ws-load: socket {i} refused: {e}");
+            break;
+        }
+        if (i + 1) % (n / 10).max(1) == 0 {
+            println!("ws-load: {} open ({:.0} s)", i + 1, t.elapsed().as_secs_f64());
+        }
+    }
+    println!("ws-load: holding {}", held.len());
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+trait ReadWrite: std::io::Read + std::io::Write {}
+impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
+
 fn ws_hold(host: &str, port: u16, path: &str, n: usize, msg: &str, pid: &str) {
     use std::io::{Read, Write};
     let rss = || std::fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())).unwrap_or(0);
@@ -798,6 +859,11 @@ fn main_with(args: &[&str]) {
         // A warm cell against a fresh one for every request: `fresh-bench
         // <module.wasm> <n> [env=K=V]... <request>`.
         ["fresh-bench", wasm, n, ref rest @ ..] => fresh_bench(wasm, n.parse().unwrap(), rest),
+        // Hold `n` WebSockets open on a server (through a proxy, maybe, and
+        // TLS with `ca.pem`), each after one message, until killed; measure
+        // the server from outside: `ws-load <ip:port> <host> <path> <n>
+        // <message> [ca.pem]`.
+        ["ws-load", addr, host, path, n, msg, ref tls @ ..] => ws_load(addr, host, path, n.parse().unwrap(), msg, tls.first().copied()),
         ["compute", "native"] => compute_native(),
         ["api-bench", "native"] => api_bench_native(),
         ["api-bench", e] => main_with(&["api-bench", e, "rust"]),

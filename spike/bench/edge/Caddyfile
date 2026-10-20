@@ -1,0 +1,8 @@
+{
+	auto_https disable_redirects
+	admin off
+}
+million.localhost:443 {
+	tls /certs/cert.pem /certs/key.pem
+	reverse_proxy 127.0.0.1:8080
+}

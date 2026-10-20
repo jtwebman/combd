@@ -1124,6 +1124,39 @@ Next for this tier, biggest first:
 5. Maybe a Zig or C backend if rustc compile time hurts. The safe Rust
    backend stays the reference.
 
+## The edge: TLS in combd, or edge nodes in front (2026-10-20)
+
+combd gets an idle connection down to 2.24 KB, but in front of it on each
+node sits Caddy: it ends TLS and proxies every socket to combd on
+localhost. So a client is three sockets on the node (client to Caddy,
+Caddy to combd, and combd's end), plus Caddy's own state for it (TLS,
+buffers, two goroutines), by estimate tens of KB. On a 1 GB node that's
+the limit, not combd. Two modes, one code path:
+
+**Single (small fleets, like the arena's three droplets).** combd ends TLS
+itself (rustls, already used on the wire), on 443, and connections go
+straight into its loops: one socket per client, no hop. Certificates come
+from files (what `tls.sh` already ships) and reload when they change; port
+80 redirects. A restart hands the port over (`SO_REUSEPORT`: the new
+process listens before the old one stops), so new connections never fail;
+open sockets reconnect, as they do now. Idle connections give back their
+TLS buffers, as they do their WebSocket buffers.
+
+**Edge (big fleets).** Machines of their own run `combd edge`: the same
+binary, holding only client sockets and TLS, no cells, near users. They
+carry every client over a few multiplexed connections on the wire we
+already have, to compute nodes that run combd as usual. A client is one
+socket at the edge; compute restarts without one client's TCP connection
+dropping; and later the edge can hold hibernated sessions' state, so even
+those survive a compute restart. This is fleet mode's rule made general:
+a socket stays on the node that took it, and its events go to the owner.
+
+**Order:** measure first (Caddy, HAProxy, and combd with no proxy on a
+1 GB box: "Results", "What a node holds"), then single mode, so the arena
+drops Caddy; edge mode after v0.1, when a fleet needs it. HAProxy (C,
+buffers only while there's data, TLS buffers freed when idle) is the
+stopgap if it gets close to the floor.
+
 ## Scaling the fleet: rules that keep it quiet
 
 The fleet must not hit the walls Erlang distribution hits:
