@@ -1077,14 +1077,12 @@ machine-code tier, compiled ahead of time instead of while requests run.
 - `snapshot_after_init` keeps working either way. It's taken when no frames are
   on the stack.
 
-**Compiling never blocks "ready".** A cell has two states:
-- **Ready:** it serves traffic on the interpreter within microseconds of
-  deploy.
-- **Fast:** it switches to machine code once its artifact exists.
-
-Nodes never compile on the request path, and a node waking a cell only loads a
-finished artifact. `combd deploy --wait-aot` can hold a rollout until
-artifacts exist for every CPU in the fleet, then shift traffic.
+**No tier-up (decided 2026-10-20).** A module runs compiled or
+interpreted, chosen in its manifest, never both and never switching while
+it runs: a cell that ran compiled under load and fell back to the
+interpreter (or the other way) would be a different program to the
+operator. A compiled module's deploy waits for its builds; see "Compile on
+deploy" below.
 
 **Compile runtimes once, apps at deploy.** The `jsc` runtime (values, JSON,
 regex, Workers APIs) is the same for every JS app, so it is compiled once per
@@ -1123,6 +1121,76 @@ Next for this tier, biggest first:
 4. **Wasm SIMD** in the generator.
 5. Maybe a Zig or C backend if rustc compile time hurts. The safe Rust
    backend stays the reference.
+
+## Compile on deploy: builders, the admin panel, and CPU targets (2026-10-20)
+
+The AOT tier is 15 to 39x the interpreter, but today only modules built
+into the combd binary run compiled, so every deployed app (million, the
+arena) runs interpreted. The platform should work like Cloudflare's:
+upload the manifest and the Wasm, and it comes back running fast.
+
+**Each module picks its engine** (`[modules.<name>] engine = "compiled"`,
+the default, or `"interpreted"`), and runs that way only.
+
+**A deploy goes live when it's built.** Uploading still goes through the
+admin API, and the bucket holds it, but nodes don't take it yet:
+1. The cluster lists the builds it needs: each compiled module, for each
+   CPU target its nodes have.
+2. Builders take those jobs, compile, sign, and upload the artifacts.
+3. When every build is there, the deploy is ready; nodes fetch the
+   artifacts for their own target and move to it as deploys move today
+   (an object at its next idle moment, so nothing in play is cut off).
+4. A build that fails fails the deploy: the version that's running keeps
+   running, and the panel says why. There is no interpreted fallback.
+
+**Builders are their own machines.** Compiling Rust takes cores and
+minutes; a 1 vCPU node can't spare either. A builder is `combd builder
+<cluster admin URL>` with a build token: it asks for jobs, runs `aot-gen`
+(Wasm to safe Rust) and rustc, and uploads. The first one is a machine we
+own (the Windows box, under WSL); later the platform can start them on
+demand. Any number can run; a job is leased to one at a time.
+
+**Targets come from the cluster.** Each node reports what it is: x86-64 at
+a feature level (v2, v3, v4: AVX2 and so on) or ARM64, and builds are per
+target, so a mixed cluster (x64 and ARM, older and newer x64) gets a build
+for each kind it has. Tuning for one CPU model (`znver4`, `icelake`) can be
+an option per cluster later; for this code it's usually a few percent.
+
+**Loading one: the one new `unsafe`.** An artifact is the generated Rust
+built as a library, loaded into the running node (`dlopen`). Rust has no
+stable ABI, so it must be built by the same rustc and the same combd-aot
+sources as the node's own binary: the node publishes that pin (rustc
+version, combd-aot hash, target), the builder uses that toolchain, the
+library carries the pin, and the node refuses one that doesn't match.
+The code inside is safe Rust (`forbid(unsafe_code)`), so the sandbox comes
+from rustc on the builder, which is why nodes trust only signed artifacts:
+each builder has a key the cluster lists, and a node checks the signature
+before loading. The loader is a small crate of its own, like combd-mem.
+
+**The admin API and panel.** On the admin port, for operators, not apps:
+- `/v1/nodes`: each node, its version, target, region, and stats;
+- `/v1/procs`: per process, CPU time (counted by the loop around every
+  slice), cells, sessions awake and asleep, mailbox refusals, batches;
+- `/v1/deploys`: each deploy, its builds per target (wanted, building,
+  done, failed) and which nodes have moved to it;
+- `/v1/builders`: who's building what.
+And a page at `/` that shows them: what I've been doing by hand with SSH
+and perf, without either.
+
+**Later: GPUs.** Wasm can't touch a GPU itself, so it would be host calls
+(as wasi-nn does), and placement: a node says what it has, a process says
+what it needs, and it runs only where that is.
+
+**Build order:**
+1. Per-process CPU accounting, and `/v1/nodes` and `/v1/procs`, and the
+   panel. (Needed to see what the rest does.)
+2. `[modules]` and `engine`, with compiled modules that are already in the
+   binary (the tests' guest): the plumbing, and deploys that wait.
+3. The artifact: generated Rust as a library, the pin, the loader.
+4. `combd builder`, build jobs, signing, artifacts in the bucket, and
+   `/v1/deploys` and `/v1/builders`.
+5. Node targets (x86-64 levels, ARM64), and a build per target.
+6. Million and the arena compiled, and the click test again.
 
 ## The edge: TLS in combd, or edge nodes in front (2026-10-20)
 
