@@ -3820,7 +3820,8 @@ impl<E: Engine> Loop<'_, E> {
         if self.core.is_some() && !matches!(origin, Origin::Fleet(_)) {
             let hops = if matches!(origin, Origin::Wire(..)) { 1 } else { 0 };
             // Spread: a new object starts where its name says, not here.
-            if let (0, Some(scope)) = (hops, self.app.procs[self.app.object_proc(&name)].spread) {
+            // (A name with no app here, as before any deploy: no process to ask.)
+            if let (0, Some(scope)) = (hops, self.app.procs.get(self.app.object_proc(&name)).and_then(|p| p.spread)) {
                 let f = &self.sh.fleet.as_ref().unwrap().cfg;
                 let all: Vec<own::Node> = f.peers.keys().copied().chain([f.node]).collect::<BTreeSet<_>>().into_iter().collect();
                 let among = crate::fleet::among(&f.regions, f.node, &all, scope);
