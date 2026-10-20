@@ -1155,8 +1155,8 @@ a socket stays on the node that took it, and its events go to the owner.
 1 GB box: "Results", "What a node holds"), then single mode, so the arena
 drops Caddy (built 2026-10-20: ~14 KB a connection over TLS, 7.5x less than
 behind Caddy; limits and timeouts at the edge; Autobahn and testssl.sh
-clean; next, rustls's unbuffered API for idle connections, and HTTP/2 and
-HTTP/3 behind settings); edge mode after v0.1, when a fleet needs it. HAProxy (C,
+clean; then rustls's unbuffered API, ~10 KB a connection; next, the socket
+kept open across a restart, and HTTP/2 and HTTP/3 behind settings); edge mode after v0.1, when a fleet needs it. HAProxy (C,
 buffers only while there's data, TLS buffers freed when idle) is the
 stopgap if it gets close to the floor.
 

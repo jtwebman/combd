@@ -175,6 +175,10 @@ resource "digitalocean_droplet" "node" {
       "COMBD_TLS_CERT=/etc/combd/tls/cert.pem",
       "COMBD_TLS_KEY=/etc/combd/tls/key.pem",
       "COMBD_REDIRECT_PORT=80",
+      # What combd may use of the droplet's 1 GB: Docker and the OS have the
+      # rest. Past 85% it reclaims, past 95% it refuses new work, so the
+      # kernel never has to kill it.
+      "COMBD_MEMORY_BUDGET=700M",
       "",
     ])
     ca       = file("${local.secrets}/certs/ca.pem")

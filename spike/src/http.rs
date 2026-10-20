@@ -472,7 +472,7 @@ enum Msg {
     /// Fleet mode: the answer to a peer call (`None`: lost).
     PeerReply { id: u64, res: Option<own::PeerRes> },
     /// A WebSocket handshake for an object you own: take the connection.
-    Adopt { s: TcpStream, rbuf: Vec<u8>, tls: Option<Box<rustls::ServerConnection>>, name: String, path: String, key: String },
+    Adopt { s: TcpStream, rbuf: Vec<u8>, tls: Option<Box<crate::tls::Tls>>, name: String, path: String, key: String },
     /// Fleet mode: another node's object sends on a socket we hold.
     WsPush { name: String, sock: u64, op: u8, payload: Vec<u8> },
     /// Fleet mode: a push of ours couldn't reach the socket's node.
@@ -566,7 +566,7 @@ struct Conn {
     /// Set once the connection asked to be a WebSocket.
     ws: Option<WsConn>,
     /// TLS, ended here: the socket's bytes go through it (`read_all`, `flush`).
-    tls: Option<Box<rustls::ServerConnection>>,
+    tls: Option<Box<crate::tls::Tls>>,
     /// On the redirect port: every request gets a 301 to HTTPS.
     redirect: bool,
     /// When it was taken, or last answered: its idle time runs from here.
@@ -575,6 +575,11 @@ struct Conn {
     reading: Option<Instant>,
     /// It has had an answer (so it's kept alive, not new).
     served: bool,
+    /// The peer stopped sending (it closed, or broke the connection).
+    peer_done: bool,
+    /// Closing: we've sent all we owe and stopped sending, and read and
+    /// drop what still comes, since when (`settle`).
+    linger: Option<Instant>,
 }
 
 /// A WebSocket. It belongs to an object, but outlives it: an idle object
@@ -1674,8 +1679,11 @@ impl<E: Engine> Loop<'_, E> {
                     WAKER => self.read_inbox()?,
                     Token(id) => {
                         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { continue };
-                        if ev.is_readable() && read_all(c, &self.sh.cfg.limits) {
-                            // The peer is done sending: answer what's buffered, then close.
+                        if c.linger.is_some() {
+                            c.peer_done |= drop_reads(&mut c.s);
+                        } else if ev.is_readable() && read_all(c, &self.sh.cfg.limits) {
+                            // The peer is done sending (or past a limit): answer
+                            // what's buffered, then close.
                             c.close_after = true;
                         }
                         touched.push(id);
@@ -1800,7 +1808,7 @@ impl<E: Engine> Loop<'_, E> {
                     }
                     s.set_nodelay(true)?;
                     let tls = match self.sh.tls.lock().unwrap().as_ref().filter(|_| !redirect) {
-                        Some((cfg, _)) => match rustls::ServerConnection::new(cfg.clone()) {
+                        Some((cfg, _)) => match crate::tls::Tls::new(cfg.clone()) {
                             Ok(t) => Some(Box::new(t)),
                             Err(e) => {
                                 eprintln!("TLS: {e}");
@@ -2757,7 +2765,7 @@ impl<E: Engine> Loop<'_, E> {
         });
         self.poll.registry().register(&mut s, Token(id), Interest::READABLE)?;
         self.next_gen += 1;
-        self.conns[id] = Some(Conn { s, gen: self.next_gen, rbuf, wbuf: vec![], wpos: 0, writing: false, close_after: false, busy: false, ws: None, tls: None, redirect: false, at: Instant::now(), reading: None, served: false });
+        self.conns[id] = Some(Conn { s, gen: self.next_gen, rbuf, wbuf: vec![], wpos: 0, writing: false, close_after: false, busy: false, ws: None, tls: None, redirect: false, at: Instant::now(), reading: None, served: false, peer_done: false, linger: None });
         Ok(id)
     }
 
@@ -3199,6 +3207,11 @@ impl<E: Engine> Loop<'_, E> {
         let (lim, now) = (&self.sh.cfg.limits, Instant::now());
         let mut late = vec![];
         for (id, c) in self.conns.iter_mut().enumerate() {
+            // Lingering long enough: it goes.
+            if c.as_ref().is_some_and(|c| c.linger.is_some_and(|t| now - t >= LINGER)) {
+                late.push(id);
+                continue;
+            }
             let Some(c) = c.as_mut().filter(|c| c.ws.is_none() && !c.busy && !c.close_after) else { continue };
             let handshaking = c.tls.as_ref().is_some_and(|t| t.is_handshaking());
             let over = match c.reading {
@@ -3228,7 +3241,19 @@ impl<E: Engine> Loop<'_, E> {
     fn settle(&mut self, id: usize) -> std::io::Result<()> {
         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return Ok(()) };
         // A WebSocket is always "busy"; it closes once its last bytes are out.
-        let closed = flush(c) || (c.close_after && (!c.busy || c.ws.is_some()) && !pending(c));
+        let failed = flush(c);
+        let done = c.close_after && (!c.busy || c.ws.is_some()) && !pending(c);
+        // Closing on a peer that may still be sending: all we owe is out, so
+        // stop sending (it sees a clean end), and read and drop the rest a
+        // while. Closing now, with its bytes unread, would send it a reset,
+        // and its kernel would throw away what we last sent (a 413, a 1009).
+        if done && !failed && !c.peer_done && c.linger.is_none() {
+            let _ = c.s.shutdown(std::net::Shutdown::Write);
+            c.linger = Some(Instant::now());
+            c.rbuf.clear();
+            return Ok(());
+        }
+        let closed = failed || (done && (c.peer_done || c.linger.is_some_and(|t| t.elapsed() >= LINGER)));
         if closed {
             if c.ws.as_ref().is_some_and(|w| !w.gone) {
                 // Gone without a close frame (RFC 6455's 1006).
@@ -4387,10 +4412,12 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router, lim: &
 fn read_all(c: &mut Conn, lim: &Limits) -> bool {
     let limit = if c.ws.is_some() { 4 * lim.max_ws_message } else { lim.max_header_bytes + lim.max_body };
     let was_empty = c.rbuf.is_empty();
-    let gone = match c.tls.as_mut() {
-        Some(tls) => read_tls(tls, &mut c.s, &mut c.rbuf, limit),
+    let end = match c.tls.as_mut() {
+        Some(tls) => tls.read(&mut c.s, &mut c.rbuf, limit),
         None => read_plain(&mut c.s, &mut c.rbuf, limit),
     };
+    c.peer_done |= end == Some(true);
+    let gone = end.is_some();
     // A request starts with its first byte: its read timeout runs from here.
     if was_empty && !c.rbuf.is_empty() && c.ws.is_none() && c.reading.is_none() {
         c.reading = Some(Instant::now());
@@ -4402,17 +4429,33 @@ fn read_all(c: &mut Conn, lim: &Limits) -> bool {
     gone
 }
 
-fn read_plain(s: &mut TcpStream, rbuf: &mut Vec<u8>, limit: usize) -> bool {
+/// `None`: keep going. `Some(true)`: the peer is done (it closed, or the
+/// connection broke). `Some(false)`: past `limit`, while it may still send.
+fn read_plain(s: &mut TcpStream, rbuf: &mut Vec<u8>, limit: usize) -> Option<bool> {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return Some(true),
+            Ok(n) => {
+                rbuf.extend_from_slice(&buf[..n]);
+                if rbuf.len() > limit {
+                    return Some(false);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return None,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Some(true),
+        }
+    }
+}
+
+/// A lingering connection's reads: dropped. `true`: the peer is done.
+fn drop_reads(s: &mut TcpStream) -> bool {
     let mut buf = [0u8; 16 * 1024];
     loop {
         match s.read(&mut buf) {
             Ok(0) => return true,
-            Ok(n) => {
-                rbuf.extend_from_slice(&buf[..n]);
-                if rbuf.len() > limit {
-                    return true;
-                }
-            }
+            Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::WouldBlock => return false,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => return true,
@@ -4420,18 +4463,15 @@ fn read_plain(s: &mut TcpStream, rbuf: &mut Vec<u8>, limit: usize) -> bool {
     }
 }
 
+/// How long a closing connection reads and drops what its peer still sends.
+const LINGER: Duration = Duration::from_secs(2);
+
 /// Write until done or the socket would block. Returns true on a write error.
 fn flush(c: &mut Conn) -> bool {
     if let Some(tls) = c.tls.as_mut() {
-        // As much of it as TLS takes now: its buffer has a limit, so a slow
-        // reader's backlog stays in wbuf, where the WebSocket limits see it.
-        while c.wpos < c.wbuf.len() {
-            match tls.writer().write(&c.wbuf[c.wpos..]) {
-                Ok(0) => break,
-                Ok(n) => c.wpos += n,
-                Err(_) => return true,
-            }
-        }
+        // As much as TLS takes now: it holds a limited backlog, so a slow
+        // reader's stays in wbuf, where the WebSocket limits see it.
+        let gone = tls.write(&mut c.s, &mut c.rbuf, &c.wbuf, &mut c.wpos);
         if c.wpos == c.wbuf.len() {
             c.wbuf.clear();
             c.wpos = 0;
@@ -4439,16 +4479,7 @@ fn flush(c: &mut Conn) -> bool {
                 c.wbuf = Vec::new();
             }
         }
-        while tls.wants_write() {
-            match tls.write_tls(&mut c.s) {
-                Ok(0) => return true,
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return false,
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => return true,
-            }
-        }
-        return false;
+        return gone;
     }
     while c.wpos < c.wbuf.len() {
         match c.s.write(&c.wbuf[c.wpos..]) {
@@ -4477,35 +4508,6 @@ fn pending(c: &Conn) -> bool {
     c.wpos < c.wbuf.len() || c.tls.as_ref().is_some_and(|t| t.wants_write())
 }
 
-/// Read what the socket has through TLS. `true`: the peer is gone, or broke
-/// TLS (rustls queues the alert; `flush` tries to send it).
-fn read_tls(tls: &mut rustls::ServerConnection, s: &mut TcpStream, rbuf: &mut Vec<u8>, limit: usize) -> bool {
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        match tls.read_tls(s) {
-            Ok(0) => return true,
-            Ok(_) => {
-                if tls.process_new_packets().is_err() {
-                    return true;
-                }
-                loop {
-                    match tls.reader().read(&mut buf) {
-                        Ok(0) => return true, // close_notify: done
-                        Ok(n) => rbuf.extend_from_slice(&buf[..n]),
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Err(_) => return true,
-                    }
-                }
-                if rbuf.len() > limit {
-                    return true;
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return false,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return true,
-        }
-    }
-}
 
 /// A listening socket others may share (`SO_REUSEPORT`): a new combd
 /// starts on the port before the old one stops, and no connection is

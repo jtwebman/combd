@@ -2230,11 +2230,13 @@ takes its TLS with it. `COMBD_REDIRECT_PORT` answers plain HTTP with a 301
 to HTTPS (only a plain host name goes in the `location`). The port is
 taken with `SO_REUSEPORT`, so a new combd can listen before the old stops.
 
-**Memory, the same 1 GB node as above:** ~14 KB a connection (combd ~10,
-the kernel ~4); 40,000 held in 538 MB, so about 70,000 in 1 GB. Caddy's
-~106 KB held 9,500; HAProxy's ~33 KB, 28,700. TLS is ~7.6 KB of it, rustls
-keeping its buffers past the handshake; its "unbuffered" API, where we own
-the buffers, could give them back when idle (next).
+**Memory, the same 1 GB node as above:** ~10 KB a connection (combd ~6,
+the kernel ~4); 40,000 held in 390 MB, so about 100,000 in 1 GB. Caddy's
+~106 KB held 9,500; HAProxy's ~33 KB, 28,700. It was ~14 KB with rustls's
+own buffering, which keeps a 4 KB read buffer for every connection, idle
+or not; with its unbuffered API (`tls.rs`), the encrypted bytes in and out
+are ours, and given back once empty. TLS is ~3.9 KB of an idle connection
+now (it was ~7.6): rustls's protocol state and keys.
 
 **The edge's limits** (`Limits`, node-wide): a body (`COMBD_MAX_BODY`, 1
 MiB: 413), the head (`COMBD_MAX_HEADER_BYTES`, 16 KiB, and
@@ -2258,8 +2260,12 @@ the throughput ones under it pass). The 9 failures of the first run (close
 codes, 7.9.*) are fixed. Non-strict: a bad frame right after a good message
 can fail the socket before the good one's echo is out, and invalid UTF-8
 in a fragmented message is caught when it ends, not at the first bad
-fragment. Left: a lingering close, so a socket refused while its client is
-still sending always gets its close code (once in a run it was a reset).
+fragment. A socket refused while its client was still sending sometimes
+got a reset, not its 1009 (once in a run, over Docker's network): closing
+with its bytes unread sent one, and its kernel threw away what we'd sent.
+Now a closing connection lingers: all we owe goes out, we stop sending,
+and read and drop the rest for up to 2 s. All 24 of the 9.* cases over
+the limit get 1009, plain and over TLS.
 
 **testssl.sh 3.2:** TLS 1.2 and 1.3 only; AEAD ciphers with forward secrecy
 only; not vulnerable to anything it tests (Heartbleed, ROBOT, CRIME, POODLE,

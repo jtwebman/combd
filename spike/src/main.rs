@@ -24,6 +24,7 @@ mod s3;
 mod secrets;
 mod sim;
 mod store;
+mod tls;
 mod wire;
 mod ws;
 mod manifest;
@@ -556,7 +557,6 @@ fn density<E: Engine>(name: &str, eng: &E, prog: &E::Program) {
 }
 
 fn ws_load(addr: &str, host: &str, path: &str, n: usize, msg: &str, ca: Option<&str>) {
-    use std::io::{Read, Write};
     let tls = ca.map(|ca| wire::admin_client(std::path::Path::new(ca)).unwrap());
     let mut held = Vec::with_capacity(n);
     let t = Instant::now();
@@ -1822,6 +1822,35 @@ mod tests {
         s.write_all(&[0x16, 0x03, 0x01]).unwrap(); // the start of a ClientHello, no more
         let (_, took) = rest(&mut s);
         assert!(took < Duration::from_secs(2), "a stalled handshake: closed in {took:?}");
+    }
+
+    /// A request refused while its client is still sending (a body over
+    /// max_body) gets its answer: the connection lingers (stops sending,
+    /// reads and drops the rest a while) before it closes, so the client's
+    /// kernel isn't sent a reset that would throw the answer away.
+    #[test]
+    fn a_refused_client_still_sending_gets_its_answer() {
+        use std::io::{Read, Write};
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, cfg(&dir.0, 1));
+        for _ in 0..5 {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut w = s.try_clone().unwrap();
+            let sender = std::thread::spawn(move || {
+                let _ = write!(w, "POST /do/a/x HTTP/1.1\r\nhost: x\r\ncontent-length: 8000000\r\n\r\n");
+                let chunk = vec![b'x'; 64 << 10];
+                for _ in 0..120 {
+                    if w.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut got = vec![];
+            let r = s.read_to_end(&mut got);
+            sender.join().unwrap();
+            assert!(got.starts_with(b"HTTP/1.1 413"), "{r:?}: {:?}", String::from_utf8_lossy(&got[..got.len().min(60)]));
+        }
     }
 
     /// A new certificate on disk reaches new connections within seconds;
@@ -3455,12 +3484,13 @@ callers = ["api"]
         assert_eq!(json(&mut b)["i"].as_u64(), Some(9));
         a.text(r#"{"t":"set","i":15626,"v":true}"#);
         assert_eq!(json(&mut a), serde_json::json!({ "t": "set", "n": 1, "i": 1, "v": true }), "not chunk 0's box 9");
-        // Too many sets in a second: the rest are refused.
-        for i in 100..130 {
+        // Too many sets in a second: the rest are refused. 50 at once: even if
+        // they straddle a second, at most 40 get in.
+        for i in 100..150 {
             b.text(&format!(r#"{{"t":"set","i":{i},"v":true}}"#));
         }
         let mut slow = 0;
-        for _ in 100..130 {
+        for _ in 100..150 {
             slow += (json(&mut b)["t"] == "slow") as u32;
         }
         assert!(slow >= 10, "{slow} refused");
@@ -3468,7 +3498,7 @@ callers = ["api"]
         let mut c = Ws::open_to(port, host, "/ws").unwrap();
         c.text(r#"{"t":"range","from":0,"to":31250}"#);
         let ones: usize = (0..2).map(|_| { let all = json(&mut c); (0..15625).map(|i| bit(all["bits"].as_str().unwrap(), i) as usize).sum::<usize>() }).sum();
-        assert_eq!(ones, 2 + 30 - slow as usize + 1, "boxes 7 and 9, the sets that got in, and 15626");
+        assert_eq!(ones, 2 + 50 - slow as usize + 1, "boxes 7 and 9, the sets that got in, and 15626");
         assert!(eventually(4000, || http_to(port, host, "GET", "/api/count", "").1 == format!("{{\"checked\":{ones}}}")), "{}", http_to(port, host, "GET", "/api/count", "").1);
         // A closed socket ends its session.
         drop(a);
