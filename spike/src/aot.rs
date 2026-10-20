@@ -128,6 +128,13 @@ impl Engine for Aot {
         combd_aot::find(wasm).ok_or_else(|| "no AOT build for this module (run spike/aot.sh)".into())
     }
 
+    fn load_as(&self, wasm: &[u8], kind: crate::engine::Kind) -> Result<&'static Compiled, String> {
+        match kind {
+            crate::engine::Kind::Compiled => self.load(wasm),
+            crate::engine::Kind::Interpreted => Err("this node runs modules compiled only".into()),
+        }
+    }
+
     fn spawn(&self, m: &&'static Compiled) -> Result<AotVm, String> {
         let imports = m.imports.iter().map(|(md, n, r)| Import { module: md.to_string(), name: n.to_string(), results: *r }).collect();
         let mail: Arc<Mutex<Mail>> = Default::default();

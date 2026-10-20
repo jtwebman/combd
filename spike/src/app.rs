@@ -60,6 +60,8 @@ pub struct Proc {
     pub spread: Option<crate::fleet::Scope>,
     /// `memory_kb`, in Wasm pages: the most a cell may grow to.
     pub memory_pages: Option<u32>,
+    /// How its module runs (`[modules.<name>] engine`).
+    pub engine: crate::engine::Kind,
     pub max_concurrent: usize,
     pub timeout: Duration,
     /// Processes (of its app) that may `call` or `send` to this one.
@@ -103,7 +105,7 @@ pub struct App<P> {
     pub router: Router,
     /// Programs by the hash of their bytes: the same module loads once,
     /// across apps and versions.
-    by_hash: HashMap<[u8; 32], usize>,
+    by_hash: HashMap<([u8; 32], crate::engine::Kind), usize>,
     /// Apps taken down: (`tenants` index); their processes are retired.
     gone: Vec<usize>,
 }
@@ -146,7 +148,7 @@ pub struct AppDir<'a> {
 impl<P> App<P> {
     /// One program, the old routes.
     pub fn single(prog: P, max_concurrent: usize) -> App<P> {
-        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, mailbox: usize::MAX, batch: 100, spread: None, memory_pages: None, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
+        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, mailbox: usize::MAX, batch: 100, spread: None, memory_pages: None, engine: crate::engine::Kind::Interpreted, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
         let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default(), pools: vec![] };
         App { progs: vec![Arc::new(prog)], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
     }
@@ -159,7 +161,7 @@ impl<P> App<P> {
     /// Every app, from its resolved manifest: each module loaded once (the
     /// same bytes in two apps are one program), each process with its
     /// settings and rights, all scoped to its app.
-    pub fn from_apps(apps: &[AppDir], load: impl Fn(&[u8]) -> Result<P, String>) -> Result<App<P>, String> {
+    pub fn from_apps(apps: &[AppDir], load: impl Fn(&[u8], crate::engine::Kind) -> Result<P, String>) -> Result<App<P>, String> {
         let mut seen = std::collections::HashSet::new();
         for a in apps {
             if !seen.insert((a.org, a.app)) {
@@ -172,7 +174,7 @@ impl<P> App<P> {
     /// A new `App`: this one, with `apps` deployed (new, or new versions of
     /// apps it has) and the apps in `remove` taken down. Append-only: see the
     /// module's notes.
-    pub fn with_apps(&self, apps: &[AppDir], remove: &[(String, String)], load: impl Fn(&[u8]) -> Result<P, String>) -> Result<App<P>, String> {
+    pub fn with_apps(&self, apps: &[AppDir], remove: &[(String, String)], load: impl Fn(&[u8], crate::engine::Kind) -> Result<P, String>) -> Result<App<P>, String> {
         let mut progs = self.progs.clone();
         let mut by_hash = self.by_hash.clone();
         let mut procs = self.procs.clone();
@@ -228,11 +230,13 @@ impl<P> App<P> {
                     use sha2::Digest;
                     sha2::Sha256::digest(&wasm).into()
                 };
-                let prog = match by_hash.get(&hash) {
+                // The same bytes run compiled and interpreted are two programs.
+                let kind = a.resolved.modules.get(&p.kind).copied().unwrap_or_default();
+                let prog = match by_hash.get(&(hash, kind)) {
                     Some(&i) => i,
                     None => {
-                        progs.push(Arc::new(load(&wasm).map_err(|e| format!("{key}: modules/{}.wasm: {e}", p.kind))?));
-                        by_hash.insert(hash, progs.len() - 1);
+                        progs.push(Arc::new(load(&wasm, kind).map_err(|e| format!("{key}: modules/{}.wasm: {e}", p.kind))?));
+                        by_hash.insert((hash, kind), progs.len() - 1);
                         progs.len() - 1
                     }
                 };
@@ -261,6 +265,7 @@ impl<P> App<P> {
                     }),
                     batch: p.settings.get("batch").and_then(serde_json::Value::as_u64).map_or(1, |n| n as usize),
                     mailbox: p.settings.get("mailbox").and_then(serde_json::Value::as_u64).map_or(usize::MAX, |n| n as usize),
+                    engine: kind,
                     memory_pages: p.settings.get("memory_kb").and_then(serde_json::Value::as_u64).map(|kb| kb.div_ceil(64) as u32),
                     max_concurrent: n("max_concurrent").max(1) as usize,
                     timeout: Duration::from_millis(n("timeout_ms")),

@@ -344,7 +344,7 @@ struct Shared {
     /// Per process (`org/app/proc`): the time its cells ran, in us, host
     /// calls included, and the slices they ran in. Each loop adds its own
     /// every 250 ms.
-    procs: Mutex<BTreeMap<String, (u64, u64)>>,
+    procs: Mutex<BTreeMap<String, (u64, u64, crate::engine::Kind)>>,
 }
 
 /// How long a cell runs before others get a turn: a slice, and the host
@@ -1067,7 +1067,7 @@ fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, kn
     }
     // Take down what's gone, then each change on its own: one app that
     // won't load is skipped (and tried again next time), not the rest.
-    let mut next = now.with_apps(&[], &gone, |w| eng.load(w).map_err(|e| e.to_string())).and_then(|a| check_caps(eng, a))?;
+    let mut next = now.with_apps(&[], &gone, |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))?;
     for g in &gone {
         known.remove(g);
     }
@@ -1078,7 +1078,7 @@ fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, kn
                 return Err(format!("its manifest says it's {:?}", m.app));
             }
             let a = crate::app::AppDir { org: &c.org, dir: &c.dir, resolved: &r, app: &m.app, domains: &m.domains };
-            next.with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string())).and_then(|a| check_caps(eng, a))
+            next.with_apps(&[a], &[], |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))
         });
         match one {
             Ok(n) => {
@@ -1124,7 +1124,7 @@ pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::c
             return Err(format!("its manifest says it's {:?}, not {app:?}", m.app));
         }
         let a = crate::app::AppDir { org, dir: &dir, resolved: &r, app: &m.app, domains: &m.domains };
-        live.now().with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string())).and_then(|a| check_caps(eng, a))?;
+        live.now().with_apps(&[a], &[], |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))?;
         Ok(m.domains.clone())
     })();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1142,7 +1142,7 @@ pub fn deploy_dir<E: Engine>(eng: &E, live: &Live<E::Program>, org: &str, dir: &
     let m = crate::manifest::load(dir).map_err(|e| format!("{at}: {e}"))?.ok_or(format!("{at}: no manifest"))?;
     let r = m.resolve(&crate::manifest::load_dev(dir).map_err(|e| format!("{at}: {e}"))?).map_err(|e| format!("{at}: {e}"))?;
     let a = crate::app::AppDir { org, dir, resolved: &r, app: &m.app, domains: &m.domains };
-    let next = live.now().with_apps(&[a], &[], |w| eng.load(w).map_err(|e| e.to_string())).and_then(|a| check_caps(eng, a))?;
+    let next = live.now().with_apps(&[a], &[], |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))?;
     live.swap(next);
     Ok(())
 }
@@ -1180,7 +1180,7 @@ pub fn load_apps<E: Engine>(eng: &E, apps: &[(String, std::path::PathBuf)]) -> R
         loaded.push((org.clone(), dir.clone(), m, r));
     }
     let list: Vec<crate::app::AppDir> = loaded.iter().map(|(org, dir, m, r)| crate::app::AppDir { org, dir, resolved: r, app: &m.app, domains: &m.domains }).collect();
-    let app = App::from_apps(&list, |w| eng.load(w).map_err(|e| e.to_string())).and_then(|a| check_caps(eng, a))?;
+    let app = App::from_apps(&list, |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))?;
     let pools: Vec<crate::pg::PoolCfg> = loaded.iter().flat_map(|(org, _, m, r)| crate::pg::PgCfg::from_manifest(r, &format!("{org}/{}", m.app)).map(|c| c.pools).unwrap_or_default()).collect();
     Ok((app, (!pools.is_empty()).then_some(crate::pg::PgCfg { pools })))
 }
@@ -3371,9 +3371,10 @@ impl<E: Engine> Loop<'_, E> {
         for (i, r) in self.ran.iter_mut().enumerate().filter(|(_, r)| r.0 > 0) {
             let Some(p) = self.app.procs.get(i) else { continue };
             let t = &self.app.tenants[p.tenant];
-            let e = procs.entry(format!("{}/{}/{}", t.org, t.app, p.name)).or_default();
+            let e = procs.entry(format!("{}/{}/{}", t.org, t.app, p.name)).or_insert((0, 0, p.engine));
             e.0 += r.0 / 1000;
             e.1 += r.1;
+            e.2 = p.engine;
             *r = (0, 0);
         }
     }
@@ -3552,7 +3553,8 @@ impl<E: Engine> Loop<'_, E> {
                     s.ev_requests.load(Relaxed)
                 );
                 // Per process: the time its cells ran (us, host calls in) and their slices.
-                let procs: serde_json::Map<String, serde_json::Value> = self.sh.procs.lock().unwrap().iter().map(|(k, &(us, slices))| (k.clone(), serde_json::json!({ "cpu_us": us, "slices": slices }))).collect();
+                let engine = |k: crate::engine::Kind| if k == crate::engine::Kind::Compiled { "compiled" } else { "interpreted" };
+                let procs: serde_json::Map<String, serde_json::Value> = self.sh.procs.lock().unwrap().iter().map(|(k, &(us, slices, e))| (k.clone(), serde_json::json!({ "cpu_us": us, "slices": slices, "engine": engine(e) }))).collect();
                 let node = self.sh.fleet.as_ref().map(|f| f.cfg.node);
                 let tail = serde_json::json!({ "node": node, "version": option_env!("COMBD_VERSION").unwrap_or("dev"), "procs": procs }).to_string();
                 let body = format!("{},{}", &body[..body.len() - 1], &tail[1..]);

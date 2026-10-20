@@ -10,6 +10,8 @@
 mod admin;
 #[cfg(feature = "aot-lite")]
 mod aot;
+#[cfg(feature = "aot-lite")]
+mod both;
 mod aot_gen;
 mod app;
 mod catalog;
@@ -420,6 +422,12 @@ fn finish<V: CellVm>(vm: &mut V, slice: u32, st: &mut HostState) -> Result<Vec<u
             Outcome::Trap(t) => return Err(t),
         }
     }
+}
+
+/// Both engines: each module runs as its manifest says.
+#[cfg(feature = "aot-lite")]
+fn both() -> both::Both {
+    both::Both { interp: interp::Interp { max_pages: 16384 }, aot: aot::Aot }
 }
 
 /// Copy a request into the cell and begin `handle`. Nothing runs yet.
@@ -1136,7 +1144,10 @@ fn main_with(args: &[&str]) {
             });
             let r = match engine {
                 "interp" => http::serve_fleet_apps(&interp::Interp { max_pages: 16384 }, port, cfg, admin),
-                _ => Err("serve-fleet runs the interpreter: deployed modules aren't in the AOT build".into()),
+                // Each module as its manifest says (compiled: those in this build, for now).
+                #[cfg(feature = "aot-lite")]
+                "both" => http::serve_fleet_apps(&both(), port, cfg, admin),
+                _ => Err("serve-fleet: interp, or both (with the AOT tier)".into()),
             };
             if let Err(e) = r {
                 eprintln!("combd     {e}");
@@ -1192,7 +1203,9 @@ fn main_with(args: &[&str]) {
                 "interp" => http::serve_apps(&interp::Interp { max_pages: 16384 }, root, port),
                 #[cfg(feature = "aot-lite")]
                 "aot" => http::serve_apps(&aot::Aot, root, port),
-                _ => panic!("unknown engine (interp, aot)"),
+                #[cfg(feature = "aot-lite")]
+                "both" => http::serve_apps(&both(), root, port),
+                _ => panic!("unknown engine (interp, aot, both)"),
             }
         }
         // An app: its manifest and modules in `dir`, the `dev` environment.
@@ -1202,7 +1215,9 @@ fn main_with(args: &[&str]) {
                 "interp" => http::serve_app(&interp::Interp { max_pages: 16384 }, dir, port),
                 #[cfg(feature = "aot-lite")]
                 "aot" => http::serve_app(&aot::Aot, dir, port),
-                _ => panic!("unknown engine (interp, aot)"),
+                #[cfg(feature = "aot-lite")]
+                "both" => http::serve_app(&both(), dir, port),
+                _ => panic!("unknown engine (interp, aot, both)"),
             }
         }
         ["serve", engine, cell, port] => {
@@ -1738,6 +1753,41 @@ mod tests {
         let (name, p) = procs().as_object().unwrap().iter().next().map(|(k, v)| (k.clone(), v.clone())).unwrap();
         assert!(p["cpu_us"].as_u64().unwrap() >= 100_000, "{name}: {p} (300 ms busy: most of it, even on a loaded machine)");
         assert!(p["slices"].as_u64().unwrap() >= 2, "{name}: {p}");
+    }
+
+    /// An app whose module wants to run compiled, and a node that only
+    /// interprets: refused, saying why, not run some other way.
+    #[test]
+    fn a_compiled_module_never_runs_interpreted() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::write(app.0.join("combd.toml"), "[app]\nname = \"c\"\n[modules.classic]\nengine = \"compiled\"\n[durable.room]\nmodule = \"classic\"\nroutes = [\"/room/:id/*\"]\n").unwrap();
+        std::fs::copy(GUEST, app.0.join("modules/classic.wasm")).unwrap();
+        let e = http::load_app(&interp::Interp { max_pages: 16384 }, &app.0).err().expect("refused");
+        assert!(e.contains("interpreted only"), "{e}");
+    }
+
+    /// Both engines on a node: the same module, compiled for one process and
+    /// interpreted for another, each the way it says.
+    #[cfg(feature = "aot-lite")]
+    #[test]
+    fn each_module_runs_the_way_it_says() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::write(app.0.join("combd.toml"), "[app]\nname = \"two\"\n[modules.fast]\nengine = \"compiled\"\n[modules.slow]\nengine = \"interpreted\"\n[durable.a]\nmodule = \"fast\"\nroutes = [\"/a/:id/*\"]\n[durable.b]\nmodule = \"slow\"\nroutes = [\"/b/:id/*\"]\n").unwrap();
+        for m in ["fast", "slow"] {
+            std::fs::copy(GUEST, app.0.join(format!("modules/{m}.wasm"))).unwrap();
+        }
+        let eng = both();
+        let (a, _) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = server_app(eng, cfg(&dir.0, 1), move |_| a);
+        for p in ["/a/x/incr", "/b/x/incr"] {
+            assert_eq!(http_to(port, "two.localhost", "POST", p, ""), (200, "{\"count\":1}".into()), "{p}");
+        }
+        let procs = || serde_json::from_str::<serde_json::Value>(&http(port, "GET", "/_combd/stats", "").1).unwrap()["procs"].clone();
+        assert!(eventually(2000, || procs()["local/two/b"]["engine"] == "interpreted"), "{}", procs());
+        assert_eq!(procs()["local/two/a"]["engine"], "compiled", "{}", procs());
     }
 
     /// A busy object's mailbox fills: what comes past `mailbox` is refused

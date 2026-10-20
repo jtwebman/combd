@@ -86,6 +86,9 @@ pub struct Manifest {
     pub secrets: BTreeMap<String, Spec>,
     pub processes: BTreeMap<String, Process>,
     pub pools: BTreeMap<String, Pool>,
+    /// `[modules.<name>] engine`: how each module runs (a module not listed
+    /// runs interpreted, for now: compiled needs builders).
+    pub modules: BTreeMap<String, crate::engine::Kind>,
 }
 
 /// A process: its kind, its settings (by dotted key), and who may reach it.
@@ -153,6 +156,7 @@ pub struct Resolved {
     pub environ: Vec<(String, String)>,
     pub processes: BTreeMap<String, Process>,
     pub pools: BTreeMap<String, Pool>,
+    pub modules: BTreeMap<String, crate::engine::Kind>,
 }
 
 /// The settings each built-in kind takes, in the same spec format.
@@ -334,8 +338,8 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
         None => return Err(vec!["want a table at the top".into()]),
     };
     for k in top.keys() {
-        if !["app", "vars", "secrets"].contains(&k.as_str()) && !TYPES.contains(&k.as_str()) {
-            errs.push(format!("{k}: unknown section (app, vars, secrets, {})", TYPES.join(", ")));
+        if !["app", "vars", "secrets", "modules"].contains(&k.as_str()) && !TYPES.contains(&k.as_str()) {
+            errs.push(format!("{k}: unknown section (app, vars, secrets, modules, {})", TYPES.join(", ")));
         }
     }
     let table = |k: &str, errs: &mut Vec<String>| -> Map<String, Json> {
@@ -512,8 +516,33 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
             }
         }
     }
+    // How each module runs: `[modules.<name>] engine = "compiled" | "interpreted"`.
+    let mut modules = BTreeMap::new();
+    for (m, cfg) in table("modules", &mut errs) {
+        if !has_module(&m) {
+            errs.push(format!("modules.{m}: no module modules/{m}.wasm"));
+            continue;
+        }
+        let Some(cfg) = cfg.as_object() else {
+            errs.push(format!("modules.{m}: want a table"));
+            continue;
+        };
+        for k in cfg.keys().filter(|k| *k != "engine") {
+            errs.push(format!("modules.{m}.{k}: unknown key"));
+        }
+        match cfg.get("engine").map(|e| e.as_str()) {
+            None => {}
+            Some(Some("compiled")) => {
+                modules.insert(m, crate::engine::Kind::Compiled);
+            }
+            Some(Some("interpreted")) => {
+                modules.insert(m, crate::engine::Kind::Interpreted);
+            }
+            Some(e) => errs.push(format!("modules.{m}.engine {:?}: \"compiled\" or \"interpreted\"", e.unwrap_or("?"))),
+        }
+    }
     if errs.is_empty() {
-        Ok(Manifest { app: name, domains, vars, secrets, processes, pools })
+        Ok(Manifest { app: name, domains, vars, secrets, processes, pools, modules })
     } else {
         Err(errs)
     }
@@ -1003,7 +1032,7 @@ impl Manifest {
         if size > MAX_ENVIRON {
             return Err(format!("the env vars come to {size} bytes: at most {MAX_ENVIRON}"));
         }
-        Ok(Resolved { environ, processes, pools })
+        Ok(Resolved { environ, processes, pools, modules: self.modules.clone() })
     }
 }
 
@@ -1324,6 +1353,20 @@ callers = ["ghost"]
             "pool.pg.callers: no process \"missing\"",
             "pool.mysql.module \"combd:mysql\": a pool hands out a built-in kind",
         ] {
+            assert!(e.contains(want), "missing {want:?} in:\n{e}");
+        }
+    }
+
+    /// `[modules]`: how each module runs, and nothing it can't say.
+    #[test]
+    fn modules_say_how_they_run() {
+        let ok = "[app]\nname = \"shop\"\n[modules.api]\nengine = \"compiled\"\n[modules.admin]\nengine = \"interpreted\"\n[http.web]\nmodule = \"api\"\nroutes = [\"/\"]\n";
+        let m = load(&dir(&[("combd.toml", ok)]).0).unwrap().unwrap();
+        assert_eq!(m.modules.get("api"), Some(&crate::engine::Kind::Compiled));
+        assert_eq!(m.modules.get("admin"), Some(&crate::engine::Kind::Interpreted));
+        assert_eq!(m.modules.get("imager"), None, "not listed: interpreted, for now");
+        let e = errors("[app]\nname = \"shop\"\n[modules.ghost]\nengine = \"compiled\"\n[modules.api]\nengine = \"fast\"\n[modules.imager]\nspeed = 1\n[http.web]\nmodule = \"api\"\nroutes = [\"/\"]\n");
+        for want in ["modules.ghost: no module modules/ghost.wasm", "modules.api.engine \"fast\": \"compiled\" or \"interpreted\"", "modules.imager.speed: unknown key"] {
             assert!(e.contains(want), "missing {want:?} in:\n{e}");
         }
     }

@@ -21,11 +21,28 @@ pub struct Import {
     pub results: u32,
 }
 
+/// How a module runs, as its manifest says (`[modules.<name>] engine`):
+/// only that way, never switching.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Kind {
+    #[default]
+    Interpreted,
+    Compiled,
+}
+
 pub trait Engine {
     type Program;
     type Vm: CellVm;
     /// Validate and prepare a module, once per deploy.
     fn load(&self, wasm: &[u8]) -> Result<Self::Program, String>;
+    /// The same, to run `kind`: an engine that can't says so, and the deploy
+    /// fails (a module never runs another way than it asked).
+    fn load_as(&self, wasm: &[u8], kind: Kind) -> Result<Self::Program, String> {
+        match kind {
+            Kind::Interpreted => self.load(wasm),
+            Kind::Compiled => Err("this node runs modules interpreted only (engine = \"compiled\" needs a build)".into()),
+        }
+    }
     /// Make a fresh cell from a loaded program.
     fn spawn(&self, program: &Self::Program) -> Result<Self::Vm, String>;
     /// Something worth saying about a module before it runs (`None`: nothing).

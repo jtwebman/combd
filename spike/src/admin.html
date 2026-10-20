@@ -38,7 +38,7 @@
 
 <h2>Processes <span class="dim">(CPU per core, over the last poll)</span></h2>
 <div class="wrap"><table id="procs"><thead><tr>
-  <th>Process</th><th>CPU</th><th>Slices/s</th><th>On nodes</th>
+  <th>Process</th><th>Engine</th><th>CPU</th><th>Slices/s</th><th>On nodes</th>
 </tr></thead><tbody></tbody></table></div>
 
 <script>
@@ -99,7 +99,7 @@ async function poll() {
     ]);
     const prev = last.get(x.node);
     for (const [name, p] of Object.entries(s.procs || {})) {
-      const a = sum.get(name) || { cpu: 0, slices: 0, nodes: new Set() };
+      const a = sum.get(name) || { cpu: 0, slices: 0, nodes: new Set(), engine: p.engine };
       const was = prev?.procs[name];
       if (prev && was) {
         const secs = (now - prev.at) / 1000;
@@ -112,7 +112,7 @@ async function poll() {
     last.set(x.node, { at: now, procs: s.procs || {} });
   }
   for (const [name, a] of [...sum].sort((x, y) => y[1].cpu - x[1].cpu)) {
-    row(procs, [name, cpuCell(a.cpu), Math.round(a.slices).toLocaleString(), [...a.nodes].join(" ")]);
+    row(procs, [name, a.engine ?? "", cpuCell(a.cpu), Math.round(a.slices).toLocaleString(), [...a.nodes].join(" ")]);
   }
 }
 poll();
