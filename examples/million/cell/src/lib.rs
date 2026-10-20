@@ -77,9 +77,15 @@ fn tell(msg: &Value) {
     unsafe { send(m.as_ptr(), m.len() as u32) };
 }
 
-/// Straight to a viewer's socket: the viewer doesn't run.
-fn push(sock: u64, msg: &str) {
-    tell(&json!({ "to": "viewer", "id": sock.to_string(), "ws": msg }));
+/// Straight to viewers' sockets: the viewers don't run. The message is
+/// quoted once, and each push only adds its socket: with a hundred watching,
+/// building each one as JSON was most of a set's time.
+fn push(socks: impl Iterator<Item = u64>, msg: &str) {
+    let tail = format!(r#"","ws":{}}}"#, Value::from(msg));
+    for sock in socks {
+        let m = format!(r#"{{"to":"viewer","id":"{sock}{tail}"#);
+        unsafe { send(m.as_ptr(), m.len() as u32) };
+    }
 }
 
 fn err(code: u16, msg: &str) -> String {
@@ -92,8 +98,8 @@ pub fn run(req: &str) -> String {
     let mut parts = req.splitn(4, ' ');
     let (_, method, path, body) = (parts.next(), parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-    match env("COMBD_PROCESS").as_deref() {
-        Some("web") => match (method, path.split('?').next().unwrap_or("")) {
+    match PROCESS.with(|p| p.get_or_init(|| env("COMBD_PROCESS").unwrap_or_default()).clone()).as_str() {
+        "web" => match (method, path.split('?').next().unwrap_or("")) {
             ("GET", "/") => format!("200\ncontent-type: text/html; charset=utf-8\ncache-control: no-cache\n\n{INDEX}"),
             ("GET", "/api/count") => {
                 let r = ask(&json!({ "to": "boxes", "id": "all", "method": "GET", "path": "/total" }));
@@ -101,8 +107,8 @@ pub fn run(req: &str) -> String {
             }
             _ => err(404, "not found"),
         },
-        Some("chunk") => chunk(method, path, &v),
-        Some("boxes") => boxes(method, path, &v),
+        "chunk" => chunk(method, path, &v),
+        "boxes" => boxes(method, path, &v),
         other => err(500, &format!("million: no process {other:?}")),
     }
 }
@@ -122,10 +128,14 @@ struct Chunk {
     /// When it last dropped expired watchers: not on every request, since
     /// with 100,000 watching, a scan per request was the whole node's time.
     pruned: i64,
+    /// Every box, as a new watcher gets it: built again only after a change.
+    all: Option<String>,
 }
 
 thread_local! {
     static CH: RefCell<Option<Chunk>> = const { RefCell::new(None) };
+    /// Which process this is (`COMBD_PROCESS`), read once.
+    static PROCESS: std::cell::OnceCell<String> = const { std::cell::OnceCell::new() };
 }
 
 fn load() -> Chunk {
@@ -142,11 +152,17 @@ fn load() -> Chunk {
     if dirty {
         unsafe { tick_every(1000) };
     }
-    Chunk { n: 0, bits, checked: rows.len() as u64, subs: HashMap::new(), dirty, pruned: 0 }
+    Chunk { n: 0, bits, checked: rows.len() as u64, subs: HashMap::new(), dirty, pruned: 0, all: None }
 }
 
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    const D: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(b.len() * 2);
+    for &x in b {
+        s.push(D[(x >> 4) as usize] as char);
+        s.push(D[(x & 15) as usize] as char);
+    }
+    s
 }
 
 fn chunk(method: &str, path: &str, v: &Value) -> String {
@@ -166,7 +182,9 @@ fn chunk(method: &str, path: &str, v: &Value) -> String {
             ("POST", "/sub") => {
                 let Some(sock) = v["sock"].as_u64() else { return err(400, "sock") };
                 if c.subs.insert(sock, now + SUB_MS).is_none() {
-                    push(sock, &json!({ "t": "all", "n": c.n, "bits": hex(&c.bits) }).to_string());
+                    let (n, bits) = (c.n, &c.bits);
+                    let all = c.all.get_or_insert_with(|| json!({ "t": "all", "n": n, "bits": hex(bits) }).to_string());
+                    push(std::iter::once(sock), all);
                 }
             }
             ("POST", "/unsub") => {
@@ -182,6 +200,7 @@ fn chunk(method: &str, path: &str, v: &Value) -> String {
                     return "200 {}".into();
                 }
                 c.bits[i / 8] ^= 1 << (i % 8);
+                c.all = None;
                 if on {
                     query("INSERT INTO on_ (i) VALUES (?)", &[json!(i)]);
                     c.checked += 1;
@@ -191,10 +210,7 @@ fn chunk(method: &str, path: &str, v: &Value) -> String {
                 }
                 // Out once the write is on disk (the host holds them).
                 // ponytail: one push per watcher per set; one per node is next.
-                let msg = json!({ "t": "set", "n": c.n, "i": i, "v": on }).to_string();
-                for &sock in c.subs.keys() {
-                    push(sock, &msg);
-                }
+                push(c.subs.keys().copied(), &json!({ "t": "set", "n": c.n, "i": i, "v": on }).to_string());
                 // The total hears at most once a second.
                 if !c.dirty {
                     c.dirty = true;

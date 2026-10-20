@@ -17,7 +17,8 @@
   input[type=number] { width: 7em; font: inherit; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px; }
   #space { position: relative; margin: 0 4px; }
   #status { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 4px 10px; border-radius: 4px; }
-  #status:empty { display: none; }
+  #status:empty, #lag:empty { display: none; }
+  #lag { position: fixed; bottom: 48px; left: 50%; transform: translateX(-50%); max-width: calc(100% - 32px); background: #b3261e; color: #fff; padding: 4px 10px; border-radius: 4px; text-align: center; }
   #space input { position: absolute; margin: 0; width: 20px; height: 20px; accent-color: var(--accent); }
 </style>
 </head>
@@ -31,6 +32,7 @@
 </header>
 <div id="space"></div>
 <div id="status" role="status"></div>
+<div id="lag" role="alert"></div>
 <script>
 const TOTAL = 1_000_000, CHUNK = 15_625, SIZE = 26;
 const space = document.getElementById("space");
@@ -39,6 +41,9 @@ const status = document.getElementById("status"), at = document.getElementById("
 const bits = new Map();
 const pool = [];
 let cols = 1, ws = null, watching = "", sentAt = 0, range = [0, 0];
+// This page's clicks the server hasn't sent back yet: box -> when.
+const unseen = new Map();
+let retry = 1000;
 
 const on = (i) => { const b = bits.get(Math.floor(i / CHUNK)), j = i % CHUNK; return b ? (b[j >> 3] >> (j & 7)) & 1 : null; };
 const put = (n, j, v) => { const b = bits.get(n); if (b) b[j >> 3] = v ? b[j >> 3] | (1 << (j & 7)) : b[j >> 3] & ~(1 << (j & 7)); };
@@ -47,15 +52,16 @@ const put = (n, j, v) => { const b = bits.get(n); if (b) b[j >> 3] = v ? b[j >> 
 // boxes there, then every change to them.
 function connect() {
   ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
-  ws.onopen = () => { watching = ""; tell(); };
+  ws.onopen = () => { watching = ""; retry = 1000; tell(); };
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.t === "all") bits.set(m.n, new Uint8Array(m.bits.match(/../g).map((h) => parseInt(h, 16))));
-    else if (m.t === "set") put(m.n, m.i, m.v);
+    else if (m.t === "set") { put(m.n, m.i, m.v); unseen.delete(m.n * CHUNK + m.i); }
     else if (m.t === "slow") { put(Math.floor(m.i / CHUNK), m.i % CHUNK, !on(m.i)); say("Slow down a little."); }
     draw();
   };
-  ws.onclose = () => { bits.clear(); draw(); setTimeout(connect, 1000); };
+  // Back off, so a struggling server isn't also answering every page each second.
+  ws.onclose = () => { bits.clear(); unseen.clear(); draw(); setTimeout(connect, retry * (0.5 + Math.random())); retry = Math.min(retry * 2, 30_000); };
 }
 
 // The range, when the chunks on screen change, and every 20 s to keep
@@ -70,6 +76,19 @@ function tell() {
   sentAt = Date.now();
 }
 setInterval(tell, 5000);
+
+// Say so when the server stops keeping up: clicks not back, or the boxes on
+// screen not here, after 5 s.
+function health() {
+  const late = Date.now() - 5000;
+  const [lo, hi] = range;
+  let msg = "";
+  if (ws?.readyState !== WebSocket.OPEN) msg = "Lost the server. Reconnecting…";
+  else if ([...unseen.values()].some((t) => t < late)) msg = "The server is behind: your clicks may not have reached everyone yet.";
+  else if (sentAt < late && (on(lo) === null || on(Math.max(lo, hi - 1)) === null)) msg = "The server is slow to send these boxes.";
+  document.getElementById("lag").textContent = msg;
+}
+setInterval(health, 1000);
 
 let sayTimer;
 function say(s) { status.textContent = s; clearTimeout(sayTimer); sayTimer = setTimeout(() => (status.textContent = ""), 2000); }
@@ -112,6 +131,7 @@ space.addEventListener("change", (e) => {
   const i = +e.target.dataset.i;
   if (ws?.readyState !== WebSocket.OPEN || on(i) === null) { draw(); return; }
   put(Math.floor(i / CHUNK), i % CHUNK, e.target.checked);
+  unseen.set(i, Date.now());
   ws.send(JSON.stringify({ t: "set", i, v: e.target.checked }));
 });
 
