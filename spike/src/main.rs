@@ -13,6 +13,7 @@ mod aot;
 mod aot_gen;
 mod app;
 mod catalog;
+mod click;
 mod catnode;
 mod catsim;
 mod deploy;
@@ -886,6 +887,12 @@ fn main_with(args: &[&str]) {
         // the server from outside: `ws-load <ip:port> <host> <path> <n>
         // <message> [ca.pem]`.
         ["ws-load", addr, host, path, n, msg, ref tls @ ..] => ws_load(addr, host, path, n.parse().unwrap(), msg, tls.first().copied()),
+        // Million's pages, clicking: `ws-click <ip:port> <host> <path> <n>
+        // <ca.pem> [max clicks, 30] [max seconds between, 20]`.
+        ["ws-click", addr, host, path, n, ca, ref rest @ ..] => {
+            let arg = |i: usize, d: u64| rest.get(i).map_or(d, |v| v.parse().unwrap());
+            click::run(addr, host, path, n.parse().unwrap(), ca, arg(0, 30), arg(1, 20))
+        }
         ["compute", "native"] => compute_native(),
         ["api-bench", "native"] => api_bench_native(),
         ["api-bench", e] => main_with(&["api-bench", e, "rust"]),
