@@ -180,6 +180,7 @@ fn schema(kind: &str) -> Option<&'static str> {
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
             hibernate_ms = { type = "int", min = 0, max = 86400000, default = 5000 }
             hibernate = { type = "enum", values = ["auto", "app", "off"], default = "auto" }
+            on_close = { type = "enum", values = ["wake", "drop"], default = "wake" }
             state_kb = { type = "int", min = 1, max = 1024, default = 4 }
             "memory_kb?" = { type = "int", min = 64, max = 4194304 }
             "#
@@ -200,6 +201,7 @@ fn schema(kind: &str) -> Option<&'static str> {
             socket = { type = "bool", default = false }
             hibernate_ms = { type = "int", min = 0, max = 86400000, default = 5000 }
             hibernate = { type = "enum", values = ["auto", "app", "off"], default = "auto" }
+            on_close = { type = "enum", values = ["wake", "drop"], default = "wake" }
             state_kb = { type = "int", min = 1, max = 1024, default = 4 }
             "memory_kb?" = { type = "int", min = 64, max = 4194304 }
             "#
@@ -1237,6 +1239,7 @@ routes = ["/chat"]
 hibernate_ms = 0
 callers = ["room"]
 memory_kb = 256
+on_close = "drop"
 [pool.pg-pool]
 module = "combd:postgres"
 url = "postgres://x"
@@ -1248,6 +1251,7 @@ callers = ["api", "admin-api"]
         assert_eq!(m.processes["room"].routes[0].segs, [Seg::Lit("room".into()), Seg::Param("id".into()), Seg::Rest]);
         assert_eq!(["api", "room", "chat", "pg-pool"].map(|n| m.processes[n].ty()), ["http", "durable", "ws", "pool"]);
         assert_eq!(m.processes["chat"].settings["memory_kb"], 256, "an optional setting, set");
+        assert_eq!(m.processes["chat"].settings["on_close"], "drop");
         assert_eq!((m.pools["pg-pool"].owners.as_slice(), m.pools["pg-pool"].settings["member"].as_str()), (&["api".to_string(), "admin-api".to_string()][..], Some("pg-pool")), "a pool is its own member");
         let e = errors(
             r#"

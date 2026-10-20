@@ -42,6 +42,9 @@ pub struct Proc {
     pub fresh: bool,
     pub hibernate: Duration,
     pub sleep: Sleep,
+    /// A ws session hears its socket close (`WSCLOSE`); `on_close = "drop"`:
+    /// it just ends, unwoken (its subscriptions expire on their own).
+    pub wake_on_close: bool,
     pub state_max: usize,
     /// `memory_kb`, in Wasm pages: the most a cell may grow to.
     pub memory_pages: Option<u32>,
@@ -131,7 +134,7 @@ pub struct AppDir<'a> {
 impl<P> App<P> {
     /// One program, the old routes.
     pub fn single(prog: P, max_concurrent: usize) -> App<P> {
-        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, state_max: 0, memory_pages: None, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
+        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, memory_pages: None, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
         let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default(), pools: vec![] };
         App { progs: vec![Arc::new(prog)], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
     }
@@ -232,6 +235,7 @@ impl<P> App<P> {
                     socket: p.settings["socket"].as_bool() == Some(true),
                     fresh: p.settings.get("fresh").and_then(serde_json::Value::as_bool) == Some(true),
                     hibernate: Duration::from_millis(n("hibernate_ms")),
+                    wake_on_close: p.settings.get("on_close").and_then(serde_json::Value::as_str) != Some("drop"),
                     sleep: match p.settings.get("hibernate").and_then(serde_json::Value::as_str) {
                         Some("app") => Sleep::App,
                         Some("off") => Sleep::Off,

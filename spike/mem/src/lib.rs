@@ -177,12 +177,14 @@ fn reserve(n: usize) -> io::Result<*mut u8> {
 /// The memory this process costs the machine, in bytes (`None` where we
 /// can't tell). On Linux, its cgroup's (a container's, or a service's): its
 /// own memory and what the kernel holds for it (sockets' buffers, about 4
-/// KB a connection, which RSS leaves out), less file cache it would give
-/// back. Elsewhere, or with no cgroup to read, its resident memory.
+/// KB a connection, which RSS leaves out), and what of it went to swap,
+/// less file cache it would give back. Elsewhere, or with no cgroup to
+/// read, its resident memory.
 pub fn resident() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        if let Some(n) = cgroup_dir().and_then(|d| cgroup_used(&std::fs::read_to_string(d.join("memory.current")).ok()?, &std::fs::read_to_string(d.join("memory.stat")).ok()?)) {
+        let read = |d: &std::path::Path, f: &str| std::fs::read_to_string(d.join(f)).ok();
+        if let Some(n) = cgroup_dir().and_then(|d| cgroup_used(&read(&d, "memory.current")?, &read(&d, "memory.stat")?, read(&d, "memory.swap.current").as_deref())) {
             return Some(n);
         }
         let pages: u64 = std::fs::read_to_string("/proc/self/statm").ok()?.split_whitespace().nth(1)?.parse().ok()?;
@@ -241,11 +243,15 @@ fn cgroup_dir() -> Option<std::path::PathBuf> {
 }
 
 /// What a cgroup uses that it can't give back: `memory.current` less the
-/// file cache nobody's using (`inactive_file`), as `docker stats` counts.
-pub fn cgroup_used(current: &str, stat: &str) -> Option<u64> {
+/// file cache nobody's using (`inactive_file`), as `docker stats` counts,
+/// plus what went to swap (`memory.swap.current`). Swapped pages leave
+/// `memory.current`, so without them a node piling into swap looks smaller
+/// (the load test: 409 MB at 70,000 connections, 379 at 105,000).
+pub fn cgroup_used(current: &str, stat: &str, swap: Option<&str>) -> Option<u64> {
     let total: u64 = current.trim().parse().ok()?;
     let inactive = stat.lines().find_map(|l| l.strip_prefix("inactive_file ")).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
-    Some(total.saturating_sub(inactive))
+    let swapped = swap.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+    Some(total.saturating_sub(inactive) + swapped)
 }
 
 /// Bytes the allocator has handed out and not had back (glibc only: 0
@@ -366,9 +372,10 @@ mod tests {
     #[test]
     fn a_cgroup_counts_all_but_idle_file_cache() {
         let stat = "anon 600000000\nfile 90000000\nkernel 150000000\nsock 2000000\ninactive_file 70000000\nactive_file 20000000\n";
-        assert_eq!(cgroup_used("800000000\n", stat), Some(730_000_000));
-        assert_eq!(cgroup_used("max", stat), None);
-        assert_eq!(cgroup_used("1000", ""), Some(1000), "no stat: all of it");
+        assert_eq!(cgroup_used("800000000\n", stat, None), Some(730_000_000));
+        assert_eq!(cgroup_used("800000000\n", stat, Some("270000000\n")), Some(1_000_000_000), "and what went to swap");
+        assert_eq!(cgroup_used("max", stat, None), None);
+        assert_eq!(cgroup_used("1000", "", None), Some(1000), "no stat: all of it");
         #[cfg(target_os = "linux")]
         assert!(resident().is_some_and(|n| n > 0));
     }

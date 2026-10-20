@@ -17,6 +17,9 @@ module = "viewer"
 routes = ["/ws"]
 hibernate_ms = 2000
 hibernate = "app"
+# A closed socket's viewer just ends, unwoken: its chunks forget it when its
+# subscriptions expire (60 s). Everyone leaving at once is then cheap.
+on_close = "drop"
 state_kb = 1
 memory_kb = 512
 callers = ["chunk"]

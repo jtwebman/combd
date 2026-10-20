@@ -3522,9 +3522,11 @@ callers = ["api"]
         let ones: usize = (0..2).map(|_| { let all = json(&mut c); (0..15625).map(|i| bit(all["bits"].as_str().unwrap(), i) as usize).sum::<usize>() }).sum();
         assert_eq!(ones, 2 + 50 - slow as usize + 1, "boxes 7 and 9, the sets that got in, and 15626");
         assert!(eventually(4000, || http_to(port, host, "GET", "/api/count", "").1 == format!("{{\"checked\":{ones}}}")), "{}", http_to(port, host, "GET", "/api/count", "").1);
-        // A closed socket ends its session.
+        // A closed socket ends its session, unwoken (`on_close = "drop"`).
+        let woken = stat(port, "sessions_woken");
         drop(a);
         assert!(eventually(3000, || stat(port, "sessions_live") == 2), "{}", stat(port, "sessions_live"));
+        assert_eq!(stat(port, "sessions_woken"), woken, "nobody woke to hear it");
     }
 
     /// `memory_kb` under what a module starts with could never start a cell:

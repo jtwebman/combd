@@ -2487,6 +2487,10 @@ impl<E: Engine> Loop<'_, E> {
     /// A socket in an object's list is gone without a close: tell the
     /// object once (1006), wherever it runs.
     fn socket_lost(&mut self, name: &str, id: u64) {
+        // A session ends with its socket: nothing to tell.
+        if session_sock(name).is_some() {
+            return;
+        }
         if self.ws_gone.get(name).is_some_and(|g| g.contains(&id)) || !self.ws_lost.insert(id) {
             return;
         }
@@ -2608,6 +2612,13 @@ impl<E: Engine> Loop<'_, E> {
             let _ = self.deliver(origin, (410, "{\"error\":\"that session is gone\"}".into()));
             return;
         };
+        // `on_close = "drop"`: the socket's gone, so the session is, unwoken.
+        // Everyone leaving at once (a deploy, a network blip) is then cheap.
+        if req.starts_with("do WSCLOSE ") && !self.app.procs[s.proc].wake_on_close {
+            self.remove_session(&name);
+            let _ = self.deliver(origin, (200, "{}".into()));
+            return;
+        }
         s.waiting.push_back((origin, req));
         self.session_next(&name);
     }

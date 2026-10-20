@@ -18,6 +18,8 @@ const CHUNK: usize = 15_625;
 /// A subscription lasts this long unless the viewer renews it (every 20 s),
 /// so a viewer lost with its node leaves nothing behind.
 const SUB_MS: i64 = 60_000;
+/// How often a chunk drops watchers whose subscriptions ran out.
+const PRUNE_MS: i64 = 10_000;
 
 #[link(wasm_import_module = "combd")]
 extern "C" {
@@ -117,6 +119,9 @@ struct Chunk {
     subs: HashMap<u64, i64>,
     /// The count changed since it last told `boxes`.
     dirty: bool,
+    /// When it last dropped expired watchers: not on every request, since
+    /// with 100,000 watching, a scan per request was the whole node's time.
+    pruned: i64,
 }
 
 thread_local! {
@@ -137,7 +142,7 @@ fn load() -> Chunk {
     if dirty {
         unsafe { tick_every(1000) };
     }
-    Chunk { n: 0, bits, checked: rows.len() as u64, subs: HashMap::new(), dirty }
+    Chunk { n: 0, bits, checked: rows.len() as u64, subs: HashMap::new(), dirty, pruned: 0 }
 }
 
 fn hex(b: &[u8]) -> String {
@@ -149,7 +154,10 @@ fn chunk(method: &str, path: &str, v: &Value) -> String {
         let mut cell = cell.borrow_mut();
         let c = cell.get_or_insert_with(load);
         let now = unsafe { now_ms() };
-        c.subs.retain(|_, until| *until > now);
+        if now - c.pruned >= PRUNE_MS {
+            c.subs.retain(|_, until| *until > now);
+            c.pruned = now;
+        }
         if let Some(n) = v["n"].as_u64() {
             c.n = n;
         }
