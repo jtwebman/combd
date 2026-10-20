@@ -1697,6 +1697,27 @@ mod tests {
         assert!(eventually(3000, || keep(port).1 == "HTTP/1.1 503"), "over its memory budget");
     }
 
+    /// A busy object's mailbox fills: what comes past `mailbox` is refused
+    /// at once (503, overloaded), not queued, and the object goes on.
+    #[test]
+    fn a_full_mailbox_refuses_new_requests() {
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = server_app(interp::Interp { max_pages: 16384 }, cfg(&dir.0, 1), |eng| {
+            let mut a = app::App::single(eng.load(&wasm()).unwrap(), 4);
+            a.procs.iter_mut().for_each(|p| p.mailbox = 2);
+            a
+        });
+        let busy = std::thread::spawn(move || http(port, "POST", "/do/mb/busy", "1500"));
+        assert!(eventually(1000, || stat(port, "objects_live") == 1));
+        let rest: Vec<_> = (0..4).map(|_| std::thread::spawn(move || http(port, "GET", "/do/mb/count", "").0)).collect();
+        let mut got: Vec<u16> = rest.into_iter().map(|t| t.join().unwrap()).collect();
+        got.sort();
+        assert_eq!(got, [200, 200, 503, 503], "two wait their turn, two are refused");
+        assert_eq!(busy.join().unwrap().0, 200);
+        assert_eq!(stat(port, "mailbox_refused"), 2);
+        assert_eq!(http(port, "GET", "/do/mb/count", "").0, 200, "and it takes requests again");
+    }
+
     /// `memory_kb` on the AOT tier too: a cell capped under what it needs
     /// can't grow there, and one capped under where it starts won't start.
     #[cfg(feature = "aot-lite")]

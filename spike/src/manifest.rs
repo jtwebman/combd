@@ -178,6 +178,7 @@ fn schema(kind: &str) -> Option<&'static str> {
         "combd:ws" => {
             r#"
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
+            mailbox = { type = "int", min = 1, max = 1000000, default = 1000 }
             hibernate_ms = { type = "int", min = 0, max = 86400000, default = 5000 }
             hibernate = { type = "enum", values = ["auto", "app", "off"], default = "auto" }
             on_close = { type = "enum", values = ["wake", "drop"], default = "wake" }
@@ -188,6 +189,7 @@ fn schema(kind: &str) -> Option<&'static str> {
         "combd:durable" => {
             r#"
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
+            mailbox = { type = "int", min = 1, max = 1000000, default = 1000 }
             "memory_kb?" = { type = "int", min = 64, max = 4194304 }
             "#
         }
@@ -195,6 +197,7 @@ fn schema(kind: &str) -> Option<&'static str> {
         "combd:user" => {
             r#"
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
+            mailbox = { type = "int", min = 1, max = 1000000, default = 1000 }
             max_concurrent = { type = "int", min = 1, max = 1000, default = 32 }
             fresh = { type = "bool", default = false }
             durable = { type = "bool", default = false }

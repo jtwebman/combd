@@ -306,6 +306,8 @@ struct Stats {
     sessions_live: AtomicU64,
     sessions_hibernated: AtomicU64,
     sessions_woken: AtomicU64,
+    /// Requests refused because their object's or session's mailbox was full.
+    mailbox_refused: AtomicU64,
     /// Event cells: instances started, and requests they took.
     ev_instances: AtomicU64,
     ev_requests: AtomicU64,
@@ -2619,6 +2621,9 @@ impl<E: Engine> Loop<'_, E> {
             let _ = self.deliver(origin, (200, "{}".into()));
             return;
         }
+        if s.waiting.len() >= self.app.procs[s.proc].mailbox && !req.starts_with("do WSCLOSE ") {
+            return self.overloaded(origin);
+        }
         s.waiting.push_back((origin, req));
         self.session_next(&name);
     }
@@ -3370,7 +3375,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3396,6 +3401,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.sessions_live.load(Relaxed),
                     s.sessions_hibernated.load(Relaxed),
                     s.sessions_woken.load(Relaxed),
+                    s.mailbox_refused.load(Relaxed),
                     combd_mem::heap_in_use(),
                     s.conns_open.load(Relaxed),
                     s.conns_refused.load(Relaxed),
@@ -3651,10 +3657,21 @@ impl<E: Engine> Loop<'_, E> {
         }
     }
 
+    fn overloaded(&mut self, origin: Origin) {
+        self.sh.stats.mailbox_refused.fetch_add(1, Relaxed);
+        let _ = self.deliver(origin, (503, "{\"error\":\"overloaded\"}".into()));
+    }
+
     /// Run a request on an object this loop owns, now or after the ones ahead of it.
     fn submit(&mut self, origin: Origin, name: String, req: String) {
         if session_sock(&name).is_some() && self.app.procs[self.app.object_proc(&name)].socket {
             return self.session_submit(origin, name, req);
+        }
+        // A full mailbox refuses what's new. Not what the host itself owes
+        // the object: the core's runs, alarms, beats, and closes.
+        let new = !matches!(origin, Origin::Fleet(_) | Origin::Alarm { .. } | Origin::Tick) && !req.starts_with("do WSCLOSE ");
+        if new && self.objects.get(&name).is_some_and(|o| o.waiting.len() >= self.app.procs[self.app.object_proc(&name)].mailbox) {
+            return self.overloaded(origin);
         }
         if self.core.is_some() && !matches!(origin, Origin::Fleet(_)) {
             let hops = if matches!(origin, Origin::Wire(..)) { 1 } else { 0 };

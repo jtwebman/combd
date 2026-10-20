@@ -431,6 +431,12 @@ pub mod room {
                     sql("INSERT INTO kv (k, v) VALUES ('count', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", &[json!(room.count)]);
                     format!("200 {}", json!({ "count": room.count }))
                 }
+                // Busy for `body` ms (requests queue behind it).
+                ("POST", "/busy") => {
+                    let until = unsafe { host::now_ms() } + body.trim().parse::<i64>().unwrap_or(0);
+                    while unsafe { host::now_ms() } < until {}
+                    "200 {}".into()
+                }
                 ("GET", "/msgs") => format!("200 {}", json!({ "msgs": room.msgs })),
                 ("POST", "/msg") => {
                     let id = sql("INSERT INTO msgs (body) VALUES (?) RETURNING id", &[json!(body)])[0][0].clone();
