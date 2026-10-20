@@ -24,6 +24,9 @@ fuzz = ["wasmtime", "dep:wasm-smith", "dep:arbitrary", "dep:wat"]
 [dependencies]
 combd-guest = { path = "../guest" }
 combd-aot = { path = "aot", optional = true, default-features = false }
+# The listening socket with SO_REUSEPORT, so a new combd can take the port
+# before the old one stops (already here, through tokio).
+socket2 = { version = "0.6", features = ["all"] }
 # Cells' memory, copy-on-write from their module's image: the interpreter's
 # only unsafe code.
 combd-mem = { path = "mem" }

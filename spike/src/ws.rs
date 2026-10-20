@@ -19,6 +19,13 @@ pub enum Event {
     Close(u16),
 }
 
+/// A close code an endpoint may put on the wire (RFC 6455 section 7.4, and
+/// IANA's registry since: 1012 to 1014). 1004, 1005, 1006, and 1015 are
+/// reserved; 3000 to 4999 are for libraries and apps.
+pub fn sendable(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
+}
+
 /// Close codes we send.
 pub const PROTOCOL: u16 = 1002;
 pub const BAD_DATA: u16 = 1007;
@@ -26,11 +33,23 @@ pub const TOO_BIG: u16 = 1009;
 /// We closed it: it read too slowly (policy violation).
 pub const TOO_SLOW: u16 = 1008;
 
-/// Joins fragments across reads.
-#[derive(Default)]
+/// Joins fragments across reads, up to `max` bytes a message.
 pub struct Decoder {
+    pub max: usize,
     /// A fragmented message so far: (text?, bytes).
     frag: Option<(bool, Vec<u8>)>,
+}
+
+impl Default for Decoder {
+    fn default() -> Decoder {
+        Decoder::with_max(MAX_MESSAGE)
+    }
+}
+
+impl Decoder {
+    pub fn with_max(max: usize) -> Decoder {
+        Decoder { max, frag: None }
+    }
 }
 
 impl Decoder {
@@ -38,7 +57,7 @@ impl Decoder {
     /// bytes. `Err(code)`: close the socket with this code.
     pub fn next(&mut self, buf: &mut Vec<u8>) -> Result<Option<Event>, u16> {
         loop {
-            let Some((fin, op, payload, used)) = frame(buf)? else { return Ok(None) };
+            let Some((fin, op, payload, used)) = frame(buf, self.max)? else { return Ok(None) };
             if op >= 8 && (!fin || payload.len() > 125) {
                 return Err(PROTOCOL); // control frames are short and whole
             }
@@ -49,7 +68,11 @@ impl Decoder {
                         0 => Ok(Some(Event::Close(1005))),
                         1 => Err(PROTOCOL),
                         _ if std::str::from_utf8(&payload[2..]).is_err() => Err(BAD_DATA),
-                        _ => Ok(Some(Event::Close(u16::from_be_bytes([payload[0], payload[1]])))),
+                        _ => match u16::from_be_bytes([payload[0], payload[1]]) {
+                            code if sendable(code) => Ok(Some(Event::Close(code))),
+                            // 1005 and 1006 mean "no code" and "gone": never on the wire.
+                            _ => Err(PROTOCOL),
+                        },
                     };
                 }
                 0x9 => return Ok(Some(Event::Ping(payload))),
@@ -65,7 +88,7 @@ impl Decoder {
                 }
                 0x0 => {
                     let Some((text, mut msg)) = self.frag.take() else { return Err(PROTOCOL) };
-                    if msg.len() + payload.len() > MAX_MESSAGE {
+                    if msg.len() + payload.len() > self.max {
                         return Err(TOO_BIG);
                     }
                     msg.extend_from_slice(&payload);
@@ -89,7 +112,7 @@ fn finish(text: bool, msg: Vec<u8>) -> Result<Event, u16> {
 
 /// One whole frame at the front of `buf`: (fin, opcode, unmasked payload,
 /// bytes used), or `None` if it hasn't all arrived.
-fn frame(buf: &[u8]) -> Result<Option<(bool, u8, Vec<u8>, usize)>, u16> {
+fn frame(buf: &[u8], max: usize) -> Result<Option<(bool, u8, Vec<u8>, usize)>, u16> {
     if buf.len() < 2 {
         return Ok(None);
     }
@@ -111,7 +134,7 @@ fn frame(buf: &[u8]) -> Result<Option<(bool, u8, Vec<u8>, usize)>, u16> {
         },
         n => (n as u64, 2),
     };
-    if len > MAX_MESSAGE as u64 {
+    if len > max as u64 {
         return Err(TOO_BIG);
     }
     let len = len as usize;
@@ -293,6 +316,11 @@ pub mod tests {
             got.push(e);
         }
         assert_eq!(got, vec![Event::Text("hi".into()), Event::Ping(b"p".to_vec()), Event::Text("hello".into()), Event::Binary(vec![0; 70_000]), Event::Close(1000)]);
+        // Codes no endpoint may send are a protocol error (Autobahn 7.9.x).
+        for (code, want) in [(0u16, Err(PROTOCOL)), (999, Err(PROTOCOL)), (1004, Err(PROTOCOL)), (1005, Err(PROTOCOL)), (1006, Err(PROTOCOL)), (1015, Err(PROTOCOL)), (1016, Err(PROTOCOL)), (2999, Err(PROTOCOL)), (1001, Ok(Some(Event::Close(1001)))), (1013, Ok(Some(Event::Close(1013)))), (4999, Ok(Some(Event::Close(4999)))), (5000, Err(PROTOCOL))] {
+            let mut buf = client(true, 8, &code.to_be_bytes());
+            assert_eq!(Decoder::default().next(&mut buf), want, "close {code}");
+        }
         assert!(buf.is_empty());
         // Partial frames wait for more bytes.
         let whole = client(true, 1, b"later");

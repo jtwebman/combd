@@ -1,0 +1,10 @@
+{
+  "outdir": "/reports/all",
+  "servers": [
+    { "agent": "combd", "url": "ws://host.docker.internal:9001" },
+    { "agent": "combd-tls", "url": "wss://host.docker.internal:9443" }
+  ],
+  "cases": ["*"],
+  "exclude-cases": ["12.*", "13.*"],
+  "exclude-agent-cases": {}
+}

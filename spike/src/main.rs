@@ -1682,6 +1682,181 @@ mod tests {
         assert!(aot::Aot.spawn(&prog).unwrap().cap_memory(1).is_err(), "under where it starts");
     }
 
+    /// A TLS connection to a test server, trusting `ca` (from `wire::make_certs`).
+    fn tls_to(port: u16, ca: &std::path::Path) -> rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
+        // As a browser would: offering HTTP/1.1 by ALPN.
+        let mut cfg = (*wire::admin_client(ca).unwrap()).clone();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let cfg = Arc::new(cfg);
+        let tcp = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        rustls::StreamOwned::new(rustls::ClientConnection::new(cfg, "node0.combd".try_into().unwrap()).unwrap(), tcp)
+    }
+
+    /// One answer's head and body (a content-length answer).
+    fn read_answer(s: &mut impl std::io::Read) -> (String, String) {
+        let (mut head, mut b) = (vec![], [0u8; 1]);
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(s.read(&mut b).unwrap(), 1, "closed early: {}", String::from_utf8_lossy(&head));
+            head.push(b[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let n: usize = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
+        let mut body = vec![0u8; n];
+        s.read_exact(&mut body).unwrap();
+        (head, String::from_utf8(body).unwrap())
+    }
+
+    /// The next frame from the server: (opcode, payload).
+    fn read_frame(s: &mut impl std::io::Read) -> (u8, Vec<u8>) {
+        let mut h = [0u8; 2];
+        s.read_exact(&mut h).unwrap();
+        let n = match h[1] & 0x7f {
+            126 => {
+                let mut b = [0u8; 2];
+                s.read_exact(&mut b).unwrap();
+                u16::from_be_bytes(b) as usize
+            }
+            127 => {
+                let mut b = [0u8; 8];
+                s.read_exact(&mut b).unwrap();
+                u64::from_be_bytes(b) as usize
+            }
+            n => n as usize,
+        };
+        let mut p = vec![0u8; n];
+        s.read_exact(&mut p).unwrap();
+        (h[0] & 0x0f, p)
+    }
+
+    /// HTTPS ended in combd: requests on a kept connection, sockets to
+    /// objects on other loops (their TLS goes with them), plain HTTP turned
+    /// away, and the redirect port.
+    #[test]
+    fn https_ended_here() {
+        use std::io::{Read, Write};
+        let dir = store::tempdir::Dir::new();
+        let certs = dir.0.join("certs");
+        wire::make_certs(&certs, 1).unwrap();
+        let ca = certs.join("ca.pem");
+        let redirect = free_ports(1)[0];
+        let c = http::Config { tls: Some((certs.join("node0.pem"), certs.join("node0.key"))), redirect_port: Some(redirect), ..cfg(&dir.0.join("d"), 4) };
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, c);
+        // Two requests on one connection.
+        let mut s = tls_to(port, &ca);
+        for _ in 0..2 {
+            write!(s, "GET /_combd/ping HTTP/1.1\r\nhost: node0.combd\r\n\r\n").unwrap();
+            assert!(read_answer(&mut s).0.starts_with("HTTP/1.1 200"));
+        }
+        assert_eq!(s.conn.alpn_protocol(), Some(&b"http/1.1"[..]));
+        // Plain HTTP on the TLS port gets nothing that reads as HTTP.
+        let mut p = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        p.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write!(p, "GET /_combd/ping HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();
+        let mut got = vec![];
+        let _ = p.read_to_end(&mut got);
+        assert!(!got.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&got));
+        // Sockets to eight rooms over TLS: some rooms live on other loops, so
+        // their sockets move there, TLS and all. Each hears its own message.
+        for r in 0..8 {
+            let mut w = tls_to(port, &ca);
+            write!(w, "GET /do/room{r}/ws HTTP/1.1\r\nhost: node0.combd\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").unwrap();
+            assert!(read_answer(&mut w).0.starts_with("HTTP/1.1 101"));
+            w.write_all(&ws::tests::client(true, 1, format!("hi {r}").as_bytes())).unwrap();
+            let (op, p) = read_frame(&mut w);
+            assert_eq!((op, String::from_utf8(p).unwrap().contains(&format!("\"text\":\"hi {r}\""))), (1, true));
+        }
+        let mut st = tls_to(port, &ca);
+        write!(st, "GET /_combd/stats HTTP/1.1\r\nhost: node0.combd\r\n\r\n").unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&read_answer(&mut st).1).unwrap();
+        assert!(stats["ws_handoffs"].as_u64() > Some(0), "some sockets moved loops: {stats}");
+        // The redirect port: plain HTTP, sent to HTTPS.
+        let mut p = std::net::TcpStream::connect(("127.0.0.1", redirect)).unwrap();
+        write!(p, "GET /a?b HTTP/1.1\r\nhost: shop.example.com\r\n\r\n").unwrap();
+        let (head, _) = read_answer(&mut p);
+        assert!(head.starts_with("HTTP/1.1 301") && head.contains("location: https://shop.example.com/a?b"), "{head}");
+    }
+
+    /// A connection that sends nothing, one that sends half a request (408),
+    /// a kept one with nothing to do, and a TLS handshake that stalls are all
+    /// closed in their time; a WebSocket isn't.
+    #[test]
+    fn slow_and_idle_connections_are_closed() {
+        use std::io::{Read, Write};
+        let lim = http::Limits { read_timeout: Duration::from_millis(400), keepalive: Duration::from_millis(600), tls_handshake: Duration::from_millis(400), ..http::Limits::default() };
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { limits: lim.clone(), ..cfg(&dir.0.join("a"), 1) });
+        let open = |port: u16| {
+            let s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s
+        };
+        // Closed with what it's told (if anything), and how long it took.
+        let rest = |s: &mut std::net::TcpStream| {
+            let t = Instant::now();
+            let mut got = vec![];
+            let _ = s.read_to_end(&mut got);
+            (String::from_utf8_lossy(&got).into_owned(), t.elapsed())
+        };
+        let (got, took) = rest(&mut open(port));
+        assert!(got.is_empty() && took < Duration::from_secs(2), "nothing sent: closed in {took:?}");
+        let mut s = open(port);
+        write!(s, "GET /_combd/ping HTTP/1.1\r\nhost: x\r\n").unwrap();
+        let (got, took) = rest(&mut s);
+        assert!(got.starts_with("HTTP/1.1 408") && took < Duration::from_secs(2), "half a request: {got:?} in {took:?}");
+        let mut s = open(port);
+        write!(s, "GET /_combd/ping HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();
+        assert!(read_answer(&mut s).0.starts_with("HTTP/1.1 200"));
+        let (got, took) = rest(&mut s);
+        assert!(got.is_empty() && took >= Duration::from_millis(500) && took < Duration::from_secs(2), "kept, then idle: closed in {took:?}");
+        // A WebSocket stays, past every one of them.
+        let mut w = Ws::open(port, "/do/room/ws").unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        w.text("still here");
+        assert!(String::from_utf8(w.recv().1).unwrap().contains("still here"));
+        // A TLS handshake that never finishes.
+        let certs = dir.0.join("certs");
+        wire::make_certs(&certs, 1).unwrap();
+        let (tport, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { limits: lim, tls: Some((certs.join("node0.pem"), certs.join("node0.key"))), ..cfg(&dir.0.join("b"), 1) });
+        let mut s = open(tport);
+        s.write_all(&[0x16, 0x03, 0x01]).unwrap(); // the start of a ClientHello, no more
+        let (_, took) = rest(&mut s);
+        assert!(took < Duration::from_secs(2), "a stalled handshake: closed in {took:?}");
+    }
+
+    /// A new certificate on disk reaches new connections within seconds;
+    /// one that won't load leaves the old one.
+    #[test]
+    fn a_new_certificate_is_picked_up() {
+        use std::io::Write;
+        let dir = store::tempdir::Dir::new();
+        let (old, new) = (dir.0.join("old"), dir.0.join("new"));
+        wire::make_certs(&old, 1).unwrap();
+        wire::make_certs(&new, 1).unwrap();
+        let live = dir.0.join("live");
+        std::fs::create_dir(&live).unwrap();
+        for f in ["node0.pem", "node0.key"] {
+            std::fs::copy(old.join(f), live.join(f)).unwrap();
+        }
+        let c = http::Config { tls: Some((live.join("node0.pem"), live.join("node0.key"))), ..cfg(&dir.0.join("d"), 1) };
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, c);
+        let ping = |ca: &std::path::Path| {
+            let mut s = tls_to(port, ca);
+            write!(s, "GET /_combd/ping HTTP/1.1\r\nhost: node0.combd\r\nconnection: close\r\n\r\n").ok()?;
+            Some(read_answer(&mut s).0)
+        };
+        let ok = |ca: &std::path::Path| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ping(ca))).ok().flatten().is_some_and(|h| h.starts_with("HTTP/1.1 200"));
+        assert!(ok(&old.join("ca.pem")) && !ok(&new.join("ca.pem")));
+        // A broken one first: the old stays.
+        std::fs::write(live.join("node0.pem"), "not a certificate").unwrap();
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(ok(&old.join("ca.pem")), "a bad file keeps the old certificate");
+        std::fs::copy(new.join("node0.key"), live.join("node0.key")).unwrap();
+        std::fs::copy(new.join("node0.pem"), live.join("node0.pem")).unwrap();
+        assert!(eventually(10_000, || ok(&new.join("ca.pem"))), "the new one, for new connections");
+        assert!(!ok(&old.join("ca.pem")));
+    }
+
     #[test]
     fn memory_limit_is_enforced() {
         let eng = interp::Interp { max_pages: 64 }; // 4 MiB
@@ -1770,6 +1945,9 @@ mod tests {
             master_key: None,
             memory_budget: None,
             max_conns: u64::MAX,
+            tls: None,
+            redirect_port: None,
+            limits: http::Limits::default(),
         }
     }
 

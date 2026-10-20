@@ -1,5 +1,5 @@
 #!/bin/sh
-# run.sh <caddy|haproxy|haproxy-small|direct> <n>: a fresh server like an
+# run.sh <caddy|haproxy|haproxy-small|direct|combd-tls> <n>: a fresh server like an
 # arena node (1 GB, 1 CPU: combd with the million app, and the proxy in
 # front, if any), n idle WebSockets held by ws-load in another container,
 # and the server's memory (its cgroup's: every process and the kernel).
@@ -27,10 +27,11 @@ case $mode in
   haproxy-small) proxy="haproxy -f /bench/haproxy-small.cfg >/tmp/p.log 2>&1"; port=443; ca=/certs/ca.pem ;;
   haproxy) proxy="haproxy -f /bench/haproxy.cfg >/tmp/p.log 2>&1"; port=443; ca=/certs/ca.pem ;;
   direct) proxy="sleep infinity"; port=8080; ca="" ;;
+  combd-tls) proxy="sleep infinity"; port=443; ca=/certs/ca.pem; tls="-e COMBD_TLS_CERT=/certs/cert.pem -e COMBD_TLS_KEY=/certs/key.pem"; listen=443 ;;
 esac
-docker run -d --name edge-srv --network edge-bench --memory 1g --memory-swap 1g --cpus 1 --ulimit nofile=1048576:1048576 --sysctl net.ipv4.ip_local_port_range="1024 65535" \
+docker run -d --name edge-srv ${tls:-} --network edge-bench --memory 1g --memory-swap 1g --cpus 1 --ulimit nofile=1048576:1048576 --sysctl net.ipv4.ip_local_port_range="1024 65535" \
   -v combd-linux-target:/target:ro -v $R/examples/million/app:/app:ro -v $B:/bench:ro -v $B/certs:/certs:ro -e MALLOC_MMAP_MAX_=4000000 -e MALLOC_MMAP_THRESHOLD_=131072 \
-  combd-edge-bench sh -c "COMBD_DATA=/tmp/d COMBD_THREADS=1 COMBD_MAX_CONNS=1000000 /target/release/combd-spike serve-app interp /app 8080 >/tmp/c.log 2>&1 & $proxy & wait" >/dev/null
+  combd-edge-bench sh -c "COMBD_DATA=/tmp/d COMBD_THREADS=1 COMBD_MAX_CONNS=1000000 /target/release/combd-spike serve-app interp /app ${listen:-8080} >/tmp/c.log 2>&1 & $proxy & wait" >/dev/null
 sleep 3
 base=$(docker exec edge-srv cat /sys/fs/cgroup/memory.current)
 docker run -d --name edge-cli --network edge-bench --ulimit nofile=1048576:1048576 --sysctl net.ipv4.ip_local_port_range="1024 65535" -v combd-linux-target:/target:ro -v $B/certs:/certs:ro \

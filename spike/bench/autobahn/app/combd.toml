@@ -1,0 +1,9 @@
+# An echo for the Autobahn TestSuite: one session per socket, each message
+# sent back as it came.
+[app]
+name = "echo"
+
+[ws.echo]
+module = "echo"
+routes = ["/"]
+hibernate = "off"

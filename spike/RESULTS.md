@@ -2221,6 +2221,51 @@ to the 6 KB: not measured yet, but a few KB would put a 1 GB node at
 70,000 to 120,000. These are idle connections; fan-out under load is
 another measurement.
 
+## Single mode: combd ends TLS, and holds the edge itself (2026-10-20)
+
+`COMBD_TLS_CERT` and `COMBD_TLS_KEY` (PEM files, reloaded when the
+certificate's file changes; a bad one keeps the old) put rustls on the main
+port, TLS 1.2 and 1.3, ALPN `http/1.1`. A socket handed to another loop
+takes its TLS with it. `COMBD_REDIRECT_PORT` answers plain HTTP with a 301
+to HTTPS (only a plain host name goes in the `location`). The port is
+taken with `SO_REUSEPORT`, so a new combd can listen before the old stops.
+
+**Memory, the same 1 GB node as above:** ~14 KB a connection (combd ~10,
+the kernel ~4); 40,000 held in 538 MB, so about 70,000 in 1 GB. Caddy's
+~106 KB held 9,500; HAProxy's ~33 KB, 28,700. TLS is ~7.6 KB of it, rustls
+keeping its buffers past the handshake; its "unbuffered" API, where we own
+the buffers, could give them back when idle (next).
+
+**The edge's limits** (`Limits`, node-wide): a body (`COMBD_MAX_BODY`, 1
+MiB: 413), the head (`COMBD_MAX_HEADER_BYTES`, 16 KiB, and
+`COMBD_MAX_HEADERS`, 64: 431), a WebSocket message (`COMBD_MAX_WS_MESSAGE`,
+1 MiB: 1009), and time: a request must arrive within `COMBD_READ_TIMEOUT_MS`
+(30 s: 408; slowloris), a kept connection idle past `COMBD_KEEPALIVE_MS`
+(75 s) and a TLS handshake past `COMBD_TLS_HANDSHAKE_MS` (10 s) close.
+There were no timeouts at all before: behind Caddy, they were Caddy's.
+
+**Found on the way:** a `Transfer-Encoding` request was read as having no
+body, so its chunks would be read as the next request (smuggling, RFC 9112;
+behind Caddy too). It's refused now (400), as is a `Content-Length` of
+anything but digits (`+5` parsed). And close codes no endpoint may send
+(0, 1004 to 1006, 1015 to 2999) are a protocol error now (1002).
+
+**The Autobahn TestSuite** (the WebSocket conformance suite), on an echo
+`ws` process (`bench/autobahn`), plain and over TLS: every case passes but
+those it can't: 238 OK, 11 non-strict, 3 informational of 252 plain (all
+but 9.*); the 9.* cases over 1 MiB are refused with 1009, by design (and
+the throughput ones under it pass). The 9 failures of the first run (close
+codes, 7.9.*) are fixed. Non-strict: a bad frame right after a good message
+can fail the socket before the good one's echo is out, and invalid UTF-8
+in a fragmented message is caught when it ends, not at the first bad
+fragment. Left: a lingering close, so a socket refused while its client is
+still sending always gets its close code (once in a run it was a reset).
+
+**testssl.sh 3.2:** TLS 1.2 and 1.3 only; AEAD ciphers with forward secrecy
+only; not vulnerable to anything it tests (Heartbleed, ROBOT, CRIME, POODLE,
+SWEET32, FREAK, DROWN, LOGJAM, BEAST, LUCKY13, RC4). Its two "not ok"s are
+the test certificate's (our own CA; no CRL or OCSP).
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A

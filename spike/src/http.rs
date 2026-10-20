@@ -27,6 +27,12 @@
 //!   backoff, up to `ALARM_TRIES` times.
 //! - **Eviction.** Objects idle for `COMBD_IDLE_MS`, or past `COMBD_MAX_OBJECTS`
 //!   per loop, leave memory. They come back from storage when needed.
+//! - **TLS, when it's ours to end** (single mode): `COMBD_TLS_CERT` and
+//!   `COMBD_TLS_KEY`, reloaded when the certificate changes;
+//!   `COMBD_REDIRECT_PORT` sends plain HTTP to HTTPS. What a client may send
+//!   and how long it may take: `Limits` (`COMBD_MAX_BODY`,
+//!   `COMBD_MAX_HEADER_BYTES`, `COMBD_MAX_HEADERS`, `COMBD_MAX_WS_MESSAGE`,
+//!   `COMBD_READ_TIMEOUT_MS`, `COMBD_KEEPALIVE_MS`, `COMBD_TLS_HANDSHAKE_MS`).
 //! - **Limits.** At most `COMBD_MAX_CONNS` connections (200,000); past it a
 //!   new one gets 503 and `retry-after`. The node's memory budget is
 //!   `COMBD_MEMORY_BUDGET` (bytes, or 512M, 4G), else its container's limit,
@@ -76,10 +82,7 @@ use std::time::{Duration, Instant};
 
 const LISTENER: Token = Token(usize::MAX);
 const WAKER: Token = Token(usize::MAX - 1);
-const MAX_REQUEST: usize = 1 << 20;
-/// A WebSocket's unread bytes: a whole message, and more queued behind it.
-/// A client that sends faster than its object keeps up is closed past this.
-const MAX_WS_READ: usize = 4 * crate::ws::MAX_MESSAGE;
+const REDIRECT: Token = Token(usize::MAX - 2);
 /// A WebSocket's unsent bytes. A client that reads too slowly is closed past this.
 const MAX_WS_WRITE: usize = 8 << 20;
 /// A socket's messages queued at its object, before we stop reading it.
@@ -134,6 +137,68 @@ pub struct Config {
     pub memory_budget: Option<u64>,
     /// The most connections open at once (`COMBD_MAX_CONNS`); past it, 503.
     pub max_conns: u64,
+    /// TLS on the main port, ended here (`COMBD_TLS_CERT`, the chain, and
+    /// `COMBD_TLS_KEY`, PEM files; reloaded when the certificate's file
+    /// changes). `None`: plain HTTP, as behind a proxy.
+    pub tls: Option<(PathBuf, PathBuf)>,
+    /// A port that only redirects to HTTPS (`COMBD_REDIRECT_PORT`, 80).
+    pub redirect_port: Option<u16>,
+    pub limits: Limits,
+}
+
+/// What a client may send, and how long it may take (node-wide, from the
+/// environment). Defaults are close to nginx's and HAProxy's.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// A request's body (`COMBD_MAX_BODY`, 1 MiB): past it, 413.
+    pub max_body: usize,
+    /// The request line and headers (`COMBD_MAX_HEADER_BYTES`, 16 KiB) and
+    /// how many headers (`COMBD_MAX_HEADERS`, 64): past either, 431.
+    pub max_header_bytes: usize,
+    pub max_headers: usize,
+    /// A WebSocket message (`COMBD_MAX_WS_MESSAGE`, 1 MiB): past it, 1009.
+    pub max_ws_message: usize,
+    /// A request, head and body, must arrive within this, and a new
+    /// connection must start one within it (`COMBD_READ_TIMEOUT_MS`, 30 s):
+    /// past it, 408 (slowloris).
+    pub read_timeout: Duration,
+    /// A kept connection with nothing to do (`COMBD_KEEPALIVE_MS`, 75 s).
+    pub keepalive: Duration,
+    /// A TLS handshake (`COMBD_TLS_HANDSHAKE_MS`, 10 s).
+    pub tls_handshake: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { max_body: 1 << 20, max_header_bytes: 16 << 10, max_headers: 64, max_ws_message: 1 << 20, read_timeout: Duration::from_secs(30), keepalive: Duration::from_secs(75), tls_handshake: Duration::from_secs(10) }
+    }
+}
+
+impl Limits {
+    pub fn from_env() -> Limits {
+        let d = Limits::default();
+        let n = |k: &str, v: usize| std::env::var(k).ok().and_then(|x| x.parse::<usize>().ok()).filter(|&x| x > 0).unwrap_or(v);
+        let ms = |k: &str, v: Duration| Duration::from_millis(n(k, v.as_millis() as usize) as u64);
+        Limits {
+            max_body: n("COMBD_MAX_BODY", d.max_body),
+            max_header_bytes: n("COMBD_MAX_HEADER_BYTES", d.max_header_bytes),
+            max_headers: n("COMBD_MAX_HEADERS", d.max_headers),
+            max_ws_message: n("COMBD_MAX_WS_MESSAGE", d.max_ws_message),
+            read_timeout: ms("COMBD_READ_TIMEOUT_MS", d.read_timeout),
+            keepalive: ms("COMBD_KEEPALIVE_MS", d.keepalive),
+            tls_handshake: ms("COMBD_TLS_HANDSHAKE_MS", d.tls_handshake),
+        }
+    }
+}
+
+/// The status line for a request we refuse before it runs.
+fn refusal(code: u16) -> &'static [u8] {
+    match code {
+        408 => b"HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        413 => b"HTTP/1.1 413 Content Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        431 => b"HTTP/1.1 431 Request Header Fields Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        _ => b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+    }
 }
 
 /// What a node too busy for new work answers, before it closes.
@@ -189,6 +254,9 @@ impl Config {
             master_key: std::env::var("COMBD_MASTER_KEY_FILE").ok().map(PathBuf::from),
             memory_budget: memory_budget(),
             max_conns: num("COMBD_MAX_CONNS", 200_000) as u64,
+            tls: std::env::var("COMBD_TLS_CERT").ok().zip(std::env::var("COMBD_TLS_KEY").ok()).map(|(c, k)| (PathBuf::from(c), PathBuf::from(k))),
+            redirect_port: std::env::var("COMBD_REDIRECT_PORT").ok().and_then(|p| p.parse().ok()),
+            limits: Limits::from_env(),
             public: std::env::var("COMBD_PUBLIC_URLS").unwrap_or_default().split(',').filter_map(|kv| kv.split_once('=')).filter_map(|(n, u)| Some((n.trim().parse().ok()?, u.trim().to_string()))).collect(),
         }
     }
@@ -265,6 +333,8 @@ struct Shared {
     index: Mutex<AlarmIndex>,
     stats: Stats,
     fleet: Option<FleetShared>,
+    /// TLS as loaded, and when its certificate's file last changed.
+    tls: Mutex<Option<(Arc<rustls::ServerConfig>, std::time::SystemTime)>>,
 }
 
 /// Fleet mode: what the loops share.
@@ -402,7 +472,7 @@ enum Msg {
     /// Fleet mode: the answer to a peer call (`None`: lost).
     PeerReply { id: u64, res: Option<own::PeerRes> },
     /// A WebSocket handshake for an object you own: take the connection.
-    Adopt { s: TcpStream, rbuf: Vec<u8>, name: String, path: String, key: String },
+    Adopt { s: TcpStream, rbuf: Vec<u8>, tls: Option<Box<rustls::ServerConnection>>, name: String, path: String, key: String },
     /// Fleet mode: another node's object sends on a socket we hold.
     WsPush { name: String, sock: u64, op: u8, payload: Vec<u8> },
     /// Fleet mode: a push of ours couldn't reach the socket's node.
@@ -495,6 +565,16 @@ struct Conn {
     busy: bool,
     /// Set once the connection asked to be a WebSocket.
     ws: Option<WsConn>,
+    /// TLS, ended here: the socket's bytes go through it (`read_all`, `flush`).
+    tls: Option<Box<rustls::ServerConnection>>,
+    /// On the redirect port: every request gets a 301 to HTTPS.
+    redirect: bool,
+    /// When it was taken, or last answered: its idle time runs from here.
+    at: Instant,
+    /// The first byte of the request being read, if one is.
+    reading: Option<Instant>,
+    /// It has had an answer (so it's kept alive, not new).
+    served: bool,
 }
 
 /// A WebSocket. It belongs to an object, but outlives it: an idle object
@@ -1103,9 +1183,12 @@ where
     let app = live.now();
     std::fs::create_dir_all(&cfg.data).expect("create the data directory");
     let index = Mutex::new(AlarmIndex::open(&cfg.data).expect("open the alarm index"));
-    let listener = std::net::TcpListener::bind(("0.0.0.0", port)).expect("bind");
-    listener.set_nonblocking(true).expect("nonblocking");
-    println!("combd     listening on :{port} with {} event loop(s), data in {}", cfg.threads, cfg.data.display());
+    let listener = listen(port).unwrap_or_else(|e| panic!("listen on :{port}: {e}"));
+    let redirect = cfg.redirect_port.map(|p| listen(p).unwrap_or_else(|e| panic!("listen on :{p}: {e}")));
+    let tls = cfg.tls.as_ref().map(|(cert, key)| load_tls(cert, key).unwrap_or_else(|e| panic!("TLS: {e}")));
+    let how = if tls.is_some() { "HTTPS" } else { "HTTP" };
+    let also = cfg.redirect_port.map_or(String::new(), |p| format!(" (and :{p}, to HTTPS)"));
+    println!("combd     listening on :{port} ({how}){also} with {} event loop(s), data in {}", cfg.threads, cfg.data.display());
     let mut polls = vec![];
     let mut peers = vec![];
     let mut inboxes = vec![];
@@ -1174,11 +1257,13 @@ where
         index,
         stats: Stats { checkpoints, fsyncs_slow: slow, fsync_max_us: max_us, ..Stats::default() },
         fleet,
+        tls: Mutex::new(tls),
     };
     let sh = &sh;
     std::thread::scope(|sc| {
         for (me, (poll, inbox)) in polls.into_iter().zip(inboxes).enumerate() {
             let l = listener.try_clone().expect("clone listener");
+            let r = redirect.as_ref().map(|r| r.try_clone().expect("clone listener"));
             let app = app.clone();
             sc.spawn(move || {
                 let mut lp = Loop {
@@ -1216,6 +1301,8 @@ where
                     last_tick: Instant::now(),
                     local_socks: HashMap::new(),
                     sessions: HashMap::new(),
+                    last_tls_check: Instant::now(),
+                    last_conn_check: Instant::now(),
                     next_sock: 0,
                     boot: {
                         let mut b = [0u8; 8];
@@ -1236,7 +1323,7 @@ where
                     next_call: 0,
                     ticks: HashMap::new(),
                 };
-                if let Err(e) = lp.run(TcpListener::from_std(l)) {
+                if let Err(e) = lp.run(TcpListener::from_std(l), r.map(TcpListener::from_std)) {
                     eprintln!("event loop stopped: {e}");
                 }
             });
@@ -1293,6 +1380,10 @@ struct Loop<'a, E: Engine> {
     local_socks: HashMap<u64, Who>,
     /// Socket processes' sessions on this loop, by name.
     sessions: HashMap<String, Session<E>>,
+    /// When loop 0 last looked at the certificate's file, and this loop at
+    /// its connections' timeouts.
+    last_tls_check: Instant,
+    last_conn_check: Instant,
     next_sock: u64,
     /// Random bits for socket ids, so a restart never reuses one.
     boot: u64,
@@ -1540,9 +1631,12 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
 }
 
 impl<E: Engine> Loop<'_, E> {
-    fn run(&mut self, mut listener: TcpListener) -> std::io::Result<()> {
+    fn run(&mut self, mut listener: TcpListener, mut redirect: Option<TcpListener>) -> std::io::Result<()> {
         let mut events = Events::with_capacity(1024);
         self.poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
+        if let Some(r) = redirect.as_mut() {
+            self.poll.registry().register(r, REDIRECT, Interest::READABLE)?;
+        }
         self.warm(0)?;
         // Alarms from before a restart.
         let threads = self.sh.cfg.threads;
@@ -1575,11 +1669,12 @@ impl<E: Engine> Loop<'_, E> {
             touched.clear();
             for ev in events.iter() {
                 match ev.token() {
-                    LISTENER => self.accept(&mut listener)?,
+                    LISTENER => self.accept(&mut listener, false)?,
+                    REDIRECT => self.accept(redirect.as_mut().unwrap(), true)?,
                     WAKER => self.read_inbox()?,
                     Token(id) => {
                         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { continue };
-                        if ev.is_readable() && read_all(c) {
+                        if ev.is_readable() && read_all(c, &self.sh.cfg.limits) {
                             // The peer is done sending: answer what's buffered, then close.
                             c.close_after = true;
                         }
@@ -1692,7 +1787,7 @@ impl<E: Engine> Loop<'_, E> {
         Ok(())
     }
 
-    fn accept(&mut self, listener: &mut TcpListener) -> std::io::Result<()> {
+    fn accept(&mut self, listener: &mut TcpListener, redirect: bool) -> std::io::Result<()> {
         loop {
             match listener.accept() {
                 Ok((mut s, _)) => {
@@ -1704,7 +1799,19 @@ impl<E: Engine> Loop<'_, E> {
                         continue;
                     }
                     s.set_nodelay(true)?;
-                    self.add_conn(s, vec![])?;
+                    let tls = match self.sh.tls.lock().unwrap().as_ref().filter(|_| !redirect) {
+                        Some((cfg, _)) => match rustls::ServerConnection::new(cfg.clone()) {
+                            Ok(t) => Some(Box::new(t)),
+                            Err(e) => {
+                                eprintln!("TLS: {e}");
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    let id = self.add_conn(s, vec![])?;
+                    let c = self.conns[id].as_mut().unwrap();
+                    (c.tls, c.redirect) = (tls, redirect);
                     self.sh.stats.conns_open.fetch_add(1, Relaxed);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
@@ -1717,8 +1824,11 @@ impl<E: Engine> Loop<'_, E> {
         while let Ok(m) = self.inbox.try_recv() {
             match m {
                 Msg::Run { origin, obj, req } => self.submit(origin, obj, req),
-                Msg::Adopt { s, rbuf, name, path, key } => {
+                Msg::Adopt { s, rbuf, tls, name, path, key } => {
                     let id = self.add_conn(s, rbuf)?;
+                    if let Some(c) = self.conns[id].as_mut() {
+                        c.tls = tls;
+                    }
                     self.upgrade(id, name, path, key);
                 }
                 Msg::WsPush { name, sock, op, payload } => self.ws_local(&name, sock, op, &payload)?,
@@ -2405,7 +2515,7 @@ impl<E: Engine> Loop<'_, E> {
                 Ok(Some(Event::Pong)) => {}
                 Ok(Some(Event::Close(code))) => {
                     // Echo the close (RFC 6455), then tell the object.
-                    let echo = if code == 1005 || !(1000..5000).contains(&code) { 1000 } else { code };
+                    let echo = if code == 1005 { 1000 } else { code };
                     c.wbuf.extend_from_slice(&crate::ws::close(echo));
                     c.close_after = true;
                     self.drop_socket(who, code);
@@ -2434,7 +2544,7 @@ impl<E: Engine> Loop<'_, E> {
         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return };
         let who = (id, c.gen);
         c.busy = true; // no more HTTP on this connection
-        c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: Default::default(), open: false, gone: false, inflight: 0 });
+        c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: crate::ws::Decoder::with_max(self.sh.cfg.limits.max_ws_message), open: false, gone: false, inflight: 0 });
         self.local_socks.insert(sock, who);
         self.submit(Origin::Socket(who, sock, true), name, format!("do WSOPEN {path} {sock}"));
     }
@@ -2455,7 +2565,7 @@ impl<E: Engine> Loop<'_, E> {
         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return };
         let who = (id, c.gen);
         c.busy = true;
-        c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: Default::default(), open: false, gone: false, inflight: 0 });
+        c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: crate::ws::Decoder::with_max(self.sh.cfg.limits.max_ws_message), open: false, gone: false, inflight: 0 });
         self.local_socks.insert(sock, who);
         self.sessions.insert(name.clone(), Session { sock, proc: p, cell: None, frozen: None, state: None, busy: false, running: String::new(), waiting: VecDeque::new(), last_used: Instant::now() });
         self.sh.stats.sessions_live.fetch_add(1, Relaxed);
@@ -2647,7 +2757,7 @@ impl<E: Engine> Loop<'_, E> {
         });
         self.poll.registry().register(&mut s, Token(id), Interest::READABLE)?;
         self.next_gen += 1;
-        self.conns[id] = Some(Conn { s, gen: self.next_gen, rbuf, wbuf: vec![], wpos: 0, writing: false, close_after: false, busy: false, ws: None });
+        self.conns[id] = Some(Conn { s, gen: self.next_gen, rbuf, wbuf: vec![], wpos: 0, writing: false, close_after: false, busy: false, ws: None, tls: None, redirect: false, at: Instant::now(), reading: None, served: false });
         Ok(id)
     }
 
@@ -2959,6 +3069,27 @@ impl<E: Engine> Loop<'_, E> {
         }
     }
 
+    /// A new certificate on disk (a renewal, a new name): new connections get
+    /// it; open ones keep theirs. A bad one is logged and the old one stays.
+    fn reload_tls(&mut self, cert: &std::path::Path, key: &std::path::Path) {
+        if self.last_tls_check.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_tls_check = Instant::now();
+        let Ok(changed) = std::fs::metadata(cert).and_then(|m| m.modified()) else { return };
+        let mut cur = self.sh.tls.lock().unwrap();
+        if cur.as_ref().is_some_and(|(_, t)| *t == changed) {
+            return;
+        }
+        match load_tls(cert, key) {
+            Ok(t) => {
+                println!("combd     TLS: a new certificate from {}", cert.display());
+                *cur = Some(t);
+            }
+            Err(e) => eprintln!("combd     TLS: keeping the old certificate: {e}"),
+        }
+    }
+
     /// Memory is short (`pressure` 2): no new connections or sockets.
     fn full(&self) -> bool {
         self.sh.stats.pressure.load(Relaxed) >= 2
@@ -2978,6 +3109,13 @@ impl<E: Engine> Loop<'_, E> {
             let st = &self.sh.stats;
             st.memory_used.store(used, Relaxed);
             st.pressure.store(pressure(used, budget, st.pressure.load(Relaxed)), Relaxed);
+        }
+        if let (0, Some((cert, key))) = (self.me, &self.sh.cfg.tls) {
+            self.reload_tls(cert, key);
+        }
+        if self.last_conn_check.elapsed() >= Duration::from_millis(250) {
+            self.last_conn_check = Instant::now();
+            self.check_conns();
         }
         let squeeze = self.sh.stats.pressure.load(Relaxed) >= 1;
         let idle = self.idle_limit();
@@ -3049,6 +3187,40 @@ impl<E: Engine> Loop<'_, E> {
             let _ = write!(c.wbuf, "content-length: {}\r\n\r\n", body.len());
             c.wbuf.extend_from_slice(body.as_bytes());
             c.busy = false;
+            c.at = Instant::now();
+        }
+    }
+
+    /// Connections past their time (`Limits`): a request still arriving
+    /// past the read timeout gets 408; a new one that sent nothing, a kept
+    /// one idle past keep-alive, or a TLS handshake that drags, just closes.
+    /// WebSockets and requests at work are left alone.
+    fn check_conns(&mut self) {
+        let (lim, now) = (&self.sh.cfg.limits, Instant::now());
+        let mut late = vec![];
+        for (id, c) in self.conns.iter_mut().enumerate() {
+            let Some(c) = c.as_mut().filter(|c| c.ws.is_none() && !c.busy && !c.close_after) else { continue };
+            let handshaking = c.tls.as_ref().is_some_and(|t| t.is_handshaking());
+            let over = match c.reading {
+                Some(t) if now - t > lim.read_timeout => {
+                    if !handshaking {
+                        c.wbuf.extend_from_slice(refusal(408));
+                    }
+                    true
+                }
+                Some(_) => false,
+                None if handshaking => now - c.at > lim.tls_handshake,
+                None if c.served => now - c.at > lim.keepalive,
+                None => now - c.at > lim.read_timeout,
+            };
+            if over {
+                c.close_after = true;
+                c.rbuf.clear();
+                late.push(id);
+            }
+        }
+        for id in late {
+            let _ = self.settle(id);
         }
     }
 
@@ -3056,7 +3228,7 @@ impl<E: Engine> Loop<'_, E> {
     fn settle(&mut self, id: usize) -> std::io::Result<()> {
         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return Ok(()) };
         // A WebSocket is always "busy"; it closes once its last bytes are out.
-        let closed = flush(c) || (c.close_after && (!c.busy || c.ws.is_some()) && c.wpos == c.wbuf.len());
+        let closed = flush(c) || (c.close_after && (!c.busy || c.ws.is_some()) && !pending(c));
         if closed {
             if c.ws.as_ref().is_some_and(|w| !w.gone) {
                 // Gone without a close frame (RFC 6455's 1006).
@@ -3070,7 +3242,7 @@ impl<E: Engine> Loop<'_, E> {
             }
             return Ok(());
         }
-        let want = c.wpos < c.wbuf.len();
+        let want = pending(c);
         if want != c.writing {
             let interest = if want { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
             self.poll.registry().reregister(&mut c.s, Token(id), interest)?;
@@ -3089,14 +3261,29 @@ impl<E: Engine> Loop<'_, E> {
         if c.busy {
             return Ok(());
         }
-        let who = (id, c.gen);
-        let req = match parse(c, &self.app.router) {
-            Ok(Some(r)) => r,
-            Ok(None) => return Ok(()),
-            Err(()) => {
-                eprintln!("bad request: {:?}", String::from_utf8_lossy(&c.rbuf[..c.rbuf.len().min(200)]));
+        if c.redirect {
+            if let Some(r) = redirect_to_https(&c.rbuf) {
+                c.wbuf.extend_from_slice(&r);
                 c.rbuf.clear();
-                c.wbuf.extend_from_slice(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                c.close_after = true;
+            }
+            return Ok(());
+        }
+        let who = (id, c.gen);
+        let req = match parse(c, &self.app.router, &self.sh.cfg.limits) {
+            Ok(Some(r)) => {
+                // The next request's read time starts now, if it's here already.
+                c.reading = (!c.rbuf.is_empty()).then(Instant::now);
+                c.served = true;
+                r
+            }
+            Ok(None) => return Ok(()),
+            Err(code) => {
+                if code == 400 {
+                    eprintln!("bad request: {:?}", String::from_utf8_lossy(&c.rbuf[..c.rbuf.len().min(200)]));
+                }
+                c.rbuf.clear();
+                c.wbuf.extend_from_slice(refusal(code));
                 c.close_after = true;
                 return Ok(());
             }
@@ -3119,7 +3306,7 @@ impl<E: Engine> Loop<'_, E> {
                     self.free.push(id);
                     let (tx, waker) = &self.sh.peers[o];
                     self.sh.stats.ws_handoffs.fetch_add(1, Relaxed);
-                    let _ = tx.send(Msg::Adopt { s: c.s, rbuf: c.rbuf, name, path, key });
+                    let _ = tx.send(Msg::Adopt { s: c.s, rbuf: c.rbuf, tls: c.tls, name, path, key });
                     waker.wake()?;
                 }
             }
@@ -4046,19 +4233,22 @@ fn reply_parts(payload: &str) -> (Vec<&str>, &str) {
 }
 
 /// Take one whole request off the front of the read buffer.
-fn parse(c: &mut Conn, router: &Router) -> Result<Option<Req>, ()> {
-    parse_buf(&mut c.rbuf, &mut c.close_after, router)
+fn parse(c: &mut Conn, router: &Router, lim: &Limits) -> Result<Option<Req>, u16> {
+    parse_buf(&mut c.rbuf, &mut c.close_after, router, lim)
 }
 
 /// `parse` on just the bytes read so far (and the connection's close flag),
 /// so it can be tested and fuzzed without a socket.
-fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Result<Option<Req>, ()> {
-    let mut headers = [httparse::EMPTY_HEADER; 32];
+fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router, lim: &Limits) -> Result<Option<Req>, u16> {
+    let mut headers = vec![httparse::EMPTY_HEADER; lim.max_headers];
     let mut req = httparse::Request::new(&mut headers);
     let hlen = match req.parse(rbuf) {
+        Ok(httparse::Status::Complete(n)) if n > lim.max_header_bytes => return Err(431),
         Ok(httparse::Status::Complete(n)) => n,
+        Ok(httparse::Status::Partial) if rbuf.len() > lim.max_header_bytes => return Err(431),
         Ok(httparse::Status::Partial) => return Ok(None),
-        Err(_) => return Err(()),
+        Err(httparse::Error::TooManyHeaders) => return Err(431),
+        Err(_) => return Err(400),
     };
     let mut clen: Option<usize> = None;
     let mut close = false;
@@ -4066,7 +4256,7 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
     let mut host = "";
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("host") {
-            host = std::str::from_utf8(h.value).map_err(|_| ())?;
+            host = std::str::from_utf8(h.value).map_err(|_| 400u16)?;
         }
         if h.name.eq_ignore_ascii_case("upgrade") && h.value.eq_ignore_ascii_case(b"websocket") {
             upgrade = true;
@@ -4075,12 +4265,23 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
         } else if h.name.eq_ignore_ascii_case("sec-websocket-version") {
             ws_ok = h.value == b"13";
         }
+        // Bodies come only with a length. A Transfer-Encoding (chunked) is
+        // refused: read as no body, its chunks would be taken for the next
+        // request on the connection (smuggling, RFC 9112 section 6.1).
+        if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(400);
+        }
         if h.name.eq_ignore_ascii_case("content-length") {
             // A bad length, or two that disagree, is refused (RFC 9112): read
-            // as 0, the body would be taken for the next request.
-            let v: usize = std::str::from_utf8(h.value).ok().and_then(|v| v.trim().parse().ok()).ok_or(())?;
+            // as 0, the body would be taken for the next request. Digits only:
+            // Rust's parse would take "+5".
+            let v = std::str::from_utf8(h.value).map(str::trim).map_err(|_| 400u16)?;
+            if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(400);
+            }
+            let v: usize = v.parse().map_err(|_| 400u16)?;
             if clen.is_some_and(|c| c != v) {
-                return Err(());
+                return Err(400);
             }
             clen = Some(v);
         } else if h.name.eq_ignore_ascii_case("connection") && h.value.eq_ignore_ascii_case(b"close") {
@@ -4090,8 +4291,8 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
     // Checked: a huge length used to wrap `hlen + clen` past usize::MAX, and
     // slicing the body then panicked the event loop (any client could).
     let clen = clen.unwrap_or(0);
-    if clen > MAX_REQUEST - hlen.min(MAX_REQUEST) {
-        return Err(());
+    if clen > lim.max_body {
+        return Err(413);
     }
     if rbuf.len() < hlen + clen {
         // The body hasn't all arrived yet. Don't act on `connection: close`
@@ -4104,7 +4305,7 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
     // Only standard methods: `ALARM` is how the host runs an object's alarm,
     // and a client must never be able to fire one.
     if !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].contains(&method) {
-        return Err(());
+        return Err(400);
     }
     let line = |kind: &str, path: &str| if body.is_empty() { format!("{kind} {method} {path}") } else { format!("{kind} {method} {path} {body}") };
     // A manifest's routes: by host, then path (the query string isn't part of it).
@@ -4117,14 +4318,14 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
         let r = match router.route(host, path.split('?').next().unwrap_or("")) {
             Some(Hit::Object(name, sub)) => {
                 if name.len() > MAX_NAME {
-                    return Err(());
+                    return Err(400);
                 }
                 match (upgrade, ws_key) {
                     (true, Some(key)) if method == "GET" && ws_ok && clen == 0 && !sub.contains(char::is_whitespace) => {
                         rbuf.drain(..hlen);
                         return Ok(Some(Req::Upgrade(name, sub, key)));
                     }
-                    (true, _) => return Err(()),
+                    (true, _) => return Err(400),
                     _ => Req::Object(name, line("do", &sub)),
                 }
             }
@@ -4134,7 +4335,7 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
                     rbuf.drain(..hlen);
                     return Ok(Some(Req::Session(p, path, key)));
                 }
-                _ => return Err(()),
+                _ => return Err(400),
             },
             Some(Hit::Cell(p)) => Req::Cell(p, line("api", path)),
             None => Req::NotFound,
@@ -4143,18 +4344,18 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
         return Ok(Some(r));
     }
     // The object and the path inside it, for `/do/<name>/...` and `/do/id/<uuid>/...`.
-    let object = |path: &str| -> Result<Option<(String, String)>, ()> {
+    let object = |path: &str| -> Result<Option<(String, String)>, u16> {
         if let Some(rest) = path.strip_prefix("/do/id/") {
             // `/do/id/<uuid>/<rest>`: an object made by `/do/new`. Its name gets an
             // `id:` prefix, so it can never meet an object named the same way.
             let (id, sub) = rest.split_once('/').map_or((rest, "/".to_string()), |(n, s)| (n, format!("/{s}")));
-            return Ok(Some((format!("id:{}", parse_uuid(id).ok_or(())?), sub)));
+            return Ok(Some((format!("id:{}", parse_uuid(id).ok_or(400u16)?), sub)));
         }
         if let Some(rest) = path.strip_prefix("/do/") {
             // `/do/<name>/<rest>`: a Durable Object request.
             let (name, sub) = rest.split_once('/').map_or((rest, "/".to_string()), |(n, s)| (n, format!("/{s}")));
             if name.is_empty() || name.len() > MAX_NAME {
-                return Err(());
+                return Err(400);
             }
             return Ok(Some((name.to_string(), sub)));
         }
@@ -4162,9 +4363,9 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
     };
     if upgrade {
         // A WebSocket handshake: only for objects, only version 13, no body.
-        let (Some((name, sub)), Some(key)) = (object(path)?, ws_key) else { return Err(()) };
+        let (Some((name, sub)), Some(key)) = (object(path)?, ws_key) else { return Err(400) };
         if method != "GET" || !ws_ok || clen != 0 || sub.contains(char::is_whitespace) {
-            return Err(());
+            return Err(400);
         }
         rbuf.drain(..hlen);
         return Ok(Some(Req::Upgrade(name, sub, key)));
@@ -4183,14 +4384,32 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router) -> Res
 }
 
 /// Read until the socket would block. Returns true if the peer closed.
-fn read_all(c: &mut Conn) -> bool {
+fn read_all(c: &mut Conn, lim: &Limits) -> bool {
+    let limit = if c.ws.is_some() { 4 * lim.max_ws_message } else { lim.max_header_bytes + lim.max_body };
+    let was_empty = c.rbuf.is_empty();
+    let gone = match c.tls.as_mut() {
+        Some(tls) => read_tls(tls, &mut c.s, &mut c.rbuf, limit),
+        None => read_plain(&mut c.s, &mut c.rbuf, limit),
+    };
+    // A request starts with its first byte: its read timeout runs from here.
+    if was_empty && !c.rbuf.is_empty() && c.ws.is_none() && c.reading.is_none() {
+        c.reading = Some(Instant::now());
+    }
+    // A socket past its read limit is told why (1009), not just dropped.
+    if c.rbuf.len() > limit && c.ws.as_ref().is_some_and(|w| w.open && !w.gone) {
+        c.wbuf.extend_from_slice(&crate::ws::close(crate::ws::TOO_BIG));
+    }
+    gone
+}
+
+fn read_plain(s: &mut TcpStream, rbuf: &mut Vec<u8>, limit: usize) -> bool {
     let mut buf = [0u8; 16 * 1024];
     loop {
-        match c.s.read(&mut buf) {
+        match s.read(&mut buf) {
             Ok(0) => return true,
             Ok(n) => {
-                c.rbuf.extend_from_slice(&buf[..n]);
-                if c.rbuf.len() > if c.ws.is_some() { MAX_WS_READ } else { MAX_REQUEST } {
+                rbuf.extend_from_slice(&buf[..n]);
+                if rbuf.len() > limit {
                     return true;
                 }
             }
@@ -4203,6 +4422,34 @@ fn read_all(c: &mut Conn) -> bool {
 
 /// Write until done or the socket would block. Returns true on a write error.
 fn flush(c: &mut Conn) -> bool {
+    if let Some(tls) = c.tls.as_mut() {
+        // As much of it as TLS takes now: its buffer has a limit, so a slow
+        // reader's backlog stays in wbuf, where the WebSocket limits see it.
+        while c.wpos < c.wbuf.len() {
+            match tls.writer().write(&c.wbuf[c.wpos..]) {
+                Ok(0) => break,
+                Ok(n) => c.wpos += n,
+                Err(_) => return true,
+            }
+        }
+        if c.wpos == c.wbuf.len() {
+            c.wbuf.clear();
+            c.wpos = 0;
+            if c.wbuf.capacity() > IDLE_BUF {
+                c.wbuf = Vec::new();
+            }
+        }
+        while tls.wants_write() {
+            match tls.write_tls(&mut c.s) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return false,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return true,
+            }
+        }
+        return false;
+    }
     while c.wpos < c.wbuf.len() {
         match c.s.write(&c.wbuf[c.wpos..]) {
             Ok(0) => return true,
@@ -4225,6 +4472,92 @@ fn flush(c: &mut Conn) -> bool {
 /// The most a connection's empty buffers keep between messages.
 const IDLE_BUF: usize = 1024;
 
+/// Bytes still to go out: ours, or TLS's (the handshake writes before any answer).
+fn pending(c: &Conn) -> bool {
+    c.wpos < c.wbuf.len() || c.tls.as_ref().is_some_and(|t| t.wants_write())
+}
+
+/// Read what the socket has through TLS. `true`: the peer is gone, or broke
+/// TLS (rustls queues the alert; `flush` tries to send it).
+fn read_tls(tls: &mut rustls::ServerConnection, s: &mut TcpStream, rbuf: &mut Vec<u8>, limit: usize) -> bool {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match tls.read_tls(s) {
+            Ok(0) => return true,
+            Ok(_) => {
+                if tls.process_new_packets().is_err() {
+                    return true;
+                }
+                loop {
+                    match tls.reader().read(&mut buf) {
+                        Ok(0) => return true, // close_notify: done
+                        Ok(n) => rbuf.extend_from_slice(&buf[..n]),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(_) => return true,
+                    }
+                }
+                if rbuf.len() > limit {
+                    return true;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return false,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// A listening socket others may share (`SO_REUSEPORT`): a new combd
+/// starts on the port before the old one stops, and no connection is
+/// refused in between.
+fn listen(port: u16) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+    let s = Socket::new(Domain::IPV4, Type::STREAM, None)?;
+    s.set_reuse_address(true)?;
+    s.set_reuse_port(true)?;
+    s.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+    s.listen(4096)?;
+    s.set_nonblocking(true)?;
+    Ok(s.into())
+}
+
+/// The certificate chain and key, as a TLS server for HTTP/1.1, and when
+/// the certificate's file last changed.
+fn load_tls(cert: &std::path::Path, key: &std::path::Path) -> Result<(Arc<rustls::ServerConfig>, std::time::SystemTime), String> {
+    use rustls::pki_types::pem::PemObject;
+    let chain: Vec<rustls::pki_types::CertificateDer> = rustls::pki_types::CertificateDer::pem_file_iter(cert).and_then(|i| i.collect()).map_err(|e| format!("{}: {e}", cert.display()))?;
+    let k = rustls::pki_types::PrivateKeyDer::from_pem_file(key).map_err(|e| format!("{}: {e}", key.display()))?;
+    let mut c = rustls::ServerConfig::builder_with_provider(crate::wire::provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_no_client_auth()
+        .with_single_cert(chain, k)
+        .map_err(|e| format!("{}: {e}", cert.display()))?;
+    c.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let changed = std::fs::metadata(cert).and_then(|m| m.modified()).map_err(|e| e.to_string())?;
+    Ok((Arc::new(c), changed))
+}
+
+/// A 301 to the same host and path over HTTPS, once a request has come in
+/// whole (`None`: not yet). Only a plain host name goes in the answer.
+fn redirect_to_https(rbuf: &[u8]) -> Option<Vec<u8>> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut headers);
+    let good = |h: &str| !h.is_empty() && h.len() <= 253 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    match req.parse(rbuf) {
+        Ok(httparse::Status::Partial) if rbuf.len() < 8192 => None,
+        Ok(httparse::Status::Complete(_)) => {
+            let host = req.headers.iter().find(|h| h.name.eq_ignore_ascii_case("host")).and_then(|h| std::str::from_utf8(h.value).ok()).map(|h| h.split(':').next().unwrap_or("").to_ascii_lowercase());
+            let path = req.path.filter(|p| p.starts_with('/')).unwrap_or("/");
+            Some(match host.filter(|h| good(h)) {
+                Some(h) => format!("HTTP/1.1 301 Moved Permanently\r\nlocation: https://{h}{path}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").into_bytes(),
+                None => b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+            })
+        }
+        _ => Some(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4240,10 +4573,10 @@ mod tests {
         let mut close2 = false;
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut n = 0;
-            while let Ok(Some(_)) = parse_buf(&mut rbuf, &mut close, &Router::legacy()) {
+            while let Ok(Some(_)) = parse_buf(&mut rbuf, &mut close, &Router::legacy(), &Limits::default()) {
                 n += 1;
             }
-            while let Ok(Some(_)) = parse_buf(&mut rbuf2, &mut close2, &routed) {
+            while let Ok(Some(_)) = parse_buf(&mut rbuf2, &mut close2, &routed, &Limits::default()) {
                 n += 1;
             }
             n
@@ -4253,6 +4586,54 @@ mod tests {
 
     /// Any client could send this: `hlen + clen` wrapped past usize::MAX,
     /// and slicing the body panicked the event loop.
+    /// What a front door must refuse, or it reads one request's body as the
+    /// next request (RFC 9112).
+    #[test]
+    fn requests_that_could_smuggle_another_are_refused() {
+        for bad in [
+            "POST / HTTP/1.1\r\nhost: a\r\ntransfer-encoding: chunked\r\n\r\n5\r\nGET /\r\n0\r\n\r\n",
+            "POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST / HTTP/1.1\r\nhost: a\r\ntransfer-encoding : chunked\r\n\r\n",
+            "POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 5\r\ncontent-length: 6\r\n\r\nhello!",
+            "POST / HTTP/1.1\r\nhost: a\r\ncontent-length: +5\r\n\r\nhello",
+            "POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 0x5\r\n\r\nhello",
+            "POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 5 5\r\n\r\nhello",
+            "POST / HTTP/1.1\r\nhost: a\r\ncontent-length:\r\n\r\n",
+            "POST / HTTP/1.1\r\nhost: a\r\n folded: header\r\n\r\n",
+        ] {
+            let mut rbuf = bad.as_bytes().to_vec();
+            assert!(parse_buf(&mut rbuf, &mut false, &Router::legacy(), &Limits::default()).is_err(), "took {bad:?}");
+        }
+        // The same length twice is the same length (RFC 9110 allows it).
+        let mut rbuf = b"POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 5\r\ncontent-length: 5\r\n\r\nhello".to_vec();
+        assert!(parse_buf(&mut rbuf, &mut false, &Router::legacy(), &Limits::default()).is_ok_and(|r| r.is_some()));
+    }
+
+    /// Each limit, with the status a client is told.
+    #[test]
+    fn limits_refuse_with_the_right_status() {
+        let lim = Limits { max_body: 10, max_header_bytes: 100, max_headers: 4, ..Limits::default() };
+        let p = |r: &str| parse_buf(&mut r.as_bytes().to_vec(), &mut false, &Router::legacy(), &lim).map(|x| x.is_some());
+        assert_eq!(p("POST /do/a/x HTTP/1.1\r\nhost: a\r\ncontent-length: 11\r\n\r\n"), Err(413), "a body over max_body");
+        assert_eq!(p("POST /do/a/x HTTP/1.1\r\nhost: a\r\ncontent-length: 10\r\n\r\n0123456789"), Ok(true), "one at it");
+        assert_eq!(p("GET / HTTP/1.1\r\na: 1\r\nb: 2\r\nc: 3\r\nd: 4\r\ne: 5\r\n\r\n"), Err(431), "too many headers");
+        assert_eq!(p(&format!("GET /{} HTTP/1.1\r\n\r\n", "x".repeat(200))), Err(431), "a head over max_header_bytes");
+        assert_eq!(p(&format!("GET /{}", "x".repeat(200))), Err(431), "one still arriving, over already");
+        assert_eq!(p("GET / HTTP/1.1\r\nhost: a"), Ok(false), "one still arriving, under");
+    }
+
+    /// The redirect port: the same host and path, over HTTPS; a host that
+    /// isn't a plain name gets 400, not a header of its own.
+    #[test]
+    fn plain_http_is_sent_to_https() {
+        let r = |req: &str| redirect_to_https(req.as_bytes()).map(|b| String::from_utf8(b).unwrap());
+        assert_eq!(r("GET /x?y=1 HTTP/1.1\r\nHost: Million.combd.dev:80\r\n\r\n").unwrap().lines().take(2).collect::<Vec<_>>(), ["HTTP/1.1 301 Moved Permanently", "location: https://million.combd.dev/x?y=1"]);
+        assert!(r("GET / HTTP/1.1\r\nHost: a.b\r\n").is_none(), "not all here yet");
+        for bad in ["GET / HTTP/1.1\r\nHost: evil.com\rlocation: x\r\n\r\n", "GET / HTTP/1.1\r\nHost: a b\r\n\r\n", "GET / HTTP/1.1\r\n\r\n"] {
+            assert!(r(bad).is_some_and(|a| a.starts_with("HTTP/1.1 400")), "{bad:?}");
+        }
+    }
+
     #[test]
     fn pressure_rises_at_85_and_95_and_falls_under_90() {
         let p = |used, was| pressure(used, 100, was);

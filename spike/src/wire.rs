@@ -33,7 +33,7 @@ pub struct Tls {
     client: Arc<rustls::ClientConfig>,
 }
 
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 

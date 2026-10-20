@@ -1,0 +1,7 @@
+{
+  "outdir": "/reports/nine",
+  "servers": [{ "agent": "combd", "url": "ws://host.docker.internal:9001" }],
+  "cases": ["9.3.*", "9.4.*"],
+  "exclude-cases": [],
+  "exclude-agent-cases": {}
+}
