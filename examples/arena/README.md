@@ -133,3 +133,9 @@ node in front of combd.
    a `terraform apply` that changes it (a new app, or a renewal),
    `cloud/tls.sh` gives every node the new one and reloads Caddy. With more
    than one app on the nodes, each names its domains in its manifest.
+8. **A push sends the bundle before the nodes move to the new image.** So a
+   change the old combd can't read (the manifest's format, 2026-10-19) is
+   refused by the nodes still on it, and the new combd then can't load the
+   old bundles: after the nodes have moved, deploy each app again (through
+   a node already on the new image). Next time: the new combd reads the old
+   format through the rollout.

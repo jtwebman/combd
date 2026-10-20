@@ -131,7 +131,13 @@ fn load() -> Chunk {
         let i = r[0].as_u64().unwrap_or(0) as usize;
         bits[i / 8] |= 1 << (i % 8);
     }
-    Chunk { n: 0, bits, checked: rows.len() as u64, subs: HashMap::new(), dirty: false }
+    // The total hears from a chunk with boxes checked as soon as it wakes,
+    // not only after its next change.
+    let dirty = !rows.is_empty();
+    if dirty {
+        unsafe { tick_every(1000) };
+    }
+    Chunk { n: 0, bits, checked: rows.len() as u64, subs: HashMap::new(), dirty }
 }
 
 fn hex(b: &[u8]) -> String {
