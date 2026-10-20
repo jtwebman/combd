@@ -2325,6 +2325,65 @@ so their memory is cold, and the kernel moved it to swap without harm.
   session whose app doesn't need to hear its close shouldn't be woken for it.
 - **The droplet's own 390 MB.** Trimming Ubuntu's extras would fit more in RAM.
 
+## Clicking: 10,000 pages on million, and batches (2026-10-20)
+
+Each of 10,002 pages (`ws-click`, three load droplets in nyc3, against n0)
+watches a random 1,000 boxes, renews that every 20 s as the page does,
+clicks 1 to 30 of them 1 to 20 s apart, then sits and watches. Every click
+is timed to its echo (the chunk sends each change to every watcher, the
+clicker too), and one with none in 10 s counts as lost. At the peak that's
+~620 clicks a second, each to ~160 watchers: ~100,000 pushes a second.
+
+**First run: n0 fell behind and never came back.** 0% idle, 65% of it in
+the interpreter. ~8,000 changes a second delivered of the ~100,000 asked;
+echoes 4 to 10 s late or lost, thousands every 10 s. Then it fed itself:
+renewals arrived after their subscriptions (60 s) ran out, so each was a
+new one, and a new watcher got all 15,625 boxes hex-encoded again. Every
+socket stayed up and memory stayed under budget, and once the clients
+had gone, n0 still ran at 100%, its chunks' queues at ~320 MB: hours of
+work. Restarted. What was wrong, and what changed:
+- **Nothing pushed back** (a combd bug): queues grew without end, and the
+  memory budget never saw it. Now `mailbox` (default 1,000): past it, a
+  request is refused at once, 503 `overloaded`.
+- **The chunk's own costs** (the app): a change built as JSON for each
+  watcher, in Wasm; the boxes hex-encoded a `format!` per byte. Fixed.
+- **One push per watcher per click** (both): now **batches**. An object
+  that exports `handle_batch` takes what's waiting at once (up to `batch`,
+  100), one transaction, an answer each; million's chunk sends each watcher
+  one message for the whole batch. Batches form only from a queue, so
+  they grow with the load.
+
+**One core, no fleet** (a load droplet as the server, one loop, the same
+10,000 pages from the other two):
+
+| Chunk | Changes delivered | Echo p50 / p99 | Lost every 10 s |
+|---|---|---|---|
+| as it was | ~8,000/s | 1 to 10 s | ~9,000 |
+| its costs fixed | ~15,000/s | 3 to 9 s | ~5,000 to 8,000 |
+| and batches | ~140,000/s | 1.3 s / 2.2 s, falling | **0** |
+
+**Second run, live, with batches.** n0 ran every chunk this time (after
+its restart each started on the first node to ask, and every viewer was on
+n0), so all 10,000 sessions, all 64 chunks, and the fleet's replication of
+each batch were on its one core. 10,005 connections, none refused, memory
+345 to 365 MB of 700. At the peak, echoes p50 4 to 6.6 s and 3 to 10% lost
+(2,989 requests refused by full mailboxes); as the clicking slowed, p50
+went to 270 ms with none lost, and sitting and watching kept n0 at ~50%
+(the renewals: each wakes a sleeping viewer). Within 15 s of the clients
+leaving, n0 was idle.
+
+**Then it crashed.** A socket closing while its session ran a request
+(`on_close = "drop"`) ended the session mid-request, and when the request
+finished, the loop panicked: 10,000 leaving at once found it. Fixed, with
+a test that panics without the fix.
+
+**What's left:** n0 at the peak was ~44% interpreter, most of it viewers
+waking (three runs each: wake, the message, sleep again) for clicks and
+renewals; the chunks belong spread over the fleet, not on the node that
+asked first; a push to another node is still one wire frame per watcher;
+and `heap_in_use` counts cells' reserved address space (6.9 GB on a 1 GB
+node), not the heap.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A
