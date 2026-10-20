@@ -57,6 +57,7 @@ function connect() {
     const m = JSON.parse(e.data);
     if (m.t === "all") bits.set(m.n, new Uint8Array(m.bits.match(/../g).map((h) => parseInt(h, 16))));
     else if (m.t === "set") { put(m.n, m.i, m.v); unseen.delete(m.n * CHUNK + m.i); }
+    else if (m.t === "sets") for (const [i, v] of m.c) { put(m.n, i, v); unseen.delete(m.n * CHUNK + i); }
     else if (m.t === "slow") { put(Math.floor(m.i / CHUNK), m.i % CHUNK, !on(m.i)); say("Slow down a little."); }
     draw();
   };

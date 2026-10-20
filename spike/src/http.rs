@@ -308,6 +308,8 @@ struct Stats {
     sessions_woken: AtomicU64,
     /// Requests refused because their object's or session's mailbox was full.
     mailbox_refused: AtomicU64,
+    /// Requests that ran in a batch (`handle_batch`).
+    batched: AtomicU64,
     /// Event cells: instances started, and requests they took.
     ev_instances: AtomicU64,
     ev_requests: AtomicU64,
@@ -655,6 +657,8 @@ struct Task<E: Engine> {
     pg: Vec<u64>,
     /// An event cell's callback: its instance.
     ev: Option<usize>,
+    /// A batch (`handle_batch`): the requests after the first, in order.
+    more: Vec<Origin>,
 }
 
 /// A Durable Object in memory.
@@ -2048,7 +2052,7 @@ impl<E: Engine> Loop<'_, E> {
                 cell.vm.begin("on_event", &[ticket, n])
             }
         };
-        let t = Task { origin: Origin::Ev(i), cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: Some(i) };
+        let t = Task { origin: Origin::Ev(i), cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: Some(i), more: vec![] };
         match started {
             Ok(()) => self.tasks.push_back(t),
             Err(e) => {
@@ -2711,7 +2715,7 @@ impl<E: Engine> Loop<'_, E> {
         s.busy = true;
         s.last_used = Instant::now();
         s.running = req.split(' ').nth(1).unwrap_or("").to_string();
-        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open: None, ws_drop: vec![], pg: vec![], ev: None });
+        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open: None, ws_drop: vec![], pg: vec![], ev: None, more: vec![] });
         Ok(())
     }
 
@@ -2814,7 +2818,19 @@ impl<E: Engine> Loop<'_, E> {
     /// operation, and the guard-page AOT tier doesn't promise it's exact
     /// at a trap either (LLVM may drop a store around a load that faults).
     fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> Option<((u16, String), Vec<WsOut>)> {
-        let Task { mut cell, obj, origin, ws_open, ws_drop, pg, .. } = t;
+        let Task { mut cell, obj, origin, ws_open, ws_drop, pg, more, .. } = t;
+        // A batch: an answer each, in order. A count that's off fails them all.
+        let (answer, rest) = if more.is_empty() {
+            (answer, vec![])
+        } else {
+            match answer.and_then(|a| unframe(&a, 1 + more.len())) {
+                Ok(mut all) => {
+                    let first = all.remove(0);
+                    (Ok(first), more.into_iter().zip(all.into_iter().map(Ok)).collect())
+                }
+                Err(e) => (Err(e.clone()), more.into_iter().map(|o| (o, Err(e.clone()))).collect::<Vec<(Origin, Result<String, String>)>>()),
+            }
+        };
         // A beat the request asked for, if it succeeded.
         if let (Some(ms), Some(name), true) = (cell.host().tick.take(), &obj, answer.is_ok()) {
             if ms == 0 {
@@ -2869,7 +2885,7 @@ impl<E: Engine> Loop<'_, E> {
             return self.session_finish(&name, cell, answer, ws);
         }
         if let Origin::Fleet(req) = origin {
-            return self.fleet_finish(name, req, cell, answer, ws, ws_open, ws_drop).map(|r| (r, vec![]));
+            return self.fleet_finish(name, req, cell, answer, ws, ws_open, ws_drop, rest).map(|r| (r, vec![]));
         }
         let o = self.objects.get_mut(&name).expect("object of a running task");
         o.busy = false;
@@ -2919,6 +2935,9 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }
         };
+        // The rest of a batch: their own answers if it committed, else the
+        // first's failure.
+        let rest: Vec<(Origin, (u16, String))> = rest.into_iter().map(|(o, a)| (o, match a { Ok(a) if ok => split_answer(&a), _ => reply.clone() })).collect();
         if ok {
             self.sockets_committed(&name, joined, &ws_drop);
         }
@@ -2946,7 +2965,14 @@ impl<E: Engine> Loop<'_, E> {
             if ok && o.committed > o.synced {
                 let (reply, ws) = out.take().unwrap();
                 o.held.push((o.committed, origin, reply, ws));
+                let gen = o.committed;
+                o.held.extend(rest.iter().map(|(origin, reply)| (gen, *origin, reply.clone(), vec![])));
                 self.kick_sync(&name);
+            }
+        }
+        if out.is_some() {
+            for (origin, reply) in rest {
+                let _ = self.deliver(origin, reply);
             }
         }
         self.next_waiting(&name);
@@ -3201,17 +3227,50 @@ impl<E: Engine> Loop<'_, E> {
                     continue;
                 }
             }
-            match self.run_object(name, origin, req) {
-                Ok(true) => return,
+            // Waiting requests are a batch, if the object takes them so: one
+            // run, one transaction, an answer each.
+            let (req, more) = self.batch_after(name, origin, req);
+            let n = 1 + more.len() as u64;
+            match self.run_object(name, origin, req, more.clone()) {
+                Ok(true) => {
+                    if n > 1 {
+                        self.sh.stats.batched.fetch_add(n, Relaxed);
+                    }
+                    return;
+                }
                 Ok(false) => {
                     self.fleet_skip(name, origin); // a stale alarm: nothing ran
                     continue;
                 }
                 Err(reply) => {
-                    let _ = self.deliver(origin, reply);
+                    for o in std::iter::once(origin).chain(more) {
+                        let _ = self.deliver(o, reply.clone());
+                    }
                 }
             }
         }
+    }
+
+    /// After `first`, the plain requests waiting behind it, up to the
+    /// process's `batch`, if its cell takes batches (exports `handle_batch`):
+    /// all of them framed, and the others' origins. Else `first` alone.
+    /// WebSocket events, alarms, and beats go one at a time.
+    fn batch_after(&mut self, name: &str, origin: Origin, first: String) -> (String, Vec<Origin>) {
+        let max = self.app.procs[self.app.object_proc(name)].batch;
+        let plain = |o: &Origin, r: &str| !matches!(o, Origin::Alarm { .. } | Origin::Tick) && matches!(r.split(' ').nth(1), Some("GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"));
+        let Some(o) = self.objects.get_mut(name) else { return (first, vec![]) };
+        let takes = max > 1 && plain(&origin, &first) && o.waiting.front().is_some_and(|(o, r)| plain(o, r)) && o.cell.as_mut().is_some_and(|c| c.vm.has_export("handle_batch"));
+        if !takes {
+            return (first, vec![]);
+        }
+        let mut reqs = vec![first];
+        let mut more = vec![];
+        while reqs.len() < max && o.waiting.front().is_some_and(|(o, r)| plain(o, r)) {
+            let (o, r) = o.waiting.pop_front().unwrap();
+            more.push(o);
+            reqs.push(r);
+        }
+        (frame(&reqs), more)
     }
 
     fn conn(&mut self, (id, gen): Who) -> Option<&mut Conn> {
@@ -3375,7 +3434,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"batched\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3402,6 +3461,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.sessions_hibernated.load(Relaxed),
                     s.sessions_woken.load(Relaxed),
                     s.mailbox_refused.load(Relaxed),
+                    s.batched.load(Relaxed),
                     combd_mem::heap_in_use(),
                     s.conns_open.load(Relaxed),
                     s.conns_refused.load(Relaxed),
@@ -3445,7 +3505,7 @@ impl<E: Engine> Loop<'_, E> {
             eprintln!("cell trapped starting a request: {trap}");
             return self.deliver(origin, (500, String::new()));
         }
-        self.tasks.push_back(Task { origin, cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: None });
+        self.tasks.push_back(Task { origin, cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: None, more: vec![] });
         Ok(())
     }
 
@@ -3702,7 +3762,7 @@ impl<E: Engine> Loop<'_, E> {
             o.waiting.push_back((origin, req));
             return;
         }
-        match self.run_object(&name, origin, req) {
+        match self.run_object(&name, origin, req, vec![]) {
             Ok(true) => {}
             Ok(false) => self.fleet_skip(&name, origin),
             Err(reply) => {
@@ -3713,7 +3773,9 @@ impl<E: Engine> Loop<'_, E> {
 
     /// Begin one request on an object: its warm cell (or a fresh one), inside
     /// a transaction. `Ok(false)`: nothing to run (a stale alarm).
-    fn run_object(&mut self, name: &str, origin: Origin, mut req: String) -> Result<bool, (u16, String)> {
+    /// `more`: a batch, the requests after the first (`req` holds them all,
+    /// framed for `handle_batch`).
+    fn run_object(&mut self, name: &str, origin: Origin, mut req: String, more: Vec<Origin>) -> Result<bool, (u16, String)> {
         let (eng, app) = (self.eng, self.app.clone());
         let ticking = self.ticks.contains_key(name);
         let proc = app.object_proc(name);
@@ -3808,13 +3870,14 @@ impl<E: Engine> Loop<'_, E> {
         cell.host().ws_ids = ids;
         cell.host().ws_out.clear();
         cell.host().ws_in = ws_in;
-        if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
+        let export = if more.is_empty() { "handle" } else { "handle_batch" };
+        if let Err(trap) = crate::start_export(&mut cell.vm, export, &req, &mut cell.st) {
             eprintln!("object {name:?} trapped starting a request: {trap}");
             o.db.lock().unwrap().rollback();
             return Err((500, String::new()));
         }
         o.busy = true;
-        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open, ws_drop, pg: vec![], ev: None });
+        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open, ws_drop, pg: vec![], ev: None, more });
         Ok(true)
     }
 }
@@ -4018,7 +4081,8 @@ impl<E: Engine> Loop<'_, E> {
     /// A request the core ran is done: commit locally (no fsync: the bucket
     /// is what makes it durable), hold the answer, and tell the core.
     #[allow(clippy::too_many_arguments)]
-    fn fleet_finish(&mut self, name: String, req: own::ReqId, cell: Cell<E>, answer: Result<String, String>, ws: Vec<WsOut>, ws_open: Option<u64>, ws_drop: Vec<u64>) -> Option<(u16, String)> {
+    #[allow(clippy::too_many_arguments)]
+    fn fleet_finish(&mut self, name: String, req: own::ReqId, cell: Cell<E>, answer: Result<String, String>, ws: Vec<WsOut>, ws_open: Option<u64>, ws_drop: Vec<u64>, rest: Vec<(Origin, Result<String, String>)>) -> Option<(u16, String)> {
         let Some(o) = self.objects.get_mut(&name) else { return None };
         o.busy = false;
         o.last_used = Instant::now();
@@ -4054,6 +4118,21 @@ impl<E: Engine> Loop<'_, E> {
         }
         // The sends wait with the answer, for the core to say it's proven.
         let ok = committed.is_some();
+        // The rest of a batch: answers of their own (or the first's failure).
+        // They changed nothing more than the first did, so they go to the
+        // core as unchanged, after it: answered once its writes are proven.
+        let rest: Vec<(own::Act, own::ReqId, bool)> = rest
+            .into_iter()
+            .filter_map(|(o, a)| {
+                let Origin::Fleet(r) = o else { return None };
+                let fr = self.freqs.get_mut(&r)?;
+                fr.resp = Some(match a {
+                    Ok(a) if ok => split_answer(&a),
+                    _ => reply.clone(),
+                });
+                Some((fr.act, r, !matches!(fr.origin, Origin::Tick)))
+            })
+            .collect();
         let act = self.freqs.get_mut(&req).map(|fr| {
             fr.resp = Some(reply);
             if ok {
@@ -4066,6 +4145,9 @@ impl<E: Engine> Loop<'_, E> {
         self.next_waiting(&name);
         if let Some((act, proof)) = act {
             self.core_on(own::Event::Ran { obj: own::obj_id(&name), act, req, changed, proof });
+        }
+        for (act, req, proof) in rest {
+            self.core_on(own::Event::Ran { obj: own::obj_id(&name), act, req, changed: false, proof });
         }
         None
     }
@@ -4265,6 +4347,35 @@ fn json_err(m: &str) -> Vec<u8> {
 }
 
 /// The socket a handshake's answer accepts, if it's a 101.
+/// Several requests (or answers) as one string, for `handle_batch`: each is
+/// its length in bytes, a newline, then itself.
+pub fn frame(parts: &[String]) -> String {
+    let mut s = String::with_capacity(parts.iter().map(|p| p.len() + 8).sum());
+    for p in parts {
+        s.push_str(&p.len().to_string());
+        s.push('\n');
+        s.push_str(p);
+    }
+    s
+}
+
+/// `frame` undone: exactly `n` parts, or why not.
+pub fn unframe(s: &str, n: usize) -> Result<Vec<String>, String> {
+    let mut parts = Vec::with_capacity(n);
+    let mut rest = s;
+    while !rest.is_empty() {
+        let (len, after) = rest.split_once('\n').ok_or("handle_batch: an answer without its length")?;
+        let len: usize = len.parse().map_err(|_| "handle_batch: a bad length")?;
+        let part = after.get(..len).ok_or("handle_batch: an answer shorter than its length")?;
+        parts.push(part.to_string());
+        rest = &after[len..];
+    }
+    if parts.len() != n {
+        return Err(format!("handle_batch: {} answers for {n} requests", parts.len()));
+    }
+    Ok(parts)
+}
+
 fn ws_accepted(answer: &str, ws_open: Option<u64>) -> Option<u64> {
     ws_open.filter(|_| split_answer(answer).0 == 101)
 }

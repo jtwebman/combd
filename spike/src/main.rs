@@ -424,6 +424,11 @@ fn finish<V: CellVm>(vm: &mut V, slice: u32, st: &mut HostState) -> Result<Vec<u
 
 /// Copy a request into the cell and begin `handle`. Nothing runs yet.
 fn start<V: CellVm>(vm: &mut V, req: &str, st: &mut HostState) -> Result<(), String> {
+    start_export(vm, "handle", req, st)
+}
+
+/// The same, with requests for `export` (`handle_batch` takes several).
+fn start_export<V: CellVm>(vm: &mut V, export: &str, req: &str, st: &mut HostState) -> Result<(), String> {
     // A new request: a fresh host-time budget, wherever the engine keeps it.
     st.host_time = Default::default();
     if let Some(h) = vm.host_state() {
@@ -434,7 +439,7 @@ fn start<V: CellVm>(vm: &mut V, req: &str, st: &mut HostState) -> Result<(), Str
     if !vm.write(ptr, req.as_bytes()) {
         return Err("bad alloc pointer".into());
     }
-    vm.begin("handle", &[ptr as u64, req.len() as u64])
+    vm.begin(export, &[ptr as u64, req.len() as u64])
 }
 
 fn response<V: CellVm>(vm: &V, r: &[u64]) -> String {
@@ -1718,6 +1723,36 @@ mod tests {
         assert_eq!(http(port, "GET", "/do/mb/count", "").0, 200, "and it takes requests again");
     }
 
+    /// Requests waiting on a busy object run as one batch (`handle_batch`):
+    /// each gets its own answer, and all of them land.
+    #[test]
+    fn waiting_requests_run_as_a_batch() {
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, cfg(&dir.0, 1));
+        assert_eq!(http(port, "POST", "/do/bt/incr", "").0, 200, "warm: a cell to batch on");
+        let busy = std::thread::spawn(move || http(port, "POST", "/do/bt/busy", "800"));
+        std::thread::sleep(Duration::from_millis(200));
+        let incrs: Vec<_> = (0..6).map(|_| std::thread::spawn(move || http(port, "POST", "/do/bt/incr", ""))).collect();
+        let mut counts: Vec<i64> = incrs.into_iter().map(|t| t.join().unwrap()).map(|(code, body)| {
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["count"].as_i64().unwrap()
+        }).collect();
+        counts.sort();
+        assert_eq!(counts, [2, 3, 4, 5, 6, 7], "an answer each, in the order they ran");
+        assert_eq!(busy.join().unwrap().0, 200);
+        assert_eq!(stat(port, "batched"), 6, "the six waited, then ran together");
+        assert_eq!(http(port, "GET", "/do/bt/count", "").1, "{\"count\":7}");
+    }
+
+    #[test]
+    fn batches_frame_and_unframe() {
+        let parts = vec!["do POST /a 1".to_string(), String::new(), "héllo\n2".to_string()];
+        assert_eq!(http::unframe(&http::frame(&parts), 3).unwrap(), parts);
+        assert!(http::unframe(&http::frame(&parts), 2).unwrap_err().contains("3 answers for 2"));
+        assert!(http::unframe("5\nabc", 1).is_err(), "shorter than it says");
+        assert!(http::unframe("x\nabc", 1).is_err());
+    }
+
     /// `memory_kb` on the AOT tier too: a cell capped under what it needs
     /// can't grow there, and one capped under where it starts won't start.
     #[cfg(feature = "aot-lite")]
@@ -2313,6 +2348,60 @@ mod tests {
         assert!(stat(b, "fences") >= 1, "the takeover should fence: {}", http(b, "GET", "/_combd/stats", "").1);
         assert!(stat(b, "tail_entries") >= 25, "the writes came from the peers: {}", http(b, "GET", "/_combd/stats", "").1);
         assert_eq!(ok(b, "POST", "/do/p1/incr"), "{\"count\":31}");
+    }
+
+    /// Fleet mode: a batch is one transaction the core proves once, and
+    /// each request's answer waits for that. The owner stops right after:
+    /// the next one has every write.
+    #[test]
+    fn fleet_batches_are_proven_before_they_answer() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 3).unwrap();
+        let bucket = test_bucket();
+        let wports = free_ports(3);
+        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
+        let node = |n: own::Node| {
+            let fc = fleet::FleetCfg {
+                node: n,
+                lease_ms: 1000,
+                replicas: 2,
+                s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
+                peers: peers.clone(),
+                wire_port: wports[n as usize],
+                wire_certs: Some(dir.0.join("certs")),
+                insecure: false,
+                upload_ms: 60_000,
+                upload_bytes: 1 << 20,
+                read_lease: true,
+            };
+            let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
+            do_server(interp::Interp { max_pages: 16384 }, c)
+        };
+        let (a, stop_a, ta) = node(0);
+        let (b, _, _) = node(1);
+        let (_c, _, _) = node(2);
+        for p in [a, b, _c] {
+            stat(p, "fences");
+        }
+        assert!(eventually(10_000, || http(a, "POST", "/do/fb/incr", "").0 == 200), "a first write");
+        let busy = std::thread::spawn(move || http(a, "POST", "/do/fb/busy", "800"));
+        std::thread::sleep(Duration::from_millis(200));
+        let incrs: Vec<_> = (0..6).map(|_| std::thread::spawn(move || http(a, "POST", "/do/fb/incr", ""))).collect();
+        let mut counts: Vec<i64> = incrs.into_iter().map(|t| t.join().unwrap()).map(|(code, body)| {
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["count"].as_i64().unwrap()
+        }).collect();
+        counts.sort();
+        assert_eq!(counts, [2, 3, 4, 5, 6, 7]);
+        assert_eq!(busy.join().unwrap().0, 200);
+        assert_eq!(stat(a, "batched"), 6, "{}", http(a, "GET", "/_combd/stats", "").1);
+        stop_a.store(true, std::sync::atomic::Ordering::Relaxed);
+        ta.join().unwrap();
+        assert!(eventually(15_000, || http(b, "GET", "/do/fb/count", "") == (200, "{\"count\":7}".into())), "{:?}", http(b, "GET", "/do/fb/count", ""));
     }
 
     /// A tiny WebSocket client, for tests.
@@ -3539,9 +3628,19 @@ callers = ["api"]
         for i in 100..150 {
             b.text(&format!(r#"{{"t":"set","i":{i},"v":true}}"#));
         }
-        let mut slow = 0;
-        for _ in 100..150 {
-            slow += (json(&mut b)["t"] == "slow") as u32;
+        // Each comes back once: refused (`slow`), or as a change, alone or
+        // in a batch with others (`sets`).
+        let (mut slow, mut back) = (0, 0);
+        while back < 50 {
+            let m = json(&mut b);
+            back += match m["t"].as_str() {
+                Some("sets") => m["c"].as_array().unwrap().len(),
+                Some("slow") => {
+                    slow += 1;
+                    1
+                }
+                _ => 1,
+            };
         }
         assert!(slow >= 10, "{slow} refused");
         // The count: each chunk tells `boxes` at most once a second.

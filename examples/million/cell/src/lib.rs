@@ -95,6 +95,15 @@ fn err(code: u16, msg: &str) -> String {
 /// One request: `api METHOD PATH BODY` (http) or `do METHOD PATH BODY`
 /// (an object).
 pub fn run(req: &str) -> String {
+    let mut sets = vec![];
+    let answer = run_in(req, &mut sets);
+    tell_sets(&sets);
+    answer
+}
+
+/// One request; a chunk's changes go on `sets` (box, on), for the watchers
+/// once the request, or the whole batch, is done.
+fn run_in(req: &str, sets: &mut Vec<(usize, bool)>) -> String {
     let mut parts = req.splitn(4, ' ');
     let (_, method, path, body) = (parts.next(), parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
@@ -107,7 +116,7 @@ pub fn run(req: &str) -> String {
             }
             _ => err(404, "not found"),
         },
-        "chunk" => chunk(method, path, &v),
+        "chunk" => chunk(method, path, &v, sets),
         "boxes" => boxes(method, path, &v),
         other => err(500, &format!("million: no process {other:?}")),
     }
@@ -165,7 +174,25 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
-fn chunk(method: &str, path: &str, v: &Value) -> String {
+/// The watchers hear a chunk's changes: one message for one, and for a
+/// batch, one with them all (`sets`), so a hundred watching get a hundred
+/// pushes per batch, not per click.
+fn tell_sets(sets: &[(usize, bool)]) {
+    if sets.is_empty() {
+        return;
+    }
+    CH.with(|cell| {
+        let cell = cell.borrow();
+        let Some(c) = cell.as_ref() else { return };
+        let msg = match sets {
+            [(i, on)] => json!({ "t": "set", "n": c.n, "i": i, "v": on }),
+            _ => json!({ "t": "sets", "n": c.n, "c": sets.iter().map(|&(i, on)| json!([i, on])).collect::<Vec<_>>() }),
+        };
+        push(c.subs.keys().copied(), &msg.to_string());
+    });
+}
+
+fn chunk(method: &str, path: &str, v: &Value, sets: &mut Vec<(usize, bool)>) -> String {
     CH.with(|cell| {
         let mut cell = cell.borrow_mut();
         let c = cell.get_or_insert_with(load);
@@ -209,8 +236,8 @@ fn chunk(method: &str, path: &str, v: &Value) -> String {
                     c.checked -= 1;
                 }
                 // Out once the write is on disk (the host holds them).
-                // ponytail: one push per watcher per set; one per node is next.
-                push(c.subs.keys().copied(), &json!({ "t": "set", "n": c.n, "i": i, "v": on }).to_string());
+                // ponytail: one push per watcher per batch; one per node is next.
+                sets.push((i, on));
                 // The total hears at most once a second.
                 if !c.dirty {
                     c.dirty = true;
@@ -271,6 +298,28 @@ pub extern "C" fn release(ptr: *mut u8, len: u32) {
 }
 
 /// The answer, as (ptr << 32) | len; the host frees it with `release`.
+/// Requests that waited, all at once (each its length, a newline, then
+/// itself): one transaction, an answer each, framed the same way, and the
+/// watchers hear every change in one message.
+#[no_mangle]
+pub extern "C" fn handle_batch(ptr: *mut u8, len: u32) -> u64 {
+    let reqs = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
+    let mut rest = core::str::from_utf8(&reqs).unwrap_or("");
+    let (mut out, mut sets) = (String::new(), vec![]);
+    while let Some((n, after)) = rest.split_once('\n') {
+        let (req, more) = after.split_at(n.parse::<usize>().unwrap_or(after.len()).min(after.len()));
+        let answer = run_in(req, &mut sets);
+        out.push_str(&answer.len().to_string());
+        out.push('\n');
+        out.push_str(&answer);
+        rest = more;
+    }
+    tell_sets(&sets);
+    let out = Box::into_raw(out.into_bytes().into_boxed_slice());
+    let len = out.len() as u64;
+    ((out as *mut u8 as u64) << 32) | len
+}
+
 #[no_mangle]
 pub extern "C" fn handle(ptr: *mut u8, len: u32) -> u64 {
     let req = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };

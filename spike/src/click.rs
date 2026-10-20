@@ -124,20 +124,27 @@ impl Page {
                     let bits = hex.chunks(2).map(|h| u8::from_str_radix(std::str::from_utf8(h).unwrap_or("0"), 16).unwrap_or(0)).collect();
                     self.bits.insert(n, bits);
                 }
-                Some("set") => {
-                    t.changes += 1;
-                    let (i, on) = (v["i"].as_u64().unwrap_or(0), v["v"].as_bool().unwrap_or(false));
-                    if let Some(b) = self.bits.get_mut(&n).and_then(|b| b.get_mut(i as usize / 8)) {
-                        *b = if on { *b | 1 << (i % 8) } else { *b & !(1 << (i % 8)) };
-                    }
-                    let at = n * CHUNK + i;
-                    if self.waiting.get(&at).is_some_and(|w| w.1 == on) {
-                        t.echoes.push(self.waiting.remove(&at).unwrap().0.elapsed().as_millis() as u32);
+                // One change, or a batch of them (`sets`: [box, on] pairs).
+                Some("set") => self.change(n, v["i"].as_u64().unwrap_or(0), v["v"].as_bool().unwrap_or(false), t),
+                Some("sets") => {
+                    for c in v["c"].as_array().into_iter().flatten() {
+                        self.change(n, c[0].as_u64().unwrap_or(0), c[1].as_bool().unwrap_or(false), t);
                     }
                 }
                 Some("slow") => t.slow += 1,
                 _ => {}
             }
+        }
+    }
+
+    fn change(&mut self, n: u64, i: u64, on: bool, t: &mut Tally) {
+        t.changes += 1;
+        if let Some(b) = self.bits.get_mut(&n).and_then(|b| b.get_mut(i as usize / 8)) {
+            *b = if on { *b | 1 << (i % 8) } else { *b & !(1 << (i % 8)) };
+        }
+        let at = n * CHUNK + i;
+        if self.waiting.get(&at).is_some_and(|w| w.1 == on) {
+            t.echoes.push(self.waiting.remove(&at).unwrap().0.elapsed().as_millis() as u32);
         }
     }
 

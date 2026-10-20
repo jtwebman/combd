@@ -707,4 +707,25 @@ mod cell {
         let len = out.len() as u64;
         ((out as *mut u8 as u64) << 32) | len
     }
+
+    /// Several of an object's requests at once (each its length, a newline,
+    /// then itself), in one transaction: an answer each, framed the same way.
+    #[no_mangle]
+    pub extern "C" fn handle_batch(ptr: *mut u8, len: u32) -> u64 {
+        let reqs = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
+        super::api::warm();
+        let mut rest = core::str::from_utf8(&reqs).unwrap_or("");
+        let mut out = String::new();
+        while let Some((n, after)) = rest.split_once('\n') {
+            let (req, more) = after.split_at(n.parse::<usize>().unwrap_or(after.len()).min(after.len()));
+            let answer = super::run(req, || unsafe { counter_incr() });
+            out.push_str(&answer.len().to_string());
+            out.push('\n');
+            out.push_str(&answer);
+            rest = more;
+        }
+        let out = Box::into_raw(out.into_bytes().into_boxed_slice());
+        let len = out.len() as u64;
+        ((out as *mut u8 as u64) << 32) | len
+    }
 }
