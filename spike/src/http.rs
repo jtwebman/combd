@@ -2881,7 +2881,9 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }, vec![]));
         };
-        if self.sessions.contains_key(&name) {
+        // A session's, even if it's gone while this ran (its socket closed,
+        // with `on_close = "drop"`): `session_finish` lets that go.
+        if self.app.procs[cell.proc].socket {
             return self.session_finish(&name, cell, answer, ws);
         }
         if let Origin::Fleet(req) = origin {

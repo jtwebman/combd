@@ -421,6 +421,16 @@ pub mod room {
     }
 
     pub fn handle(method: &str, path: &str, body: &str) -> String {
+        // As a `ws` process (tests): sessions have no storage, and
+        // `session-busy N` keeps one running N ms.
+        if method == "WSOPEN" && path == "/slow" {
+            return "101 {}".into();
+        }
+        if let Some(ms) = body.strip_prefix("session-busy ") {
+            let until = unsafe { host::now_ms() } + ms.trim().parse::<i64>().unwrap_or(0);
+            while unsafe { host::now_ms() } < until {}
+            return "200 {}".into();
+        }
         ROOM.with(|r| {
             let mut r = r.borrow_mut();
             let room = r.get_or_insert_with(load);

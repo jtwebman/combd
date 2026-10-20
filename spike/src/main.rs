@@ -1702,6 +1702,31 @@ mod tests {
         assert!(eventually(3000, || keep(port).1 == "HTTP/1.1 503"), "over its memory budget");
     }
 
+    /// A socket closes while its session is mid-request, with `on_close =
+    /// "drop"`: the session goes, and when the request finishes, the node
+    /// goes on (it once took the loop down: "object of a running task").
+    #[test]
+    fn a_session_dropped_mid_request_doesnt_take_the_node_down() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::write(app.0.join("combd.toml"), "[app]\nname = \"slow\"\n[ws.slow]\nmodule = \"classic\"\nroutes = [\"/slow\"]\non_close = \"drop\"\nhibernate = \"off\"\n").unwrap();
+        std::fs::copy(GUEST, app.0.join("modules/classic.wasm")).unwrap();
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, _) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = server_app(eng, cfg(&dir.0, 1), move |_| a);
+        let mut w = Ws::open_to(port, "slow.localhost", "/slow").unwrap();
+        w.text("session-busy 600");
+        std::thread::sleep(Duration::from_millis(100));
+        drop(w);
+        std::thread::sleep(Duration::from_millis(1000));
+        assert_eq!(http(port, "GET", "/_combd/ping", "").0, 200, "the node is still up");
+        assert_eq!(stat(port, "sessions_live"), 0);
+        let mut w = Ws::open_to(port, "slow.localhost", "/slow").unwrap();
+        w.text("session-busy 1");
+        assert!(eventually(2000, || stat(port, "sessions_live") == 1), "and takes new sessions");
+    }
+
     /// A busy object's mailbox fills: what comes past `mailbox` is refused
     /// at once (503, overloaded), not queued, and the object goes on.
     #[test]
