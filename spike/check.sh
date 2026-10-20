@@ -31,8 +31,9 @@ grep -E "test result|FAILED|panicked" "$out"
 grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { echo "check: tests failed"; exit 1; }
 cargo test --release -q -p combd-mem 2>&1 | grep -q "test result: ok" || { echo "check: combd-mem failed"; exit 1; }
 [ "$1" = quick ] && { echo "check: ok (quick)"; exit 0; }
-# A compiled module's build, loaded the way a node does (slow: it compiles).
-cargo test --release -q --features aot-lite -- --ignored a_build_loads 2>&1 | grep -q "test result: ok. 1 passed" || { echo "check: loading a build failed"; exit 1; }
+# Compiled modules (slow: they compile): a build loaded the way a node does,
+# a deploy that waits for a builder, and builds' signatures.
+cargo test --release -q --features aot-lite -- --include-ignored a_build_loads a_compiled_deploy builds:: 2>&1 | grep -q "test result: ok. 3 passed" || { echo "check: compiled modules failed"; exit 1; }
 ./spectest.sh | tail -1 | tee /dev/stderr | grep -q " 0 fail" || { echo "check: spec testsuite failed"; exit 1; }
 ./target/release/combd-spike fuzz 3000 | grep -q "no mismatches" || { echo "check: fuzz found a mismatch"; exit 1; }
 echo "check: ok"

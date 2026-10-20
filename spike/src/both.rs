@@ -10,6 +10,8 @@ use std::sync::Arc;
 pub struct Both {
     pub interp: Interp,
     pub aot: Aot,
+    /// In a fleet: where builds come from (the bucket, from builders).
+    pub builds: Option<Arc<crate::builds::Builds>>,
 }
 
 pub enum Program {
@@ -36,7 +38,16 @@ impl Engine for Both {
     fn load_as(&self, wasm: &[u8], kind: Kind) -> Result<Program, String> {
         match kind {
             Kind::Interpreted => self.interp.load(wasm).map(Program::Interpreted),
-            Kind::Compiled => self.aot.load(wasm).map(Program::Compiled),
+            // Built in (or in COMBD_AOT_DIR), else this node's build from the
+            // bucket; until there is one, the deploy waits.
+            Kind::Compiled => match (self.aot.load(wasm), &self.builds) {
+                (Ok(c), _) => Ok(Program::Compiled(c)),
+                (Err(e), None) => Err(e),
+                (Err(_), Some(b)) => match b.fetch(wasm)? {
+                    crate::builds::Fetch::Ready(_) => crate::aot::built(&b.dir, wasm).map(Program::Compiled),
+                    crate::builds::Fetch::Building => Err(format!("module {} {}", crate::builds::module_id(wasm), crate::engine::BEING_BUILT)),
+                },
+            },
         }
     }
 

@@ -14,6 +14,8 @@ mod aot;
 mod both;
 #[cfg(feature = "aot-lite")]
 mod build;
+#[cfg(feature = "aot-lite")]
+mod builds;
 mod aot_gen;
 mod app;
 mod catalog;
@@ -429,7 +431,20 @@ fn finish<V: CellVm>(vm: &mut V, slice: u32, st: &mut HostState) -> Result<Vec<u
 /// Both engines: each module runs as its manifest says.
 #[cfg(feature = "aot-lite")]
 fn both() -> both::Both {
-    both::Both { interp: interp::Interp { max_pages: 16384 }, aot: aot::Aot }
+    both::Both { interp: interp::Interp { max_pages: 16384 }, aot: aot::Aot, builds: None }
+}
+
+/// A fleet node's: its builds from the bucket, trusting COMBD_BUILDER_KEYS,
+/// kept in COMBD_BUILDS_DIR (default `<data>/builds`).
+#[cfg(feature = "aot-lite")]
+fn both_in(fc: &fleet::FleetCfg, data: &std::path::Path) -> Result<both::Both, String> {
+    let keys = match std::env::var("COMBD_BUILDER_KEYS") {
+        Ok(f) => builds::parse_keys(&std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?),
+        Err(_) => vec![],
+    };
+    let dir = std::env::var_os("COMBD_BUILDS_DIR").map_or(data.join("builds"), Into::into);
+    let b = builds::Builds::new(fc.s3.clone(), dir, keys, fc.node)?;
+    Ok(both::Both { builds: Some(std::sync::Arc::new(b)), ..both() })
 }
 
 /// Copy a request into the cell and begin `handle`. Nothing runs yet.
@@ -1164,13 +1179,40 @@ fn main_with(args: &[&str]) {
                 "interp" => http::serve_fleet_apps(&interp::Interp { max_pages: 16384 }, port, cfg, admin),
                 // Each module as its manifest says (compiled: those in this build, for now).
                 #[cfg(feature = "aot-lite")]
-                "both" => http::serve_fleet_apps(&both(), port, cfg, admin),
+                "both" => both_in(fc, &cfg.data).and_then(|eng| http::serve_fleet_apps(&eng, port, cfg, admin)),
                 _ => Err("serve-fleet: interp, or both (with the AOT tier)".into()),
             };
             if let Err(e) = r {
                 eprintln!("combd     {e}");
                 std::process::exit(1);
             }
+        }
+        // A builder's key (its private half into `file`), and the public half
+        // for every node's COMBD_BUILDER_KEYS.
+        #[cfg(feature = "aot-lite")]
+        ["builder-key", file] => match builds::new_key(std::path::Path::new(file)) {
+            Ok(public) => println!("a builder key is in {file}; for COMBD_BUILDER_KEYS: {public}"),
+            Err(e) => {
+                eprintln!("combd     {e}");
+                std::process::exit(1);
+            }
+        },
+        // Build compiled modules for the fleet in COMBD_S3 (for this binary's
+        // pin), signing with COMBD_BUILDER_KEY, until killed.
+        #[cfg(feature = "aot-lite")]
+        ["builder"] => {
+            let s3 = s3::S3::from_env().unwrap_or_else(|| {
+                eprintln!("combd     builder: needs the fleet's bucket (COMBD_S3, ...)");
+                std::process::exit(1);
+            });
+            let key = builds::load_key(std::path::Path::new(&std::env::var("COMBD_BUILDER_KEY").unwrap_or_else(|_| "builder.key".into()))).unwrap_or_else(|e| {
+                eprintln!("combd     builder: {e}");
+                std::process::exit(1);
+            });
+            let id = std::env::var("COMBD_BUILDER_ID").unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_else(|_| "builder".into()));
+            let aot = std::env::var_os("COMBD_AOT_SRC").map_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot"), Into::into);
+            let work = std::env::var_os("COMBD_BUILD_WORK").map_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds"), Into::into);
+            builds::builder(&s3, &id, &key, &aot, &work, &std::sync::atomic::AtomicBool::new(false));
         }
         // A new admin token, and its line for COMBD_ADMIN_TOKENS.
         ["admin-token", ref scopes @ ..] if !scopes.is_empty() => {
@@ -2598,6 +2640,75 @@ mod tests {
         stop_a.store(true, std::sync::atomic::Ordering::Relaxed);
         ta.join().unwrap();
         assert!(eventually(15_000, || http(b, "GET", "/do/fb/count", "") == (200, "{\"count\":7}".into())), "{:?}", http(b, "GET", "/do/fb/count", ""));
+    }
+
+    /// Compile on deploy, end to end: an app with a compiled module is
+    /// deployed to a fleet, waits (building) while a builder builds it for
+    /// the fleet's kind of node, and goes live by itself, compiled on every
+    /// node. Slow (a real build): `cargo test --features aot -- --ignored`.
+    #[cfg(feature = "aot-lite")]
+    #[test]
+    #[ignore]
+    fn a_compiled_deploy_waits_for_its_build_then_goes_live() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 2).unwrap();
+        let bucket = s3::S3 { bucket: test_bucket(), ..base.clone() };
+        bucket.make_bucket().unwrap();
+        let wports = free_ports(2);
+        let peers: HashMap<own::Node, String> = (0..2).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
+        let (token, line) = admin::new_token(&["*/*:*"]);
+        let admin_port = free_ports(1)[0];
+        let certs = dir.0.join("certs");
+        let master = dir.0.join("master.key");
+        secrets::new_master(&master).unwrap();
+        let public = builds::new_key(&dir.0.join("builder.key")).unwrap();
+        let keys = builds::parse_keys(&public);
+        let ports = free_ports(2);
+        for n in 0..2u32 {
+            let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 1, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new() };
+            let b = builds::Builds::new(bucket.clone(), dir.0.join(format!("builds{n}")), keys.clone(), n).unwrap();
+            let eng = both::Both { builds: Some(Arc::new(b)), ..both() };
+            let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), ..cfg(&dir.0.join(format!("d{n}")), 1) };
+            let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: false, tls: None, tokens: admin::parse_tokens(&line).unwrap() });
+            let port = ports[n as usize];
+            std::thread::spawn(move || http::serve_fleet_apps(&eng, port, c, admin).unwrap());
+        }
+        let url = format!("http://127.0.0.1:{admin_port}");
+        assert!(eventually(20_000, || std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok()));
+        let api = |m: &str, p: &str, b: &[u8]| admin::request(&url, None, &token, m, p, b).unwrap();
+        // The guest, with a custom section: the same program, another hash,
+        // so it isn't the copy built into this binary.
+        let mut wasm = std::fs::read(GUEST).unwrap();
+        wasm.extend_from_slice(&[0, 6, 4, b't', b'e', b's', b't', 1]);
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::write(app.0.join("modules/classic.wasm"), &wasm).unwrap();
+        std::fs::write(app.0.join("combd.toml"), "[app]\nname = \"fast\"\ndomains = [\"fast.test\"]\n[modules.classic]\nengine = \"compiled\"\n[durable.room]\nmodule = \"classic\"\nroutes = [\"/room/:id/*\"]\n").unwrap();
+        let (code, v) = api("PUT", "/v1/apps/acme/fast", &deploy::bundle(&app.0).unwrap());
+        assert_eq!((code, v["building"].as_bool()), (200, Some(true)), "{v}");
+        assert_eq!(http_to(ports[0], "fast.test", "POST", "/room/r/incr", "").0, 404, "not live while it builds");
+        let (_, d) = api("GET", "/v1/deploys", b"");
+        assert_eq!(d["pending"][0]["app"], "acme/fast", "{d}");
+        // A builder comes along.
+        let stop = Arc::new(AtomicBool::new(false));
+        let (b, key, s) = (bucket.clone(), builds::load_key(&dir.0.join("builder.key")).unwrap(), stop.clone());
+        let aot_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot");
+        let work = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds");
+        std::thread::spawn(move || builds::builder(&b, "test-builder", &key, &aot_src, &work, &s));
+        assert!(eventually(300_000, || api("GET", "/v1/apps/acme/fast", b"").1["version"] == v["version"]), "live once built: {}", api("GET", "/v1/deploys", b"").1);
+        for &p in &ports {
+            assert!(eventually(20_000, || http_to(p, "fast.test", "POST", "/room/r/incr", "").0 == 200), "node {p}");
+        }
+        // The object runs on its owner (the other node forwards): compiled there, and nowhere interpreted.
+        let engines = || ports.iter().map(|&p| serde_json::from_str::<serde_json::Value>(&http(p, "GET", "/_combd/stats", "").1).unwrap()["procs"]["acme/fast/room"]["engine"].clone()).collect::<Vec<_>>();
+        assert!(eventually(3000, || engines().contains(&serde_json::json!("compiled"))), "{:?}", engines());
+        assert!(!engines().contains(&serde_json::json!("interpreted")), "{:?}", engines());
+        assert_eq!(api("GET", "/v1/deploys", b"").1["pending"].as_array().map(Vec::len), Some(0));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A tiny WebSocket client, for tests.

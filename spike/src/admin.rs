@@ -112,7 +112,8 @@ fn allowed(tokens: &[([u8; 32], Vec<String>)], token: &str, org: &str, app: &str
 
 /// What the API does, given a request it has checked: (status, JSON body).
 pub trait Api: Sync {
-    fn deploy(&self, org: &str, app: &str, bundle: &[u8]) -> Result<String, String>;
+    /// `{"version"}`, and `"building": true` while it waits for builds.
+    fn deploy(&self, org: &str, app: &str, bundle: &[u8]) -> Result<Json, String>;
     fn current(&self, org: &str, app: &str) -> Result<Option<String>, String>;
     fn rollback(&self, org: &str, app: &str, version: &str) -> Result<(), String>;
     fn remove(&self, org: &str, app: &str) -> Result<(), String>;
@@ -123,6 +124,12 @@ pub trait Api: Sync {
     fn nodes(&self) -> Result<Json, String> {
         Err("not in a fleet".into())
     }
+    /// Deploys waiting for builds, and their builds.
+    fn deploys(&self) -> Result<Json, String> {
+        Err("not in a fleet".into())
+    }
+    /// Every couple of seconds: what's waiting gets another go.
+    fn tick(&self) {}
 }
 
 /// GET a JSON answer from `url` (http or https, Mozilla's roots), in 3 s.
@@ -166,8 +173,19 @@ pub fn serve(cfg: AdminCfg, api: &dyn Api, stop: &std::sync::atomic::AtomicBool)
     let addr = if cfg.public { "0.0.0.0" } else { "127.0.0.1" };
     let l = std::net::TcpListener::bind((addr, cfg.port))?;
     l.set_nonblocking(true)?;
+    // One tick at a time: a slow one isn't joined by the next.
+    let ticking = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|sc| {
+        let mut ticked = std::time::Instant::now();
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if ticked.elapsed() >= std::time::Duration::from_secs(2) && !ticking.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                ticked = std::time::Instant::now();
+                let ticking = &ticking;
+                sc.spawn(move || {
+                    api.tick();
+                    ticking.store(false, std::sync::atomic::Ordering::Release);
+                });
+            }
             match l.accept() {
                 Ok((s, _)) => {
                     let cfg = &cfg;
@@ -286,6 +304,7 @@ fn endpoint<'a>(method: &str, path: &'a str) -> Option<(&'a str, &'a str, Vec<&'
         ["v1", "apps", org, app, rest @ ..] => (*org, *app, rest.to_vec()),
         // The cluster's own: a token for every app (`*/*`).
         ["v1", "nodes"] if method == "GET" => return Some(("*", "*", vec!["nodes"], "read")),
+        ["v1", "deploys"] if method == "GET" => return Some(("*", "*", vec!["deploys"], "read")),
         _ => return None,
     };
     let action = match (method, rest.as_slice()) {
@@ -315,13 +334,13 @@ fn authorize(cfg: &AdminCfg, method: &str, path: &str, token: Option<&str>) -> R
 fn run(api: &dyn Api, method: &str, path: &str, body: &[u8]) -> (u16, Json) {
     let Some((org, app, rest, _)) = endpoint(method, path) else { return (404, json!({ "error": "no such endpoint" })) };
     if (org, app) == ("*", "*") {
-        return match api.nodes() {
+        return match if rest == ["deploys"] { api.deploys() } else { api.nodes() } {
             Ok(v) => (200, v),
             Err(e) => (400, json!({ "error": e })),
         };
     }
     let r = match (method, rest.as_slice()) {
-        ("PUT", []) => api.deploy(org, app, body).map(|v| json!({ "version": v })),
+        ("PUT", []) => api.deploy(org, app, body),
         ("GET", []) => api.current(org, app).map(|v| json!({ "version": v })),
         ("POST", ["rollback"]) => match serde_json::from_slice::<Json>(body).ok().and_then(|v| v["version"].as_str().map(String::from)) {
             Some(v) => api.rollback(org, app, &v).map(|()| json!({ "version": v })),

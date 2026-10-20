@@ -912,7 +912,7 @@ where
             let (s3, stop, cat, public) = (&s3, cfg.stop.clone(), cat.clone(), cfg.public.clone());
             let scratch = scratch.clone();
             sc.spawn(move || {
-                let api = NodeApi { eng, public, live, s3, cat, scratch, master };
+                let api = NodeApi { eng, public, live, s3, cat, scratch, master, pending: Default::default() };
                 if let Err(e) = crate::admin::serve(admin, &api, &stop) {
                     eprintln!("combd     the admin API stopped: {e}");
                 }
@@ -950,7 +950,24 @@ struct NodeApi<'a, E: Engine> {
     cat: Arc<crate::catnode::CatNode>,
     scratch: std::path::PathBuf,
     master: Option<&'a crate::secrets::Key>,
+    /// Deploys waiting for their builds: org, app, the bundle, its version,
+    /// the compiled modules, since when, and why it failed if it did.
+    /// ponytail: in this node's memory: if it restarts, they're dropped (deploy again).
+    pending: std::sync::Mutex<Vec<Pending>>,
 }
+
+struct Pending {
+    org: String,
+    app: String,
+    bundle: Vec<u8>,
+    version: String,
+    compiled: Vec<Vec<u8>>,
+    since: Instant,
+    failed: Option<String>,
+}
+
+/// How long a deploy may wait for its builds.
+const BUILD_WAIT: Duration = Duration::from_secs(60 * 60);
 
 impl<E: Engine> NodeApi<'_, E> {
     /// The live version's manifest, if one is live.
@@ -968,8 +985,43 @@ impl<E: Engine + Sync> crate::admin::Api for NodeApi<'_, E>
 where
     E::Program: Sync + Send,
 {
-    fn deploy(&self, org: &str, app: &str, bundle: &[u8]) -> Result<String, String> {
-        deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, self.master, org, app, bundle)
+    fn deploy(&self, org: &str, app: &str, bundle: &[u8]) -> Result<serde_json::Value, String> {
+        match deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, self.master, org, app, bundle)? {
+            Deployed::Live(v) => Ok(serde_json::json!({ "version": v })),
+            Deployed::Building(v, compiled) => {
+                let mut p = self.pending.lock().unwrap();
+                p.retain(|x| (x.org.as_str(), x.app.as_str()) != (org, app));
+                p.push(Pending { org: org.into(), app: app.into(), bundle: bundle.to_vec(), version: v.clone(), compiled, since: Instant::now(), failed: None });
+                Ok(serde_json::json!({ "version": v, "building": true }))
+            }
+        }
+    }
+
+    /// Deploys waiting for builds: each tried again; live once it's built.
+    fn tick(&self) {
+        let waiting: Vec<(String, String, Vec<u8>, Instant)> = self.pending.lock().unwrap().iter().filter(|p| p.failed.is_none()).map(|p| (p.org.clone(), p.app.clone(), p.bundle.clone(), p.since)).collect();
+        for (org, app, bundle, since) in waiting {
+            let r = deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, self.master, &org, &app, &bundle);
+            let mut p = self.pending.lock().unwrap();
+            let Some(i) = p.iter().position(|x| x.org == org && x.app == app) else { continue };
+            match r {
+                Ok(Deployed::Live(_)) => {
+                    p.remove(i);
+                }
+                Ok(Deployed::Building(..)) if since.elapsed() > BUILD_WAIT => p[i].failed = Some(format!("not built in {} minutes", BUILD_WAIT.as_secs() / 60)),
+                Ok(Deployed::Building(..)) => {}
+                Err(e) => p[i].failed = Some(e),
+            }
+        }
+    }
+
+    fn deploys(&self) -> Result<serde_json::Value, String> {
+        let p = self.pending.lock().unwrap();
+        let list: Vec<serde_json::Value> = p
+            .iter()
+            .map(|x| serde_json::json!({ "app": format!("{}/{}", x.org, x.app), "version": x.version, "waiting_s": x.since.elapsed().as_secs(), "failed": x.failed, "builds": compiled_status(self.s3, &x.compiled) }))
+            .collect();
+        Ok(serde_json::json!({ "pending": list }))
     }
 
     fn current(&self, org: &str, app: &str) -> Result<Option<String>, String> {
@@ -997,7 +1049,10 @@ where
     /// An earlier version, checked again (vars may have changed since).
     fn rollback(&self, org: &str, app: &str, version: &str) -> Result<(), String> {
         let b = crate::deploy::get_version(self.s3, org, app, version)?;
-        deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, self.master, org, app, &b).map(|_| ())
+        match deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, self.master, org, app, &b)? {
+            Deployed::Live(_) => Ok(()),
+            Deployed::Building(..) => Err("that version's builds are gone: deploy it again".into()),
+        }
     }
 
     fn remove(&self, org: &str, app: &str) -> Result<(), String> {
@@ -1110,7 +1165,7 @@ fn load_one(dir: &std::path::Path, env: &crate::manifest::EnvValues) -> Result<(
 /// its write checks the domains again, against the log's head, so two
 /// deploys on two nodes can never both claim one. Every node picks it up.
 #[allow(clippy::too_many_arguments)]
-pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::catnode::CatNode, s3: &crate::s3::S3, scratch: &std::path::Path, master: Option<&crate::secrets::Key>, org: &str, app: &str, bundle: &[u8]) -> Result<String, String> {
+pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::catnode::CatNode, s3: &crate::s3::S3, scratch: &std::path::Path, master: Option<&crate::secrets::Key>, org: &str, app: &str, bundle: &[u8]) -> Result<Deployed, String> {
     let ident = |s: &str| !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
     if !ident(org) || !ident(app) {
         return Err("org and app: lowercase letters, digits, - and _".into());
@@ -1118,20 +1173,59 @@ pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::c
     let v = crate::deploy::version_of(bundle);
     let dir = scratch.join(format!("{org}-{app}-{v}"));
     crate::deploy::unpack(bundle, &dir)?;
+    // `Ok(None)`: its compiled modules aren't all built yet.
     let checked = (|| {
         let (m, r) = load_one(&dir, &crate::deploy::env(&cat.now().0, master, org, app)?)?;
         if m.app != app {
             return Err(format!("its manifest says it's {:?}, not {app:?}", m.app));
         }
+        // A compiled module goes live once it's built for every kind of node.
+        let compiled = m.modules.iter().filter(|(_, k)| **k == crate::engine::Kind::Compiled).map(|(n, _)| std::fs::read(crate::manifest::module_path(&dir, n)).map_err(|e| format!("modules/{n}.wasm: {e}"))).collect::<Result<Vec<_>, _>>()?;
+        if !compiled.is_empty() && !compiled_built(s3, &compiled)? {
+            return Ok((None, compiled));
+        }
         let a = crate::app::AppDir { org, dir: &dir, resolved: &r, app: &m.app, domains: &m.domains };
-        live.now().with_apps(&[a], &[], |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))?;
-        Ok(m.domains.clone())
+        match live.now().with_apps(&[a], &[], |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a)) {
+            Ok(_) => Ok((Some(m.domains.clone()), compiled)),
+            Err(e) if e.contains(crate::engine::BEING_BUILT) => Ok((None, compiled)),
+            Err(e) => Err(e),
+        }
     })();
     let _ = std::fs::remove_dir_all(&dir);
-    let domains = checked.map_err(|e| format!("{org}/{app}: {e}"))?;
+    let (domains, compiled) = checked.map_err(|e| format!("{org}/{app}: {e}"))?;
     crate::deploy::put_version(s3, org, app, bundle)?;
+    let Some(domains) = domains else { return Ok(Deployed::Building(v, compiled)) };
     cat.submit(&format!("{org}/{app}"), crate::deploy::live_value(&v, &domains)).map_err(|e| format!("{org}/{app}: {e}"))?;
-    Ok(v)
+    Ok(Deployed::Live(v))
+}
+
+/// What a deploy did: it's live, or it waits for its compiled modules'
+/// builds (their bytes, to watch them).
+pub enum Deployed {
+    Live(String),
+    Building(String, Vec<Vec<u8>>),
+}
+
+/// Built for every kind of node in the fleet (each one missing is asked for).
+#[cfg(feature = "aot-lite")]
+fn compiled_built(s3: &crate::s3::S3, wasms: &[Vec<u8>]) -> Result<bool, String> {
+    crate::builds::all_built(s3, wasms)
+}
+
+/// Without the AOT tier: as built as it'll get (and the load says why not).
+#[cfg(not(feature = "aot-lite"))]
+fn compiled_built(_: &crate::s3::S3, _: &[Vec<u8>]) -> Result<bool, String> {
+    Ok(true)
+}
+
+#[cfg(feature = "aot-lite")]
+fn compiled_status(s3: &crate::s3::S3, wasms: &[Vec<u8>]) -> Vec<serde_json::Value> {
+    crate::builds::status(s3, wasms)
+}
+
+#[cfg(not(feature = "aot-lite"))]
+fn compiled_status(_: &crate::s3::S3, _: &[Vec<u8>]) -> Vec<serde_json::Value> {
+    vec![]
 }
 
 /// Deploy the app in `dir` (org `org`) onto a running node: checked and

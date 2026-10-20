@@ -21,6 +21,10 @@ pub struct Import {
     pub results: u32,
 }
 
+/// What a load error says while a compiled module's build is still coming:
+/// a deploy waits on it, it isn't a mistake.
+pub const BEING_BUILT: &str = "is being built";
+
 /// How a module runs, as its manifest says (`[modules.<name>] engine`):
 /// only that way, never switching.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
