@@ -607,9 +607,31 @@ fn ws_load(addr: &str, host: &str, path: &str, n: usize, msg: &str, ca: Option<&
             println!("ws-load: {} open ({:.0} s)", i + 1, t.elapsed().as_secs_f64());
         }
     }
+    // Read and drop what comes, as a browser would (TLS bytes, unread): a
+    // socket left full holds its data in the kernel, and a client holding
+    // tens of thousands runs out of memory. And say how many the server closed.
     println!("ws-load: holding {}", held.len());
-    loop {
-        std::thread::sleep(Duration::from_secs(3600));
+    for s in &held {
+        let _ = s.set_nonblocking(true);
+    }
+    let mut open = vec![true; held.len()];
+    let mut buf = [0u8; 16 * 1024];
+    for round in 1u64.. {
+        for (s, up) in held.iter_mut().zip(open.iter_mut()).filter(|(_, up)| **up) {
+            loop {
+                match std::io::Read::read(s, &mut buf) {
+                    Ok(0) => *up = false,
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => *up = false,
+                }
+                break;
+            }
+        }
+        if round % 15 == 0 {
+            println!("ws-load: holding {} ({} closed by the server)", open.iter().filter(|u| **u).count(), open.iter().filter(|u| !**u).count());
+        }
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 
