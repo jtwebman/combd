@@ -27,6 +27,12 @@
 //!   backoff, up to `ALARM_TRIES` times.
 //! - **Eviction.** Objects idle for `COMBD_IDLE_MS`, or past `COMBD_MAX_OBJECTS`
 //!   per loop, leave memory. They come back from storage when needed.
+//! - **Limits.** At most `COMBD_MAX_CONNS` connections (200,000); past it a
+//!   new one gets 503 and `retry-after`. The node's memory budget is
+//!   `COMBD_MEMORY_BUDGET` (bytes, or 512M, 4G), else its container's limit,
+//!   else the machine's RAM: past 85% it reclaims (idle sessions freeze, idle
+//!   objects and warm cells go after a second, not a minute), past 95% new
+//!   connections and sockets get 503 too, until it's back under 90%.
 //!
 //! `GET /_combd/stats` shows what the node is doing.
 //!
@@ -122,6 +128,47 @@ pub struct Config {
     /// Fleet mode: the master key's file (`COMBD_MASTER_KEY_FILE`), which
     /// opens the apps' secrets. Every node needs the same one.
     pub master_key: Option<PathBuf>,
+    /// How much memory this node may use (`COMBD_MEMORY_BUDGET`, else the
+    /// container's limit, else the machine's RAM): past 85% it reclaims,
+    /// past 95% it refuses new work (`Pressure`).
+    pub memory_budget: Option<u64>,
+    /// The most connections open at once (`COMBD_MAX_CONNS`); past it, 503.
+    pub max_conns: u64,
+}
+
+/// What a node too busy for new work answers, before it closes.
+const BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+/// The memory a node may use: `COMBD_MEMORY_BUDGET` (bytes, or with K, M,
+/// or G), else its container's limit (cgroup v2), else the machine's RAM.
+fn memory_budget() -> Option<u64> {
+    if let Ok(v) = std::env::var("COMBD_MEMORY_BUDGET") {
+        let (n, mul) = match v.trim().to_ascii_uppercase() {
+            s if s.ends_with('G') => (s[..s.len() - 1].to_string(), 1 << 30),
+            s if s.ends_with('M') => (s[..s.len() - 1].to_string(), 1 << 20),
+            s if s.ends_with('K') => (s[..s.len() - 1].to_string(), 1 << 10),
+            s => (s, 1),
+        };
+        return n.trim().parse::<u64>().ok().map(|n| n * mul);
+    }
+    if let Some(n) = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+        return Some(n);
+    }
+    let kb = std::fs::read_to_string("/proc/meminfo").ok()?.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some(kb * 1024)
+}
+
+/// How hard a node is pressed for memory: 0 fine; 1 (85% of its budget)
+/// reclaim, sooner than usual; 2 (95%) refuse new connections and sockets,
+/// until it's back under 90%.
+fn pressure(used: u64, budget: u64, was: u64) -> u64 {
+    let pct = used.saturating_mul(100) / budget.max(1);
+    match pct {
+        95.. => 2,
+        90.. if was == 2 => 2,
+        85.. => 1,
+        _ => 0,
+    }
 }
 
 impl Config {
@@ -140,6 +187,8 @@ impl Config {
             environ: Arc::default(),
             catalog: None,
             master_key: std::env::var("COMBD_MASTER_KEY_FILE").ok().map(PathBuf::from),
+            memory_budget: memory_budget(),
+            max_conns: num("COMBD_MAX_CONNS", 200_000) as u64,
             public: std::env::var("COMBD_PUBLIC_URLS").unwrap_or_default().split(',').filter_map(|kv| kv.split_once('=')).filter_map(|(n, u)| Some((n.trim().parse().ok()?, u.trim().to_string()))).collect(),
         }
     }
@@ -176,6 +225,12 @@ struct Stats {
     ws_messages: AtomicU64,
     /// Handshakes another loop accepted and handed to the object's loop.
     ws_handoffs: AtomicU64,
+    /// Connections open, and refused (over `max_conns`, or memory pressure).
+    conns_open: AtomicU64,
+    conns_refused: AtomicU64,
+    /// Memory: what the node uses, and its pressure (`pressure`).
+    memory_used: AtomicU64,
+    pressure: AtomicU64,
     /// Socket processes' sessions, how many of them are hibernating, and
     /// how many times one has woken.
     sessions_live: AtomicU64,
@@ -972,9 +1027,13 @@ pub fn deploy_dir<E: Engine>(eng: &E, live: &Live<E::Program>, org: &str, dir: &
 }
 
 /// A `memory_kb` under what its module starts with could never start a
-/// cell: the app is refused here, with why, not at its first request.
+/// cell: the app is refused here, with why, not at its first request. And
+/// what's worth knowing about a ws process the host freezes is said.
 fn check_caps<E: Engine>(eng: &E, app: App<E::Program>) -> Result<App<E::Program>, String> {
     for p in app.procs.iter().filter(|p| !p.retired) {
+        if let (true, Sleep::Auto, Some(note)) = (p.socket, p.sleep, eng.note(&app.progs[p.prog])) {
+            eprintln!("combd     warning: {}/{}: {note}", app.tenants[p.tenant].key(), p.name);
+        }
         if let Some(pages) = p.memory_pages {
             let mut vm = eng.spawn(&app.progs[p.prog])?;
             vm.cap_memory(pages).map_err(|e| format!("{}/{}: {e}", app.tenants[p.tenant].key(), p.name))?;
@@ -1636,9 +1695,17 @@ impl<E: Engine> Loop<'_, E> {
     fn accept(&mut self, listener: &mut TcpListener) -> std::io::Result<()> {
         loop {
             match listener.accept() {
-                Ok((s, _)) => {
+                Ok((mut s, _)) => {
+                    // Full: say so, and close. The client tries again (or
+                    // another node: DNS and load balancers pick another).
+                    if self.full() || self.sh.stats.conns_open.load(Relaxed) >= self.sh.cfg.max_conns {
+                        self.sh.stats.conns_refused.fetch_add(1, Relaxed);
+                        let _ = s.write_all(BUSY);
+                        continue;
+                    }
                     s.set_nodelay(true)?;
                     self.add_conn(s, vec![])?;
+                    self.sh.stats.conns_open.fetch_add(1, Relaxed);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
                 Err(_) => return Ok(()), // another loop took it, or a transient error
@@ -2864,7 +2931,7 @@ impl<E: Engine> Loop<'_, E> {
     fn sweep(&mut self) {
         self.last_sweep = Instant::now();
         self.retire_cells();
-        let idle = self.sh.cfg.idle;
+        let idle = self.idle_limit();
         self.sweep_cells();
         // Database handles keep an object here until they've been idle for
         // their pool's `session_idle_ms`; then they close, and it can leave.
@@ -2892,11 +2959,28 @@ impl<E: Engine> Loop<'_, E> {
         }
     }
 
+    /// Memory is short (`pressure` 2): no new connections or sockets.
+    fn full(&self) -> bool {
+        self.sh.stats.pressure.load(Relaxed) >= 2
+    }
+
+    /// How long idle is too long: shorter while memory is short.
+    fn idle_limit(&self) -> Duration {
+        if self.sh.stats.pressure.load(Relaxed) >= 1 { Duration::from_secs(1).min(self.sh.cfg.idle) } else { self.sh.cfg.idle }
+    }
+
     /// What every sweep does, one node or a fleet: warm worker cells back to
     /// what's been needed lately, and sessions idle past their
-    /// `hibernate_ms` give up their cell for their state.
+    /// `hibernate_ms` give up their cell for their state. Loop 0 also
+    /// measures the node's memory; while it's short, all of this goes sooner.
     fn sweep_cells(&mut self) {
-        let idle = self.sh.cfg.idle;
+        if let (0, Some(budget), Some(used)) = (self.me, self.sh.cfg.memory_budget, combd_mem::resident()) {
+            let st = &self.sh.stats;
+            st.memory_used.store(used, Relaxed);
+            st.pressure.store(pressure(used, budget, st.pressure.load(Relaxed)), Relaxed);
+        }
+        let squeeze = self.sh.stats.pressure.load(Relaxed) >= 1;
+        let idle = self.idle_limit();
         for pool in &mut self.pools {
             trim_idle(pool, idle);
         }
@@ -2907,7 +2991,7 @@ impl<E: Engine> Loop<'_, E> {
         for (n, s) in self.sessions.iter().filter(|(_, s)| !s.busy && s.waiting.is_empty()) {
             if !socks.contains_key(&s.sock) {
                 ended.push(n.clone());
-            } else if s.cell.is_some() && !ticks.contains_key(n) && s.last_used.elapsed() >= procs[s.proc].hibernate {
+            } else if s.cell.is_some() && !ticks.contains_key(n) && (squeeze || s.last_used.elapsed() >= procs[s.proc].hibernate) {
                 sleepy.push((n.clone(), procs[s.proc].sleep));
             }
         }
@@ -2982,6 +3066,7 @@ impl<E: Engine> Loop<'_, E> {
             if let Some(mut c) = self.conns.get_mut(id).and_then(Option::take) {
                 let _ = self.poll.registry().deregister(&mut c.s);
                 self.free.push(id);
+                self.sh.stats.conns_open.fetch_sub(1, Relaxed);
             }
             return Ok(());
         }
@@ -3018,6 +3103,11 @@ impl<E: Engine> Loop<'_, E> {
         };
         c.busy = true;
         match req {
+            // A new socket is new work: not while memory is short.
+            Req::Upgrade(..) | Req::Session(..) if self.full() => {
+                self.sh.stats.conns_refused.fetch_add(1, Relaxed);
+                self.queue_reply(who, (503, "\0retry-after: 1\0{\"error\":\"busy: try again, or another node\"}".into()));
+            }
             Req::Upgrade(name, path, key) => {
                 let o = owner(&name, self.sh.cfg.threads);
                 if o == self.me {
@@ -3036,7 +3126,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"heap_in_use\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3063,6 +3153,11 @@ impl<E: Engine> Loop<'_, E> {
                     s.sessions_hibernated.load(Relaxed),
                     s.sessions_woken.load(Relaxed),
                     combd_mem::heap_in_use(),
+                    s.conns_open.load(Relaxed),
+                    s.conns_refused.load(Relaxed),
+                    s.memory_used.load(Relaxed),
+                    self.sh.cfg.memory_budget.unwrap_or(0),
+                    s.pressure.load(Relaxed),
                     s.ev_instances.load(Relaxed),
                     s.ev_requests.load(Relaxed)
                 );
@@ -3755,7 +3850,7 @@ impl<E: Engine> Loop<'_, E> {
         self.last_sweep = Instant::now();
         self.retire_cells();
         self.sweep_cells();
-        let idle = self.sh.cfg.idle;
+        let idle = self.idle_limit();
         let gone: Vec<String> = self
             .objects
             .iter()
@@ -4158,6 +4253,12 @@ mod tests {
 
     /// Any client could send this: `hlen + clen` wrapped past usize::MAX,
     /// and slicing the body panicked the event loop.
+    #[test]
+    fn pressure_rises_at_85_and_95_and_falls_under_90() {
+        let p = |used, was| pressure(used, 100, was);
+        assert_eq!([p(50, 0), p(85, 0), p(94, 1), p(95, 1), p(92, 2), p(89, 2), p(80, 2)], [0, 1, 1, 2, 2, 1, 0]);
+    }
+
     #[test]
     fn idle_pooled_cells_go_but_the_newest_stays() {
         let now = Instant::now();

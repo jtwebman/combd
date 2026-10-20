@@ -246,6 +246,18 @@ impl CellVm for AotVm {
         (self.m.export)(name).is_some()
     }
 
+    /// The generated code reads the limit from the cell (`c.max_pages`) on
+    /// every grow, so lowering it here is all it takes.
+    fn cap_memory(&mut self, pages: u32) -> Result<(), String> {
+        let (c, mem) = self.state.as_mut().ok_or("cell is running")?;
+        let have = mem.len() / combd_aot::rt::PAGE;
+        if have > pages as usize {
+            return Err(format!("memory_kb {} is under this module's starting memory ({} KB): give it more, or build it smaller (a Rust module's 1 MB stack: -C link-arg=-zstack-size=65536)", pages as usize * 64, have * 64));
+        }
+        c.max_pages = c.max_pages.min(pages);
+        Ok(())
+    }
+
     fn host_out(&self) -> Vec<u8> {
         self.state.as_ref().map_or_else(Vec::new, |(c, _)| c.host.out())
     }

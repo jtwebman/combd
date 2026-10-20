@@ -28,6 +28,10 @@ pub trait Engine {
     fn load(&self, wasm: &[u8]) -> Result<Self::Program, String>;
     /// Make a fresh cell from a loaded program.
     fn spawn(&self, program: &Self::Program) -> Result<Self::Vm, String>;
+    /// Something worth saying about a module before it runs (`None`: nothing).
+    fn note(&self, _program: &Self::Program) -> Option<String> {
+        None
+    }
     /// A cell again, from what `CellVm::freeze` kept.
     fn thaw(&self, _program: &Self::Program, _saved: &[u8]) -> Result<Self::Vm, String> {
         Err("this engine can't thaw a cell".into())
@@ -64,8 +68,7 @@ pub trait CellVm {
         None
     }
     /// Lower the most this cell's memory may grow to (`memory_kb`), in
-    /// pages. `Err`: it already starts bigger. Engines that fix the limit
-    /// when they compile (the AOT tier) ignore it.
+    /// pages. `Err`: it already starts bigger. Both of our engines do it.
     fn cap_memory(&mut self, _pages: u32) -> Result<(), String> {
         Ok(())
     }

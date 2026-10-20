@@ -33,6 +33,8 @@ pub struct Stats {
     pub calls: u64,
     pub traps: u64,
     pub inconclusive: u64,
+    /// Calls made on a cell that was frozen and thawed first.
+    pub thawed: u64,
     pub refused: BTreeMap<String, u64>,
     /// Traps by kind, as Wasmtime names them.
     pub trap_kinds: BTreeMap<String, u64>,
@@ -260,14 +262,37 @@ fn compare(bin: &[u8], mut rng: Rng, engine: &wasmtime::Engine, st: &mut Stats) 
             if matches!(a, Got::Trap(_)) {
                 st.traps += 1;
             }
-            if let Some(mem) = memory(&mut store, &inst) {
-                let ours_mem = vm.read(0, mem.len() as u32);
-                if ours_mem.as_deref() != Some(&mem[..]) || vm.read(0, mem.len() as u32 + 1).is_some() {
-                    let first = ours_mem.map(|o| o.iter().zip(&mem).position(|(x, y)| x != y));
-                    return Err(format!("after {name}({raw:x?}): memory differs (wasmtime has {} bytes; first difference at {first:?})", mem.len()));
-                }
+            same_memory(&mut store, &inst, &vm, &format!("after {name}({raw:x?})"))?;
+            // Frozen and thawed between calls (as an idle session is), it must
+            // go on exactly as Wasmtime's, which never was. A trapped cell
+            // doesn't freeze.
+            let Some(saved) = vm.freeze() else { continue };
+            let mut vm = ENGINE.thaw(&m, &saved).map_err(|e| format!("after {name}({raw:x?}): can't thaw what it froze: {e}"))?;
+            same_memory(&mut store, &inst, &vm, &format!("thawed after {name}({raw:x?})"))?;
+            let (raw2, vals2): (Vec<u64>, Vec<Val>) = ty.params().map(|t| arg(&mut rng, &t)).unzip();
+            let (a2, b2) = (ours(&mut vm, &name, &raw2)?, theirs(&mut store, &inst, &name, &vals2, &mut st.trap_kinds));
+            st.calls += 1;
+            st.thawed += 1;
+            if a2 == Got::Limit || b2 == Got::Limit {
+                st.inconclusive += 1;
+                continue;
             }
+            if a2 != b2 {
+                return Err(format!("thawed, then {name}({raw2:x?}): ours {a2:x?}, wasmtime {b2:x?}"));
+            }
+            same_memory(&mut store, &inst, &vm, &format!("thawed, then {name}({raw2:x?})"))?;
         }
+    }
+    Ok(())
+}
+
+/// Our memory against Wasmtime's, every byte, and the same size.
+fn same_memory(store: &mut Store<wasmtime::StoreLimits>, inst: &Instance, vm: &<Interp as Engine>::Vm, when: &str) -> Result<(), String> {
+    let Some(mem) = memory(store, inst) else { return Ok(()) };
+    let ours_mem = vm.read(0, mem.len() as u32);
+    if ours_mem.as_deref() != Some(&mem[..]) || vm.read(0, mem.len() as u32 + 1).is_some() {
+        let first = ours_mem.map(|o| o.iter().zip(&mem).position(|(x, y)| x != y));
+        return Err(format!("{when}: memory differs (wasmtime has {} bytes; first difference at {first:?})", mem.len()));
     }
     Ok(())
 }

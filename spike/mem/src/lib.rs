@@ -174,6 +174,26 @@ fn reserve(n: usize) -> io::Result<*mut u8> {
     Ok(p as *mut u8)
 }
 
+/// This process's resident memory, in bytes (`None` where we can't tell).
+pub fn resident() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let pages: u64 = std::fs::read_to_string("/proc/self/statm").ok()?.split_whitespace().nth(1)?.parse().ok()?;
+        // SAFETY: a plain query.
+        Some(pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+        // SAFETY: our own pid, a buffer of the size we say.
+        let n = unsafe { libc::proc_pidinfo(std::process::id() as i32, libc::PROC_PIDTASKINFO, 0, &mut info as *mut _ as *mut c_void, size) };
+        (n == size).then_some(info.pti_resident_size)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    None
+}
+
 /// Bytes the allocator has handed out and not had back (glibc only: 0
 /// elsewhere). Unlike RSS, it doesn't count memory freed but kept.
 pub fn heap_in_use() -> u64 {
@@ -210,6 +230,76 @@ mod tests {
         let c = Mem::new(Some(&img), 3 * PAGE).unwrap();
         assert_eq!(c.bytes()[10], 1, "and never reach the image");
         assert!(Image::new(&[0; PAGE]).unwrap().is_none(), "all zeros: nothing to share");
+    }
+
+    /// Random images, writes, grows (past the reservation too), clones, and
+    /// drops, against a plain Vec as the model: every byte must match.
+    #[test]
+    fn random_operations_match_a_plain_vec() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n.max(1) as u64) as usize
+        };
+        for _ in 0..60 {
+            // An image of up to 3 pages and a bit, mostly zeros.
+            let mut start = vec![0u8; rand(3) * PAGE + rand(5000)];
+            for _ in 0..rand(80) {
+                if !start.is_empty() {
+                    let i = rand(start.len());
+                    start[i] = rand(256) as u8;
+                }
+            }
+            let img = Image::new(&start).unwrap();
+            let len = start.len().div_ceil(PAGE).max(img.as_ref().map_or(0, |i| i.len() / PAGE)) * PAGE;
+            let mut model = start.clone();
+            model.resize(len, 0);
+            let mut cells = vec![(Mem::new(img.as_ref(), len).unwrap(), model)];
+            for _ in 0..200 {
+                let k = rand(cells.len());
+                match rand(10) {
+                    0..=5 => {
+                        let (m, v) = &mut cells[k];
+                        if !v.is_empty() {
+                            let (i, b) = (rand(v.len()), rand(256) as u8);
+                            m.bytes_mut()[i] = b;
+                            v[i] = b;
+                        }
+                    }
+                    6 => {
+                        let (m, v) = &mut cells[k];
+                        // Now and then past the reservation, so it moves.
+                        let to = if rand(4) == 0 { (MIN_RESERVE / PAGE + rand(3)) * PAGE } else { v.len() + rand(3) * PAGE };
+                        if to >= v.len() {
+                            m.grow(to).unwrap();
+                            v.resize(to, 0);
+                        }
+                    }
+                    7 => {
+                        let c = (cells[k].0.clone(), cells[k].1.clone());
+                        cells.push(c);
+                    }
+                    8 if cells.len() > 1 => {
+                        cells.swap_remove(k);
+                    }
+                    _ => cells.push((Mem::new(img.as_ref(), len).unwrap(), { let mut v = start.clone(); v.resize(len, 0); v })),
+                }
+                // A few bytes every step, all of them now and then.
+                let (m, v) = &cells[rand(cells.len())];
+                assert_eq!(m.len(), v.len());
+                for _ in 0..8 {
+                    if !v.is_empty() {
+                        let i = rand(v.len());
+                        assert_eq!(m.bytes()[i], v[i], "byte {i}");
+                    }
+                }
+            }
+            for (m, v) in &cells {
+                assert!(m.bytes() == &v[..], "a cell's memory differs from its model");
+            }
+        }
     }
 
     #[test]

@@ -937,7 +937,7 @@ fn main_with(args: &[&str]) {
             let n: u64 = n.parse().unwrap();
             let t = Instant::now();
             let st = fuzz::run(start..start + n, true);
-            println!("fuzz     {n} seeds in {:.1} s: {} modules, {} calls ({} trapped), {} inconclusive", t.elapsed().as_secs_f64(), st.modules, st.calls, st.traps, st.inconclusive);
+            println!("fuzz     {n} seeds in {:.1} s: {} modules, {} calls ({} trapped; {} on a thawed cell), {} inconclusive", t.elapsed().as_secs_f64(), st.modules, st.calls, st.traps, st.thawed, st.inconclusive);
             for (why, count) in &st.refused {
                 println!("fuzz     refused {count:5}  {why}");
             }
@@ -1562,6 +1562,9 @@ mod tests {
         for _ in 0..3 {
             request(&mut vm, "api GET /api/hits", &mut HostState::default()).unwrap();
         }
+        assert!(eng.note(&prog).is_none(), "laid out by wasm-ld: nothing to say");
+        let bare = eng.load(&wat::parse_str("(module (memory 1))").unwrap()).unwrap();
+        assert!(eng.note(&bare).is_some_and(|n| n.contains("keeps its whole stack")));
         let saved = vm.freeze().expect("an idle cell freezes");
         // What it changed: its 100 users (built once, kept), and the heap.
         assert!(saved.len() < 16 * 1024, "{} bytes", saved.len());
@@ -1571,6 +1574,46 @@ mod tests {
         for cut in [1, 3, 5, 9] {
             assert!(eng.thaw(&prog, &saved[..saved.len() - cut]).is_err(), "a freeze cut short by {cut} is refused");
         }
+    }
+
+    /// Past the connection cap, and while memory is short, a node answers
+    /// 503 to new connections and sockets; the ones it has go on.
+    #[test]
+    fn a_full_node_refuses_new_work() {
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { max_conns: 2, ..cfg(&dir.0, 1) });
+        let keep = |port: u16| {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(s, "GET /_combd/ping HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();
+            let mut b = [0u8; 12];
+            s.read_exact(&mut b).unwrap();
+            (s, String::from_utf8_lossy(&b).into_owned())
+        };
+        let (a, b) = (keep(port), keep(port));
+        assert_eq!((a.1.as_str(), b.1.as_str()), ("HTTP/1.1 200", "HTTP/1.1 200"));
+        assert_eq!(keep(port).1, "HTTP/1.1 503", "a third, past max_conns");
+        drop((a, b));
+        assert!(eventually(2000, || keep(port).1 == "HTTP/1.1 200"), "room again once they've gone");
+        // A budget it's already over: it refuses, once it has measured.
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { memory_budget: Some(1 << 20), ..cfg(&dir.0, 1) });
+        assert!(eventually(3000, || keep(port).1 == "HTTP/1.1 503"), "over its memory budget");
+    }
+
+    /// `memory_kb` on the AOT tier too: a cell capped under what it needs
+    /// can't grow there, and one capped under where it starts won't start.
+    #[cfg(feature = "aot-lite")]
+    #[test]
+    fn memory_kb_caps_the_aot_tier_too() {
+        let prog = aot::Aot.load(&wasm()).unwrap();
+        let mut vm = aot::Aot.spawn(&prog).unwrap();
+        vm.cap_memory(64).unwrap(); // 4 MiB
+        assert!(request(&mut vm, "sieve 5000000", &mut HostState::default()).is_err(), "5 MB of sieve under a 4 MiB cap");
+        let mut ok = aot::Aot.spawn(&prog).unwrap();
+        assert!(request(&mut ok, "sieve 5000000", &mut HostState::default()).is_ok(), "and fine without one");
+        assert!(aot::Aot.spawn(&prog).unwrap().cap_memory(1).is_err(), "under where it starts");
     }
 
     #[test]
@@ -1659,6 +1702,8 @@ mod tests {
             public: Default::default(),
             catalog: None,
             master_key: None,
+            memory_budget: None,
+            max_conns: u64::MAX,
         }
     }
 

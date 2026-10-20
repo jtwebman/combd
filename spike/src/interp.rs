@@ -1172,6 +1172,11 @@ impl Engine for Interp {
         load(wasm).map(Arc::new)
     }
 
+    /// A frozen cell's dead stack is left out only for a wasm-ld layout.
+    fn note(&self, m: &Arc<Module>) -> Option<String> {
+        (m.mem.0 > 0 && !m.stack_first).then(|| "not laid out by wasm-ld (no __data_end and __heap_base), so a frozen cell keeps its whole stack: safe, just bigger".into())
+    }
+
     fn thaw(&self, m: &Arc<Module>, saved: &[u8]) -> Result<Vm, String> {
         let mut vm = self.spawn(m)?;
         vm.apply(saved).ok_or("not a frozen cell of this module")?;
@@ -1362,7 +1367,10 @@ impl CellVm for Vm {
         // Differences closer than this are one run: a run costs 8 bytes.
         const GAP: usize = 8;
         let (mem, base) = (self.mem.bytes(), &self.m.start[..]);
-        let dead = if self.m.stack_first { (self.globals[0] as u32 as usize).min(mem.len()) } else { 0 };
+        // Only with the stack pointer back where it starts: every frame is
+        // gone. Anywhere else, something unusual is going on: keep it all.
+        let sp = self.globals[0] & 0xffff_ffff;
+        let dead = if self.m.stack_first && sp == self.m.globals[0] & 0xffff_ffff { (sp as usize).min(mem.len()) } else { 0 };
         let was = |j: usize| base.get(j).copied().unwrap_or(0);
         let differs = |j: usize, x: u8| j >= dead && x != was(j);
         let (mut runs, mut n, mut end) = (Vec::new(), 0u32, 0usize);
