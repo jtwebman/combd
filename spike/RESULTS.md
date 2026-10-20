@@ -2272,6 +2272,59 @@ only; not vulnerable to anything it tests (Heartbleed, ROBOT, CRIME, POODLE,
 SWEET32, FREAK, DROWN, LOGJAM, BEAST, LUCKY13, RC4). Its two "not ok"s are
 the test certificate's (our own CA; no CRL or OCSP).
 
+## A load test on a live node: 105,000 connections on a 1 GB droplet (2026-10-20)
+
+n0 (DigitalOcean, nyc3, 1 vCPU, 1 GB RAM, 1 GB swap; combd in single mode,
+one loop) against three load droplets in the same region (`bench/load`,
+their own Terraform state, destroyed after), each holding 35,000 million
+viewers over TLS (`ws-load`, the real Let's Encrypt certificate), each
+sent one range message (a subscription and its 3.9 KB snapshot).
+
+**What broke first, and was fixed on the way:**
+1. **Files, at ~1,000 connections.** The container's soft open-file limit
+   was 1024: combd couldn't open objects' storage, chunk 0 never restored,
+   and the node stopped answering until the load stopped. combd now raises
+   the limit to its ceiling (524,288) and keeps connections under three
+   quarters of it.
+2. **The kernel's connection tracking, at ~8,000.** Docker's rules turn it
+   on, and a 1 GB droplet gets 8,192 entries: past that the kernel drops
+   packets (new connections, and the node's own DNS and bucket traffic).
+   Any server on these droplets stops there, Caddy too. Fixed on n0 by
+   hand: 80 and 443 aren't tracked (`NOTRACK` in the raw table; combd uses
+   the host's network, no NAT), and 65,536 entries for the rest.
+3. **The load droplets' own memory.** A client that never read its sockets
+   left 3.9 KB of each in the kernel and ran out of memory at ~34,000 (the
+   OOM killer took sshd and the client). `ws-load` reads and drops now.
+
+**Then:**
+
+| On n0 | RAM used | Swap used | combd's measure | Ping |
+|---|---|---|---|---|
+| nothing | 390 MB | 48 MB | 12 MB | 0.24 s |
+| 35,000 | 704 MB | 48 MB | 282 MB | 0.24 s |
+| 70,000 | 847 MB | 267 MB | 409 MB | 0.24 s |
+| 105,000 | 855 MB | 518 MB | 379 MB | 0.24 s |
+
+105,000 held, none closed, none refused, and n0 answering as fast as idle
+throughout (the ping is from Oregon). About 9 KB a connection in all
+(RAM and swap, the kernel's included), as measured locally (~10). But it
+took swap: in RAM alone a 1 GB droplet holds about 60,000 (the OS, Docker,
+and the rest take 390 MB before anything else). The sessions are asleep,
+so their memory is cold, and the kernel moved it to swap without harm.
+
+**What it showed that isn't right yet:**
+- **The budget doesn't count swap.** combd's measure is the cgroup's
+  memory, and pages moved to swap leave it (409 MB at 70,000, 379 at
+  105,000): the 85% and 95% lines were never reached. It should count the
+  cgroup's swap too.
+- **Everyone leaving at once took 7.5 minutes,** with the node not
+  answering (and 49 new connections refused). Each closing socket woke its
+  session (from swap, often) to unsubscribe, and million's chunk pruned its
+  subscriptions on every request: with 105,000 on chunk 0, a scan of
+  105,000 per request. The chunk should prune on a timer; a sleeping
+  session whose app doesn't need to hear its close shouldn't be woken for it.
+- **The droplet's own 390 MB.** Trimming Ubuntu's extras would fit more in RAM.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A
