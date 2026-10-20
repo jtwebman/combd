@@ -189,6 +189,7 @@ resource "digitalocean_droplet" "node" {
     tls_cert = "${acme_certificate.arena.certificate_pem}${acme_certificate.arena.issuer_pem}"
     tls_key  = acme_certificate.arena.private_key_pem
     update   = file("${path.module}/combd-update.sh")
+    tune     = file("${path.module}/combd-tune.sh")
   })
   # Running nodes keep what they started with: a change here is for new
   # droplets (the image itself rolls out through combd-update).

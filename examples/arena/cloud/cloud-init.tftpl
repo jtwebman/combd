@@ -44,11 +44,27 @@ write_files:
   - path: /etc/combd/update
     content: |
       COMBD_IMAGE=${image}
+  # Kernel limits and a trimmed OS, at every boot, before Docker (combd-tune).
+  - path: /usr/local/bin/combd-tune
+    permissions: "0755"
+    encoding: b64
+    content: ${base64encode(tune)}
+  - path: /etc/systemd/system/combd-tune.service
+    content: |
+      [Unit]
+      Description=Kernel limits and a trimmed OS for combd
+      Before=docker.service
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/combd-tune
+      [Install]
+      WantedBy=multi-user.target
   - path: /etc/cron.d/combd-update
     content: |
       * * * * * root /usr/local/bin/combd-update
 runcmd:
   # A little swap: 1 GB is tight for combd, Docker, and the OS together.
   - fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  - systemctl daemon-reload && systemctl enable --now combd-tune
   - systemctl enable --now docker
   - docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro ${image} ./target/release/combd-spike serve-fleet interp 443
