@@ -191,6 +191,8 @@ fn schema(kind: &str) -> Option<&'static str> {
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
             mailbox = { type = "int", min = 1, max = 1000000, default = 1000 }
             batch = { type = "int", min = 1, max = 10000, default = 100 }
+            placement = { type = "enum", values = ["first", "spread"], default = "first" }
+            scope = { type = "enum", values = ["zone", "region", "fleet"], default = "region" }
             "memory_kb?" = { type = "int", min = 64, max = 4194304 }
             "#
         }
@@ -200,6 +202,8 @@ fn schema(kind: &str) -> Option<&'static str> {
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
             mailbox = { type = "int", min = 1, max = 1000000, default = 1000 }
             batch = { type = "int", min = 1, max = 10000, default = 100 }
+            placement = { type = "enum", values = ["first", "spread"], default = "first" }
+            scope = { type = "enum", values = ["zone", "region", "fleet"], default = "region" }
             max_concurrent = { type = "int", min = 1, max = 1000, default = 32 }
             fresh = { type = "bool", default = false }
             durable = { type = "bool", default = false }

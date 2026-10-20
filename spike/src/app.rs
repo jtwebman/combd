@@ -53,6 +53,11 @@ pub struct Proc {
     /// `batch`: the most waiting requests an object takes at once, if its
     /// module exports `handle_batch` (one run, one transaction).
     pub batch: usize,
+    /// `placement = "spread"`: in a fleet, a new object starts on the node
+    /// rendezvous hashing picks for its name, not the one that asked first,
+    /// among the nodes in `scope` of the one that asked (its zone, its
+    /// region, or the whole fleet).
+    pub spread: Option<crate::fleet::Scope>,
     /// `memory_kb`, in Wasm pages: the most a cell may grow to.
     pub memory_pages: Option<u32>,
     pub max_concurrent: usize,
@@ -141,7 +146,7 @@ pub struct AppDir<'a> {
 impl<P> App<P> {
     /// One program, the old routes.
     pub fn single(prog: P, max_concurrent: usize) -> App<P> {
-        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, mailbox: usize::MAX, batch: 100, memory_pages: None, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
+        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, mailbox: usize::MAX, batch: 100, spread: None, memory_pages: None, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
         let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default(), pools: vec![] };
         App { progs: vec![Arc::new(prog)], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
     }
@@ -249,6 +254,11 @@ impl<P> App<P> {
                         _ => Sleep::Auto,
                     },
                     state_max: n("state_kb") as usize * 1024,
+                    spread: (p.settings.get("placement").and_then(serde_json::Value::as_str) == Some("spread")).then(|| match p.settings.get("scope").and_then(serde_json::Value::as_str) {
+                        Some("zone") => crate::fleet::Scope::Zone,
+                        Some("fleet") => crate::fleet::Scope::Fleet,
+                        _ => crate::fleet::Scope::Region,
+                    }),
                     batch: p.settings.get("batch").and_then(serde_json::Value::as_u64).map_or(1, |n| n as usize),
                     mailbox: p.settings.get("mailbox").and_then(serde_json::Value::as_u64).map_or(usize::MAX, |n| n as usize),
                     memory_pages: p.settings.get("memory_kb").and_then(serde_json::Value::as_u64).map(|kb| kb.div_ceil(64) as u32),

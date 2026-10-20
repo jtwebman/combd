@@ -3737,6 +3737,16 @@ impl<E: Engine> Loop<'_, E> {
         }
         if self.core.is_some() && !matches!(origin, Origin::Fleet(_)) {
             let hops = if matches!(origin, Origin::Wire(..)) { 1 } else { 0 };
+            // Spread: a new object starts where its name says, not here.
+            if let (0, Some(scope)) = (hops, self.app.procs[self.app.object_proc(&name)].spread) {
+                let f = &self.sh.fleet.as_ref().unwrap().cfg;
+                let all: Vec<own::Node> = f.peers.keys().copied().chain([f.node]).collect::<BTreeSet<_>>().into_iter().collect();
+                let among = crate::fleet::among(&f.regions, f.node, &all, scope);
+                let now = self.core_now();
+                if let Some(n) = self.core.as_ref().unwrap().place(now, own::obj_id(&name), &among) {
+                    return self.forward(n, FReq { origin, name, cell_req: req, hops: 0, act: 0, resp: None, ws: vec![], retries: 0 });
+                }
+            }
             return self.fleet_request(origin, name, req, hops);
         }
         if !self.objects.contains_key(&name) {

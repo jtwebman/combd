@@ -154,6 +154,8 @@ resource "digitalocean_droplet" "node" {
     env = join("\n", [
       "COMBD_NODE=${each.key}",
       "COMBD_PEERS=${local.peers}",
+      # Where each node is, for placement's scope ("spread" within a region).
+      "COMBD_REGIONS=${join(",", [for i, r in var.regions : "${i}=${r}"])}",
       "COMBD_PUBLIC_URLS=${local.public}",
       "COMBD_WIRE_CERTS=/etc/combd/certs",
       "COMBD_REPLICAS=2",

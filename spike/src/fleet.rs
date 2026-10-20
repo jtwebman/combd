@@ -45,6 +45,32 @@ pub struct FleetCfg {
     /// only once every node runs a version that does (an older peer would
     /// promise nothing).
     pub read_lease: bool,
+    /// Where each node is (`COMBD_REGIONS`: `0=nyc3/a,1=fra1/a,...`, a
+    /// region and, after a slash, a zone), for placement's scope. A node
+    /// not listed is in the region (and zone) of every other one not listed.
+    pub regions: HashMap<Node, String>,
+}
+
+/// Placement's scope: which nodes a spread object may start on, seen from
+/// `me`: those in its zone, its region, or all of them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Scope {
+    Zone,
+    Region,
+    Fleet,
+}
+
+pub fn among(regions: &HashMap<Node, String>, me: Node, all: &[Node], scope: Scope) -> Vec<Node> {
+    let place = |n: Node| regions.get(&n).map_or("", String::as_str);
+    let region = |n: Node| place(n).split('/').next().unwrap_or("");
+    all.iter()
+        .copied()
+        .filter(|&n| match scope {
+            Scope::Fleet => true,
+            Scope::Region => region(n) == region(me),
+            Scope::Zone => place(n) == place(me),
+        })
+        .collect()
 }
 
 impl FleetCfg {
@@ -71,7 +97,15 @@ impl FleetCfg {
         // Under the wire's frame limit: a takeover gets the rest in one reply.
         let upload_bytes = std::env::var("COMBD_UPLOAD_BYTES").ok().and_then(|p| p.parse().ok()).unwrap_or(1 << 20).min(16 << 20);
         let read_lease = std::env::var("COMBD_READ_LEASE").as_deref() == Ok("1");
-        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure, upload_ms, upload_bytes, read_lease })
+        let regions = std::env::var("COMBD_REGIONS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|p| {
+                let (n, place) = p.split_once('=')?;
+                Some((n.trim().parse().ok()?, place.trim().to_string()))
+            })
+            .collect();
+        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure, upload_ms, upload_bytes, read_lease, regions })
     }
 }
 
@@ -572,6 +606,18 @@ fn fatal(e: std::io::Error) -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn placement_scope_picks_the_nodes_near() {
+        let regions: HashMap<Node, String> = [(0, "nyc3/a"), (1, "nyc3/b"), (2, "fra1/a"), (3, "nyc3/a")].map(|(n, p)| (n, p.to_string())).into();
+        let all = [0, 1, 2, 3, 4];
+        assert_eq!(among(&regions, 0, &all, Scope::Zone), [0, 3]);
+        assert_eq!(among(&regions, 0, &all, Scope::Region), [0, 1, 3]);
+        assert_eq!(among(&regions, 2, &all, Scope::Region), [2]);
+        assert_eq!(among(&regions, 0, &all, Scope::Fleet), all);
+        assert_eq!(among(&regions, 4, &all, Scope::Region), [4], "unlisted: with the unlisted");
+        assert_eq!(among(&HashMap::new(), 1, &all, Scope::Zone), all, "none listed: one place");
+    }
+
     use super::*;
 
     /// Frames from another node, damaged at random (a buggy or compromised

@@ -468,6 +468,14 @@ pub fn obj_id(name: &str) -> Obj {
     u128::from_be_bytes(Sha256::digest(name.as_bytes())[..16].try_into().unwrap())
 }
 
+/// Rendezvous hashing's score for an object on a node (splitmix64).
+fn spread_score(o: Obj, n: Node) -> u64 {
+    let mut z = (o as u64) ^ ((o >> 64) as u64) ^ (n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 pub fn own_key(o: Obj) -> String {
     format!("own/{o:032x}")
 }
@@ -859,6 +867,25 @@ impl Core {
             Phase::Serving(s) if s.epoch == e => Some(s),
             _ => None,
         }
+    }
+
+    /// Where an object of a spread process (`placement = "spread"`) should
+    /// start: the node rendezvous hashing picks among `among` (its scope)
+    /// heard from within a lease (this one counts), if that isn't this one. `None`:
+    /// start it here, or it's already here or starting, or this core knows
+    /// who has it (and routes there itself). A node going quiet moves only
+    /// its own share.
+    pub fn place(&self, now: u64, o: Obj, among: &[Node]) -> Option<Node> {
+        if self.objs.get(&o).is_some_and(|s| !matches!(s.phase, Phase::Idle)) {
+            return None;
+        }
+        if self.hints.get(&o).is_some_and(|&(_, t)| now.saturating_sub(t) < self.lease_ms) {
+            return None;
+        }
+        let born = self.born.unwrap_or(now);
+        let alive = |n: Node| n == self.node || now.saturating_sub(self.heard.get(&n).copied().unwrap_or(born)) < self.lease_ms;
+        let pick = among.iter().copied().filter(|&n| alive(n)).max_by_key(|&n| spread_score(o, n))?;
+        (pick != self.node).then_some(pick)
     }
 
     pub fn on(&mut self, now: u64, ev: Event) -> Vec<Effect> {
@@ -1659,6 +1686,33 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
+    /// Spread placement: the fleet's nodes share the objects, every core
+    /// agrees on who gets which, and a node gone quiet gets none.
+    #[test]
+    fn spread_places_by_rendezvous_among_live_nodes() {
+        let core = |me| Core::with_lease(me, Bugs::default(), 1000).replicate(vec![0, 1, 2], 2);
+        let objs: Vec<Obj> = (0..64).map(|n| obj_id(&format!("acme/million/chunk/{n}"))).collect();
+        let (mut a, b) = (core(0), core(1));
+        a.on(0, Event::Tick);
+        let at = |c: &Core, now, o| c.place(now, o, &[0, 1, 2]).unwrap_or(c.node);
+        let mut count = [0; 3];
+        for &o in &objs {
+            assert_eq!(at(&a, 0, o), at(&b, 0, o), "every node agrees");
+            count[at(&a, 0, o) as usize] += 1;
+        }
+        assert!(count.iter().all(|&n| n >= 10), "spread: {count:?}");
+        // Node 2 silent for a lease (node 1 heard): its share goes elsewhere, the rest stay.
+        a.on(1500, Event::Heard { node: 1 });
+        for &o in &objs {
+            let before = at(&a, 0, o);
+            let after = at(&a, 1500, o);
+            assert_ne!(after, 2);
+            if before != 2 {
+                assert_eq!(after, before, "only node 2's objects move");
+            }
+        }
+    }
+
     /// Bucket values come from storage anyone may have damaged: the
     /// decoders must never panic.
     #[test]
