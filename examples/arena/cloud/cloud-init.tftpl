@@ -32,6 +32,10 @@ write_files:
     permissions: "0600"
     encoding: b64
     content: ${base64encode(tls_key)}
+  # The builders whose builds of compiled modules this node loads.
+  - path: /etc/combd/builder-keys
+    encoding: b64
+    content: ${base64encode(builders)}
   - path: /etc/combd/env
     permissions: "0600"
     encoding: b64
@@ -67,4 +71,4 @@ runcmd:
   - fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
   - systemctl daemon-reload && systemctl enable --now combd-tune
   - systemctl enable --now docker
-  - docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro ${image} ./target/release/combd-spike serve-fleet interp 443
+  - docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro ${image} ./target/release/combd-spike serve-fleet both 443

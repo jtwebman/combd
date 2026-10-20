@@ -25,6 +25,6 @@ SOCKS=$(curl -sk -m 3 https://127.0.0.1/_combd/stats | sed -n 's/.*"sockets_open
 logger -t combd-update "moving to $NEW"
 docker rm -f combd >/dev/null 2>&1
 docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env \
-    -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro "$IMAGE" ./target/release/combd-spike serve-fleet interp 443 >/dev/null
+    -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro "$IMAGE" ./target/release/combd-spike serve-fleet both 443 >/dev/null
 rm -f $SEEN
 docker image prune -f >/dev/null 2>&1

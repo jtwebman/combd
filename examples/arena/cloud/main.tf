@@ -181,6 +181,8 @@ resource "digitalocean_droplet" "node" {
       # rest. Past 85% it reclaims, past 95% it refuses new work, so the
       # kernel never has to kill it.
       "COMBD_MEMORY_BUDGET=700M",
+      # Compiled modules: builds signed by these builders only.
+      "COMBD_BUILDER_KEYS=/etc/combd/builder-keys",
       "",
     ])
     ca       = file("${local.secrets}/certs/ca.pem")
@@ -190,6 +192,7 @@ resource "digitalocean_droplet" "node" {
     master   = file("${local.secrets}/master.key")
     tls_cert = "${acme_certificate.arena.certificate_pem}${acme_certificate.arena.issuer_pem}"
     tls_key  = acme_certificate.arena.private_key_pem
+    builders = file("${local.secrets}/builder-keys")
     update   = file("${path.module}/combd-update.sh")
     tune     = file("${path.module}/combd-tune.sh")
   })
