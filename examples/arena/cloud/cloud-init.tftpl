@@ -23,25 +23,15 @@ write_files:
     permissions: "0600"
     encoding: b64
     content: ${base64encode(master)}
-  # HTTPS in front of combd: the arena's certificate, port 80 redirected.
-  - path: /etc/caddy/cert.pem
+  # combd ends HTTPS itself (on 443; 80 redirects): the arena's
+  # certificate, which tls.sh replaces when it's renewed.
+  - path: /etc/combd/tls/cert.pem
     encoding: b64
     content: ${base64encode(tls_cert)}
-  - path: /etc/caddy/key.pem
+  - path: /etc/combd/tls/key.pem
     permissions: "0600"
     encoding: b64
     content: ${base64encode(tls_key)}
-  - path: /etc/caddy/Caddyfile
-    content: |
-      ${sites} {
-        tls /etc/caddy/cert.pem /etc/caddy/key.pem
-        # While combd restarts (a new image), hold requests and retry
-        # instead of answering 502.
-        reverse_proxy 127.0.0.1:8080 {
-          lb_try_duration 20s
-          lb_try_interval 250ms
-        }
-      }
   - path: /etc/combd/env
     permissions: "0600"
     encoding: b64
@@ -61,5 +51,4 @@ runcmd:
   # A little swap: 1 GB is tight for combd, Docker, and the OS together.
   - fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
   - systemctl enable --now docker
-  - docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro ${image} ./target/release/combd-spike serve-fleet interp 8080
-  - docker run -d --name caddy --restart unless-stopped --network host -v /etc/caddy:/etc/caddy:ro caddy:2.8.4
+  - docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro ${image} ./target/release/combd-spike serve-fleet interp 443

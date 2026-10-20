@@ -20,11 +20,11 @@ WAITED=$(( $(date +%s) - $(cut -d' ' -f2 $SEEN) ))
 [ $WAITED -ge $(( ${N:-0} * 120 )) ] || exit 0
 # Don't cut off a game: wait while this node has open WebSockets, but no
 # more than 15 minutes past its turn.
-SOCKS=$(curl -s -m 3 http://127.0.0.1:8080/_combd/stats | sed -n 's/.*"sockets_open":\([0-9]*\).*/\1/p')
+SOCKS=$(curl -sk -m 3 https://127.0.0.1/_combd/stats | sed -n 's/.*"sockets_open":\([0-9]*\).*/\1/p')
 [ "${SOCKS:-0}" -gt 0 ] && [ $WAITED -lt $(( ${N:-0} * 120 + 900 )) ] && exit 0
 logger -t combd-update "moving to $NEW"
 docker rm -f combd >/dev/null 2>&1
 docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env \
-    -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro "$IMAGE" ./target/release/combd-spike serve-fleet interp 8080 >/dev/null
+    -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro "$IMAGE" ./target/release/combd-spike serve-fleet interp 443 >/dev/null
 rm -f $SEEN
 docker image prune -f >/dev/null 2>&1

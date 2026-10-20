@@ -10,7 +10,7 @@ for n in 0 1 2; do
     echo "n$n.$HOST: pulling $IMAGE and restarting combd"
     ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "root@n$n.$HOST" "docker pull -q $IMAGE >/dev/null && docker rm -f combd >/dev/null && \
         docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env \
-        -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro $IMAGE ./target/release/combd-spike serve-fleet interp 8080 >/dev/null"
+        -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro $IMAGE ./target/release/combd-spike serve-fleet interp 443 >/dev/null"
     i=0; until curl -sf -m 3 -o /dev/null "https://n$n.$HOST/_combd/ping"; do i=$((i + 1)); [ $i -gt 60 ] && { echo "  no answer after 3 minutes"; exit 1; }; sleep 3; done
     echo "  up"
 done

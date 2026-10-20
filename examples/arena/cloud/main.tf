@@ -3,8 +3,8 @@
 # with the nearest healthy node, DNS only (not proxied, so a player's ping is
 # to the node itself). Each node also gets its own name, n<i>.arena.<domain>.
 # HTTPS (a .dev name must have it): a Let's Encrypt certificate for the name
-# and *.name, got through a DNS challenge on Cloudflare, served by Caddy on
-# each node in front of combd.
+# and *.name, got through a DNS challenge on Cloudflare, served by combd
+# itself on each node (single mode: it ends TLS; 80 redirects).
 #
 #   ./up.sh     secrets, then terraform apply, then deploy the game
 #   ./down.sh   terraform destroy (the bucket stays: empty it to delete it)
@@ -171,6 +171,10 @@ resource "digitalocean_droplet" "node" {
       # Every node keeps its peers' promises (the version this fleet started
       # on does), so owners may answer reads under a lease.
       "COMBD_READ_LEASE=1",
+      # HTTPS ended here, on 443 (single mode); 80 sends plain HTTP there.
+      "COMBD_TLS_CERT=/etc/combd/tls/cert.pem",
+      "COMBD_TLS_KEY=/etc/combd/tls/key.pem",
+      "COMBD_REDIRECT_PORT=80",
       "",
     ])
     ca       = file("${local.secrets}/certs/ca.pem")
@@ -180,7 +184,6 @@ resource "digitalocean_droplet" "node" {
     master   = file("${local.secrets}/master.key")
     tls_cert = "${acme_certificate.arena.certificate_pem}${acme_certificate.arena.issuer_pem}"
     tls_key  = acme_certificate.arena.private_key_pem
-    sites    = join(", ", concat([local.host, "*.${local.host}"], local.apps))
     update   = file("${path.module}/combd-update.sh")
   })
   # Running nodes keep what they started with: a change here is for new
@@ -329,9 +332,4 @@ output "host" {
 
 output "nodes" {
   value = { for k, d in digitalocean_droplet.node : "n${k}.${local.host}" => "${d.ipv4_address} (${d.region})" }
-}
-
-# Every name Caddy answers (tls.sh).
-output "sites" {
-  value = join(", ", concat([local.host, "*.${local.host}"], local.apps))
 }

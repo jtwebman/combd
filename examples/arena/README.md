@@ -109,8 +109,10 @@ plays on the nearest node either way: the page measures its round trip to
 each, and the matchmaker picks by those. Each node also
 has its own name, `n0.arena.<domain>` and so on. HTTPS throughout (a
 `.dev` name must have it): Terraform gets a Let's Encrypt certificate for
-the name and `*.name` through a DNS challenge, and Caddy serves it on each
-node in front of combd.
+the name and `*.name` through a DNS challenge, and combd serves it itself
+on each node (single mode: it ends TLS on 443, and 80 redirects there).
+Until 2026-10-20 Caddy did, in front: a node held about 9,500 connections
+then, about 70,000 now (`spike/RESULTS.md`, "What a node holds").
 
 1. GitHub builds the image (`.github/workflows/arena-image.yml`) on each
    push; make the `combd-arena` package public once so droplets can pull it.
@@ -125,13 +127,16 @@ node in front of combd.
 6. After that, a push to `main` rolls out by itself: CI says a new version
    is coming (no new matches), waits for live ones to end, and deploys the
    game; a change to combd itself also moves each node to the new image
-   (about 40 MB), one at a time, while Caddy holds requests until it's back
-   (a few seconds). A change to docs alone does nothing.
+   (about 40 MB), one at a time. While one restarts (a few seconds) it
+   refuses new connections, and browsers try another of the name's nodes;
+   holding them instead (the socket kept open across the restart) is next.
+   A change to docs alone does nothing.
 7. Other apps share the nodes: each in `apps` (in `cloud/main.tf`; the
    million checkboxes by default) gets `<app>.<domain>` in the certificate
    and DNS. Running nodes keep the certificate they started with, so after
    a `terraform apply` that changes it (a new app, or a renewal),
-   `cloud/tls.sh` gives every node the new one and reloads Caddy. With more
+   `cloud/tls.sh` gives every node the new one; combd picks it up within
+   seconds, for new connections. With more
    than one app on the nodes, each names its domains in its manifest.
 8. **A push sends the bundle before the nodes move to the new image.** So a
    change the old combd can't read (the manifest's format, 2026-10-19) is
