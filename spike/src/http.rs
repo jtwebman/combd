@@ -341,7 +341,15 @@ struct Shared {
     fleet: Option<FleetShared>,
     /// TLS as loaded, and when its certificate's file last changed.
     tls: Mutex<Option<(Arc<rustls::ServerConfig>, std::time::SystemTime)>>,
+    /// Per process (`org/app/proc`): the time its cells ran, in us, host
+    /// calls included, and the slices they ran in. Each loop adds its own
+    /// every 250 ms.
+    procs: Mutex<BTreeMap<String, (u64, u64)>>,
 }
+
+/// How long a cell runs before others get a turn: a slice, and the host
+/// calls it makes that are done at once.
+const SLICE_TIME: Duration = Duration::from_micros(100);
 
 /// Fleet mode: what the loops share.
 struct FleetShared {
@@ -901,10 +909,10 @@ where
     std::thread::scope(|sc| {
         let (live, stop) = (&live, cfg.stop.clone());
         if let Some(admin) = admin {
-            let (s3, stop, cat) = (&s3, cfg.stop.clone(), cat.clone());
+            let (s3, stop, cat, public) = (&s3, cfg.stop.clone(), cat.clone(), cfg.public.clone());
             let scratch = scratch.clone();
             sc.spawn(move || {
-                let api = NodeApi { eng, live, s3, cat, scratch, master };
+                let api = NodeApi { eng, public, live, s3, cat, scratch, master };
                 if let Err(e) = crate::admin::serve(admin, &api, &stop) {
                     eprintln!("combd     the admin API stopped: {e}");
                 }
@@ -935,6 +943,8 @@ where
 /// The admin API's work on a node of a fleet.
 struct NodeApi<'a, E: Engine> {
     eng: &'a E,
+    /// Every node's public address (`COMBD_PUBLIC_URLS`), to gather stats.
+    public: BTreeMap<u32, String>,
     live: &'a Live<E::Program>,
     s3: &'a crate::s3::S3,
     cat: Arc<crate::catnode::CatNode>,
@@ -964,6 +974,24 @@ where
 
     fn current(&self, org: &str, app: &str) -> Result<Option<String>, String> {
         Ok(crate::deploy::live(&self.cat.now().0, org, app))
+    }
+
+    /// Every node's stats, asked at once (3 s each at most): a node that
+    /// doesn't answer says why, and the rest still come.
+    fn nodes(&self) -> Result<serde_json::Value, String> {
+        if self.public.is_empty() {
+            return Err("no nodes to ask: set COMBD_PUBLIC_URLS".into());
+        }
+        let got: Vec<serde_json::Value> = std::thread::scope(|sc| {
+            let asks: Vec<_> = self.public.iter().map(|(&n, url)| (n, url.clone(), sc.spawn(move || crate::admin::get_json(&format!("{}/_combd/stats", url.trim_end_matches('/')))))).collect();
+            asks.into_iter()
+                .map(|(n, url, t)| match t.join().unwrap_or_else(|_| Err("panicked".into())) {
+                    Ok(stats) => serde_json::json!({ "node": n, "url": url, "stats": stats }),
+                    Err(e) => serde_json::json!({ "node": n, "url": url, "error": e }),
+                })
+                .collect()
+        });
+        Ok(serde_json::json!({ "nodes": got }))
     }
 
     /// An earlier version, checked again (vars may have changed since).
@@ -1279,6 +1307,7 @@ where
         stats: Stats { checkpoints, fsyncs_slow: slow, fsync_max_us: max_us, ..Stats::default() },
         fleet,
         tls: Mutex::new(tls),
+        procs: Mutex::new(BTreeMap::new()),
     };
     let sh = &sh;
     std::thread::scope(|sc| {
@@ -1324,6 +1353,7 @@ where
                     sessions: HashMap::new(),
                     last_tls_check: Instant::now(),
                     last_conn_check: Instant::now(),
+                    ran: vec![],
                     last_accept_warning: Instant::now(),
                     next_sock: 0,
                     boot: {
@@ -1406,6 +1436,9 @@ struct Loop<'a, E: Engine> {
     /// its connections' timeouts.
     last_tls_check: Instant,
     last_conn_check: Instant,
+    /// Per process (by index): the ns its cells ran and the slices, since
+    /// they last went into `Shared::procs`.
+    ran: Vec<(u64, u64)>,
     last_accept_warning: Instant,
     next_sock: u64,
     /// Random bits for socket ids, so a restart never reuses one.
@@ -1769,7 +1802,33 @@ impl<E: Engine> Loop<'_, E> {
                     }
                     *n += 1;
                 }
-                let answer = match t.cell.vm.run(crate::SLICE) {
+                // A host call that's done at once (a send, the clock, a query
+                // that didn't wait) costs the cell no round: it goes on, in
+                // its slice's time. Before, each was a trip round the loop
+                // (14 us on an M4), so a chunk telling 160 watchers took 160.
+                let (proc, started) = (t.cell.proc, Instant::now());
+                let outcome = loop {
+                    let o = t.cell.vm.run(crate::SLICE);
+                    let Outcome::HostCall { import, args } = o else { break Ok(o) };
+                    let r = crate::serve(&mut t.cell.vm, import, &args, &mut t.cell.st);
+                    if r.is_err() || t.cell.st.pending.is_some() || started.elapsed() >= SLICE_TIME {
+                        break Err(r);
+                    }
+                };
+                self.ran(proc, started, 1);
+                // Out of time after a host call, or one that waits: as before.
+                let outcome = match outcome {
+                    Ok(o) => o,
+                    Err(Ok(())) => {
+                        match t.cell.st.pending.take() {
+                            Some(op) => self.park(t, op, true),
+                            None => self.tasks.push_back(t),
+                        }
+                        continue;
+                    }
+                    Err(Err(trap)) => Outcome::Trap(trap),
+                };
+                let answer = match outcome {
                     Outcome::Yield => {
                         // A compiled cell paused inside a database call: park it.
                         match t.cell.vm.db_pending() {
@@ -1778,16 +1837,7 @@ impl<E: Engine> Loop<'_, E> {
                         }
                         continue;
                     }
-                    Outcome::HostCall { import, args } => match crate::serve(&mut t.cell.vm, import, &args, &mut t.cell.st) {
-                        Ok(()) => {
-                            match t.cell.st.pending.take() {
-                                Some(op) => self.park(t, op, true),
-                                None => self.tasks.push_back(t),
-                            }
-                            continue;
-                        }
-                        Err(trap) => Err(trap),
-                    },
+                    Outcome::HostCall { .. } => unreachable!("served above"),
                     // An event cell's callback answers by `respond`, not by return.
                     Outcome::Done(_) if t.ev.is_some() => Ok(String::new()),
                     Outcome::Done(r) => {
@@ -3189,6 +3239,7 @@ impl<E: Engine> Loop<'_, E> {
         if self.last_conn_check.elapsed() >= Duration::from_millis(250) {
             self.last_conn_check = Instant::now();
             self.check_conns();
+            self.publish_ran();
         }
         let squeeze = self.sh.stats.pressure.load(Relaxed) >= 1;
         let idle = self.idle_limit();
@@ -3301,6 +3352,32 @@ impl<E: Engine> Loop<'_, E> {
     /// past the read timeout gets 408; a new one that sent nothing, a kept
     /// one idle past keep-alive, or a TLS handshake that drags, just closes.
     /// WebSockets and requests at work are left alone.
+    fn ran(&mut self, proc: usize, at: Instant, slices: u64) {
+        if self.ran.len() <= proc {
+            self.ran.resize(proc + 1, (0, 0));
+        }
+        let r = &mut self.ran[proc];
+        r.0 += at.elapsed().as_nanos() as u64;
+        r.1 += slices;
+    }
+
+    /// This loop's time per process, into what the node shows (by name, as
+    /// a deploy renumbers them).
+    fn publish_ran(&mut self) {
+        if self.ran.iter().all(|r| r.1 == 0 && r.0 == 0) {
+            return;
+        }
+        let mut procs = self.sh.procs.lock().unwrap();
+        for (i, r) in self.ran.iter_mut().enumerate().filter(|(_, r)| r.0 > 0) {
+            let Some(p) = self.app.procs.get(i) else { continue };
+            let t = &self.app.tenants[p.tenant];
+            let e = procs.entry(format!("{}/{}/{}", t.org, t.app, p.name)).or_default();
+            e.0 += r.0 / 1000;
+            e.1 += r.1;
+            *r = (0, 0);
+        }
+    }
+
     fn check_conns(&mut self) {
         let (lim, now) = (&self.sh.cfg.limits, Instant::now());
         let mut late = vec![];
@@ -3474,6 +3551,11 @@ impl<E: Engine> Loop<'_, E> {
                     s.ev_instances.load(Relaxed),
                     s.ev_requests.load(Relaxed)
                 );
+                // Per process: the time its cells ran (us, host calls in) and their slices.
+                let procs: serde_json::Map<String, serde_json::Value> = self.sh.procs.lock().unwrap().iter().map(|(k, &(us, slices))| (k.clone(), serde_json::json!({ "cpu_us": us, "slices": slices }))).collect();
+                let node = self.sh.fleet.as_ref().map(|f| f.cfg.node);
+                let tail = serde_json::json!({ "node": node, "version": option_env!("COMBD_VERSION").unwrap_or("dev"), "procs": procs }).to_string();
+                let body = format!("{},{}", &body[..body.len() - 1], &tail[1..]);
                 self.queue_reply(who, (200, body));
             }
             Req::NewId => self.queue_reply(who, (200, format!("{{\"id\":\"{}\"}}", uuid_v7()))),

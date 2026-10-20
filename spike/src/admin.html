@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>combd</title>
+<style>
+  :root { --bg: #fff; --fg: #111; --dim: #666; --line: #e3e3e3; --bad: #b3261e; --bar: #2a6df4; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #eee; --dim: #999; --line: #2a2a2a; --bad: #ff6b60; --bar: #6d9cff; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; margin-bottom: 16px; }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 15px; margin: 24px 0 8px; }
+  .dim { color: var(--dim); }
+  .bad { color: var(--bad); }
+  input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--fg); width: 22em; max-width: 100%; }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 4px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-weight: 600; color: var(--dim); }
+  .bar { display: inline-block; height: 8px; background: var(--bar); border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>combd</h1>
+  <span id="when" class="dim"></span>
+  <label style="margin-left:auto">Token <input id="token" type="password" autocomplete="off" placeholder="a */*:read token"></label>
+</header>
+<div id="msg" class="dim">Paste a token to see the cluster.</div>
+
+<h2>Nodes</h2>
+<div class="wrap"><table id="nodes"><thead><tr>
+  <th>Node</th><th>Version</th><th>Connections</th><th>Sessions (asleep)</th><th>Memory</th><th>Pressure</th><th>Mailbox refused</th><th>Batched</th>
+</tr></thead><tbody></tbody></table></div>
+
+<h2>Processes <span class="dim">(CPU per core, over the last poll)</span></h2>
+<div class="wrap"><table id="procs"><thead><tr>
+  <th>Process</th><th>CPU</th><th>Slices/s</th><th>On nodes</th>
+</tr></thead><tbody></tbody></table></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const tok = $("token");
+try { tok.value = sessionStorage.getItem("combd-token") || ""; } catch {}
+tok.addEventListener("change", () => { try { sessionStorage.setItem("combd-token", tok.value); } catch {} poll(); });
+
+const mb = (b) => (b / 1048576).toFixed(0) + " MB";
+const n = (x) => (x ?? 0).toLocaleString();
+// The last sample of each node's processes: (time, {proc: [cpu_us, slices]}).
+const last = new Map();
+
+function row(tbody, cells) {
+  const tr = document.createElement("tr");
+  for (const c of cells) {
+    const td = document.createElement("td");
+    if (c instanceof Node) td.append(c); else td.textContent = c;
+    tr.append(td);
+  }
+  tbody.append(tr);
+}
+
+function cpuCell(share) {
+  const s = document.createElement("span");
+  const bar = document.createElement("span");
+  bar.className = "bar";
+  bar.style.width = Math.round(Math.min(1, share) * 80) + "px";
+  s.append(bar, (share * 100).toFixed(1) + "%");
+  return s;
+}
+
+async function poll() {
+  if (!tok.value) return;
+  let r;
+  try {
+    r = await fetch("/v1/nodes", { headers: { authorization: "Bearer " + tok.value } });
+  } catch (e) { $("msg").textContent = "Can't reach this node: " + e; $("msg").className = "bad"; return; }
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) { $("msg").textContent = body.error || ("HTTP " + r.status); $("msg").className = "bad"; return; }
+  $("msg").textContent = ""; $("when").textContent = "as of " + new Date().toLocaleTimeString();
+  const nodes = $("nodes").tBodies[0], procs = $("procs").tBodies[0];
+  nodes.replaceChildren(); procs.replaceChildren();
+  const now = performance.now(), sum = new Map();
+  for (const x of body.nodes || []) {
+    if (x.error) {
+      const e = document.createElement("span"); e.className = "bad"; e.textContent = x.error;
+      row(nodes, ["n" + x.node, e, "", "", "", "", "", ""]);
+      continue;
+    }
+    const s = x.stats;
+    row(nodes, [
+      "n" + x.node, s.version, n(s.conns_open),
+      `${n(s.sessions_live)} (${n(s.sessions_hibernated)})`,
+      s.memory_budget ? `${mb(s.memory_used)} of ${mb(s.memory_budget)}` : mb(s.memory_used),
+      ["ok", "reclaiming", "refusing"][s.pressure] ?? s.pressure,
+      n(s.mailbox_refused), n(s.batched),
+    ]);
+    const prev = last.get(x.node);
+    for (const [name, p] of Object.entries(s.procs || {})) {
+      const a = sum.get(name) || { cpu: 0, slices: 0, nodes: new Set() };
+      const was = prev?.procs[name];
+      if (prev && was) {
+        const secs = (now - prev.at) / 1000;
+        a.cpu += (p.cpu_us - was.cpu_us) / 1e6 / secs;
+        a.slices += (p.slices - was.slices) / secs;
+      }
+      a.nodes.add("n" + x.node);
+      sum.set(name, a);
+    }
+    last.set(x.node, { at: now, procs: s.procs || {} });
+  }
+  for (const [name, a] of [...sum].sort((x, y) => y[1].cpu - x[1].cpu)) {
+    row(procs, [name, cpuCell(a.cpu), Math.round(a.slices).toLocaleString(), [...a.nodes].join(" ")]);
+  }
+}
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

@@ -72,11 +72,39 @@ pub fn load_tls(dir: &Path, node: Node) -> Result<Tls, String> {
 /// The admin API's TLS: this node's certificate, and no client
 /// certificate (clients show a token instead).
 pub fn admin_tls(dir: &Path, node: Node) -> Result<Arc<rustls::ServerConfig>, String> {
+    admin_tls_with(dir, node, None)
+}
+
+/// The admin API's TLS: the fleet's certificate for its own names
+/// (`node0.combd`, what the CLI checks), and with `public` (the node's
+/// public certificate and key files), that one for every other name, so a
+/// browser can open the panel. ponytail: the public one as it was at start;
+/// a renewal reaches the panel at the next restart.
+pub fn admin_tls_with(dir: &Path, node: Node, public: Option<(&Path, &Path)>) -> Result<Arc<rustls::ServerConfig>, String> {
     let e = |what: &str, x: &dyn std::fmt::Display| format!("{what}: {x}");
-    let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(dir.join(format!("node{node}.pem"))).map_err(|x| e("node cert", &x))?.collect::<Result<_, _>>().map_err(|x| e("node cert", &x))?;
-    let key = PrivateKeyDer::from_pem_file(dir.join(format!("node{node}.key"))).map_err(|x| e("node key", &x))?;
-    let c = rustls::ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions().map_err(|x| e("tls", &x))?.with_no_client_auth().with_single_cert(certs, key).map_err(|x| e("server cert", &x))?;
+    let load = |cert: &Path, key: &Path| -> Result<Arc<rustls::sign::CertifiedKey>, String> {
+        let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(cert).map_err(|x| e("cert", &x))?.collect::<Result<_, _>>().map_err(|x| e("cert", &x))?;
+        let key = PrivateKeyDer::from_pem_file(key).map_err(|x| e("key", &x))?;
+        let signer = provider().key_provider.load_private_key(key).map_err(|x| e("key", &x))?;
+        Ok(Arc::new(rustls::sign::CertifiedKey::new(certs, signer)))
+    };
+    let fleet = load(&dir.join(format!("node{node}.pem")), &dir.join(format!("node{node}.key")))?;
+    let public = public.map(|(c, k)| load(c, k)).transpose()?;
+    let c = rustls::ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions().map_err(|x| e("tls", &x))?.with_no_client_auth().with_cert_resolver(Arc::new(AdminCerts { fleet, public }));
     Ok(Arc::new(c))
+}
+
+#[derive(Debug)]
+struct AdminCerts {
+    fleet: Arc<rustls::sign::CertifiedKey>,
+    public: Option<Arc<rustls::sign::CertifiedKey>>,
+}
+
+impl rustls::server::ResolvesServerCert for AdminCerts {
+    fn resolve(&self, hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let fleet_name = hello.server_name().is_none_or(|n| n.ends_with(".combd"));
+        Some(if fleet_name { self.fleet.clone() } else { self.public.clone().unwrap_or_else(|| self.fleet.clone()) })
+    }
 }
 
 /// A client for the admin API that trusts the fleet CA in `ca`.

@@ -1192,6 +1192,21 @@ what it needs, and it runs only where that is.
 5. Node targets (x86-64 levels, ARM64), and a build per target.
 6. Million and the arena compiled, and the click test again.
 
+**Queued after it:**
+- **The click test against celld and workerd** (and Cloudflare, for cost
+  and latency): a Workers version of million, `ws-click` against each on
+  the same droplet size, sessions per GB and changes per second side by
+  side. After AOT, so combd isn't measured on its interpreter against
+  their JITs.
+- **Million: hot chunks split.** On the real site most people land at box
+  1, so chunk 0 is hot while the rest idle. A supervisor holds the chunk
+  map; a chunk that runs big batches or refuses work asks to split, and
+  its halves (new ids, spread in the region) take its bits; viewers get
+  the map with their next renewal. Pays only where the halves can run on
+  different cores or nodes, and it doesn't cut pushes (a viewer of both
+  halves gets every change); it spreads them. Test it with most viewers
+  at the top, not spread evenly.
+
 ## The edge: TLS in combd, or edge nodes in front (2026-10-20)
 
 combd gets an idle connection down to 2.24 KB, but in front of it on each

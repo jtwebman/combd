@@ -46,7 +46,7 @@ const KEEP_IDLE: Duration = Duration::from_secs(10);
 const MAX_POOLED: usize = 16;
 
 /// HTTPS: Mozilla's root certificates, made once.
-fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+pub fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
     static C: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
     C.get_or_init(|| {
         let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };

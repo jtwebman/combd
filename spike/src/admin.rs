@@ -16,6 +16,8 @@
 //! PUT    /v1/apps/<org>/<app>/vars      {"NAME": value, ...}: set vars
 //! PUT    /v1/apps/<org>/<app>/secrets/<name>   the value (the body): set it
 //! DELETE /v1/apps/<org>/<app>/secrets/<name>   delete it
+//! GET    /v1/nodes                      every node's stats (a `*/*:read` token)
+//! GET    /                              the panel: those, as a page
 //! ```
 //!
 //! Secrets are write-only: nothing reads one back.
@@ -43,7 +45,11 @@ impl AdminCfg {
         let port = port.parse().map_err(|_| "COMBD_ADMIN_PORT: want a port")?;
         let file = std::env::var("COMBD_ADMIN_TOKENS").map_err(|_| "COMBD_ADMIN_PORT needs COMBD_ADMIN_TOKENS (a file of token hashes)")?;
         let tokens = parse_tokens(&std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?)?;
-        let tls = certs.map(|d| crate::wire::admin_tls(d, node)).transpose()?;
+        // The node's public certificate too, if it ends TLS itself: then a
+        // browser can open the panel at its public name.
+        let (cert, key) = (std::env::var("COMBD_TLS_CERT").ok(), std::env::var("COMBD_TLS_KEY").ok());
+        let public = cert.as_deref().zip(key.as_deref()).map(|(c, k)| (std::path::Path::new(c), std::path::Path::new(k)));
+        let tls = certs.map(|d| crate::wire::admin_tls_with(d, node, public)).transpose()?;
         Ok(Some(AdminCfg { port, public: tls.is_some(), tls, tokens }))
     }
 }
@@ -113,6 +119,42 @@ pub trait Api: Sync {
     fn set_vars(&self, org: &str, app: &str, vars: BTreeMap<String, Json>) -> Result<(), String>;
     /// `None`: delete it.
     fn set_secret(&self, org: &str, app: &str, name: &str, value: Option<&[u8]>) -> Result<(), String>;
+    /// Every node: its stats, or why it didn't answer.
+    fn nodes(&self) -> Result<Json, String> {
+        Err("not in a fleet".into())
+    }
+}
+
+/// GET a JSON answer from `url` (http or https, Mozilla's roots), in 3 s.
+pub fn get_json(url: &str) -> Result<Json, String> {
+    let (tls, rest) = match url.split_once("://") {
+        Some(("https", r)) => (true, r),
+        Some(("http", r)) => (false, r),
+        _ => return Err(format!("{url}: want http:// or https://")),
+    };
+    let (hostport, path) = rest.split_once('/').map_or((rest, "/".to_string()), |(h, p)| (h, format!("/{p}")));
+    let host = hostport.rsplit_once(':').map_or(hostport, |(h, _)| h);
+    let addr = if hostport.contains(':') { hostport.to_string() } else { format!("{hostport}:{}", if tls { 443 } else { 80 }) };
+    let t = std::time::Duration::from_secs(3);
+    let a = std::net::ToSocketAddrs::to_socket_addrs(&addr).map_err(|e| format!("{addr}: {e}"))?.next().ok_or(format!("{addr}: no address"))?;
+    let s = std::net::TcpStream::connect_timeout(&a, t).map_err(|e| format!("{addr}: {e}"))?;
+    let _ = s.set_read_timeout(Some(t));
+    let head = format!("GET {path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n");
+    let mut out = vec![];
+    let go = |s: &mut dyn ReadWrite, out: &mut Vec<u8>| s.write_all(head.as_bytes()).and_then(|()| s.read_to_end(out)).map(|_| ());
+    let r = if tls {
+        let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
+        let conn = rustls::ClientConnection::new(crate::s3::tls_config(), name).map_err(|e| e.to_string())?;
+        go(&mut rustls::StreamOwned::new(conn, s), &mut out)
+    } else {
+        go(&mut { s }, &mut out)
+    };
+    if out.is_empty() {
+        return Err(r.err().map_or("no answer".into(), |e| e.to_string()));
+    }
+    let text = String::from_utf8_lossy(&out);
+    let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+    serde_json::from_str(body).map_err(|_| format!("{url}: not JSON"))
 }
 
 /// Serve the admin API (blocking: a thread per connection; it's for
@@ -154,9 +196,17 @@ pub fn serve(cfg: AdminCfg, api: &dyn Api, stop: &std::sync::atomic::AtomicBool)
     Ok(())
 }
 
+/// The panel: a page that asks `/v1/nodes` with the token it's given.
+const PANEL: &str = include_str!("admin.html");
+
 fn handle(s: &mut (impl Read + Write), raw: &std::net::TcpStream, cfg: &AdminCfg, api: &dyn Api) {
     // The token is checked on the headers, before any of a body is read.
     let (status, body, early) = match read_request(s, |m, p, t| authorize(cfg, m, p, t)) {
+        Ok(Ok((method, path, _))) if method == "GET" && path == "/" => {
+            let _ = write!(s, "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncache-control: no-store\r\nx-frame-options: DENY\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{PANEL}", PANEL.len());
+            let _ = s.flush();
+            return;
+        }
         Ok(Ok((method, path, body))) => {
             let (st, b) = run(api, &method, &path, &body);
             (st, b, false)
@@ -234,6 +284,8 @@ fn endpoint<'a>(method: &str, path: &'a str) -> Option<(&'a str, &'a str, Vec<&'
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     let (org, app, rest) = match parts.as_slice() {
         ["v1", "apps", org, app, rest @ ..] => (*org, *app, rest.to_vec()),
+        // The cluster's own: a token for every app (`*/*`).
+        ["v1", "nodes"] if method == "GET" => return Some(("*", "*", vec!["nodes"], "read")),
         _ => return None,
     };
     let action = match (method, rest.as_slice()) {
@@ -247,6 +299,10 @@ fn endpoint<'a>(method: &str, path: &'a str) -> Option<(&'a str, &'a str, Vec<&'
 }
 
 fn authorize(cfg: &AdminCfg, method: &str, path: &str, token: Option<&str>) -> Result<(), Refused> {
+    // The page itself holds nothing: it asks with the token you give it.
+    if (method, path) == ("GET", "/") {
+        return Ok(());
+    }
     let Some((org, app, _, action)) = endpoint(method, path) else { return Err((404, json!({ "error": "no such endpoint" }))) };
     let Some(token) = token else { return Err((401, json!({ "error": "want Authorization: Bearer <token>" }))) };
     if !allowed(&cfg.tokens, token, org, app, action) {
@@ -258,6 +314,12 @@ fn authorize(cfg: &AdminCfg, method: &str, path: &str, token: Option<&str>) -> R
 
 fn run(api: &dyn Api, method: &str, path: &str, body: &[u8]) -> (u16, Json) {
     let Some((org, app, rest, _)) = endpoint(method, path) else { return (404, json!({ "error": "no such endpoint" })) };
+    if (org, app) == ("*", "*") {
+        return match api.nodes() {
+            Ok(v) => (200, v),
+            Err(e) => (400, json!({ "error": e })),
+        };
+    }
     let r = match (method, rest.as_slice()) {
         ("PUT", []) => api.deploy(org, app, body).map(|v| json!({ "version": v })),
         ("GET", []) => api.current(org, app).map(|v| json!({ "version": v })),

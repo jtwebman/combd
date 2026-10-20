@@ -1727,6 +1727,19 @@ mod tests {
         assert!(eventually(2000, || stat(port, "sessions_live") == 1), "and takes new sessions");
     }
 
+    /// Stats count each process's time: an object busy for 300 ms shows it.
+    #[test]
+    fn stats_count_each_process_time() {
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, cfg(&dir.0, 1));
+        assert_eq!(http(port, "POST", "/do/t/busy", "300").0, 200);
+        let procs = || serde_json::from_str::<serde_json::Value>(&http(port, "GET", "/_combd/stats", "").1).unwrap()["procs"].clone();
+        assert!(eventually(2000, || procs().as_object().is_some_and(|m| !m.is_empty())), "{}", procs());
+        let (name, p) = procs().as_object().unwrap().iter().next().map(|(k, v)| (k.clone(), v.clone())).unwrap();
+        assert!(p["cpu_us"].as_u64().unwrap() >= 100_000, "{name}: {p} (300 ms busy: most of it, even on a loaded machine)");
+        assert!(p["slices"].as_u64().unwrap() >= 2, "{name}: {p}");
+    }
+
     /// A busy object's mailbox fills: what comes past `mailbox` is refused
     /// at once (503, overloaded), not queued, and the object goes on.
     #[test]
@@ -2115,10 +2128,12 @@ mod tests {
     fn http_to(port: u16, host: &str, method: &str, path: &str, body: &str) -> (u16, String) {
         use std::io::{Read, Write};
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // Never forever: a server that doesn't answer fails the test, named.
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
         write!(s, "{method} {path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}", body.len()).unwrap();
         let mut out = String::new();
         let r = s.read_to_string(&mut out);
-        assert!(r.is_ok() && out.len() >= 12, "{method} {path}: no answer ({r:?}, {out:?})");
+        assert!(r.is_ok() && out.len() >= 12, "{method} {path} on {port}: no answer ({r:?}, {out:?})");
         let status = out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
         (status, out.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_string())
     }
@@ -3464,7 +3479,10 @@ callers = ["api"]
         // Node 0 has the admin API, over TLS with the fleet's certificates.
         let (token, line) = admin::new_token(&["acme/*:*"]);
         let (weak, weak_line) = admin::new_token(&["acme/blog:deploy"]);
+        let (ops, ops_line) = admin::new_token(&["*/*:read"]);
         let admin_ports = free_ports(2);
+        let ports = free_ports(3);
+        let public: std::collections::BTreeMap<u32, String> = (0..3).map(|n| (n, format!("http://127.0.0.1:{}", ports[n as usize]))).collect();
         let admin_port = admin_ports[0];
         let certs = dir.0.join("certs");
         let master = dir.0.join("master.key");
@@ -3472,10 +3490,10 @@ callers = ["api"]
         let nodes: Vec<u16> = (0..3u32)
             .map(|n| {
                 let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new() };
-                let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), ..cfg(&dir.0.join(format!("d{n}")), 2) };
+                let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), public: public.clone(), ..cfg(&dir.0.join(format!("d{n}")), 2) };
                 // Nodes 0 and 1 take deploys (to race them against each other).
-                let admin = (n < 2).then(|| admin::AdminCfg { port: admin_ports[n as usize], public: true, tls: Some(wire::admin_tls(&certs, n).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}")).unwrap() });
-                let port = free_ports(1)[0];
+                let admin = (n < 2).then(|| admin::AdminCfg { port: admin_ports[n as usize], public: true, tls: Some(wire::admin_tls(&certs, n).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}\n{ops_line}")).unwrap() });
+                let port = ports[n as usize];
                 std::thread::spawn(move || http::serve_fleet_apps(&interp::Interp { max_pages: 16384 }, port, c, admin).unwrap());
                 port
             })
@@ -3488,6 +3506,14 @@ callers = ["api"]
             assert!(eventually(10_000, || std::net::TcpStream::connect(("127.0.0.1", p)).is_ok()));
             stat(p, "fences");
         }
+        // The cluster's view: a `*/*` token sees every node; an app's doesn't.
+        let (code, v) = api(&ops, "GET", "/v1/nodes", b"");
+        assert_eq!(code, 200, "{v}");
+        let seen: Vec<u64> = v["nodes"].as_array().unwrap().iter().map(|x| x["stats"]["node"].as_u64().unwrap_or(99)).collect();
+        assert_eq!(seen, [0, 1, 2], "{v}");
+        assert_eq!(api(&token, "GET", "/v1/nodes", b"").0, 403, "acme's token isn't the cluster's");
+        let (code, page) = admin::request(&url, Some((&tls, "node0.combd")), "", "GET", "/", b"").unwrap();
+        assert_eq!(code, 200, "the panel, with no token: {page}");
         // An app folder: version `n`, with `extra` routes on `api`.
         let src = store::tempdir::Dir::new();
         let app = |name: &str, domain: &str, routes: &str, vars: &str| {
