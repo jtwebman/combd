@@ -174,10 +174,17 @@ fn reserve(n: usize) -> io::Result<*mut u8> {
     Ok(p as *mut u8)
 }
 
-/// This process's resident memory, in bytes (`None` where we can't tell).
+/// The memory this process costs the machine, in bytes (`None` where we
+/// can't tell). On Linux, its cgroup's (a container's, or a service's): its
+/// own memory and what the kernel holds for it (sockets' buffers, about 4
+/// KB a connection, which RSS leaves out), less file cache it would give
+/// back. Elsewhere, or with no cgroup to read, its resident memory.
 pub fn resident() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
+        if let Some(n) = cgroup_dir().and_then(|d| cgroup_used(&std::fs::read_to_string(d.join("memory.current")).ok()?, &std::fs::read_to_string(d.join("memory.stat")).ok()?)) {
+            return Some(n);
+        }
         let pages: u64 = std::fs::read_to_string("/proc/self/statm").ok()?.split_whitespace().nth(1)?.parse().ok()?;
         // SAFETY: a plain query.
         Some(pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64)
@@ -192,6 +199,23 @@ pub fn resident() -> Option<u64> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     None
+}
+
+/// This process's cgroup (v2): `0::<path>` in /proc/self/cgroup, under
+/// /sys/fs/cgroup (in a container, its own namespace's root).
+#[cfg(target_os = "linux")]
+fn cgroup_dir() -> Option<std::path::PathBuf> {
+    let me = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = me.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    Some(std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
+}
+
+/// What a cgroup uses that it can't give back: `memory.current` less the
+/// file cache nobody's using (`inactive_file`), as `docker stats` counts.
+pub fn cgroup_used(current: &str, stat: &str) -> Option<u64> {
+    let total: u64 = current.trim().parse().ok()?;
+    let inactive = stat.lines().find_map(|l| l.strip_prefix("inactive_file ")).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+    Some(total.saturating_sub(inactive))
 }
 
 /// Bytes the allocator has handed out and not had back (glibc only: 0
@@ -300,6 +324,16 @@ mod tests {
                 assert!(m.bytes() == &v[..], "a cell's memory differs from its model");
             }
         }
+    }
+
+    #[test]
+    fn a_cgroup_counts_all_but_idle_file_cache() {
+        let stat = "anon 600000000\nfile 90000000\nkernel 150000000\nsock 2000000\ninactive_file 70000000\nactive_file 20000000\n";
+        assert_eq!(cgroup_used("800000000\n", stat), Some(730_000_000));
+        assert_eq!(cgroup_used("max", stat), None);
+        assert_eq!(cgroup_used("1000", ""), Some(1000), "no stat: all of it");
+        #[cfg(target_os = "linux")]
+        assert!(resident().is_some_and(|n| n > 0));
     }
 
     #[test]
