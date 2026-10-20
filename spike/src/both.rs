@@ -17,9 +17,11 @@ pub enum Program {
     Compiled(&'static combd_aot::Compiled),
 }
 
+/// A compiled cell is boxed: it's 728 bytes, an interpreted one 176, and an
+/// idle interpreted session shouldn't carry the difference.
 pub enum Cell {
     Interpreted(Vm),
-    Compiled(AotVm),
+    Compiled(Box<AotVm>),
 }
 
 impl Engine for Both {
@@ -41,7 +43,7 @@ impl Engine for Both {
     fn spawn(&self, p: &Program) -> Result<Cell, String> {
         match p {
             Program::Interpreted(m) => self.interp.spawn(m).map(Cell::Interpreted),
-            Program::Compiled(c) => self.aot.spawn(c).map(Cell::Compiled),
+            Program::Compiled(c) => self.aot.spawn(c).map(|v| Cell::Compiled(Box::new(v))),
         }
     }
 
@@ -55,7 +57,7 @@ impl Engine for Both {
     fn thaw(&self, p: &Program, saved: &[u8]) -> Result<Cell, String> {
         match p {
             Program::Interpreted(m) => self.interp.thaw(m, saved).map(Cell::Interpreted),
-            Program::Compiled(c) => self.aot.thaw(c, saved).map(Cell::Compiled),
+            Program::Compiled(c) => self.aot.thaw(c, saved).map(|v| Cell::Compiled(Box::new(v))),
         }
     }
 }
@@ -113,7 +115,7 @@ impl CellVm for Cell {
     fn snapshot(&self) -> Option<Cell> {
         match self {
             Cell::Interpreted(v) => v.snapshot().map(Cell::Interpreted),
-            Cell::Compiled(v) => v.snapshot().map(Cell::Compiled),
+            Cell::Compiled(v) => v.snapshot().map(|v| Cell::Compiled(Box::new(v))),
         }
     }
 }

@@ -16,6 +16,7 @@ pub mod rt;
 
 #[cfg(has_js)]
 mod gen_js;
+#[cfg(has_rust)]
 mod gen_rust;
 #[cfg(has_fuzz)]
 mod gen_fuzz;
@@ -31,10 +32,23 @@ pub struct Compiled {
     pub call: fn(&mut rt::Ctx, &mut rt::Mem, u32, &[u64]) -> Result<Vec<u64>, rt::Trap>,
 }
 
-#[cfg(has_js)]
-pub static MODULES: &[Compiled] = &[gen_rust::MODULE, gen_js::MODULE];
-#[cfg(not(has_js))]
-pub static MODULES: &[Compiled] = &[gen_rust::MODULE];
+/// The modules built into this binary (by `aot.sh`): none on a node, whose
+/// modules come as builds it loads (`combd-load`).
+pub static MODULES: &[Compiled] = &[
+    #[cfg(has_rust)]
+    gen_rust::MODULE,
+    #[cfg(has_js)]
+    gen_js::MODULE,
+];
+
+/// What a build must have been made with to be loaded into this binary:
+/// the same rustc, the same sources of this crate (its types cross between
+/// them), for the same target. Rust has no stable ABI; this is what keeps
+/// the two agreeing on every layout.
+pub const PIN: &str = env!("COMBD_AOT_PIN");
+/// The same, nul-terminated, for a build to hand out by the C ABI: the pin
+/// is read before anything that depends on Rust's layouts.
+pub const PIN_NUL: &str = concat!(env!("COMBD_AOT_PIN"), "\0");
 
 /// FNV-1a, the cache key for "is there an AOT build of these bytes?".
 pub fn hash(wasm: &[u8]) -> u64 {

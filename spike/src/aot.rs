@@ -120,12 +120,37 @@ fn slice_for(reductions: u32) -> i64 {
     if reductions == u32::MAX || no_yield() { i64::MAX } else { reductions as i64 * TICKS_PER_REDUCTION }
 }
 
+/// The build of `wasm` in `dir`, loaded once (and kept: see combd-load).
+pub fn built(dir: &std::path::Path, wasm: &[u8]) -> Result<&'static Compiled, String> {
+    static LOADED: std::sync::Mutex<Vec<&'static Compiled>> = std::sync::Mutex::new(Vec::new());
+    let h = combd_aot::hash(wasm);
+    let mut loaded = LOADED.lock().unwrap();
+    if let Some(m) = loaded.iter().find(|m| m.hash == h) {
+        return Ok(m);
+    }
+    let path = dir.join(format!("{h:016x}.so"));
+    if !path.exists() {
+        return Err(format!("no build for this module yet ({})", path.display()));
+    }
+    let m = combd_load::open(&path)?;
+    if m.hash != h {
+        return Err(format!("{}: a build of another module", path.display()));
+    }
+    loaded.push(m);
+    Ok(m)
+}
+
 impl Engine for Aot {
     type Program = &'static Compiled;
     type Vm = AotVm;
 
+    /// Built into this binary, or a build in `COMBD_AOT_DIR` (`<hash>.so`).
     fn load(&self, wasm: &[u8]) -> Result<&'static Compiled, String> {
-        combd_aot::find(wasm).ok_or_else(|| "no AOT build for this module (run spike/aot.sh)".into())
+        if let Some(m) = combd_aot::find(wasm) {
+            return Ok(m);
+        }
+        let dir = std::env::var_os("COMBD_AOT_DIR").ok_or("no build for this module: none built in, and no COMBD_AOT_DIR")?;
+        built(std::path::Path::new(&dir), wasm)
     }
 
     fn load_as(&self, wasm: &[u8], kind: crate::engine::Kind) -> Result<&'static Compiled, String> {

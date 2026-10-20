@@ -13,7 +13,7 @@ resolver = "3"
 default = ["wasmtime", "fuzz"]
 # The AOT tier. Needs spike/aot/src/gen_*.rs, made by `aot.sh`.
 aot = ["aot-lite"]
-aot-lite = ["dep:combd-aot"]
+aot-lite = ["dep:combd-aot", "dep:combd-load"]
 # The AOT tier with guard pages instead of bounds checks.
 aot-guard = ["aot", "combd-aot/guard", "dep:corosensei"]
 # EXPERIMENT ONLY: see combd-aot's `experiment-unchecked`.
@@ -24,6 +24,8 @@ fuzz = ["wasmtime", "dep:wasm-smith", "dep:arbitrary", "dep:wat"]
 [dependencies]
 combd-guest = { path = "../guest" }
 combd-aot = { path = "aot", optional = true, default-features = false }
+# Loading compiled modules' builds into a running node (the AOT tier's unsafe).
+combd-load = { path = "load", optional = true }
 # The listening socket with SO_REUSEPORT, so a new combd can take the port
 # before the old one stops (already here, through tokio).
 socket2 = { version = "0.6", features = ["all"] }

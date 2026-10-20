@@ -169,6 +169,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "combd-load"
+version = "0.0.0"
+dependencies = [
+ "combd-aot",
+ "libc",
+]
+
+[[package]]
 name = "combd-mem"
 version = "0.0.0"
 dependencies = [
@@ -182,6 +190,7 @@ dependencies = [
  "arbitrary",
  "combd-aot",
  "combd-guest",
+ "combd-load",
  "combd-mem",
  "corosensei",
  "hmac 0.12.1",

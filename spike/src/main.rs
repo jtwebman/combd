@@ -12,6 +12,8 @@ mod admin;
 mod aot;
 #[cfg(feature = "aot-lite")]
 mod both;
+#[cfg(feature = "aot-lite")]
+mod build;
 mod aot_gen;
 mod app;
 mod catalog;
@@ -1112,6 +1114,22 @@ fn main_with(args: &[&str]) {
             }
             println!("fuzz-aot no mismatches");
         }
+        // A module's build, as a node loads it: `aot-build <module.wasm>
+        // <out.so> [target] [cpu]`, in ./target/aot-builds.
+        #[cfg(feature = "aot-lite")]
+        ["aot-build", input, output, ref rest @ ..] => {
+            let wasm = std::fs::read(input).unwrap();
+            let aot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot");
+            let work = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds");
+            let t = std::time::Instant::now();
+            match build::build(&wasm, &aot, &work, std::path::Path::new(output), rest.first().copied(), rest.get(1).copied()) {
+                Ok(()) => println!("aot-build {input} -> {output} in {:.1} s", t.elapsed().as_secs_f64()),
+                Err(e) => {
+                    eprintln!("aot-build {input}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         ["aot-gen", input, output] => {
             let wasm = std::fs::read(input).unwrap();
             match aot_gen::generate(&wasm, input) {
@@ -1788,6 +1806,52 @@ mod tests {
         let procs = || serde_json::from_str::<serde_json::Value>(&http(port, "GET", "/_combd/stats", "").1).unwrap()["procs"].clone();
         assert!(eventually(2000, || procs()["local/two/b"]["engine"] == "interpreted"), "{}", procs());
         assert_eq!(procs()["local/two/a"]["engine"], "compiled", "{}", procs());
+    }
+
+    /// A module's build, loaded into this process the way a node does
+    /// (`combd-load`), answers as the interpreter does; a library that isn't
+    /// a build, or a build filed as another module, is refused.
+    /// Slow (it compiles), so: `cargo test --features aot -- --ignored`.
+    #[cfg(feature = "aot-lite")]
+    #[test]
+    #[ignore]
+    fn a_build_loads_and_answers_as_interpreted() {
+        let wasm = std::fs::read(format!("{MILLION}/modules/viewer.wasm")).expect("build it first: examples/million/build.sh");
+        let dir = store::tempdir::Dir::new();
+        let name = |w: &[u8]| dir.0.join(format!("{:016x}.so", combd_aot::hash(w)));
+        let aot_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot");
+        let work = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds");
+        build::build(&wasm, &aot_src, &work, &name(&wasm), None, None).unwrap();
+        let m = aot::built(&dir.0, &wasm).unwrap();
+        let interp = interp::Interp { max_pages: 16384 };
+        let ip = interp.load(&wasm).unwrap();
+        let (mut a, mut i) = (aot::Aot.spawn(&m).unwrap(), interp.spawn(&ip).unwrap());
+        let (mut sa, mut si) = (HostState::default(), HostState::default());
+        init(&mut a, &mut sa).unwrap();
+        init(&mut i, &mut si).unwrap();
+        for req in ["do WSOPEN /ws 7", "do WSMSG /7 {\"t\":\"range\",\"from\":0,\"to\":500}", "do WSMSG /7 {\"t\":\"set\",\"i\":3,\"v\":true}", "do HIBERNATE / "] {
+            assert_eq!(request(&mut a, req, &mut sa).unwrap(), request(&mut i, req, &mut si).unwrap(), "{req}");
+        }
+        // Not a build: a library without combd's two symbols.
+        let lib = ["/usr/lib/libSystem.B.dylib", "/lib/x86_64-linux-gnu/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6"].into_iter().find(|p| std::path::Path::new(p).exists() || cfg!(target_os = "macos")).unwrap();
+        assert!(combd_load::open(std::path::Path::new(lib)).err().unwrap().contains("not a combd build"));
+        // Filed as another module: refused.
+        let other = b"not the viewer";
+        std::fs::copy(name(&wasm), name(other)).unwrap();
+        assert!(aot::built(&dir.0, other).err().unwrap().contains("another module"));
+        // Built against other combd-aot sources (an old build, after the
+        // node moved on): its pin isn't ours, and nothing else is read.
+        let old = store::tempdir::Dir::new();
+        for f in ["Cargo.toml", "build.rs", "src/lib.rs", "src/rt.rs", "src/fiber.rs", "src/guard.rs", "src/trap.c"] {
+            std::fs::create_dir_all(old.0.join(f).parent().unwrap()).unwrap();
+            std::fs::copy(aot_src.join(f), old.0.join(f)).unwrap();
+        }
+        let rt = std::fs::read_to_string(old.0.join("src/rt.rs")).unwrap();
+        std::fs::write(old.0.join("src/rt.rs"), rt + "\n// another version\n").unwrap();
+        let stale = old.0.join("stale.so");
+        build::build(&wasm, &old.0, &old.0.join("work"), &stale, None, None).unwrap();
+        let e = combd_load::open(&stale).err().unwrap();
+        assert!(e.contains("built with") && e.contains("this node is"), "{e}");
     }
 
     /// A busy object's mailbox fills: what comes past `mailbox` is refused
