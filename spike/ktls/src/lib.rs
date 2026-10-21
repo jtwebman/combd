@@ -248,7 +248,10 @@ mod tests {
     /// to the kernel: the client, still rustls, can't tell. Data both ways,
     /// then the client's close_notify arrives as an alert record. For each
     /// TLS version and cipher the kernel does.
+    /// Opt-in: it needs a kernel with kTLS (not macOS, Docker Desktop, or
+    /// WSL): `spike/ktls-test.sh` runs it on a node.
     #[test]
+    #[ignore = "needs a kernel with kTLS: spike/ktls-test.sh"]
     fn a_session_handed_to_the_kernel_goes_on() {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();

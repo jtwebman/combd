@@ -1983,7 +1983,10 @@ mod tests {
     /// Kernel TLS (`ktls`): requests on a kept-alive connection, and sockets
     /// to rooms (some moving loops), answer as before once their sessions are
     /// the kernel's. Where the kernel can't, there's nothing to test.
+    /// Opt-in, like combd-ktls's test: on a Linux box with kTLS,
+    /// `cargo test -- --ignored kernel_tls`.
     #[test]
+    #[ignore = "needs a kernel with kTLS"]
     fn kernel_tls_takes_over_after_the_handshake() {
         use std::io::Write;
         if !combd_ktls::available() {

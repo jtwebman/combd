@@ -1,11 +1,11 @@
 name: linux tests
-# What only Linux can test (kernel TLS, io_uring), on the self-hosted
+# What only Linux can test (io_uring), on the self-hosted
 # runner: the Mac that runs check.sh can't, and neither can Docker
 # Desktop's kernel (no kTLS).
 on:
   push:
     branches: [main]
-    paths: [spike/ktls/**, spike/src/tls.rs, spike/src/http.rs, .github/workflows/linux-tests.yml]
+    paths: [spike/ring/**, spike/src/http.rs, .github/workflows/linux-tests.yml]
   workflow_dispatch:
 permissions:
   contents: read
@@ -25,5 +25,5 @@ jobs:
         run: |
           [ -x ~/.cargo/bin/cargo ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.94.1
           ~/.cargo/bin/rustup toolchain install 1.94.1 --profile minimal
-      - name: Kernel TLS
-        run: cd spike && ~/.cargo/bin/cargo +1.94.1 test -q --release -p combd-ktls
+      # Kernel TLS isn't here: WSL's kernel can't (spike/ktls-test.sh runs
+      # it on a node). io_uring is.
