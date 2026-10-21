@@ -177,10 +177,11 @@ resource "digitalocean_droplet" "node" {
       "COMBD_TLS_CERT=/etc/combd/tls/cert.pem",
       "COMBD_TLS_KEY=/etc/combd/tls/key.pem",
       "COMBD_REDIRECT_PORT=80",
-      # What combd may use of the droplet's 1 GB: Docker and the OS have the
-      # rest. Past 85% it reclaims, past 95% it refuses new work, so the
-      # kernel never has to kill it.
-      "COMBD_MEMORY_BUDGET=700M",
+      # What combd may use of the droplet's 1 GB: the OS and Docker take
+      # ~400 MB, so this is about what's left in RAM. Past 85% it reclaims,
+      # past 95% it refuses new work. 700M (which counts swap) let a node
+      # swap itself into a crawl before it refused anything.
+      "COMBD_MEMORY_BUDGET=550M",
       # Compiled modules: builds signed by these builders only.
       "COMBD_BUILDER_KEYS=/etc/combd/builder-keys",
       "",
