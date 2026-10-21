@@ -310,6 +310,10 @@ struct Stats {
     mailbox_refused: AtomicU64,
     /// Requests that ran in a batch (`handle_batch`).
     batched: AtomicU64,
+    /// WebSocket frames sent, and the flushes that sent them (several
+    /// frames for a socket go in one).
+    ws_frames: AtomicU64,
+    ws_flushes: AtomicU64,
     /// Event cells: instances started, and requests they took.
     ev_instances: AtomicU64,
     ev_requests: AtomicU64,
@@ -2641,6 +2645,7 @@ impl<E: Engine> Loop<'_, E> {
             return Ok(());
         };
         let frame = crate::ws::encode(op, payload);
+        let sh = self.sh;
         let c = self.conn(who).unwrap();
         let w = c.ws.as_mut().unwrap();
         if c.wbuf.len() - c.wpos + frame.len() > MAX_WS_WRITE {
@@ -2659,6 +2664,7 @@ impl<E: Engine> Loop<'_, E> {
                 // Sent with the loop's next flush, with whatever else comes
                 // for this socket by then: one TLS record and one write for
                 // all of them, not one for each.
+                sh.stats.ws_frames.fetch_add(1, Relaxed);
                 if !c.unsent {
                     c.unsent = true;
                     self.unsent.push(who.0);
@@ -2675,6 +2681,7 @@ impl<E: Engine> Loop<'_, E> {
             let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { continue };
             if c.unsent {
                 c.unsent = false;
+                self.sh.stats.ws_flushes.fetch_add(1, Relaxed);
                 self.settle(id)?;
             }
         }
@@ -3655,7 +3662,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"batched\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3683,6 +3690,8 @@ impl<E: Engine> Loop<'_, E> {
                     s.sessions_woken.load(Relaxed),
                     s.mailbox_refused.load(Relaxed),
                     s.batched.load(Relaxed),
+                    s.ws_frames.load(Relaxed),
+                    s.ws_flushes.load(Relaxed),
                     combd_mem::heap_in_use(),
                     s.conns_open.load(Relaxed),
                     s.conns_refused.load(Relaxed),

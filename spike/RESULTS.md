@@ -2384,6 +2384,35 @@ asked first; a push to another node is still one wire frame per watcher;
 and `heap_in_use` counts cells' reserved address space (6.9 GB on a 1 GB
 node), not the heap.
 
+## Compiled: the same 10,000 pages again (2026-10-21)
+
+Million's chunks, total, and viewers compiled (builds made by a builder
+on a machine of ours, signed, loaded by the nodes); its page interpreted
+(it waits on `call`, which compiled code can't yet). On one core (a load
+droplet as the server, the other two the clients):
+
+| | Interpreted | Compiled |
+|---|---|---|
+| CPU in app code, the run | 61 s (chunk 33, viewer 28) | 12 s (chunk 8, viewer 4) |
+| Clicks lost | up to ~1,000 in a 10 s window | none |
+| Echo p99 | 2.4 to 8.5 s | 2.1 to 2.6 s |
+| A viewer, awake (2 messages in) | 89.5 KB, 34.7 us | 66.9 KB, 7.6 us |
+
+Compiled first ran out of memory: a compiled cell's memory was a Vec, and
+growing it wrote every new page. Now it's combd-mem's, as the
+interpreter's (295.7 KB a viewer was 66.9).
+
+Live on n0 (every chunk and viewer there, the fleet replicating each
+batch to Frankfurt and Singapore): ~150,000 to 170,000 changes a second
+delivered (twice the interpreted run with batches), 2% of clicks lost
+(3 to 10% before), nothing refused, and n0 idle within seconds of the
+clients leaving. Echoes at the peak were no better (p50 5 to 6 s): the
+work moved. At the peak n0 was 43% kernel (a TLS record and a system
+call per socket per frame), 24% combd's host code, 24% libc (allocating,
+copying), and 8% the compiled apps; and each batch waits on its peers
+(84 and 244 ms away). Coalescing a socket's frames per loop turn found
+1.02 frames a flush: a socket gets ~3 a second, one per chunk batch.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A
