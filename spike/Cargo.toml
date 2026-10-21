@@ -32,6 +32,8 @@ socket2 = { version = "0.6", features = ["all"] }
 # Cells' memory, copy-on-write from their module's image: the interpreter's
 # only unsafe code.
 combd-mem = { path = "mem" }
+# TLS handed to the kernel after the handshake (Linux; elsewhere it says no).
+combd-ktls = { path = "ktls" }
 corosensei = { version = "0.3.4", optional = true }
 wasmparser = "0.261"
 # The HTTP front: epoll/kqueue event loop and hyper's request parser.

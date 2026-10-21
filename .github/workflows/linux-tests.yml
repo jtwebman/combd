@@ -1,0 +1,26 @@
+name: linux tests
+# What only Linux can test (kernel TLS, io_uring), on the self-hosted
+# runner: the Mac that runs check.sh can't, and neither can Docker
+# Desktop's kernel (no kTLS).
+on:
+  push:
+    branches: [main]
+    paths: [spike/ktls/**, spike/src/tls.rs, spike/src/http.rs, .github/workflows/linux-tests.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: [self-hosted, linux, x64, combd-build]
+    steps:
+      - uses: actions/checkout@v4
+      - name: What this kernel has
+        run: |
+          uname -r
+          sudo -n modprobe tls 2>/dev/null || true
+          cat /proc/sys/net/ipv4/tcp_available_ulp 2>/dev/null || echo "no tcp_available_ulp"
+      - name: Kernel TLS
+        run: |
+          docker run --rm -v "$PWD":/combd -v combd-linux-target:/target -v combd-cargo:/usr/local/cargo/registry \
+            -w /combd/spike -e CARGO_TARGET_DIR=/target rust:1.94.1-slim-bookworm \
+            cargo test -q --release -p combd-ktls

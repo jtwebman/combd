@@ -170,6 +170,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "combd-ktls"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
 name = "combd-load"
 version = "0.0.0"
 dependencies = [
@@ -191,6 +200,7 @@ dependencies = [
  "arbitrary",
  "combd-aot",
  "combd-guest",
+ "combd-ktls",
  "combd-load",
  "combd-mem",
  "corosensei",

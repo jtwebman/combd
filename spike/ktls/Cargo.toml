@@ -1,0 +1,13 @@
+[package]
+name = "combd-ktls"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "TLS handed to the kernel after the handshake (Linux kTLS): combd's unsafe code for it."
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
