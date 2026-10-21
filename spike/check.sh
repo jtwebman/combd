@@ -28,7 +28,7 @@ for ex in ../examples/arena ../examples/million; do "$ex/build.sh" >/dev/null 2>
 out=$(mktemp) && trap 'rm -f "$out"' EXIT
 cargo test --release -q >"$out" 2>&1 || true
 grep -E "test result|FAILED|panicked" "$out"
-grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { echo "check: tests failed"; exit 1; }
+grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { grep -E "^error" -A8 "$out" | head -30; echo "check: tests failed"; exit 1; }
 cargo test --release -q -p combd-mem 2>&1 | grep -q "test result: ok" || { echo "check: combd-mem failed"; exit 1; }
 # The compiled tier too, when aot.sh has made its modules (they aren't in git).
 if [ -f aot/src/gen_rust.rs ]; then

@@ -2298,6 +2298,7 @@ mod tests {
 
     fn cfg(data: &std::path::Path, threads: usize) -> http::Config {
         http::Config {
+            ktls: false,
             threads,
             data: data.to_path_buf(),
             idle: Duration::from_secs(60),
