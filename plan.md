@@ -1207,6 +1207,57 @@ what it needs, and it runs only where that is.
   halves gets every change); it spreads them. Test it with most viewers
   at the top, not spread evenly.
 
+## Cheaper sends: kernel TLS, then io_uring (2026-10-21)
+
+The one-node ramp (million, every page clicking) put the ceiling at
+~10,000 active users on a 1 vCPU node: past it the CPU is gone, and most
+of it isn't ours. At the peak: kernel 43%, combd's host code 24%, libc
+24% (allocating, copying), the compiled apps 8%. The kernel's share is a
+small TLS record and a write per socket per frame: TCP's send path, the
+virtio NIC kicked per packet (`iowrite16`, ~6%), and each system call's
+entry and exit with AMD's SRSO mitigation (`srso_safe_ret`). Encryption
+itself was ~0.5% (rustls on AES-NI). So it's the count of sends and the
+work around each, more than the crypto.
+
+**First, measure where the kernel's 43% goes** (a load droplet set, perf
+with call graphs on a node at 10,000 and 20,000 active users): system
+call entry/exit, `tcp_sendmsg` and transmit, the NIC kicks, receiving
+the ACKs (softirq), epoll. That decides the order below; it's a day, not
+a guess.
+
+**1. Kernel TLS (kTLS).** After the handshake, rustls hands over the
+session keys (`UnbufferedServerConnection::dangerous_into_kernel_connection`,
+in the version we use) and the kernel encrypts and decrypts on the
+socket (`TCP_ULP` "tls", `SOL_TLS`). What it buys:
+- **Memory:** a connection drops its rustls state once the keys are in
+  the kernel: most of the ~9 KB an idle TLS connection costs today, for
+  every app (105,000 idle users on a node was mostly that).
+- **CPU:** a frame is written once, plain, to the socket: no copy into
+  an outgoing buffer, no record framing in combd. The kernel's crypto
+  is the same AES-GCM.
+- What it doesn't: the system call per socket per frame stays.
+- The work: a small crate for the socket options (`unsafe`, like
+  combd-mem and combd-load); the kernel connection rustls returns for
+  what comes after the handshake (key updates; session tickets are off);
+  TLS 1.3 and 1.2 with AES-GCM (ChaCha20 where the kernel has it); a
+  node without the `tls` module, or a cipher it can't do, keeps
+  rustls as now (a node, not an app, so this isn't a tier-up).
+- Risk: an alert or record the kernel hands back as a control message
+  must be read right, or a connection hangs; the Autobahn and testssl
+  runs cover it.
+
+**2. io_uring for the sends.** The loop keeps mio for readiness, and
+only the flush (every socket with frames waiting, `flush_unsent`) goes
+through one io_uring submission: one system call for all the sockets a
+turn writes, not one each, and the NIC driver sees them together (one
+kick for many packets). With kTLS the frames are plain bytes, so a send
+is a single submission entry. Linux 5.6+; the ring and its buffers in
+the same kind of small `unsafe` crate. Without io_uring (another OS, or
+it's off), the flush writes as now.
+
+**Measure after each:** the same ramp (10,000 to 40,000 active users on
+one node), and the idle hold (105,000 before: how many now).
+
 ## The edge: TLS in combd, or edge nodes in front (2026-10-20)
 
 combd gets an idle connection down to 2.24 KB, but in front of it on each
