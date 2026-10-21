@@ -19,8 +19,11 @@ jobs:
           uname -r
           sudo -n modprobe tls 2>/dev/null || true
           cat /proc/sys/net/ipv4/tcp_available_ulp 2>/dev/null || echo "no tcp_available_ulp"
-      - name: Kernel TLS
+      # On the runner itself, not in Docker: here Docker's containers run in
+      # Docker Desktop's VM, whose kernel has no kTLS; WSL's has.
+      - name: Rust (once; kept in the runner's home)
         run: |
-          docker run --rm -v "$PWD":/combd -v combd-linux-target:/target -v combd-cargo:/usr/local/cargo/registry \
-            -w /combd/spike -e CARGO_TARGET_DIR=/target rust:1.94.1-slim-bookworm \
-            cargo test -q --release -p combd-ktls
+          [ -x ~/.cargo/bin/cargo ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.94.1
+          ~/.cargo/bin/rustup toolchain install 1.94.1 --profile minimal
+      - name: Kernel TLS
+        run: cd spike && ~/.cargo/bin/cargo +1.94.1 test -q --release -p combd-ktls
