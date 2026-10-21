@@ -1508,6 +1508,32 @@ Gateway's), and the suite says what still holds.
 **When:** after v0.1. The WIT file and the suite come out of what we
 already have; the schema is the manifest code written down.
 
+## Maybe later: combd's own OS, for a hosted combd (an idea, 2026-10-21)
+
+Not for adoption: the open-source combd stays a binary and a container on
+any Linux (and a Mac or WSL for development), using what each kernel has
+(kTLS, io_uring) where it has it. But a hosted combd, sold as a service,
+could boot nodes from an image of our own: a stripped Linux kernel with
+combd as its only process, no shell, no Docker, no package manager, read-
+only and replaced whole to update (as Talos or Bottlerocket do).
+- **Why:** on a 1 GB node, Ubuntu and Docker take ~390 MB before combd
+  starts; an image like this needs maybe 30 to 60 MB: ~350 MB more for
+  users (tens of thousands more idle ones a node). Boots in a second, has
+  little to attack, and nothing to patch but the image.
+- **No local disk:** writes are on peers before they're acknowledged and
+  in the bucket for good, so an object's SQLite can live in memory and a
+  restarted node recovers from its peers and the bucket (the takeover
+  path). Fits small-state apps.
+- **Admin over SSH,** as `erl -remsh`: the admin API on localhost (or
+  mTLS), reached through an SSH tunnel, maybe an SSH server inside combd;
+  a terminal view (`combd top`) in place of the web panel.
+- **Not a unikernel:** the CPU goes to TCP per packet, not to system
+  calls (3%), so leaving Linux would cost its network stack, kTLS, and
+  drivers for little.
+- **The moat:** if a big cloud runs the open-source combd, we'd still run
+  it cheaper per user. (Whether the license should also stop that, as
+  Elastic's and Mongo's did, is its own question.)
+
 ## Maybe later: realtime objects (guaranteed ticks)
 
 combd is fair, not realtime: every request gets a slice (about 50 us) in
