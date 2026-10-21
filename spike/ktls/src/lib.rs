@@ -145,9 +145,11 @@ pub fn available() -> bool {
     let Ok(l) = std::net::TcpListener::bind("127.0.0.1:0") else { return false };
     let Ok(c) = l.local_addr().and_then(std::net::TcpStream::connect) else { return false };
     let Ok((s, _)) = l.accept() else { return false };
-    drop(c);
+    // The kernel takes TLS only on a connected socket: `c` stays open till then.
     let k = Keys { seq: 0, cipher: Cipher::AesGcm128 { key: &[0; 16], iv: &[0; 12] } };
-    enable(s.as_raw_fd(), Version::Tls13, &k, &k).is_ok()
+    let ok = enable(s.as_raw_fd(), Version::Tls13, &k, &k).is_ok();
+    drop(c);
+    ok
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -290,12 +292,15 @@ mod tests {
             let version = if conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3) { Version::Tls13 } else { Version::Tls12 };
             let s = conn.dangerous_extract_secrets().unwrap();
             if let Err(e) = enable(tcp.as_raw_fd(), version, &Keys { seq: s.tx.0, cipher: keys(&s.tx.1) }, &Keys { seq: s.rx.0, cipher: keys(&s.rx.1) }) {
-                // A kernel without kTLS (or this cipher): say so, don't fail.
+                // A kernel without kTLS (or this cipher): say so, don't fail,
+                // and `available` must say so too.
+                assert!(!available() || !matches!(suite.suite(), rustls::CipherSuite::TLS13_AES_128_GCM_SHA256), "available() says yes, but AES-128 was refused: {e}");
                 eprintln!("skipping {suite:?}: this kernel won't take it: {e}");
                 drop(tcp);
                 let _ = client.join();
                 continue;
             }
+            assert!(available(), "it worked, so available() must say so");
             // Plain bytes on the socket now: the kernel does the rest.
             let mut b = [0u8; 4];
             tcp.read_exact(&mut b).unwrap();
