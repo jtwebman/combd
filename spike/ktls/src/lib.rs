@@ -127,19 +127,32 @@ fn direction(fd: RawFd, name: libc::c_int, version: Version, k: &Keys) -> io::Re
 /// socket is in no state to go on (rustls gave its keys away): close it.
 #[cfg(target_os = "linux")]
 pub fn enable(fd: RawFd, version: Version, tx: &Keys, rx: &Keys) -> io::Result<()> {
-    set(fd, libc::SOL_TCP, sys::TCP_ULP, b"tls\0")
-        .or_else(|_| {
-            // setsockopt(TCP_ULP) takes the name's bytes, not a C string's size.
-            // SAFETY: a 3-byte buffer, its length given.
-            let r = unsafe { libc::setsockopt(fd, libc::SOL_TCP, sys::TCP_ULP, b"tls".as_ptr() as *const libc::c_void, 3) };
-            if r == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        })?;
-    direction(fd, sys::TLS_TX, version, tx)?;
-    direction(fd, sys::TLS_RX, version, rx)
+    // SAFETY: the name's 3 bytes, their length given (not a C string).
+    let r = unsafe { libc::setsockopt(fd, libc::SOL_TCP, sys::TCP_ULP, b"tls".as_ptr() as *const libc::c_void, 3) };
+    if r != 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("TCP_ULP tls: {e}")));
+    }
+    direction(fd, sys::TLS_TX, version, tx).map_err(|e| io::Error::new(e.kind(), format!("TLS_TX: {e}")))?;
+    direction(fd, sys::TLS_RX, version, rx).map_err(|e| io::Error::new(e.kind(), format!("TLS_RX: {e}")))
+}
+
+/// Can this kernel do it: tried once on a loopback connection, with a key
+/// that's never used.
+#[cfg(target_os = "linux")]
+pub fn available() -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(l) = std::net::TcpListener::bind("127.0.0.1:0") else { return false };
+    let Ok(c) = l.local_addr().and_then(std::net::TcpStream::connect) else { return false };
+    let Ok((s, _)) = l.accept() else { return false };
+    drop(c);
+    let k = Keys { seq: 0, cipher: Cipher::AesGcm128 { key: &[0; 16], iv: &[0; 12] } };
+    enable(s.as_raw_fd(), Version::Tls13, &k, &k).is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn available() -> bool {
+    false
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -276,7 +289,13 @@ mod tests {
             }
             let version = if conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3) { Version::Tls13 } else { Version::Tls12 };
             let s = conn.dangerous_extract_secrets().unwrap();
-            enable(tcp.as_raw_fd(), version, &Keys { seq: s.tx.0, cipher: keys(&s.tx.1) }, &Keys { seq: s.rx.0, cipher: keys(&s.rx.1) }).unwrap();
+            if let Err(e) = enable(tcp.as_raw_fd(), version, &Keys { seq: s.tx.0, cipher: keys(&s.tx.1) }, &Keys { seq: s.rx.0, cipher: keys(&s.rx.1) }) {
+                // A kernel without kTLS (or this cipher): say so, don't fail.
+                eprintln!("skipping {suite:?}: this kernel won't take it: {e}");
+                drop(tcp);
+                let _ = client.join();
+                continue;
+            }
             // Plain bytes on the socket now: the kernel does the rest.
             let mut b = [0u8; 4];
             tcp.read_exact(&mut b).unwrap();

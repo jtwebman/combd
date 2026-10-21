@@ -1980,6 +1980,43 @@ mod tests {
         assert!(aot::Aot.spawn(&prog).unwrap().cap_memory(1).is_err(), "under where it starts");
     }
 
+    /// Kernel TLS (`ktls`): requests on a kept-alive connection, and sockets
+    /// to rooms (some moving loops), answer as before once their sessions are
+    /// the kernel's. Where the kernel can't, there's nothing to test.
+    #[test]
+    fn kernel_tls_takes_over_after_the_handshake() {
+        use std::io::Write;
+        if !combd_ktls::available() {
+            eprintln!("skipping: this kernel has no kTLS");
+            return;
+        }
+        let dir = store::tempdir::Dir::new();
+        let certs = dir.0.join("certs");
+        wire::make_certs(&certs, 1).unwrap();
+        let ca = certs.join("ca.pem");
+        let c = http::Config { tls: Some((certs.join("node0.pem"), certs.join("node0.key"))), ktls: true, ..cfg(&dir.0.join("d"), 4) };
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, c);
+        let mut s = tls_to(port, &ca);
+        for _ in 0..5 {
+            write!(s, "GET /_combd/ping HTTP/1.1\r\nhost: node0.combd\r\n\r\n").unwrap();
+            assert!(read_answer(&mut s).0.starts_with("HTTP/1.1 200"));
+        }
+        for r in 0..8 {
+            let mut w = tls_to(port, &ca);
+            write!(w, "GET /do/room{r}/ws HTTP/1.1\r\nhost: node0.combd\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").unwrap();
+            assert!(read_answer(&mut w).0.starts_with("HTTP/1.1 101"));
+            for k in 0..3 {
+                w.write_all(&ws::tests::client(true, 1, format!("hi {r}.{k}").as_bytes())).unwrap();
+                let (op, p) = read_frame(&mut w);
+                assert_eq!((op, String::from_utf8(p).unwrap().contains(&format!("\"text\":\"hi {r}.{k}\""))), (1, true));
+            }
+        }
+        let mut st = tls_to(port, &ca);
+        write!(st, "GET /_combd/stats HTTP/1.1\r\nhost: node0.combd\r\n\r\n").unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&read_answer(&mut st).1).unwrap();
+        assert!(stats["ktls"].as_u64() >= Some(9), "the connections went to the kernel: {stats}");
+    }
+
     /// A TLS connection to a test server, trusting `ca` (from `wire::make_certs`).
     fn tls_to(port: u16, ca: &std::path::Path) -> rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
         // As a browser would: offering HTTP/1.1 by ALPN.
