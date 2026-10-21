@@ -2238,19 +2238,23 @@ mod tests {
     /// `n` free ports from the OS, never handed out twice in this process.
     /// (Ports worked out from the process id used to collide: one fleet
     /// test's wire landed on another's.)
+    /// Ports for test servers, below the range the OS hands out for
+    /// outgoing connections (32768 and up on Linux, 49152 on macOS): a port
+    /// picked there could be taken, between picking and listening, as some
+    /// test client's local port. Each test binary starts at its own place.
     fn free_ports(n: usize) -> Vec<u16> {
-        static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(vec![]);
-        let mut given = GIVEN.lock().unwrap();
-        let mut held = vec![];
+        static NEXT: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
+        let mut next = NEXT.lock().unwrap();
+        if *next == 0 {
+            *next = 20_000 + (std::process::id() % 1000) as u16 * 12;
+        }
         let mut out = vec![];
         while out.len() < n {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let p = l.local_addr().unwrap().port();
-            if !given.contains(&p) {
-                given.push(p);
+            let p = *next;
+            *next = if *next >= 32_000 { 20_000 } else { *next + 1 };
+            if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
                 out.push(p);
             }
-            held.push(l); // held until all are picked, so they differ
         }
         out
     }
