@@ -594,6 +594,9 @@ struct Conn {
     /// Closing: we've sent all we owe and stopped sending, and read and
     /// drop what still comes, since when (`settle`).
     linger: Option<Instant>,
+    /// WebSocket frames are waiting in `wbuf` to go out with the loop's next
+    /// flush (`Loop::unsent` has it).
+    unsent: bool,
 }
 
 /// A WebSocket. It belongs to an object, but outlives it: an idle object
@@ -1466,6 +1469,7 @@ where
                     last_tls_check: Instant::now(),
                     last_conn_check: Instant::now(),
                     ran: vec![],
+                    unsent: vec![],
                     last_accept_warning: Instant::now(),
                     next_sock: 0,
                     boot: {
@@ -1551,6 +1555,9 @@ struct Loop<'a, E: Engine> {
     /// Per process (by index): the ns its cells ran and the slices, since
     /// they last went into `Shared::procs`.
     ran: Vec<(u64, u64)>,
+    /// Connections with WebSocket frames written but not sent yet: they go
+    /// out together, before the loop next waits.
+    unsent: Vec<usize>,
     last_accept_warning: Instant,
     next_sock: u64,
     /// Random bits for socket ids, so a restart never reuses one.
@@ -1815,6 +1822,7 @@ impl<E: Engine> Loop<'_, E> {
         }
         let mut touched: Vec<usize> = vec![];
         while !self.sh.cfg.stop.load(Relaxed) {
+            self.flush_unsent()?;
             self.pick_up_app()?;
             // Never block while requests are waiting to run.
             let timeout = if self.tasks.is_empty() {
@@ -2647,9 +2655,30 @@ impl<E: Engine> Loop<'_, E> {
                 w.gone = true;
                 c.close_after = true;
                 self.forget(id, true);
+            } else {
+                // Sent with the loop's next flush, with whatever else comes
+                // for this socket by then: one TLS record and one write for
+                // all of them, not one for each.
+                if !c.unsent {
+                    c.unsent = true;
+                    self.unsent.push(who.0);
+                }
+                return Ok(());
             }
         }
         self.settle(who.0)
+    }
+
+    /// Send what WebSocket frames have waited (`ws_local`).
+    fn flush_unsent(&mut self) -> std::io::Result<()> {
+        for id in std::mem::take(&mut self.unsent) {
+            let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { continue };
+            if c.unsent {
+                c.unsent = false;
+                self.settle(id)?;
+            }
+        }
+        Ok(())
     }
 
     /// A socket in an object's list is gone without a close: tell the
@@ -2968,7 +2997,7 @@ impl<E: Engine> Loop<'_, E> {
         });
         self.poll.registry().register(&mut s, Token(id), Interest::READABLE)?;
         self.next_gen += 1;
-        self.conns[id] = Some(Conn { s, gen: self.next_gen, rbuf, wbuf: vec![], wpos: 0, writing: false, close_after: false, busy: false, ws: None, tls: None, redirect: false, at: Instant::now(), reading: None, served: false, peer_done: false, linger: None });
+        self.conns[id] = Some(Conn { s, gen: self.next_gen, rbuf, wbuf: vec![], wpos: 0, writing: false, close_after: false, busy: false, ws: None, tls: None, redirect: false, at: Instant::now(), reading: None, served: false, peer_done: false, linger: None, unsent: false });
         Ok(id)
     }
 
