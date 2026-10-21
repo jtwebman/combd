@@ -4,6 +4,13 @@ name = "million"
 # Locally, browsers send million.localhost to 127.0.0.1.
 domains = ["million.combd.dev", "million.localhost"]
 
+# Both modules run compiled: a deploy waits for their builds.
+[modules.million]
+engine = "compiled"
+
+[modules.viewer]
+engine = "compiled"
+
 # The page, and the count of checked boxes.
 [http.web]
 module = "million"

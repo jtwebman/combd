@@ -3904,6 +3904,12 @@ callers = ["api"]
 
     const MILLION: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/million/app");
 
+    /// Million's manifest, interpreted (it runs compiled; these tests are
+    /// the interpreter's).
+    fn million_toml() -> String {
+        std::fs::read_to_string(format!("{MILLION}/combd.toml")).unwrap().replace("engine = \"compiled\"", "engine = \"interpreted\"")
+    }
+
     /// The million checkboxes: a session (a `ws` process) per socket,
     /// asleep between events, its chunks' changes going straight to its
     /// socket without waking it, the count, and sessions that end. Asleep
@@ -3923,7 +3929,7 @@ callers = ["api"]
         let app = store::tempdir::Dir::new();
         std::fs::create_dir(app.0.join("modules")).unwrap();
         // Asleep after every event, so every event wakes it.
-        let m = std::fs::read_to_string(format!("{MILLION}/combd.toml")).unwrap().replace("hibernate_ms = 2000", "hibernate_ms = 0").replace("hibernate = \"app\"", &format!("hibernate = \"{sleep}\"")).replace("state_kb = 1", "state_kb = 16");
+        let m = million_toml().replace("hibernate_ms = 2000", "hibernate_ms = 0").replace("hibernate = \"app\"", &format!("hibernate = \"{sleep}\"")).replace("state_kb = 1", "state_kb = 16");
         std::fs::write(app.0.join("combd.toml"), m).unwrap();
         for f in ["million.wasm", "viewer.wasm"] {
             std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");
@@ -3998,7 +4004,7 @@ callers = ["api"]
     fn a_memory_cap_under_the_module_is_refused() {
         let app = store::tempdir::Dir::new();
         std::fs::create_dir(app.0.join("modules")).unwrap();
-        let m = std::fs::read_to_string(format!("{MILLION}/combd.toml")).unwrap().replace("memory_kb = 512", "memory_kb = 64");
+        let m = million_toml().replace("memory_kb = 512", "memory_kb = 64");
         std::fs::write(app.0.join("combd.toml"), m).unwrap();
         for f in ["million.wasm", "viewer.wasm"] {
             std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");
@@ -4018,7 +4024,7 @@ callers = ["api"]
         };
         let app = store::tempdir::Dir::new();
         std::fs::create_dir(app.0.join("modules")).unwrap();
-        std::fs::copy(format!("{MILLION}/combd.toml"), app.0.join("combd.toml")).unwrap();
+        std::fs::write(app.0.join("combd.toml"), million_toml()).unwrap();
         for f in ["million.wasm", "viewer.wasm"] {
             std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");
         }
