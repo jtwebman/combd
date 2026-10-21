@@ -1258,6 +1258,18 @@ it's off), the flush writes as now.
 **Measure after each:** the same ramp (10,000 to 40,000 active users on
 one node), and the idle hold (105,000 before: how many now).
 
+**Measured (2026-10-21), and the order changed.** The whole system on one
+1 vCPU node, 10,000 active users (20,000 alike): kernel 75% of all CPU;
+`sendto` 45% (TCP transmit 27%, the device queue 13%), receiving 24%
+(network interrupts and softirq, mostly the ACKs for those packets), the
+NIC kicks 4%, system call entry with SRSO 3%, copying data in 0.3%. So
+the ceiling is packets a second on a small VM, not the system calls and
+not the crypto. kTLS saves almost no CPU, but it's still the memory win
+(TLS is ~8 KB of an idle connection's ~10), so it goes first, measured
+by the idle hold. io_uring would save maybe 5 to 10%: later, if at all.
+More active users per node means fewer packets per user (an app's
+choice, as million's beat) or bigger machines.
+
 ## The edge: TLS in combd, or edge nodes in front (2026-10-20)
 
 combd gets an idle connection down to 2.24 KB, but in front of it on each
