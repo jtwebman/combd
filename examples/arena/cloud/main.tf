@@ -182,6 +182,9 @@ resource "digitalocean_droplet" "node" {
       # past 95% it refuses new work. 700M (which counts swap) let a node
       # swap itself into a crawl before it refused anything.
       "COMBD_MEMORY_BUDGET=550M",
+      # TLS in the kernel once a connection's handshake is done: an idle
+      # one is ~3.7 KB, not ~7.5 (combd-tune loads the module).
+      "COMBD_KTLS=1",
       # Compiled modules: builds signed by these builders only.
       "COMBD_BUILDER_KEYS=/etc/combd/builder-keys",
       "",

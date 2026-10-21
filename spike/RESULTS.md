@@ -2413,6 +2413,39 @@ copying), and 8% the compiled apps; and each batch waits on its peers
 (84 and 244 ms away). Coalescing a socket's frames per loop turn found
 1.02 frames a flush: a socket gets ~3 a second, one per chunk batch.
 
+## Where a node's CPU goes, and kernel TLS (2026-10-21)
+
+One 1 vCPU node, million compiled, every page clicking. A one-node ramp
+(fresh server per step, six client droplets):
+
+| Users | Worst p50 | Worst p99 | Lost | Out of |
+|---|---|---|---|---|
+| 10,000 | 425 ms | 1.6 s | 0% | (69% CPU) |
+| 20,000 | 2.1 s | 8.7 s | 0.13% | CPU |
+| 30,000 | 5.6 s | 10 s | 43% | CPU, memory |
+| 40,000 | | | 88% | memory (swapping) |
+
+Before that ramp, million's chunks learned to send on a beat (150 ms) and
+combd to send one frame to many sockets (`"ids"`): at 10,000 users the
+echo went from p50 ~1.6 s, p99 ~2 s to p50 ~300 ms, p99 ~650 ms.
+
+Where the CPU goes (the whole system, perf, 10,000 users; 20,000 alike):
+kernel 75%: `sendto` 45% (TCP transmit 27%, the device queue 13%),
+receiving 24% (network interrupts, the ACKs), the NIC kicks 4%, system
+call entry 3%, copying in 0.3%. So the ceiling is packets a second on a
+small VM: not the system calls, not the crypto.
+
+Kernel TLS (`COMBD_KTLS=1`): a connection's session goes to the kernel
+once its handshake is done. 20,000 idle TLS WebSockets on one node:
+
+| | Memory a connection (combd's and the kernel's) |
+|---|---|
+| TLS in combd (rustls) | 7,533 bytes |
+| Kernel TLS | 3,714 bytes |
+
+Half: at a 550 MB budget, ~145,000 idle connections where ~73,000 fit.
+The arena's nodes run it.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A
