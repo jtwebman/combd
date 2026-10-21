@@ -8,7 +8,7 @@ fn main() {
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let version = std::process::Command::new(rustc).arg("-V").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for f in ["src/lib.rs", "src/rt.rs"] {
+    for f in ["src/lib.rs", "src/rt.rs", "../mem/src/lib.rs"] {
         println!("cargo:rerun-if-changed={f}");
         for b in std::fs::read(f).expect("source") {
             h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);

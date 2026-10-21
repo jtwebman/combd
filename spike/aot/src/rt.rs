@@ -203,8 +203,11 @@ pub use crate::guard::Mem;
 /// A cell's linear memory, exactly the Wasm memory's size, so every access is
 /// one bounds check. Growing writes zeros only into the new part.
 #[cfg(not(feature = "guard"))]
+/// A cell's linear memory: combd-mem's, reserved up front and zeroed by
+/// the kernel, so growing only makes pages writable (a Vec's resize wrote
+/// every new page, and a cell held all of them).
 pub struct Mem {
-    pub(crate) buf: Vec<u8>,
+    pub(crate) buf: combd_mem::Mem,
 }
 
 #[cfg(not(feature = "guard"))]
@@ -227,12 +230,12 @@ fn copy_nonzero(from: &[u8]) -> Vec<u8> {
 #[cfg(not(feature = "guard"))]
 impl Mem {
     pub fn new(len: usize) -> Mem {
-        Mem { buf: vec![0; len] }
+        Mem { buf: combd_mem::Mem::new(None, len).expect("can't map a cell's memory") }
     }
 
     #[inline(always)]
     pub fn bytes(&mut self) -> &mut [u8] {
-        &mut self.buf
+        self.buf.bytes_mut()
     }
 
     #[inline(always)]
@@ -242,29 +245,36 @@ impl Mem {
 
     #[inline(always)]
     pub fn get(&self, a: usize, n: usize) -> Option<&[u8]> {
-        self.buf.get(a..a + n)
+        self.buf.bytes().get(a..a + n)
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self, a: usize, n: usize) -> Option<&mut [u8]> {
-        self.buf.get_mut(a..a + n)
+        self.buf.bytes_mut().get_mut(a..a + n)
     }
 
     pub fn grow(&mut self, max_pages: u32, n: u64) -> u64 {
         let old = self.buf.len() / PAGE;
         let new = old as u64 + n as u32 as u64;
-        if new > max_pages as u64 {
+        if new > max_pages as u64 || self.buf.grow(new as usize * PAGE).is_err() {
             return u32::MAX as u64;
         }
-        self.buf.resize(new as usize * PAGE, 0);
         old as u64
     }
 }
 
+/// A copy (a snapshot): zero chunks skipped, so pages the cell left empty
+/// stay untouched in the copy too.
 #[cfg(not(feature = "guard"))]
 impl Clone for Mem {
     fn clone(&self) -> Self {
-        Mem { buf: copy_nonzero(&self.buf) }
+        let mut m = Mem::new(self.buf.len());
+        for (i, c) in self.buf.bytes().chunks(CHUNK).enumerate() {
+            if c.iter().any(|&b| b != 0) {
+                m.buf.bytes_mut()[i * CHUNK..i * CHUNK + c.len()].copy_from_slice(c);
+            }
+        }
+        m
     }
 }
 

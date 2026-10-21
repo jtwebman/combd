@@ -739,8 +739,7 @@ fn fresh_bench(wasm: &str, n: usize, rest: &[&str]) {
     }
 }
 
-fn density_app(wasm: &str, n: usize, rest: &[&str]) {
-    let eng = interp::Interp { max_pages: 16384 };
+fn density_app<E: Engine>(eng: &E, wasm: &str, n: usize, rest: &[&str]) {
     let prog = eng.load(&std::fs::read(wasm).unwrap()).unwrap();
     let environ: Vec<Vec<u8>> = rest.iter().filter_map(|a| a.strip_prefix("env=")).map(|e| e.as_bytes().to_vec()).collect();
     let reqs: Vec<&str> = rest.iter().copied().filter(|a| !a.starts_with("env=")).collect();
@@ -904,7 +903,10 @@ fn main_with(args: &[&str]) {
         }
         // Memory per cell of a real module, after real requests:
         // `density-app <module.wasm> <n> [env=K=V]... [request]...`.
-        ["density-app", wasm, n, ref rest @ ..] => density_app(wasm, n.parse().unwrap(), rest),
+        ["density-app", wasm, n, ref rest @ ..] => density_app(&interp::Interp { max_pages: 16384 }, wasm, n.parse().unwrap(), rest),
+        // The same, compiled: a build in COMBD_AOT_DIR (or built in).
+        #[cfg(feature = "aot-lite")]
+        ["density-app-aot", wasm, n, ref rest @ ..] => density_app(&aot::Aot, wasm, n.parse().unwrap(), rest),
         // Hold `n` WebSockets open on a server, each after one message, and
         // print the server's memory per socket: `ws-hold <host> <port>
         // <path> <n> <message> <server pid>`.
@@ -1884,14 +1886,15 @@ mod tests {
         // Built against other combd-aot sources (an old build, after the
         // node moved on): its pin isn't ours, and nothing else is read.
         let old = store::tempdir::Dir::new();
-        for f in ["Cargo.toml", "build.rs", "src/lib.rs", "src/rt.rs", "src/fiber.rs", "src/guard.rs", "src/trap.c"] {
-            std::fs::create_dir_all(old.0.join(f).parent().unwrap()).unwrap();
-            std::fs::copy(aot_src.join(f), old.0.join(f)).unwrap();
+        let mem_src = aot_src.join("../mem");
+        for (from, to, f) in ["Cargo.toml", "build.rs", "src/lib.rs", "src/rt.rs", "src/fiber.rs", "src/guard.rs", "src/trap.c"].map(|f| (&aot_src, "aot", f)).into_iter().chain(["Cargo.toml", "src/lib.rs"].map(|f| (&mem_src, "mem", f))) {
+            std::fs::create_dir_all(old.0.join(to).join(f).parent().unwrap()).unwrap();
+            std::fs::copy(from.join(f), old.0.join(to).join(f)).unwrap();
         }
-        let rt = std::fs::read_to_string(old.0.join("src/rt.rs")).unwrap();
-        std::fs::write(old.0.join("src/rt.rs"), rt + "\n// another version\n").unwrap();
+        let rt = std::fs::read_to_string(old.0.join("aot/src/rt.rs")).unwrap();
+        std::fs::write(old.0.join("aot/src/rt.rs"), rt + "\n// another version\n").unwrap();
         let stale = old.0.join("stale.so");
-        build::build(&wasm, &old.0, &old.0.join("work"), &stale, None, None).unwrap();
+        build::build(&wasm, &old.0.join("aot"), &old.0.join("work"), &stale, None, None).unwrap();
         let e = combd_load::open(&stale).err().unwrap();
         assert!(e.contains("built with") && e.contains("this node is"), "{e}");
     }

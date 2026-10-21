@@ -156,6 +156,7 @@ name = "combd-aot"
 version = "0.0.0"
 dependencies = [
  "cc",
+ "combd-mem",
  "corosensei",
  "libc",
 ]

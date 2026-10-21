@@ -9,6 +9,8 @@ description = "combd's AOT tier: Wasm modules compiled to plain safe Rust by `co
 path = "src/lib.rs"
 
 [dependencies]
+# A cell's memory: reserved, zeroed by the kernel, grown without writing.
+combd-mem = { path = "../mem" }
 libc = { version = "0.2", optional = true }
 corosensei = { version = "0.3.4", optional = true }
 
