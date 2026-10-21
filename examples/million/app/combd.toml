@@ -4,16 +4,22 @@ name = "million"
 # Locally, browsers send million.localhost to 127.0.0.1.
 domains = ["million.combd.dev", "million.localhost"]
 
-# Both modules run compiled: a deploy waits for their builds.
+# Compiled: the chunks and the total (million) and the viewers (a deploy
+# waits for their builds). The page (web) runs the same code from its own
+# copy, interpreted: it asks the total with `call`, which waits on another
+# process, and compiled code can't pause mid-call yet.
 [modules.million]
 engine = "compiled"
 
 [modules.viewer]
 engine = "compiled"
 
+[modules.web]
+engine = "interpreted"
+
 # The page, and the count of checked boxes.
 [http.web]
-module = "million"
+module = "web"
 routes = ["/", "/api/count"]
 
 # One per WebSocket: what its page looks at, and the page's sets. Asleep

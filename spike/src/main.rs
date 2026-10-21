@@ -3938,7 +3938,7 @@ callers = ["api"]
         // Asleep after every event, so every event wakes it.
         let m = million_toml().replace("hibernate_ms = 2000", "hibernate_ms = 0").replace("hibernate = \"app\"", &format!("hibernate = \"{sleep}\"")).replace("state_kb = 1", "state_kb = 16");
         std::fs::write(app.0.join("combd.toml"), m).unwrap();
-        for f in ["million.wasm", "viewer.wasm"] {
+        for f in ["million.wasm", "viewer.wasm", "web.wasm"] {
             std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");
         }
         let eng = interp::Interp { max_pages: 16384 };
@@ -4013,7 +4013,7 @@ callers = ["api"]
         std::fs::create_dir(app.0.join("modules")).unwrap();
         let m = million_toml().replace("memory_kb = 512", "memory_kb = 64");
         std::fs::write(app.0.join("combd.toml"), m).unwrap();
-        for f in ["million.wasm", "viewer.wasm"] {
+        for f in ["million.wasm", "viewer.wasm", "web.wasm"] {
             std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");
         }
         let e = http::load_app(&interp::Interp { max_pages: 16384 }, &app.0).err().expect("refused");
@@ -4032,7 +4032,7 @@ callers = ["api"]
         let app = store::tempdir::Dir::new();
         std::fs::create_dir(app.0.join("modules")).unwrap();
         std::fs::write(app.0.join("combd.toml"), million_toml()).unwrap();
-        for f in ["million.wasm", "viewer.wasm"] {
+        for f in ["million.wasm", "viewer.wasm", "web.wasm"] {
             std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");
         }
         let dir = store::tempdir::Dir::new();

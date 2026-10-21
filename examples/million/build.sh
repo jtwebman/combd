@@ -6,5 +6,7 @@ cd "$(dirname "$0")"
 (cd viewer && cargo build --release --target wasm32-unknown-unknown)
 mkdir -p app/modules
 cp cell/target/wasm32-unknown-unknown/release/million_cell.wasm app/modules/million.wasm
+# The page's copy (it runs interpreted; see combd.toml).
+cp app/modules/million.wasm app/modules/web.wasm
 cp viewer/target/wasm32-unknown-unknown/release/million_viewer.wasm app/modules/viewer.wasm
 echo "built app/modules/million.wasm and viewer.wasm"
