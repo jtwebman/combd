@@ -1,0 +1,10 @@
+[package]
+name = "combd-ring"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Many sockets' sends in one system call (Linux io_uring): combd's unsafe code for it."
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"

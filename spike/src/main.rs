@@ -1983,6 +1983,28 @@ mod tests {
     /// Kernel TLS (`ktls`): requests on a kept-alive connection, and sockets
     /// to rooms (some moving loops), answer as before once their sessions are
     /// the kernel's. Where the kernel can't, there's nothing to test.
+    /// io_uring (`uring`): frames to many sockets go out through the ring,
+    /// each socket getting its own, in order. Where there's no io_uring
+    /// (macOS, or a sandbox that blocks it), there's nothing to test.
+    #[test]
+    fn io_uring_sends_the_frames() {
+        if combd_ring::Ring::new(8).is_err() {
+            eprintln!("skipping: no io_uring here");
+            return;
+        }
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { uring: true, ..cfg(&dir.0, 2) });
+        let mut socks: Vec<Ws> = (0..12).map(|r| Ws::open(port, &format!("/do/ring{r}/ws")).unwrap()).collect();
+        for k in 0..4 {
+            for (r, w) in socks.iter_mut().enumerate() {
+                w.text(&format!("m {r}.{k}"));
+                let (op, p) = w.recv();
+                assert_eq!((op, String::from_utf8(p).unwrap().contains(&format!("\"text\":\"m {r}.{k}\""))), (1, true));
+            }
+        }
+        assert!(stat(port, "ring_sends") >= 48, "the frames went through the ring");
+    }
+
     /// Opt-in, like combd-ktls's test: on a Linux box with kTLS,
     /// `cargo test -- --ignored kernel_tls`.
     #[test]
@@ -2301,6 +2323,7 @@ mod tests {
 
     fn cfg(data: &std::path::Path, threads: usize) -> http::Config {
         http::Config {
+            uring: false,
             ktls: false,
             threads,
             data: data.to_path_buf(),

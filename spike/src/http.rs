@@ -145,6 +145,10 @@ pub struct Config {
     /// done and nothing is half read or unsent, its keys go to the kernel
     /// and its rustls state goes (most of an idle TLS connection's memory).
     pub ktls: bool,
+    /// io_uring for the loop's flush (`COMBD_URING=1`, Linux, where a sandbox
+    /// allows it: Docker's default doesn't): every socket's waiting frames
+    /// in one system call. Plain sockets only (no TLS, or TLS in the kernel).
+    pub uring: bool,
     /// A port that only redirects to HTTPS (`COMBD_REDIRECT_PORT`, 80).
     pub redirect_port: Option<u16>,
     pub limits: Limits,
@@ -260,6 +264,7 @@ impl Config {
             max_conns: num("COMBD_MAX_CONNS", 200_000) as u64,
             tls: std::env::var("COMBD_TLS_CERT").ok().zip(std::env::var("COMBD_TLS_KEY").ok()).map(|(c, k)| (PathBuf::from(c), PathBuf::from(k))),
             ktls: std::env::var("COMBD_KTLS").as_deref() == Ok("1"),
+            uring: std::env::var("COMBD_URING").as_deref() == Ok("1"),
             redirect_port: std::env::var("COMBD_REDIRECT_PORT").ok().and_then(|p| p.parse().ok()),
             limits: Limits::from_env(),
             public: std::env::var("COMBD_PUBLIC_URLS").unwrap_or_default().split(',').filter_map(|kv| kv.split_once('=')).filter_map(|(n, u)| Some((n.trim().parse().ok()?, u.trim().to_string()))).collect(),
@@ -317,6 +322,8 @@ struct Stats {
     batched: AtomicU64,
     /// Connections whose TLS went to the kernel.
     ktls: AtomicU64,
+    /// Sends that went through io_uring (`uring`).
+    ring_sends: AtomicU64,
     /// WebSocket frames sent, and the flushes that sent them (several
     /// frames for a socket go in one).
     ws_frames: AtomicU64,
@@ -1485,6 +1492,7 @@ where
                     last_conn_check: Instant::now(),
                     ran: vec![],
                     unsent: vec![],
+                    ring: sh.cfg.uring.then(|| combd_ring::Ring::new(256).map_err(|e| eprintln!("combd     io_uring (COMBD_URING): {e}: writing as before")).ok()).flatten(),
                     last_accept_warning: Instant::now(),
                     next_sock: 0,
                     boot: {
@@ -1573,6 +1581,8 @@ struct Loop<'a, E: Engine> {
     /// Connections with WebSocket frames written but not sent yet: they go
     /// out together, before the loop next waits.
     unsent: Vec<usize>,
+    /// The ring those go through (`uring`), if this loop could make one.
+    ring: Option<combd_ring::Ring>,
     last_accept_warning: Instant,
     next_sock: u64,
     /// Random bits for socket ids, so a restart never reuses one.
@@ -2654,6 +2664,36 @@ impl<E: Engine> Loop<'_, E> {
         Ok(())
     }
 
+    /// The waiting frames of every plain socket (no TLS, or TLS in the
+    /// kernel) in one system call; what's left (a full socket, one that
+    /// broke, one with TLS here) `settle` sees to after, as before.
+    fn ring_sends(&mut self) {
+        use std::os::fd::AsRawFd;
+        let ids: Vec<usize> = self.unsent.iter().copied().filter(|&id| self.conns.get(id).and_then(Option::as_ref).is_some_and(|c| c.unsent && c.tls.is_none() && c.wpos < c.wbuf.len())).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let mut done = vec![];
+        {
+            let conns = &self.conns;
+            let sends: Vec<(std::os::fd::RawFd, &[u8])> = ids.iter().map(|&id| {
+                let c = conns[id].as_ref().unwrap();
+                (c.s.as_raw_fd(), &c.wbuf[c.wpos..])
+            }).collect();
+            if let Err(e) = self.ring.as_mut().unwrap().send_all(&sends, &mut done) {
+                eprintln!("combd     io_uring: {e}: writing as before");
+                self.ring = None;
+                return;
+            }
+        }
+        self.sh.stats.ring_sends.fetch_add(ids.len() as u64, Relaxed);
+        for (id, r) in ids.into_iter().zip(done) {
+            if let (Some(c), Ok(n)) = (self.conns[id].as_mut(), r) {
+                c.wpos += n;
+            }
+        }
+    }
+
     /// A frame, made already, to a socket on this loop. `false`: it's gone.
     fn ws_frame(&mut self, id: u64, op: u8, frame: &[u8]) -> std::io::Result<bool> {
         let live = self.local_socks.get(&id).copied().filter(|&who| self.conn(who).and_then(|c| c.ws.as_ref()).is_some_and(|w| w.open && !w.gone));
@@ -2690,6 +2730,9 @@ impl<E: Engine> Loop<'_, E> {
 
     /// Send what WebSocket frames have waited (`ws_local`).
     fn flush_unsent(&mut self) -> std::io::Result<()> {
+        if self.ring.is_some() && !self.unsent.is_empty() {
+            self.ring_sends();
+        }
         for id in std::mem::take(&mut self.unsent) {
             let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { continue };
             if c.unsent {
@@ -3691,7 +3734,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"batched\":{},\"ktls\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"batched\":{},\"ktls\":{},\"ring_sends\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3720,6 +3763,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.mailbox_refused.load(Relaxed),
                     s.batched.load(Relaxed),
                     s.ktls.load(Relaxed),
+                    s.ring_sends.load(Relaxed),
                     s.ws_frames.load(Relaxed),
                     s.ws_flushes.load(Relaxed),
                     combd_mem::heap_in_use(),
