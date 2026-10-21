@@ -1270,6 +1270,14 @@ by the idle hold. io_uring would save maybe 5 to 10%: later, if at all.
 More active users per node means fewer packets per user (an app's
 choice, as million's beat) or bigger machines.
 
+**io_uring, built and measured (2026-10-21): no gain.** `COMBD_URING=1`
+(Docker needs `--security-opt seccomp=unconfined`). At 10,000 active
+users, kTLS on, two rounds each, the ring carried 98% of the frames and
+the node's CPU didn't move: 66% and 65% without, 67% and 63% with, the
+same latency. The cost is TCP itself, per packet, not the system calls.
+It stays in, off by default; the arena's nodes don't run it (not worth
+dropping Docker's seccomp for).
+
 ## The edge: TLS in combd, or edge nodes in front (2026-10-20)
 
 combd gets an idle connection down to 2.24 KB, but in front of it on each

@@ -2446,6 +2446,20 @@ once its handshake is done. 20,000 idle TLS WebSockets on one node:
 Half: at a 550 MB budget, ~145,000 idle connections where ~73,000 fit.
 The arena's nodes run it.
 
+io_uring for the sends (`COMBD_URING=1`): one submission for every socket
+with frames waiting. 10,000 active users, kTLS on, a fresh server each
+run, 3 minutes:
+
+| | Server CPU | Worst p50 | Worst p99 | Lost |
+|---|---|---|---|---|
+| Without, round 1 | 66% | 563 ms | 2.3 s | 0% |
+| With, round 1 (98% of frames through the ring) | 67% | 424 ms | 1.4 s | 0% |
+| Without, round 2 | 65% | 411 ms | 1.5 s | 0% |
+| With, round 2 | 63% | 432 ms | 2.0 s | 0% |
+
+No difference beyond the noise: the system calls weren't the cost, TCP's
+work per packet is. Off by default; the arena doesn't run it.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A
