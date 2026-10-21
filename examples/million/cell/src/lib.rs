@@ -77,15 +77,20 @@ fn tell(msg: &Value) {
     unsafe { send(m.as_ptr(), m.len() as u32) };
 }
 
-/// Straight to viewers' sockets: the viewers don't run. The message is
-/// quoted once, and each push only adds its socket: with a hundred watching,
-/// building each one as JSON was most of a set's time.
+/// Straight to viewers' sockets: the viewers don't run. One send for all
+/// of them (`ids`): the host makes the frame once.
 fn push(socks: impl Iterator<Item = u64>, msg: &str) {
-    let tail = format!(r#"","ws":{}}}"#, Value::from(msg));
-    for sock in socks {
-        let m = format!(r#"{{"to":"viewer","id":"{sock}{tail}"#);
-        unsafe { send(m.as_ptr(), m.len() as u32) };
+    let mut m = String::from(r#"{"to":"viewer","ids":["#);
+    for (k, sock) in socks.enumerate() {
+        if k > 0 {
+            m.push(',');
+        }
+        m.push_str(&sock.to_string());
     }
+    m.push_str(r#"],"ws":"#);
+    m.push_str(&Value::from(msg).to_string());
+    m.push('}');
+    unsafe { send(m.as_ptr(), m.len() as u32) };
 }
 
 fn err(code: u16, msg: &str) -> String {
@@ -139,6 +144,26 @@ struct Chunk {
     pruned: i64,
     /// Every box, as a new watcher gets it: built again only after a change.
     all: Option<String>,
+    /// Changes since the last beat, for the watchers at the next one.
+    pending: Vec<(usize, bool)>,
+    /// The beat is on (`BEAT_MS`), and when the total last heard.
+    beat: bool,
+    told: i64,
+}
+
+/// The watchers hear a chunk's changes on a beat: one message each per beat,
+/// with every change since the last, however many clicks came. So a node's
+/// sends grow with its watchers, not with their clicks.
+const BEAT_MS: u64 = 150;
+/// The total hears from a chunk at most this often.
+const TOLD_MS: i64 = 1000;
+
+/// The beat, on (if it isn't: setting it again would put it off).
+fn arm(c: &mut Chunk) {
+    if !c.beat {
+        c.beat = true;
+        unsafe { tick_every(BEAT_MS) };
+    }
 }
 
 thread_local! {
@@ -158,10 +183,11 @@ fn load() -> Chunk {
     // The total hears from a chunk with boxes checked as soon as it wakes,
     // not only after its next change.
     let dirty = !rows.is_empty();
+    let mut c = Chunk { n: 0, bits, checked: rows.len() as u64, subs: HashMap::new(), dirty, pruned: 0, all: None, pending: vec![], beat: false, told: 0 };
     if dirty {
-        unsafe { tick_every(1000) };
+        arm(&mut c);
     }
-    Chunk { n: 0, bits, checked: rows.len() as u64, subs: HashMap::new(), dirty, pruned: 0, all: None }
+    c
 }
 
 fn hex(b: &[u8]) -> String {
@@ -174,9 +200,8 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
-/// The watchers hear a chunk's changes: one message for one, and for a
-/// batch, one with them all (`sets`), so a hundred watching get a hundred
-/// pushes per batch, not per click.
+/// The watchers hear a beat's changes: one message for one, and for more,
+/// one with them all (`sets`).
 fn tell_sets(sets: &[(usize, bool)]) {
     if sets.is_empty() {
         return;
@@ -235,20 +260,20 @@ fn chunk(method: &str, path: &str, v: &Value, sets: &mut Vec<(usize, bool)>) -> 
                     query("DELETE FROM on_ WHERE i = ?", &[json!(i)]);
                     c.checked -= 1;
                 }
-                // Out once the write is on disk (the host holds them).
-                // ponytail: one push per watcher per batch; one per node is next.
-                sets.push((i, on));
-                // The total hears at most once a second.
-                if !c.dirty {
-                    c.dirty = true;
-                    unsafe { tick_every(1000) };
-                }
+                // To the watchers at the next beat (and out only once the
+                // write is on disk: the host holds what a beat sends until then).
+                c.pending.push((i, on));
+                c.dirty = true;
+                arm(c);
             }
             ("TICK", _) => {
-                if c.dirty {
+                sets.append(&mut c.pending);
+                if c.dirty && now - c.told >= TOLD_MS {
                     tell(&json!({ "to": "boxes", "id": "all", "path": "/count", "body": json!({ "n": c.n, "checked": c.checked }).to_string() }));
-                    c.dirty = false;
-                } else {
+                    (c.dirty, c.told) = (false, now);
+                }
+                if !c.dirty {
+                    c.beat = false;
                     unsafe { tick_every(0) };
                 }
             }

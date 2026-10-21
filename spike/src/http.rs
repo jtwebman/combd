@@ -2637,14 +2637,16 @@ impl<E: Engine> Loop<'_, E> {
     /// Send on a socket whose connection is on this loop. One that isn't here
     /// any more (it closed, or this node restarted) is lost: its object hears.
     fn ws_local(&mut self, name: &str, id: u64, op: u8, payload: &[u8]) -> std::io::Result<()> {
+        if !self.ws_frame(id, op, &crate::ws::encode(op, payload))? && op != 8 {
+            self.socket_lost(name, id);
+        }
+        Ok(())
+    }
+
+    /// A frame, made already, to a socket on this loop. `false`: it's gone.
+    fn ws_frame(&mut self, id: u64, op: u8, frame: &[u8]) -> std::io::Result<bool> {
         let live = self.local_socks.get(&id).copied().filter(|&who| self.conn(who).and_then(|c| c.ws.as_ref()).is_some_and(|w| w.open && !w.gone));
-        let Some(who) = live else {
-            if op != 8 {
-                self.socket_lost(name, id);
-            }
-            return Ok(());
-        };
-        let frame = crate::ws::encode(op, payload);
+        let Some(who) = live else { return Ok(false) };
         let sh = self.sh;
         let c = self.conn(who).unwrap();
         let w = c.ws.as_mut().unwrap();
@@ -2655,7 +2657,7 @@ impl<E: Engine> Loop<'_, E> {
             c.wbuf.truncate(c.wpos);
             self.drop_socket(who, crate::ws::TOO_SLOW);
         } else {
-            c.wbuf.extend_from_slice(&frame);
+            c.wbuf.extend_from_slice(frame);
             if op == 8 {
                 w.gone = true;
                 c.close_after = true;
@@ -2669,10 +2671,10 @@ impl<E: Engine> Loop<'_, E> {
                     c.unsent = true;
                     self.unsent.push(who.0);
                 }
-                return Ok(());
+                return Ok(true);
             }
         }
-        self.settle(who.0)
+        self.settle(who.0).map(|()| true)
     }
 
     /// Send what WebSocket frames have waited (`ws_local`).
@@ -3798,7 +3800,29 @@ impl<E: Engine> Loop<'_, E> {
             }
             None => Origin::Discard,
         };
-        let r = if proc.socket {
+        let r = if let (true, Some(ids), Some(text)) = (proc.socket, v["ids"].as_array(), v["ws"].as_str()) {
+            // To many sessions' sockets at once (`"ids"`): the frame is made
+            // once, and each socket on this loop gets a copy. A chunk telling
+            // its watchers is one send, not one each.
+            let frame = crate::ws::encode(1, text.as_bytes());
+            let me = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node);
+            let threads = self.sh.cfg.threads;
+            for sock in ids.iter().filter_map(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))) {
+                match (&self.sh.fleet, ((sock >> 28) & 0xff) as usize % threads) {
+                    // ponytail: one wire frame per socket on another node; one per node is next.
+                    (Some(f), _) if Self::sock_node(sock) != me => f.wire.push(Self::sock_node(sock), Frame::WsPush { name: self.app.object_name(t, &format!("~{sock}")), sock, op: 1, payload: text.as_bytes().to_vec() }),
+                    (_, l) if l == self.me => {
+                        self.ws_frame(sock, 1, &frame).map_err(|e| e.to_string())?;
+                    }
+                    (_, l) => {
+                        let (tx, waker) = &self.sh.peers[l];
+                        let _ = tx.send(Msg::WsPush { name: self.app.object_name(t, &format!("~{sock}")), sock, op: 1, payload: text.as_bytes().to_vec() });
+                        let _ = waker.wake();
+                    }
+                }
+            }
+            Ok(())
+        } else if proc.socket {
             let sock = v["id"].as_str().and_then(|id| id.parse::<u64>().ok()).ok_or(format!("{target} is a socket process: name the session, \"id\""))?;
             let name = self.app.object_name(t, &format!("~{sock}"));
             let (node, me) = (Self::sock_node(sock), self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node));
