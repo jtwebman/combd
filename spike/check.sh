@@ -32,7 +32,8 @@ grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { echo "check: te
 cargo test --release -q -p combd-mem 2>&1 | grep -q "test result: ok" || { echo "check: combd-mem failed"; exit 1; }
 # The compiled tier too, when aot.sh has made its modules (they aren't in git).
 if [ -f aot/src/gen_rust.rs ]; then
-    cargo test --release -q --features aot 2>&1 | grep -q "test result: ok" || { echo "check: the compiled tier's tests failed"; exit 1; }
+    cargo test --release -q --features aot >"$out" 2>&1 || true
+    grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { grep -E "FAILED|panicked" "$out"; echo "check: the compiled tier's tests failed"; exit 1; }
 fi
 [ "$1" = quick ] && { echo "check: ok (quick)"; exit 0; }
 # Compiled modules (slow: they compile): a build loaded the way a node does,

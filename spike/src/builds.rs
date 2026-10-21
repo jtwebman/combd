@@ -101,7 +101,8 @@ pub fn parse_keys(text: &str) -> Vec<Vec<u8>> {
 /// A node's side: where its builds come from, and what it needs.
 pub struct Builds {
     pub s3: S3,
-    /// Builds fetched (and checked) so far, as `<m>.so`.
+    /// Builds fetched (and checked) so far, as `<pin>/<m>.so`: one for
+    /// another pin (a node from before an update) is never taken for this one.
     pub dir: PathBuf,
     /// The builders it trusts.
     pub keys: Vec<Vec<u8>>,
@@ -120,8 +121,10 @@ impl Builds {
     /// For this binary on this machine; and says so in the bucket
     /// (`_combd/nodes/<node>`), for deploys to know what to build.
     pub fn new(s3: S3, dir: PathBuf, keys: Vec<Vec<u8>>, node: u32) -> Result<Builds, String> {
+        let pin = pin_id(combd_aot::PIN);
+        let dir = dir.join(&pin);
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let b = Builds { s3, dir, keys, pin: pin_id(combd_aot::PIN), cpu: cpu().to_string() };
+        let b = Builds { s3, dir, keys, pin, cpu: cpu().to_string() };
         let me = serde_json::json!({ "pin": b.pin, "pin_text": combd_aot::PIN, "cpu": b.cpu, "version": option_env!("COMBD_VERSION").unwrap_or("dev"), "at": now_ms() });
         b.s3.put(&format!("_combd/nodes/{node}"), me.to_string().as_bytes(), &Cond::Any).map_err(|e| e.to_string())?.map_err(|()| "can't write the node's record")?;
         b.s3.put(&format!("_combd/builds/{}/pin", b.pin), combd_aot::PIN.as_bytes(), &Cond::Any).map_err(|e| e.to_string())?.map_err(|()| "can't write the pin")?;

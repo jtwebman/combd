@@ -2687,6 +2687,14 @@ mod tests {
         let public = builds::new_key(&dir.0.join("builder.key")).unwrap();
         let keys = builds::parse_keys(&public);
         let ports = free_ports(2);
+        // The guest, with a custom section: the same program, another hash,
+        // so it isn't the copy built into this binary.
+        let mut wasm = std::fs::read(GUEST).unwrap();
+        wasm.extend_from_slice(&[0, 6, 4, b't', b'e', b's', b't', 1]);
+        // A build left from before an update (another pin), where builds once
+        // went: never taken for this pin's.
+        std::fs::create_dir_all(dir.0.join("builds0")).unwrap();
+        std::fs::write(dir.0.join("builds0").join(format!("{}.so", builds::module_id(&wasm))), b"an old pin's build").unwrap();
         for n in 0..2u32 {
             let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 1, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new() };
             let b = builds::Builds::new(bucket.clone(), dir.0.join(format!("builds{n}")), keys.clone(), n).unwrap();
@@ -2699,10 +2707,6 @@ mod tests {
         let url = format!("http://127.0.0.1:{admin_port}");
         assert!(eventually(20_000, || std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok()));
         let api = |m: &str, p: &str, b: &[u8]| admin::request(&url, None, &token, m, p, b).unwrap();
-        // The guest, with a custom section: the same program, another hash,
-        // so it isn't the copy built into this binary.
-        let mut wasm = std::fs::read(GUEST).unwrap();
-        wasm.extend_from_slice(&[0, 6, 4, b't', b'e', b's', b't', 1]);
         let app = store::tempdir::Dir::new();
         std::fs::create_dir(app.0.join("modules")).unwrap();
         std::fs::write(app.0.join("modules/classic.wasm"), &wasm).unwrap();
