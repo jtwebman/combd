@@ -225,6 +225,7 @@ pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64
     }
     let mut t = Tally::default();
     let mut report = start + Duration::from_secs(10);
+    let mut scan = start;
     loop {
         poll.poll(&mut events, Some(Duration::from_millis(20))).unwrap();
         for e in &events {
@@ -236,20 +237,29 @@ pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64
                 }
             }
         }
+        // Every page's timers, every 50 ms, not on every wake-up: with
+        // thousands of sockets busy, the scan was most of this client's CPU.
         let now = Instant::now();
-        for p in pages.iter_mut().filter(|p| p.up) {
-            if p.clicks_left > 0 && now >= p.next_click {
-                p.click(&mut rng, max_gap, &mut t);
+        if now >= scan {
+            scan = now + Duration::from_millis(50);
+            for p in pages.iter_mut().filter(|p| p.up) {
+                if p.clicks_left > 0 && now >= p.next_click {
+                    p.click(&mut rng, max_gap, &mut t);
+                }
+                if now >= p.next_renew {
+                    p.range();
+                }
+                if !p.waiting.is_empty() {
+                    p.waiting.retain(|_, w| {
+                        let keep = now - w.0 < LOST;
+                        t.lost += !keep as u64;
+                        keep
+                    });
+                }
+                if p.tls.wants_write() {
+                    p.flush();
+                }
             }
-            if now >= p.next_renew {
-                p.range();
-            }
-            p.waiting.retain(|_, w| {
-                let keep = now - w.0 < LOST;
-                t.lost += !keep as u64;
-                keep
-            });
-            p.flush();
         }
         if now >= report {
             report += Duration::from_secs(10);
