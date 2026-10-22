@@ -2505,6 +2505,9 @@ side does shrink (~2.3 KB a connection here); the box's total doesn't. So
 kTLS doesn't halve a connection's memory; it moves it. Active, it's no
 better: 255 MB free with it, 271 MB without.
 
+Both kTLS and io_uring are out of combd since (2026-10-22): no gain for
+their Linux-only unsafe code.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A

@@ -141,14 +141,6 @@ pub struct Config {
     /// `COMBD_TLS_KEY`, PEM files; reloaded when the certificate's file
     /// changes). `None`: plain HTTP, as behind a proxy.
     pub tls: Option<(PathBuf, PathBuf)>,
-    /// Kernel TLS (`COMBD_KTLS=1`, Linux): once a connection's handshake is
-    /// done and nothing is half read or unsent, its keys go to the kernel
-    /// and its rustls state goes (most of an idle TLS connection's memory).
-    pub ktls: bool,
-    /// io_uring for the loop's flush (`COMBD_URING=1`, Linux, where a sandbox
-    /// allows it: Docker's default doesn't): every socket's waiting frames
-    /// in one system call. Plain sockets only (no TLS, or TLS in the kernel).
-    pub uring: bool,
     /// A port that only redirects to HTTPS (`COMBD_REDIRECT_PORT`, 80).
     pub redirect_port: Option<u16>,
     pub limits: Limits,
@@ -270,8 +262,6 @@ impl Config {
             memory_budget: memory_budget(),
             max_conns: num("COMBD_MAX_CONNS", 200_000) as u64,
             tls: std::env::var("COMBD_TLS_CERT").ok().zip(std::env::var("COMBD_TLS_KEY").ok()).map(|(c, k)| (PathBuf::from(c), PathBuf::from(k))),
-            ktls: std::env::var("COMBD_KTLS").as_deref() == Ok("1"),
-            uring: std::env::var("COMBD_URING").as_deref() == Ok("1"),
             redirect_port: std::env::var("COMBD_REDIRECT_PORT").ok().and_then(|p| p.parse().ok()),
             limits: Limits::from_env(),
             public: std::env::var("COMBD_PUBLIC_URLS").unwrap_or_default().split(',').filter_map(|kv| kv.split_once('=')).filter_map(|(n, u)| Some((n.trim().parse().ok()?, u.trim().to_string()))).collect(),
@@ -329,10 +319,6 @@ struct Stats {
     mailbox_refused: AtomicU64,
     /// Requests that ran in a batch (`handle_batch`).
     batched: AtomicU64,
-    /// Connections whose TLS went to the kernel.
-    ktls: AtomicU64,
-    /// Sends that went through io_uring (`uring`).
-    ring_sends: AtomicU64,
     /// WebSocket frames sent, and the flushes that sent them (several
     /// frames for a socket go in one).
     ws_frames: AtomicU64,
@@ -1390,11 +1376,7 @@ where
     }
     let listener = listen(port).unwrap_or_else(|e| panic!("listen on :{port}: {e}"));
     let redirect = cfg.redirect_port.map(|p| listen(p).unwrap_or_else(|e| panic!("listen on :{p}: {e}")));
-    if cfg.ktls && !combd_ktls::available() {
-        println!("combd     kernel TLS (COMBD_KTLS) asked for, but this kernel can't (Linux's `tls` module): TLS stays in combd");
-        cfg.ktls = false;
-    }
-    let tls = cfg.tls.as_ref().map(|(cert, key)| load_tls(cert, key, cfg.ktls).unwrap_or_else(|e| panic!("TLS: {e}")));
+    let tls = cfg.tls.as_ref().map(|(cert, key)| load_tls(cert, key).unwrap_or_else(|e| panic!("TLS: {e}")));
     let how = if tls.is_some() { "HTTPS" } else { "HTTP" };
     let also = cfg.redirect_port.map_or(String::new(), |p| format!(" (and :{p}, to HTTPS)"));
     println!("combd     listening on :{port} ({how}){also} with {} event loop(s), data in {}", cfg.threads, cfg.data.display());
@@ -1515,7 +1497,6 @@ where
                     last_conn_check: Instant::now(),
                     ran: vec![],
                     unsent: vec![],
-                    ring: sh.cfg.uring.then(|| combd_ring::Ring::new(256).map_err(|e| eprintln!("combd     io_uring (COMBD_URING): {e}: writing as before")).ok()).flatten(),
                     last_accept_warning: Instant::now(),
                     next_sock: 0,
                     boot: {
@@ -1604,8 +1585,6 @@ struct Loop<'a, E: Engine> {
     /// Connections with WebSocket frames written but not sent yet: they go
     /// out together, before the loop next waits.
     unsent: Vec<usize>,
-    /// The ring those go through (`uring`), if this loop could make one.
-    ring: Option<combd_ring::Ring>,
     last_accept_warning: Instant,
     next_sock: u64,
     /// Random bits for socket ids, so a restart never reuses one.
@@ -2687,36 +2666,6 @@ impl<E: Engine> Loop<'_, E> {
         Ok(())
     }
 
-    /// The waiting frames of every plain socket (no TLS, or TLS in the
-    /// kernel) in one system call; what's left (a full socket, one that
-    /// broke, one with TLS here) `settle` sees to after, as before.
-    fn ring_sends(&mut self) {
-        use std::os::fd::AsRawFd;
-        let ids: Vec<usize> = self.unsent.iter().copied().filter(|&id| self.conns.get(id).and_then(Option::as_ref).is_some_and(|c| c.unsent && c.tls.is_none() && c.wpos < c.wbuf.len())).collect();
-        if ids.is_empty() {
-            return;
-        }
-        let mut done = vec![];
-        {
-            let conns = &self.conns;
-            let sends: Vec<(std::os::fd::RawFd, &[u8])> = ids.iter().map(|&id| {
-                let c = conns[id].as_ref().unwrap();
-                (c.s.as_raw_fd(), &c.wbuf[c.wpos..])
-            }).collect();
-            if let Err(e) = self.ring.as_mut().unwrap().send_all(&sends, &mut done) {
-                eprintln!("combd     io_uring: {e}: writing as before");
-                self.ring = None;
-                return;
-            }
-        }
-        self.sh.stats.ring_sends.fetch_add(ids.len() as u64, Relaxed);
-        for (id, r) in ids.into_iter().zip(done) {
-            if let (Some(c), Ok(n)) = (self.conns[id].as_mut(), r) {
-                c.wpos += n;
-            }
-        }
-    }
-
     /// A frame, made already, to a socket on this loop. `false`: it's gone.
     fn ws_frame(&mut self, id: u64, op: u8, frame: &[u8]) -> std::io::Result<bool> {
         let live = self.local_socks.get(&id).copied().filter(|&who| self.conn(who).and_then(|c| c.ws.as_ref()).is_some_and(|w| w.open && !w.gone));
@@ -2753,9 +2702,6 @@ impl<E: Engine> Loop<'_, E> {
 
     /// Send what WebSocket frames have waited (`ws_local`).
     fn flush_unsent(&mut self) -> std::io::Result<()> {
-        if self.ring.is_some() && !self.unsent.is_empty() {
-            self.ring_sends();
-        }
         for id in std::mem::take(&mut self.unsent) {
             let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { continue };
             if c.unsent {
@@ -3431,7 +3377,7 @@ impl<E: Engine> Loop<'_, E> {
         if cur.as_ref().is_some_and(|(_, t)| *t == changed) {
             return;
         }
-        match load_tls(cert, key, self.sh.cfg.ktls) {
+        match load_tls(cert, key) {
             Ok(t) => {
                 println!("combd     TLS: a new certificate from {}", cert.display());
                 *cur = Some(t);
@@ -3654,25 +3600,9 @@ impl<E: Engine> Loop<'_, E> {
 
     /// Flush what's buffered, then close or update write interest.
     fn settle(&mut self, id: usize) -> std::io::Result<()> {
-        let ktls = self.sh.cfg.ktls;
         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { return Ok(()) };
         // A WebSocket is always "busy"; it closes once its last bytes are out.
-        let mut failed = flush(c);
-        // Kernel TLS: handed over at a quiet moment, and from then on this is
-        // a plain socket to us. If the kernel won't take it, the connection
-        // goes (rustls has given its keys away); the client connects again.
-        if ktls && !failed && c.tls.as_ref().is_some_and(|t| t.kernel_ready()) {
-            use std::os::fd::AsRawFd;
-            match c.tls.take().unwrap().into_kernel(c.s.as_raw_fd()) {
-                Ok(()) => {
-                    self.sh.stats.ktls.fetch_add(1, Relaxed);
-                }
-                Err(e) => {
-                    eprintln!("combd     kernel TLS: {e}");
-                    failed = true;
-                }
-            }
-        }
+        let failed = flush(c);
         let done = c.close_after && (!c.busy || c.ws.is_some()) && !pending(c);
         // Closing on a peer that may still be sending: all we owe is out, so
         // stop sending (it sees a clean end), and read and drop the rest a
@@ -3769,7 +3699,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"batched\":{},\"ktls\":{},\"ring_sends\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3797,8 +3727,6 @@ impl<E: Engine> Loop<'_, E> {
                     s.sessions_woken.load(Relaxed),
                     s.mailbox_refused.load(Relaxed),
                     s.batched.load(Relaxed),
-                    s.ktls.load(Relaxed),
-                    s.ring_sends.load(Relaxed),
                     s.ws_frames.load(Relaxed),
                     s.ws_flushes.load(Relaxed),
                     combd_mem::heap_in_use(),
@@ -5065,7 +4993,7 @@ fn listen(port: u16) -> std::io::Result<std::net::TcpListener> {
 
 /// The certificate chain and key, as a TLS server for HTTP/1.1, and when
 /// the certificate's file last changed.
-fn load_tls(cert: &std::path::Path, key: &std::path::Path, ktls: bool) -> Result<(Arc<rustls::ServerConfig>, std::time::SystemTime), String> {
+fn load_tls(cert: &std::path::Path, key: &std::path::Path) -> Result<(Arc<rustls::ServerConfig>, std::time::SystemTime), String> {
     use rustls::pki_types::pem::PemObject;
     let chain: Vec<rustls::pki_types::CertificateDer> = rustls::pki_types::CertificateDer::pem_file_iter(cert).and_then(|i| i.collect()).map_err(|e| format!("{}: {e}", cert.display()))?;
     let k = rustls::pki_types::PrivateKeyDer::from_pem_file(key).map_err(|e| format!("{}: {e}", key.display()))?;
@@ -5076,8 +5004,6 @@ fn load_tls(cert: &std::path::Path, key: &std::path::Path, ktls: bool) -> Result
         .with_single_cert(chain, k)
         .map_err(|e| format!("{}: {e}", cert.display()))?;
     c.alpn_protocols = vec![b"http/1.1".to_vec()];
-    // Kernel TLS takes the session's keys from rustls once the handshake's done.
-    c.enable_secret_extraction = ktls;
     let changed = std::fs::metadata(cert).and_then(|m| m.modified()).map_err(|e| e.to_string())?;
     Ok((Arc::new(c), changed))
 }

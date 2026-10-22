@@ -41,27 +41,6 @@ impl Tls {
         self.conn.is_handshaking()
     }
 
-    /// Done with the handshake, and nothing half read or unsent: the moment
-    /// the session can go to the kernel (`into_kernel`).
-    pub fn kernel_ready(&self) -> bool {
-        !self.conn.is_handshaking() && self.incoming.is_empty() && self.outgoing.is_empty() && !self.peer_closed
-    }
-
-    /// Hand the session to the kernel (Linux kTLS): its keys onto `fd`, and
-    /// this connection's TLS state goes. An error leaves `fd` unusable.
-    pub fn into_kernel(self, fd: std::os::fd::RawFd) -> std::io::Result<()> {
-        let other = |e: rustls::Error| std::io::Error::other(e.to_string());
-        let version = match self.conn.protocol_version() {
-            Some(rustls::ProtocolVersion::TLSv1_3) => combd_ktls::Version::Tls13,
-            _ => combd_ktls::Version::Tls12,
-        };
-        // The kernel connection rustls hands back is for what comes after the
-        // handshake (key updates, tickets): a client's key update ends the
-        // connection instead (the kernels we run can't rekey a socket).
-        let (s, _) = self.conn.dangerous_into_kernel_connection().map_err(other)?;
-        combd_ktls::enable(fd, version, &kernel_keys(&s.tx)?, &kernel_keys(&s.rx)?)
-    }
-
     /// Encrypted bytes still to go out (the handshake writes before any answer).
     pub fn wants_write(&self) -> bool {
         !self.outgoing.is_empty()
@@ -210,15 +189,4 @@ impl Tls {
         }
         Ok(())
     }
-}
-
-/// One direction's keys, as the kernel takes them.
-fn kernel_keys((seq, k): &(u64, rustls::ConnectionTrafficSecrets)) -> std::io::Result<combd_ktls::Keys<'_>> {
-    let cipher = match k {
-        rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv } => combd_ktls::Cipher::AesGcm128 { key: key.as_ref(), iv: iv.as_ref() },
-        rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv } => combd_ktls::Cipher::AesGcm256 { key: key.as_ref(), iv: iv.as_ref() },
-        rustls::ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => combd_ktls::Cipher::Chacha20Poly1305 { key: key.as_ref(), iv: iv.as_ref() },
-        _ => return Err(std::io::Error::other("a cipher the kernel doesn't do")),
-    };
-    Ok(combd_ktls::Keys { seq: *seq, cipher })
 }

@@ -1278,6 +1278,11 @@ same latency. The cost is TCP itself, per packet, not the system calls.
 It stays in, off by default; the arena's nodes don't run it (not worth
 dropping Docker's seccomp for).
 
+**Both removed (2026-10-22).** kTLS turned out to move memory into the
+kernel rather than save it (`spike/RESULTS.md`), and io_uring saved no CPU:
+Linux-only unsafe code for nothing, so out. Git has both (`combd-ktls`,
+`combd-ring`) if NIC offload or bigger sends make them worth measuring again.
+
 ## The edge: TLS in combd, or edge nodes in front (2026-10-20)
 
 combd gets an idle connection down to 2.24 KB, but in front of it on each

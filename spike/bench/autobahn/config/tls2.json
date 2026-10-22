@@ -1,0 +1,1 @@
+{"outdir": "/reports/tls2", "servers": [{"agent": "combd-tls", "url": "wss://host.docker.internal:9443"}], "cases": ["*"], "exclude-cases": ["12.*", "13.*"], "exclude-agent-cases": {}}
