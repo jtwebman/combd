@@ -940,7 +940,7 @@ where
     let cache = cfg.data.join("apps");
     let mut known = crate::deploy::Known::new();
     let (state, mut gen) = cat.now();
-    let first = sync_apps(eng, &s3, &cache, &mut known, &App::empty(), &state, master)?;
+    let (first, mut building) = sync_apps(eng, &s3, &cache, &mut known, &App::empty(), &state, master)?;
     let live = Live::new(first.unwrap_or_else(App::empty));
     let scratch = cfg.data.join("scratch");
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
@@ -958,17 +958,23 @@ where
         }
         let (s3, cat) = (s3.clone(), cat.clone());
         sc.spawn(move || {
+            let mut last = Instant::now();
             while !stop.load(Relaxed) {
                 // Woken by the catalog when its copy moves (a push, or the
                 // slow look at the bucket in case one was missed).
+                // Or, while a deploy waits on builds, every 15 s.
                 let (state, g) = cat.wait(gen, Duration::from_secs(1));
-                if g == gen {
+                if g == gen && !(building && last.elapsed() >= Duration::from_secs(15)) {
                     continue;
                 }
-                gen = g;
+                (gen, last) = (g, Instant::now());
                 match sync_apps(eng, &s3, &cache, &mut known, &live.now(), &state, master) {
-                    Ok(Some(next)) => live.swap(next),
-                    Ok(None) => {}
+                    Ok((next, b)) => {
+                        building = b;
+                        if let Some(next) = next {
+                            live.swap(next);
+                        }
+                    }
                     Err(e) => eprintln!("combd     deploys: {e} (still serving what's loaded)"),
                 }
             }
@@ -1152,11 +1158,13 @@ where
     }
 }
 
-/// What changed in the catalog since `known`, as a new app (`None`: nothing).
-fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, known: &mut crate::deploy::Known, now: &App<E::Program>, state: &crate::catalog::State, master: Option<&crate::secrets::Key>) -> Result<Option<App<E::Program>>, String> {
+/// What changed in the catalog since `known`, as a new app (`None`:
+/// nothing), and whether a change waits on builds (try again soon: the
+/// catalog won't say when they're done).
+fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, known: &mut crate::deploy::Known, now: &App<E::Program>, state: &crate::catalog::State, master: Option<&crate::secrets::Key>) -> Result<(Option<App<E::Program>>, bool), String> {
     let (changes, gone) = crate::deploy::changes(state, s3, cache, known, master)?;
     if changes.is_empty() && gone.is_empty() {
-        return Ok(None);
+        return Ok((None, false));
     }
     // Take down what's gone, then each change on its own: one app that
     // won't load is skipped (and tried again next time), not the rest.
@@ -1170,6 +1178,9 @@ fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, kn
             if m.app != c.app {
                 return Err(format!("its manifest says it's {:?}", m.app));
             }
+            // Ask for every compiled module's build at once, for every kind
+            // of node (a new combd needs them all; loading stops at the first).
+            let _ = compiled_wasms(&m, &c.dir).and_then(|w| compiled_built(s3, &w));
             let a = crate::app::AppDir { org: &c.org, dir: &c.dir, resolved: &r, app: &m.app, domains: &m.domains };
             next.with_apps(&[a], &[], |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))
         });
@@ -1185,10 +1196,13 @@ fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, kn
     if !errs.is_empty() {
         eprintln!("combd     deploys skipped for now: {}", errs.join("; "));
     }
-    if !applied {
-        return Ok(None);
-    }
-    Ok(Some(next))
+    let building = errs.iter().any(|e| e.contains(crate::engine::BEING_BUILT));
+    Ok((applied.then_some(next), building))
+}
+
+/// The bytes of an app's compiled modules.
+fn compiled_wasms(m: &crate::manifest::Manifest, dir: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
+    m.modules.iter().filter(|(_, k)| **k == crate::engine::Kind::Compiled).map(|(n, _)| std::fs::read(crate::manifest::module_path(dir, n)).map_err(|e| format!("modules/{n}.wasm: {e}"))).collect()
 }
 
 /// An app's manifest in `dir`, resolved with `env`.
@@ -1218,7 +1232,7 @@ pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::c
             return Err(format!("its manifest says it's {:?}, not {app:?}", m.app));
         }
         // A compiled module goes live once it's built for every kind of node.
-        let compiled = m.modules.iter().filter(|(_, k)| **k == crate::engine::Kind::Compiled).map(|(n, _)| std::fs::read(crate::manifest::module_path(&dir, n)).map_err(|e| format!("modules/{n}.wasm: {e}"))).collect::<Result<Vec<_>, _>>()?;
+        let compiled = compiled_wasms(&m, &dir)?;
         if !compiled.is_empty() && !compiled_built(s3, &compiled)? {
             return Ok((None, compiled));
         }

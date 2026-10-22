@@ -2742,11 +2742,11 @@ mod tests {
             return;
         };
         let dir = store::tempdir::Dir::new();
-        wire::make_certs(&dir.0.join("certs"), 2).unwrap();
+        wire::make_certs(&dir.0.join("certs"), 3).unwrap();
         let bucket = s3::S3 { bucket: test_bucket(), ..base.clone() };
         bucket.make_bucket().unwrap();
-        let wports = free_ports(2);
-        let peers: HashMap<own::Node, String> = (0..2).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
+        let wports = free_ports(3);
+        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
         let (token, line) = admin::new_token(&["*/*:*"]);
         let admin_port = free_ports(1)[0];
         let certs = dir.0.join("certs");
@@ -2754,7 +2754,7 @@ mod tests {
         secrets::new_master(&master).unwrap();
         let public = builds::new_key(&dir.0.join("builder.key")).unwrap();
         let keys = builds::parse_keys(&public);
-        let ports = free_ports(2);
+        let ports = free_ports(3);
         // The guest, with a custom section: the same program, another hash,
         // so it isn't the copy built into this binary.
         let mut wasm = std::fs::read(GUEST).unwrap();
@@ -2763,15 +2763,18 @@ mod tests {
         // went: never taken for this pin's.
         std::fs::create_dir_all(dir.0.join("builds0")).unwrap();
         std::fs::write(dir.0.join("builds0").join(format!("{}.so", builds::module_id(&wasm))), b"an old pin's build").unwrap();
-        for n in 0..2u32 {
+        // Node n on `port`, its builds in `builds`: its stop, and its thread.
+        let start = |n: u32, port: u16, builds: &str| {
             let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 1, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new() };
-            let b = builds::Builds::new(bucket.clone(), dir.0.join(format!("builds{n}")), keys.clone(), n).unwrap();
+            let b = builds::Builds::new(bucket.clone(), dir.0.join(builds), keys.clone(), n).unwrap();
             let eng = both::Both { builds: Some(Arc::new(b)), ..both() };
             let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), ..cfg(&dir.0.join(format!("d{n}")), 1) };
             let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: false, tls: None, tokens: admin::parse_tokens(&line).unwrap() });
-            let port = ports[n as usize];
-            std::thread::spawn(move || http::serve_fleet_apps(&eng, port, c, admin).unwrap());
-        }
+            let stop = c.stop.clone();
+            (stop, std::thread::spawn(move || http::serve_fleet_apps(&eng, port, c, admin).unwrap()))
+        };
+        start(0, ports[0], "builds0");
+        start(1, ports[1], "builds1");
         let url = format!("http://127.0.0.1:{admin_port}");
         assert!(eventually(20_000, || std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok()));
         let api = |m: &str, p: &str, b: &[u8]| admin::request(&url, None, &token, m, p, b).unwrap();
@@ -2786,19 +2789,36 @@ mod tests {
         assert_eq!(d["pending"][0]["app"], "acme/fast", "{d}");
         // A builder comes along.
         let stop = Arc::new(AtomicBool::new(false));
-        let (b, key, s) = (bucket.clone(), builds::load_key(&dir.0.join("builder.key")).unwrap(), stop.clone());
-        let aot_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot");
-        let work = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds");
-        std::thread::spawn(move || builds::builder(&b, "test-builder", &key, &aot_src, &work, &s));
+        let builder = |stop: &Arc<AtomicBool>| {
+            let (b, key, s) = (bucket.clone(), builds::load_key(&dir.0.join("builder.key")).unwrap(), stop.clone());
+            let aot_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot");
+            let work = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds");
+            std::thread::spawn(move || builds::builder(&b, "test-builder", &key, &aot_src, &work, &s))
+        };
+        let first_builder = builder(&stop);
         assert!(eventually(300_000, || api("GET", "/v1/apps/acme/fast", b"").1["version"] == v["version"]), "live once built: {}", api("GET", "/v1/deploys", b"").1);
-        for &p in &ports {
+        for &p in &ports[..2] {
             assert!(eventually(20_000, || http_to(p, "fast.test", "POST", "/room/r/incr", "").0 == 200), "node {p}");
         }
         // The object runs on its owner (the other node forwards): compiled there, and nowhere interpreted.
-        let engines = || ports.iter().map(|&p| serde_json::from_str::<serde_json::Value>(&http(p, "GET", "/_combd/stats", "").1).unwrap()["procs"]["acme/fast/room"]["engine"].clone()).collect::<Vec<_>>();
+        let engines = || ports[..2].iter().map(|&p| serde_json::from_str::<serde_json::Value>(&http(p, "GET", "/_combd/stats", "").1).unwrap()["procs"]["acme/fast/room"]["engine"].clone()).collect::<Vec<_>>();
         assert!(eventually(3000, || engines().contains(&serde_json::json!("compiled"))), "{:?}", engines());
         assert!(!engines().contains(&serde_json::json!("interpreted")), "{:?}", engines());
         assert_eq!(api("GET", "/v1/deploys", b"").1["pending"].as_array().map(Vec::len), Some(0));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        first_builder.join().unwrap();
+        // A node that starts where there's no build for it (as after an
+        // update to a new combd: a new pin), with nothing new in the catalog:
+        // it asks, and goes live once the build is there, by itself.
+        for k in bucket.list("_combd/builds/").unwrap() {
+            bucket.delete(&k).unwrap();
+        }
+        start(2, ports[2], "builds2");
+        assert!(eventually(60_000, || std::net::TcpStream::connect(("127.0.0.1", ports[2])).is_ok()), "node 2 is up");
+        assert_eq!(http_to(ports[2], "fast.test", "POST", "/room/r/incr", "").0, 404, "not live on it while it builds");
+        let stop = Arc::new(AtomicBool::new(false));
+        builder(&stop);
+        assert!(eventually(300_000, || http_to(ports[2], "fast.test", "POST", "/room/r/incr", "").0 == 200), "live on it once built");
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
