@@ -2444,7 +2444,9 @@ once its handshake is done. 20,000 idle TLS WebSockets on one node:
 | Kernel TLS | 3,714 bytes |
 
 Half: at a 550 MB budget, ~145,000 idle connections where ~73,000 fit.
-The arena's nodes run it.
+The arena's nodes run it. (Corrected below: this counted only combd's
+cgroup, and kTLS's own ~2.5 KB a connection is the kernel's, outside it.
+It moves the memory rather than saving it.)
 
 io_uring for the sends (`COMBD_URING=1`): one submission for every socket
 with frames waiting. 10,000 active users, kTLS on, a fresh server each
@@ -2472,9 +2474,36 @@ The same ramp as above, now with kTLS, io_uring off and on at each step
 
 The wall is still between 20,000 and 30,000, both ways. At 30,000 the
 server swaps and its CPU falls toward idle (it's waiting on pages, not
-working): memory, not CPU. combd's own count stays under its budget,
-so what fills the box is outside it, most likely the kernel's socket
-buffers for frames queued to clients that fell behind.
+working): memory, not CPU.
+
+Where the memory went (a 1 GB droplet, sampled every 10 s, then the kernel's
+slab caches at 20,000 with kTLS off and on):
+
+- **Before combd starts:** ~600 MB of the 961 MB is free. dockerd 106 MB,
+  containerd 57 MB, multipathd, unattended-upgrades and packagekitd ~70 MB.
+- **At 30,000:** the kernel's own unreclaimable memory went from 44 to
+  361 MB, and the TCP queues hold 157 MB: receive queues 62 MB (clicks
+  combd hadn't read yet, because it was already swapping), send queues
+  only 3 MB. So not frames piling up for slow clients.
+- **combd's count misses most of the kernel's part.** It reads its
+  container's cgroup, and the cgroup isn't charged for the TCP sockets
+  (`TCP` slab, ~2.3 KB a connection), their inodes (0.8 KB), the socket
+  buffers (`sock` 0 MB), or kTLS's state. combd counted 460 MB at 30,000
+  under a 550 MB budget while the box had nothing left: no pressure, so no
+  shedding, so swap.
+
+| 20,000 active, kTLS | combd's cgroup (anon) | Kernel slab (unreclaimable, whole box) | Box memory free |
+|---|---|---|---|
+| Off | 481 MB (302) | 109 MB | 271 MB |
+| On | 474 MB (256) | 194 MB | 255 MB |
+
+**A correction to the kTLS result above.** kTLS moves a connection's TLS
+state into the kernel (`kmalloc-1k` 40 MB and `kmalloc-512` 10 MB at
+20,000, ~2.5 KB a connection; neither cache exists with kTLS off), and the
+idle hold counted only combd's cgroup, which isn't charged for it. combd's
+side does shrink (~2.3 KB a connection here); the box's total doesn't. So
+kTLS doesn't halve a connection's memory; it moves it. Active, it's no
+better: 255 MB free with it, 271 MB without.
 
 ## What these numbers do not cover
 
