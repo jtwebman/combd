@@ -2259,6 +2259,7 @@ mod tests {
             data: data.to_path_buf(),
             idle: Duration::from_secs(60),
             max_objects: 10_000,
+            max_awake: 1000,
             stop: Arc::default(),
             sync_delay: Duration::ZERO,
             fleet: None,
@@ -4027,6 +4028,40 @@ callers = ["api"]
         drop(a);
         assert!(eventually(3000, || stat(port, "sessions_live") == 2), "{}", stat(port, "sessions_live"));
         assert_eq!(stat(port, "sessions_woken"), woken, "nobody woke to hear it");
+    }
+
+    /// `max_awake`: no more cells at work than that. Twelve sleeping
+    /// viewers asked at once, with room for one: each waits its turn,
+    /// asleep, and every one is answered.
+    #[test]
+    fn sleeping_sessions_wake_in_turn_under_max_awake() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        let m = million_toml().replace("hibernate_ms = 2000", "hibernate_ms = 0").replace("hibernate = \"app\"", "hibernate = \"auto\"").replace("state_kb = 1", "state_kb = 16");
+        std::fs::write(app.0.join("combd.toml"), m).unwrap();
+        for f in ["million.wasm", "viewer.wasm", "web.wasm"] {
+            std::fs::copy(format!("{MILLION}/modules/{f}"), app.0.join("modules").join(f)).expect("build it first: examples/million/build.sh");
+        }
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, _) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = server_app(eng, http::Config { max_awake: 1, ..cfg(&dir.0, 1) }, move |_| a);
+        let host = "million.localhost";
+        let mut socks: Vec<Ws> = (0..12).map(|_| Ws::open_to(port, host, "/ws").unwrap()).collect();
+        for w in &mut socks {
+            w.text(r#"{"t":"range","from":0,"to":500}"#);
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&w.recv().1).unwrap()["t"], "all");
+        }
+        assert!(eventually(3000, || stat(port, "sessions_hibernated") == 12), "all asleep");
+        for w in &mut socks {
+            w.text(r#"{"t":"range","from":15625,"to":16000}"#);
+        }
+        for w in &mut socks {
+            let m = serde_json::from_slice::<serde_json::Value>(&w.recv().1).unwrap();
+            assert_eq!((m["t"].as_str(), m["n"].as_u64()), (Some("all"), Some(1)), "{m}");
+        }
+        assert!(eventually(3000, || stat(port, "sessions_hibernated") == 12 && stat(port, "sessions_ready") == 0), "all asleep again, none waiting");
+        assert!(stat(port, "sessions_waited") > 0, "and some had to wait their turn");
     }
 
     /// `memory_kb` under what a module starts with could never start a cell:

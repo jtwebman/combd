@@ -137,6 +137,13 @@ pub struct Config {
     pub memory_budget: Option<u64>,
     /// The most connections open at once (`COMBD_MAX_CONNS`); past it, 503.
     pub max_conns: u64,
+    /// The most cells a loop has at work at once, running or waiting on a
+    /// host call (`COMBD_MAX_AWAKE`). A sleeping session wakes only under it;
+    /// past it, it waits its turn, asleep, and while that line is long the
+    /// node takes no new connections. A node that's behind stays alive and
+    /// answering, instead of waking everyone with work and running out of
+    /// memory (2026-10-22: 40,000 viewers, killed for memory).
+    pub max_awake: usize,
     /// TLS on the main port, ended here (`COMBD_TLS_CERT`, the chain, and
     /// `COMBD_TLS_KEY`, PEM files; reloaded when the certificate's file
     /// changes). `None`: plain HTTP, as behind a proxy.
@@ -261,6 +268,7 @@ impl Config {
             master_key: std::env::var("COMBD_MASTER_KEY_FILE").ok().map(PathBuf::from),
             memory_budget: memory_budget(),
             max_conns: num("COMBD_MAX_CONNS", 200_000) as u64,
+            max_awake: num("COMBD_MAX_AWAKE", 1000).max(1),
             tls: std::env::var("COMBD_TLS_CERT").ok().zip(std::env::var("COMBD_TLS_KEY").ok()).map(|(c, k)| (PathBuf::from(c), PathBuf::from(k))),
             redirect_port: std::env::var("COMBD_REDIRECT_PORT").ok().and_then(|p| p.parse().ok()),
             limits: Limits::from_env(),
@@ -315,6 +323,10 @@ struct Stats {
     sessions_live: AtomicU64,
     sessions_hibernated: AtomicU64,
     sessions_woken: AtomicU64,
+    /// Sleeping sessions with work, waiting for a cell under `max_awake`;
+    /// and how many times one has had to.
+    sessions_ready: AtomicU64,
+    sessions_waited: AtomicU64,
     /// Requests refused because their object's or session's mailbox was full.
     mailbox_refused: AtomicU64,
     /// Requests that ran in a batch (`handle_batch`).
@@ -767,7 +779,12 @@ struct Session<E: Engine> {
     running: String,
     waiting: VecDeque<(Origin, String)>,
     last_used: Instant,
+    /// In the loop's `ready` line.
+    ready: bool,
 }
+
+/// A session's mailbox while its loop is behind (`max_awake`).
+const BEHIND_MAILBOX: usize = 8;
 
 /// What the host asks a session that's idle past `hibernate_ms`.
 const HIBERNATE: &str = "do HIBERNATE /";
@@ -1520,6 +1537,7 @@ where
                     last_conn_check: Instant::now(),
                     ran: vec![],
                     unsent: vec![],
+                    ready: VecDeque::new(),
                     last_accept_warning: Instant::now(),
                     next_sock: 0,
                     boot: {
@@ -1608,6 +1626,9 @@ struct Loop<'a, E: Engine> {
     /// Connections with WebSocket frames written but not sent yet: they go
     /// out together, before the loop next waits.
     unsent: Vec<usize>,
+    /// Sleeping sessions with work, in order, for when there's room
+    /// (`max_awake`).
+    ready: VecDeque<String>,
     last_accept_warning: Instant,
     next_sock: u64,
     /// Random bits for socket ids, so a restart never reuses one.
@@ -2029,6 +2050,7 @@ impl<E: Engine> Loop<'_, E> {
                     self.release(name.as_deref(), origin, reply, ws)?;
                 }
             }
+            self.wake_ready();
         }
         Ok(())
     }
@@ -2852,7 +2874,7 @@ impl<E: Engine> Loop<'_, E> {
         c.busy = true;
         c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: crate::ws::Decoder::with_max(self.sh.cfg.limits.max_ws_message), open: false, gone: false, inflight: 0 });
         self.local_socks.insert(sock, who);
-        self.sessions.insert(name.clone(), Session { sock, proc: p, cell: None, frozen: None, state: None, busy: false, running: String::new(), waiting: VecDeque::new(), last_used: Instant::now() });
+        self.sessions.insert(name.clone(), Session { sock, proc: p, cell: None, frozen: None, state: None, busy: false, running: String::new(), waiting: VecDeque::new(), last_used: Instant::now(), ready: false });
         self.sh.stats.sessions_live.fetch_add(1, Relaxed);
         self.submit(Origin::Socket(who, sock, true), name, format!("do WSOPEN {path} {sock}"));
     }
@@ -2871,7 +2893,10 @@ impl<E: Engine> Loop<'_, E> {
             let _ = self.deliver(origin, (200, "{}".into()));
             return;
         }
-        if s.waiting.len() >= self.app.procs[s.proc].mailbox && !req.starts_with("do WSCLOSE ") {
+        // Behind (sessions waiting to wake): a short mailbox, so 40,000 of
+        // them can't hold a node's memory in queued messages.
+        let mailbox = if self.ready.is_empty() { self.app.procs[s.proc].mailbox } else { self.app.procs[s.proc].mailbox.min(BEHIND_MAILBOX) };
+        if s.waiting.len() >= mailbox && !req.starts_with("do WSCLOSE ") {
             return self.overloaded(origin);
         }
         s.waiting.push_back((origin, req));
@@ -2884,6 +2909,17 @@ impl<E: Engine> Loop<'_, E> {
         loop {
             let Some(s) = self.sessions.get_mut(name) else { return };
             if s.busy {
+                return;
+            }
+            // Asleep, with work: it wakes only if there's room for one more
+            // cell at work; else it waits its turn (`wake_ready`).
+            if s.cell.is_none() && (s.frozen.is_some() || s.state.is_some()) && !s.waiting.is_empty() && self.tasks.len() + self.parked.len() >= self.sh.cfg.max_awake {
+                if !s.ready {
+                    s.ready = true;
+                    self.ready.push_back(name.to_string());
+                    self.sh.stats.sessions_ready.fetch_add(1, Relaxed);
+                    self.sh.stats.sessions_waited.fetch_add(1, Relaxed);
+                }
                 return;
             }
             let Some((origin, req)) = s.waiting.pop_front() else { return };
@@ -3409,9 +3445,23 @@ impl<E: Engine> Loop<'_, E> {
         }
     }
 
-    /// Memory is short (`pressure` 2): no new connections or sockets.
+    /// Memory is short (`pressure` 2), or this loop is behind (as many
+    /// sessions waiting to wake as may be at work): no new connections or
+    /// sockets.
     fn full(&self) -> bool {
-        self.sh.stats.pressure.load(Relaxed) >= 2
+        self.sh.stats.pressure.load(Relaxed) >= 2 || self.ready.len() >= self.sh.cfg.max_awake
+    }
+
+    /// Wake sleeping sessions with work, in order, while there's room.
+    fn wake_ready(&mut self) {
+        while self.tasks.len() + self.parked.len() < self.sh.cfg.max_awake {
+            let Some(name) = self.ready.pop_front() else { return };
+            self.sh.stats.sessions_ready.fetch_sub(1, Relaxed);
+            if let Some(s) = self.sessions.get_mut(&name) {
+                s.ready = false;
+                self.session_next(&name);
+            }
+        }
     }
 
     /// How long idle is too long: shorter while memory is short.
@@ -3722,7 +3772,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3748,6 +3798,8 @@ impl<E: Engine> Loop<'_, E> {
                     s.sessions_live.load(Relaxed),
                     s.sessions_hibernated.load(Relaxed),
                     s.sessions_woken.load(Relaxed),
+                    s.sessions_ready.load(Relaxed),
+                    s.sessions_waited.load(Relaxed),
                     s.mailbox_refused.load(Relaxed),
                     s.batched.load(Relaxed),
                     s.ws_frames.load(Relaxed),
