@@ -1770,7 +1770,11 @@ mod tests {
         // A budget it's already over: it refuses, once it has measured.
         let dir = store::tempdir::Dir::new();
         let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { memory_budget: Some(1 << 20), ..cfg(&dir.0, 1) });
-        assert!(eventually(3000, || keep(port).1 == "HTTP/1.1 503"), "over its memory budget");
+        // This machine itself still gets in (its checks see how full it is);
+        // what's new from it is refused.
+        assert!(eventually(3000, || stat(port, "pressure") == 2), "over its memory budget");
+        let refused = Ws::open(port, "/do/full/ws").err().expect("no new socket on a full node");
+        assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
     }
 
     /// A socket closes while its session is mid-request, with `on_close =

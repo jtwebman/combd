@@ -2058,12 +2058,19 @@ impl<E: Engine> Loop<'_, E> {
     fn accept(&mut self, listener: &mut TcpListener, redirect: bool) -> std::io::Result<()> {
         loop {
             match listener.accept() {
-                Ok((mut s, _)) => {
+                Ok((mut s, from)) => {
                     // Full: say so, and close. The client tries again (or
                     // another node: DNS and load balancers pick another).
-                    if self.full() || self.sh.stats.conns_open.load(Relaxed) >= self.sh.cfg.max_conns {
+                    // Over TLS a plain 503 is only noise to the client, so
+                    // just close. Busy or short of memory, but not out of
+                    // files: never this machine itself, so its own checks
+                    // can see how full it is.
+                    let tls = self.sh.cfg.tls.is_some() && !redirect;
+                    if (self.full() && !from.ip().is_loopback()) || self.sh.stats.conns_open.load(Relaxed) >= self.sh.cfg.max_conns {
                         self.sh.stats.conns_refused.fetch_add(1, Relaxed);
-                        let _ = s.write_all(BUSY);
+                        if !tls {
+                            let _ = s.write_all(BUSY);
+                        }
                         continue;
                     }
                     s.set_nodelay(true)?;
