@@ -180,10 +180,13 @@ pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64
     let mut events = mio::Events::with_capacity(1024);
     let mut pages = Vec::with_capacity(n);
     let t0 = Instant::now();
-    for i in 0..n {
-        let tcp = std::net::TcpStream::connect(addr).unwrap_or_else(|e| panic!("socket {i}: {e}"));
+    // A node that's busy refuses (or can't take the connection yet): as a
+    // browser would, wait the second it asks for and try again.
+    let mut refused = 0u64;
+    let open = |i: usize| -> Result<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>, String> {
+        let tcp = std::net::TcpStream::connect(addr).map_err(|e| e.to_string())?;
         let mut s = rustls::StreamOwned::new(rustls::ClientConnection::new(cfg.clone(), name.clone()).unwrap(), tcp);
-        write!(s, "GET {path} HTTP/1.1\r\nhost: {host}\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").unwrap();
+        write!(s, "GET {path} HTTP/1.1\r\nhost: {host}\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").map_err(|e| e.to_string())?;
         let mut head = vec![];
         let mut b = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
@@ -193,9 +196,23 @@ pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64
             head.push(b[0]);
         }
         if !head.starts_with(b"HTTP/1.1 101") {
-            println!("ws-click: socket {i} refused: {}", String::from_utf8_lossy(&head).lines().next().unwrap_or("closed"));
-            break;
+            return Err(format!("socket {i}: {}", String::from_utf8_lossy(&head).lines().next().unwrap_or("closed")));
         }
+        Ok(s)
+    };
+    for i in 0..n {
+        let s = loop {
+            match open(i) {
+                Ok(s) => break s,
+                Err(e) => {
+                    refused += 1;
+                    if refused % 100 == 1 {
+                        println!("ws-click: refused {refused} times so far ({e}): trying again in a second");
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        };
         let (tls, tcp) = s.into_parts();
         tcp.set_nonblocking(true).unwrap();
         let mut tcp = mio::net::TcpStream::from_std(tcp);
@@ -266,7 +283,7 @@ pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64
             t.echoes.sort_unstable();
             let left: u64 = pages.iter().filter(|p| p.up).map(|p| p.clicks_left as u64).sum();
             println!(
-                "ws-click +{}s: {} up, {} closed | clicks {} ({} to go), echo p50 {} ms p99 {} ms max {} ms, lost {} | changes seen {} | slowed {}",
+                "ws-click +{}s: {} up, {} closed | clicks {} ({} to go), echo p50 {} ms p99 {} ms max {} ms, lost {} | changes seen {} | slowed {} | refused {}",
                 start.elapsed().as_secs(),
                 pages.iter().filter(|p| p.up).count(),
                 t.closed,
@@ -277,7 +294,8 @@ pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64
                 t.echoes.last().copied().unwrap_or(0),
                 t.lost,
                 t.changes,
-                t.slow
+                t.slow,
+                refused
             );
             // Each line is its own 10 s.
             t = Tally { closed: t.closed, ..Tally::default() };
