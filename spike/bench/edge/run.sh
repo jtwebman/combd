@@ -35,7 +35,7 @@ docker run -d --name edge-srv ${tls:-} --network edge-bench --memory 1g --memory
 sleep 3
 base=$(docker exec edge-srv cat /sys/fs/cgroup/memory.current)
 docker run -d --name edge-cli --network edge-bench --ulimit nofile=1048576:1048576 --sysctl net.ipv4.ip_local_port_range="1024 65535" -v combd-linux-target:/target:ro -v $B/certs:/certs:ro \
-  rust:1.94.1-slim-bookworm /target/release/combd-spike ws-load edge-srv:$port million.localhost /ws $n '{"t":"range","from":0,"to":500}' $ca >/dev/null
+  rust:1.99.1-slim-bookworm /target/release/combd-spike ws-load edge-srv:$port million.localhost /ws $n '{"t":"range","from":0,"to":500}' $ca >/dev/null
 for i in $(seq 1 300); do docker logs edge-cli 2>&1 | grep -qE "holding|refused|panicked" && break; sleep 2; done
 sleep 8
 mem=$(docker exec edge-srv cat /sys/fs/cgroup/memory.current)

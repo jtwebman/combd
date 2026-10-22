@@ -4,7 +4,7 @@
 # Two stages: the toolchain builds, and the image keeps only what runs (the
 # binary, the app, and the test cell), at the same paths. Tens of MB, not
 # 2 GB: a node pulls a new version without stealing its one CPU for a minute.
-FROM rust:1.94.1-slim-bookworm AS build
+FROM rust:1.99.1-slim-bookworm AS build
 RUN rustup target add wasm32-unknown-unknown
 # Docker Desktop's network often breaks cargo's HTTP/2 downloads ("Error in
 # the HTTP2 framing layer"); one request at a time is reliable.

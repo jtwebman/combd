@@ -1,3 +1,5 @@
 # One per WebSocket, so small: a 64 KB stack, not Rust's usual 1 MB.
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "link-arg=-zstack-size=65536"]
+# wasm-ld's layout, for a frozen idle cell to leave its empty stack out:
+# Rust stopped exporting these by itself (1.99).
+rustflags = ["-C", "link-arg=-zstack-size=65536", "-C", "link-arg=--export=__heap_base", "-C", "link-arg=--export=__data_end"]

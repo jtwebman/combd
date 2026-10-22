@@ -150,7 +150,7 @@ resource "digitalocean_droplet" "node" {
   image    = "ubuntu-24-04-x64"
   ssh_keys = [digitalocean_ssh_key.me.fingerprint]
   user_data = templatefile("${path.module}/cloud-init.tftpl", {
-    node  = each.key
+    node    = each.key
     release = var.release
     env = join("\n", [
       "COMBD_NODE=${each.key}",
@@ -187,17 +187,18 @@ resource "digitalocean_droplet" "node" {
       "COMBD_BUILDER_KEYS=/etc/combd/builder-keys",
       "",
     ])
-    ca       = file("${local.secrets}/certs/ca.pem")
-    cert     = file("${local.secrets}/certs/node${each.key}.pem")
-    key      = file("${local.secrets}/certs/node${each.key}.key")
-    tokens   = file("${local.secrets}/tokens")
-    master   = file("${local.secrets}/master.key")
-    tls_cert = "${acme_certificate.arena.certificate_pem}${acme_certificate.arena.issuer_pem}"
-    tls_key  = acme_certificate.arena.private_key_pem
-    builders = file("${local.secrets}/builder-keys")
-    update   = file("${path.module}/combd-update.sh")
-    service  = file("${path.module}/combd.service")
-    tune     = file("${path.module}/combd-tune.sh")
+    ca          = file("${local.secrets}/certs/ca.pem")
+    cert        = file("${local.secrets}/certs/node${each.key}.pem")
+    key         = file("${local.secrets}/certs/node${each.key}.key")
+    tokens      = file("${local.secrets}/tokens")
+    master      = file("${local.secrets}/master.key")
+    tls_cert    = "${acme_certificate.arena.certificate_pem}${acme_certificate.arena.issuer_pem}"
+    tls_key     = acme_certificate.arena.private_key_pem
+    builders    = file("${local.secrets}/builder-keys")
+    update      = file("${path.module}/combd-update.sh")
+    service     = file("${path.module}/combd.service")
+    release_pub = file("${path.module}/release.pub")
+    tune        = file("${path.module}/combd-tune.sh")
   })
   # Running nodes keep what they started with: a change here is for new
   # droplets (combd itself rolls out through combd-update).

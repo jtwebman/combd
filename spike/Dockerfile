@@ -2,7 +2,7 @@
 #   docker build -f spike/Dockerfile -t combd-spike .
 #   docker build -f spike/Dockerfile --build-arg FEATURES=aot-guard -t combd-spike-aot .
 #   docker run --rm combd-spike
-FROM rust:1.94.1-slim-bookworm
+FROM rust:1.99.1-slim-bookworm
 # FEATURES=aot-guard builds the AOT tier with guard pages.
 ARG FEATURES=""
 RUN rustup target add wasm32-unknown-unknown

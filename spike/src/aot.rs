@@ -128,7 +128,7 @@ pub fn built(dir: &std::path::Path, wasm: &[u8]) -> Result<&'static Compiled, St
     if let Some(m) = loaded.iter().find(|m| m.hash == h) {
         return Ok(m);
     }
-    let path = dir.join(format!("{h:016x}.so"));
+    let path = dir.join(format!("{}.so", crate::builds::module_id(wasm)));
     if !path.exists() {
         return Err(format!("no AOT build for this module yet ({})", path.display()));
     }

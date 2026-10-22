@@ -30,8 +30,12 @@ pub fn pin_id(pin: &str) -> String {
     format!("{:016x}", combd_aot::hash(pin.as_bytes()))
 }
 
+/// A module's name for its builds (in the bucket, on disk, what's signed and
+/// loaded): 128 bits of its SHA-256, so no module can pass for another and
+/// get its build. (`combd_aot::hash`, 64-bit FNV, only checks a build is of
+/// the module it was asked for, after the signature.)
 pub fn module_id(wasm: &[u8]) -> String {
-    format!("{:016x}", combd_aot::hash(wasm))
+    hex(&ring::digest::digest(&ring::digest::SHA256, wasm).as_ref()[..16])
 }
 
 /// This machine's CPU, as a build is made for: x86-64 at a feature level,

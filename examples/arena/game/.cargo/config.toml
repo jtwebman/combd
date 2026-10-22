@@ -1,0 +1,4 @@
+# wasm-ld's layout, for a frozen idle cell to leave its empty stack out:
+# Rust stopped exporting these by itself (1.99).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--export=__heap_base", "-C", "link-arg=--export=__data_end"]

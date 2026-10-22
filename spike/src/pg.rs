@@ -940,6 +940,27 @@ impl Agent {
 /// held much longer than its lease.
 const DEFER: Duration = Duration::from_millis(2);
 
+/// A connection, its I/O running on `rt`. `sslmode=require` in the URL:
+/// TLS, and the server's certificate checked against the public roots
+/// (stricter than libpq's require, which doesn't check). ponytail: public
+/// roots only; a private CA (RDS's) needs a pool setting for it. Otherwise
+/// plain, as libpq's prefer falls back to.
+fn connect(rt: &tokio::runtime::Runtime, pg: &Config) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+    if matches!(pg.get_ssl_mode(), tokio_postgres::config::SslMode::Require) {
+        let (c, conn) = rt.block_on(pg.connect(tokio_postgres_rustls::MakeRustlsConnect::new((*crate::s3::tls_config()).clone())))?;
+        rt.spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(c)
+    } else {
+        let (c, conn) = rt.block_on(pg.connect(NoTls))?;
+        rt.spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(c)
+    }
+}
+
 /// One member: a connection on its own thread, leased to one holder at a
 /// time, from its first lease (the ask it started for).
 fn run_member(id: Key, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs: Receiver<Job>, pool: Sender<Msg>) {
@@ -951,13 +972,8 @@ fn run_member(id: Key, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs
     // times. "Too many clients" isn't: the pool puts the ask back in line.
     let mut tries = 0;
     let client = loop {
-        match rt.block_on(pg.connect(NoTls)) {
-            Ok((c, conn)) => {
-                rt.spawn(async move {
-                    let _ = conn.await;
-                });
-                break c;
-            }
+        match connect(&rt, &pg) {
+            Ok(c) => break c,
             Err(e) => {
                 let full = e.code() == Some(&SqlState::TOO_MANY_CONNECTIONS);
                 if !full && tries < retries {
@@ -1212,4 +1228,25 @@ fn column(row: &tokio_postgres::Row, i: usize, t: &Type) -> Result<Json, Json> {
         Type::JSON | Type::JSONB => row.try_get::<_, Option<Json>>(i).map_err(get_err)?.unwrap_or(Json::Null),
         _ => return Err(json!({ "error": format!("column {} is {t}, which we can't read yet: cast it to text", i + 1) })),
     })
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    /// `sslmode=require` means TLS or nothing: against a server without it
+    /// (the test Postgres), no connection, not a quiet fall back to plain.
+    /// Without it, plain as before. Needs `COMBD_PG_TEST=postgres://...`.
+    #[test]
+    fn require_means_tls_or_no_connection() {
+        let Ok(url) = std::env::var("COMBD_PG_TEST") else {
+            eprintln!("skipping: set COMBD_PG_TEST to a Postgres URL");
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let sep = if url.contains('?') { '&' } else { '?' };
+        assert!(connect(&rt, &url.parse().unwrap()).is_ok(), "plain");
+        let e = connect(&rt, &format!("{url}{sep}sslmode=require").parse().unwrap()).err().expect("require: no TLS, no connection");
+        assert!(e.to_string().to_lowercase().contains("tls"), "{e}");
+    }
 }

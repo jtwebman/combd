@@ -1174,7 +1174,7 @@ impl Engine for Interp {
 
     /// A frozen cell's dead stack is left out only for a wasm-ld layout.
     fn note(&self, m: &Arc<Module>) -> Option<String> {
-        (m.mem.0 > 0 && !m.stack_first).then(|| "not laid out by wasm-ld (no __data_end and __heap_base), so a frozen cell keeps its whole stack: safe, just bigger".into())
+        (m.mem.0 > 0 && !m.stack_first).then(|| "not laid out by wasm-ld (no __data_end and __heap_base exported; Rust: -C link-arg=--export=__heap_base -C link-arg=--export=__data_end), so a frozen cell keeps its whole stack: safe, just bigger".into())
     }
 
     fn thaw(&self, m: &Arc<Module>, saved: &[u8]) -> Result<Vm, String> {

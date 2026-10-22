@@ -7,7 +7,16 @@ URL=$(sed -n 's/^COMBD_RELEASE=//p' /etc/combd/update)
 URL=${URL:-https://github.com/jtwebman/combd/releases/download/arena}
 N=$(sed -n 's/^COMBD_NODE=//p' /etc/combd/env)
 SEEN=/var/lib/combd-update.seen
-INFO=$(curl -fsSL -m 20 "$URL/combd-arena.txt") || exit 0
+# The note, signed by CI's release key (cloud/release.pub, here as
+# /etc/combd/release.pub): nothing unsigned is fetched, let alone run.
+NOTE=$(mktemp) && SIG=$(mktemp) && trap 'rm -f "$NOTE" "$SIG" "$T"' EXIT
+curl -fsSL -m 20 -o "$NOTE" "$URL/combd-arena.txt" && curl -fsSL -m 20 -o "$SIG" "$URL/combd-arena.txt.sig" || exit 0
+if ! openssl pkeyutl -verify -pubin -inkey /etc/combd/release.pub -rawin -in "$NOTE" -sigfile "$SIG" >/dev/null 2>&1; then
+    # Mid-upload (a new note, the old signature), or not ours: next minute.
+    logger -t combd-update "the release note's signature doesn't check out: not moving"
+    exit 0
+fi
+INFO=$(cat "$NOTE")
 SRC=$(echo "$INFO" | sed -n 's/^source=\([0-9a-f]*\)$/\1/p')
 SUM=$(echo "$INFO" | sed -n 's/^sha256=\([0-9a-f]*\)$/\1/p')
 [ -n "$SRC" ] && [ -n "$SUM" ] || exit 0
@@ -17,7 +26,7 @@ if [ "$(readlink /opt/combd/current)" = "/opt/combd/$SRC" ]; then rm -f $SEEN; e
 # Fetched (and checked) first, so its builds can be asked for while this
 # node waits its turn.
 if [ ! -x "/opt/combd/$SRC/spike/target/release/combd-spike" ]; then
-    T=$(mktemp) && trap 'rm -f "$T"' EXIT
+    T=$(mktemp)
     curl -fsSL -m 300 -o "$T" "$URL/combd-arena-linux-amd64.tar.gz" || exit 0
     # Mid-upload, or not what the note says: next minute.
     echo "$SUM  $T" | sha256sum -c --quiet >/dev/null 2>&1 || { logger -t combd-update "sha256 mismatch for $SRC, trying again"; exit 0; }

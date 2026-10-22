@@ -1,0 +1,7 @@
+# The one Rust for combd: here, CI, the nodes' and the builders' images
+# (Dockerfiles: rust:<this>-slim-bookworm). A build's pin includes it, so
+# moving it means every compiled module is built again (nodes wait for it).
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+targets = ["wasm32-unknown-unknown"]

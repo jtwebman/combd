@@ -47,6 +47,10 @@ write_files:
   - path: /etc/combd/update
     content: |
       COMBD_RELEASE=${release}
+  # The public half of CI's release key: combd-update runs only what it signed.
+  - path: /etc/combd/release.pub
+    encoding: b64
+    content: ${base64encode(release_pub)}
   - path: /etc/systemd/system/combd.service
     encoding: b64
     content: ${base64encode(service)}

@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 # Cargo picks the newest deps that build on this Rust.
-rust-version = "1.94"
+rust-version = "1.99"
 
 [workspace]
 resolver = "3"
@@ -52,7 +52,7 @@ webpki-roots = "1"
 hmac = "0.12"
 # Secrets: AES-256-GCM (rustls already brings it).
 ring = "0.17"
-wasmtime = { version = ">=40, <50", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
+wasmtime = { version = ">=40, <51", optional = true, default-features = false, features = ["cranelift", "runtime", "async", "std", "pooling-allocator"] }
 # Random valid Wasm modules for differential fuzzing, the same wasm-tools
 # release as wasmparser.
 wasm-smith = { version = "0.261", optional = true }
@@ -63,6 +63,8 @@ postgres = { version = "0.19", features = ["with-serde_json-1"] }
 # A member's connection, async inside its own thread: a deferred reset goes
 # out with the next statement, one round trip (the versions postgres uses).
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+# `sslmode=require`: the pool's connections over TLS (rustls, as the rest).
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 # An app's manifest: combd.toml, combd.yaml, or combd.json.
 toml = "1"

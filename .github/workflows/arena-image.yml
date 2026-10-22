@@ -39,11 +39,14 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/combd-arena:latest
             ghcr.io/${{ github.repository_owner }}/combd-arena:${{ github.sha }}
       # The same files for nodes that run combd without Docker: a tarball on
-      # the `arena` release, and a note of what's in it, uploaded last (a
-      # node reads the note, then checks the tarball's sha256 against it).
+      # the `arena` release, and a note of what's in it, uploaded last. The
+      # note is signed (ed25519, ARENA_RELEASE_KEY; nodes hold the public half,
+      # cloud/release.pub): a node checks the signature, then the tarball's
+      # sha256 against the note, so writing to the release isn't enough.
       - name: Release the files (nodes fetch them, no Docker)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_KEY: ${{ secrets.ARENA_RELEASE_KEY }}
           IMAGE: ghcr.io/${{ github.repository_owner }}/combd-arena:${{ github.sha }}
           SRC: ${{ steps.src.outputs.hash }}
         run: |
@@ -51,9 +54,11 @@ jobs:
           id=$(docker create "$IMAGE") && docker cp "$id:/combd/." out/ && docker rm "$id" >/dev/null
           tar czf combd-arena-linux-amd64.tar.gz -C out .
           printf 'source=%s\nsha256=%s\ncommit=%s\n' "$SRC" "$(sha256sum combd-arena-linux-amd64.tar.gz | cut -d' ' -f1)" "$GITHUB_SHA" > combd-arena.txt
+          key=$(mktemp) && printf '%s\n' "$RELEASE_KEY" > "$key"
+          openssl pkeyutl -sign -inkey "$key" -rawin -in combd-arena.txt -out combd-arena.txt.sig; signed=$?; rm -f "$key"; [ $signed = 0 ]
           gh release view arena >/dev/null 2>&1 || gh release create arena --prerelease --title "arena: the newest combd for the arena's nodes" --notes "Replaced on every push to main. combd-arena.txt says what's in the tarball."
           gh release upload arena combd-arena-linux-amd64.tar.gz --clobber
-          gh release upload arena combd-arena.txt --clobber
+          gh release upload arena combd-arena.txt.sig combd-arena.txt --clobber
       # The build stage: the toolchain and sources that made this combd, so
       # a builder from it makes builds the nodes of this version load.
       - uses: docker/build-push-action@v6

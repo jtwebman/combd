@@ -1856,7 +1856,7 @@ mod tests {
     fn a_build_loads_and_answers_as_interpreted() {
         let wasm = std::fs::read(format!("{MILLION}/modules/viewer.wasm")).expect("build it first: examples/million/build.sh");
         let dir = store::tempdir::Dir::new();
-        let name = |w: &[u8]| dir.0.join(format!("{:016x}.so", combd_aot::hash(w)));
+        let name = |w: &[u8]| dir.0.join(format!("{}.so", builds::module_id(w)));
         let aot_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot");
         let work = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds");
         build::build(&wasm, &aot_src, &work, &name(&wasm), None, None).unwrap();

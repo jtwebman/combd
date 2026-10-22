@@ -1,4 +1,6 @@
 # Rust's default wasm stack is 1 MiB per cell. 64 KiB is plenty for this cell
 # and keeps the density test honest.
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "link-arg=-zstack-size=65536"]
+# wasm-ld's layout, for a frozen idle cell to leave its empty stack out:
+# Rust stopped exporting these by itself (1.99).
+rustflags = ["-C", "link-arg=-zstack-size=65536", "-C", "link-arg=--export=__heap_base", "-C", "link-arg=--export=__data_end"]
