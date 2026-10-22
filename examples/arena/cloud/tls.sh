@@ -19,5 +19,5 @@ for n in 0 1 2; do
     scp -q -o ConnectTimeout=10 "$T/key.pem" "root@n$n.$HOST:/etc/combd/tls/key.pem.new"
     scp -q -o ConnectTimeout=10 "$T/cert.pem" "root@n$n.$HOST:/etc/combd/tls/cert.pem.new"
     # combd reloads when the certificate's file changes: the key goes first.
-    ssh -o ConnectTimeout=10 "root@n$n.$HOST" "chgrp combd /etc/combd/tls/key.pem.new && chmod 640 /etc/combd/tls/key.pem.new && mv /etc/combd/tls/key.pem.new /etc/combd/tls/key.pem && mv /etc/combd/tls/cert.pem.new /etc/combd/tls/cert.pem"
+    ssh -o ConnectTimeout=10 "root@n$n.$HOST" "chown combd:combd /etc/combd/tls/key.pem.new && chmod 600 /etc/combd/tls/key.pem.new && mv /etc/combd/tls/key.pem.new /etc/combd/tls/key.pem && mv /etc/combd/tls/cert.pem.new /etc/combd/tls/cert.pem"
 done

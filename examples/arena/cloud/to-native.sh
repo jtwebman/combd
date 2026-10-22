@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 HOST=$(terraform output -raw host)
 O="-o ConnectTimeout=10"
 curl -fsS -m 20 -L https://github.com/jtwebman/combd/releases/download/arena/combd-arena.txt || { echo "no arena release yet"; exit 1; }
-for n in 0 1 2; do
+for n in ${NODES:-0 1 2}; do
     node="n$n.$HOST"
     echo "$node: combd's user, files, and service"
     scp -q $O combd.service "root@$node:/etc/systemd/system/combd.service"
@@ -17,17 +17,18 @@ for n in 0 1 2; do
     ssh $O "root@$node" "set -e
         id combd >/dev/null 2>&1 || useradd --system --home-dir /var/lib/combd --shell /usr/sbin/nologin combd
         mkdir -p /opt/combd
-        chgrp combd /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node$n.key /etc/combd/tls/key.pem
-        chmod 640 /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node$n.key /etc/combd/tls/key.pem
         sed -i 's|^COMBD_DATA=/data\$|COMBD_DATA=/var/lib/combd|' /etc/combd/env
         printf 'COMBD_RELEASE=https://github.com/jtwebman/combd/releases/download/arena\n' > /etc/combd/update
         sed -i 's/^Before=docker.service/Before=combd.service/' /etc/systemd/system/combd-tune.service
         systemctl daemon-reload && systemctl enable -q combd
         # Stopped, not removed: if the new way doesn't start, the old comes back.
-        docker update -q --restart=no combd >/dev/null && docker stop combd >/dev/null
+        docker update --restart=no combd >/dev/null && docker stop combd >/dev/null
         chown -R combd:combd /var/lib/combd
+        # Its secrets are its own, 600 (combd refuses a key others may read).
+        chown combd:combd /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node$n.key /etc/combd/tls/key.pem
+        chmod 600 /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node$n.key /etc/combd/tls/key.pem
         /usr/local/bin/combd-update now
-        if [ ! -x /opt/combd/current/spike/target/release/combd-spike ]; then chown -R root:root /var/lib/combd; docker start combd; echo '  no release fetched: back on Docker'; exit 1; fi
+        if [ ! -x /opt/combd/current/spike/target/release/combd-spike ]; then chown -R root:root /var/lib/combd /etc/combd; docker start combd; echo '  no release fetched: back on Docker'; exit 1; fi
         systemctl is-active -q combd || systemctl start combd"
     i=0; until curl -sf -m 3 -o /dev/null "https://$node/_combd/ping"; do i=$((i + 1)); [ $i -gt 60 ] && { echo "  no answer after 3 minutes: stopping here"; ssh $O "root@$node" 'journalctl -u combd -n 20 --no-pager'; exit 1; }; sleep 3; done
     u=$(ssh $O "root@$node" 'ps -o user= -C combd-spike | head -1')

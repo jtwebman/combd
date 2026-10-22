@@ -19,7 +19,7 @@ LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
-# Writes only its data; reads /etc/combd (group combd).
+# Writes only its data; its secrets in /etc/combd are its own (600).
 ProtectSystem=strict
 ReadWritePaths=/var/lib/combd
 ProtectHome=yes

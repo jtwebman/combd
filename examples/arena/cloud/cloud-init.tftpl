@@ -1,7 +1,7 @@
 #cloud-config
 # One arena node: the fleet's files, and combd as its own user (no Docker).
-# Secrets arrive here (user data is readable only from the droplet itself);
-# root and the combd group read them.
+# Secrets arrive here (user data is readable only from the droplet itself)
+# and only combd (and root) can read them.
 package_update: true
 write_files:
   - path: /etc/combd/certs/ca.pem
@@ -73,7 +73,8 @@ runcmd:
   - fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
   - useradd --system --home-dir /var/lib/combd --shell /usr/sbin/nologin combd
   - mkdir -p /var/lib/combd /opt/combd && chown combd:combd /var/lib/combd
-  - chgrp combd /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node${node}.key /etc/combd/tls/key.pem && chmod 640 /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node${node}.key /etc/combd/tls/key.pem
+  # Its secrets are its own, 600 (combd refuses a key others may read).
+  - chown combd:combd /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node${node}.key /etc/combd/tls/key.pem && chmod 600 /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node${node}.key /etc/combd/tls/key.pem
   - systemctl daemon-reload && systemctl enable --now combd-tune && systemctl enable combd
   # The newest combd, and start it (if GitHub doesn't answer, cron tries again).
   - /usr/local/bin/combd-update now
