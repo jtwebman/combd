@@ -130,6 +130,34 @@ TLA+ spec, a deterministic simulator with crashes, lost messages, and
 network splits, a real cluster with kill tests, and known-bad versions that
 must fail every one of them.
 
+**Compiled on deploy.** Each module says how it runs: `interpreted`, or
+`compiled` to machine code. A compiled module is built by builders, machines
+you run that pick up jobs from the bucket and sign what they build. Nodes
+load only signed builds, and a deploy waits until its builds are ready. The
+admin panel shows the nodes, the deploys, and where each process's CPU goes.
+
+**TLS in combd itself.** A node can end TLS on its own, without Caddy or
+HAProxy in front. An idle connection costs about 10 KB there, against about
+106 KB behind Caddy. It passes the Autobahn WebSocket suite and testssl.sh.
+
+**Live, on $6 machines.** Two apps run on a three-node fleet (New York,
+Frankfurt, Singapore), one 1 vCPU, 1 GB droplet each, over an R2 bucket:
+[a real-time 1 vs 1 game](examples/arena/) and
+[One Million Checkboxes](https://million.combd.dev) ([source](examples/million/)).
+What one node that size does:
+- **105,000 idle WebSockets** held, with the node answering as fast as when
+  idle (about 60,000 fit without swap).
+- **10,000 people clicking at once** on million, every click sent to
+  everyone watching it: p50 echo about 400 ms, nothing lost, 65% CPU.
+- **The ceiling is between 20,000 and 30,000** active users. Past it the
+  box runs out of memory and swaps. The reason: the kernel's memory for
+  each connection isn't in combd's count, and the OS and Docker take
+  about 400 MB of the 1 GB before combd starts. Fixing that is next.
+
+When a node gets more than it can do, it says so: a full mailbox refuses
+at once (503 `overloaded`) instead of queueing forever, and requests that
+pile up for an object run together as one batch, in one transaction.
+
 ## What surprised us
 
 Building changed the plan. The [plan](plan.md#what-building-taught-us) has
@@ -156,6 +184,21 @@ the full story; the short version:
   cut-off node held its clients too long. All three are fixed.
 - **Benchmarks on a busy laptop swing 2x to 5x.** We only trust runs that
   alternate A and B, and real totals need quiet Linux machines.
+- **A small machine runs out of packets, not code.** At 10,000 active
+  users, 75% of a node's CPU is the kernel's TCP work. Moving TLS into the
+  kernel and sending through io_uring didn't change the CPU at all.
+- **Kernel TLS moves memory, it doesn't save it.** Our first measurement
+  said it halved a connection's memory. It only counted combd's share; the
+  kernel holds what combd let go. Measure the whole machine.
+- **The proxy was the limit, not combd.** Behind Caddy, combd was about 3%
+  of a connection's memory.
+
+## Next
+
+- **Count the whole machine's memory**, so a node sheds load before it swaps.
+- **The same apps on celld, workerd, and Cloudflare**, raced on the same
+  machines.
+- **A bigger real app:** an X clone on combd and Postgres.
 
 ## Standing on shoulders
 
