@@ -12,9 +12,6 @@ for rule in "PREROUTING -p tcp -m multiport --dports 80,443" "OUTPUT -p tcp -m m
     iptables -t raw -C $rule -j NOTRACK 2>/dev/null || iptables -t raw -A $rule -j NOTRACK
 done
 
-# Kernel TLS (COMBD_KTLS): combd hands a connection's session to it.
-modprobe tls
-
 # What Ubuntu runs that a node doesn't need: ~95 MB of the 1 GB, and the
 # timers that wake now and then for a man page index or a message of the
 # day (apt's and unattended-upgrades', the security updates, stay).

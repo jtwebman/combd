@@ -183,9 +183,6 @@ resource "digitalocean_droplet" "node" {
       # machine's free memory the same way, since the kernel's part of its
       # connections isn't in its count.
       "COMBD_MEMORY_BUDGET=550M",
-      # TLS in the kernel once a connection's handshake is done: an idle
-      # one is ~3.7 KB, not ~7.5 (combd-tune loads the module).
-      "COMBD_KTLS=1",
       # Compiled modules: builds signed by these builders only.
       "COMBD_BUILDER_KEYS=/etc/combd/builder-keys",
       "",
