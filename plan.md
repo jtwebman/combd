@@ -1,12 +1,66 @@
 # combd: plan
 
-Status: building. The spikes grew into a working runtime: Durable Objects on
-one node (D1) and across a fleet (D2, and D3 for fast writes).
-Updated: 2026-10-14
+Status: hardening before we tell people about it. A working runtime,
+live on a three-node fleet of $6 droplets (the arena and million).
+Updated: 2026-10-22
 
 This plan was written before we built anything. Most of it held up. Where
 building taught us something, the section below says what changed and why,
 and the rest of the plan is updated to match.
+
+## Where we are, and what's next (2026-10-22)
+
+**Done in the hardening round** (the order we agreed: 1, 2, 4, then 3):
+1. **Updates that never take an app down.** A node moves to a new combd
+   only once that combd's builds of every compiled module are in the
+   bucket (`builds-ready`; it asks for them early). Nodes waiting on
+   builds ask for all of them, and try again every 15 s. Frozen bundles
+   in the tests keep old deploys loading. Builders are documented
+   (examples/arena/README.md, "Builders"); the Windows builder is still
+   pulled by hand: tell JT when combd's runtime changes (the pin: rustc,
+   `spike/aot`, `spike/mem`), or he sets up Watchtower.
+2. **Overload turns people away instead of collapsing.** The whole
+   machine's memory is watched; at most `COMBD_MAX_AWAKE` cells at work a
+   loop (sleeping sessions wait their turn); a full node refuses new
+   connections (a TLS one is closed), never this machine itself. Measured:
+   ~30,000 active users held on a 1 GB node, the rest refused, the node
+   answering; ~58,000 idle (spike/RESULTS.md, "Overload, without Docker").
+3. **Security.** A review (Fable 5.1, high effort) and its fixes: signed
+   releases (ed25519, `examples/arena/cloud/release.pub`; the private key
+   is the `ARENA_RELEASE_KEY` secret and `cloud/.secrets/release.key`),
+   builds named by SHA-256, Postgres `sslmode=require`, gitleaks and
+   `cargo audit` in check.sh, Rust 1.99.1 (`rust-toolchain.toml`). The
+   leaked DigitalOcean token is rotated. The emSign CA compromise is
+   covered (webpki-roots 1.0.10, rustls-webpki 0.103.16; Ubuntu distrusts
+   the root); the nodes are patched and on kernel 6.8.0-147.
+4. **Nodes without Docker**: systemd, the `combd` user, sandboxed
+   (`examples/arena/cloud/combd.service`). kTLS, io_uring and jsc removed.
+
+**Next, in order:**
+1. **The soak test** (spike/bench/soak/README.md): six load droplets
+   (`spike/bench/load`, `terraform apply -var count_of=6`), `./soak.sh
+   start 500`, then `./soak.sh chaos`, 24 to 48 h, then `./soak.sh stop`.
+   It's ready and its sampler is tested; JT said to run it after 1, 2, 4.
+2. **Overload, the follow-ups:** a full node refusing at TCP (stop
+   listening for a moment), so browsers move to the next of the name's
+   addresses by themselves; and a client helper that, on a 503, tries
+   another node from `/_combd/nodes` (it belongs in `@combd/js`). Then
+   decide whether idle sessions may live in swap (105,000 held that way,
+   in Docker) or the node refuses first (58,000, as now).
+3. **Getting ready to tell people:** a real `combd` binary (not
+   `combd-spike`), releases for Linux and Mac, a 10-minute quickstart,
+   and the race against celld, workerd, and Cloudflare (queued below,
+   under "Compile on deploy") as the launch post.
+4. **The X clone on Postgres**, v0.1's last item.
+5. **JavaScript: `@combd/js`**, a Workers-compatible library over
+   combd's host (`fetch` handler, Request/Response, `DurableObject`,
+   `storage.sql`, WebSockets; it answers to `cloudflare:workers`), on a
+   JS-to-Wasm compiler: try scriptc (vercel-labs/scriptc) first: can its
+   Wasm import combd's host calls, what does its runtime cost a cell, and
+   how fast is it on `langs/js/app.js`.
+6. **A billion checkboxes** and the four things it needs first (per-IP
+   limits, a bucket-write budget with push-back, cheap cold wakes, hot
+   chunks): under "Compile on deploy", queued.
 
 ## The one-line idea
 
@@ -499,6 +553,13 @@ driver for the wire protocol. Each cell's own SQLite stays the default for
 per-cell state. A shared database is for data many cells need.
 
 ## JavaScript
+
+**Now (2026-10-22): jsc is retired** (git keeps it; `langs/js` stays as
+the yardstick). JS comes back as `@combd/js`, a Workers-compatible library
+over combd's host, on a JS-to-Wasm compiler that isn't ours to maintain:
+scriptc first (see "Where we are, and what's next"). Compatibility with
+Cloudflare comes from the library, not the compiler. What follows is the
+plan as it stood, kept for the reasoning.
 
 Most Workers code is JS and TypeScript, so combd needs it to grow past Rust
 developers. No V8, no JS engine in the host, and (decided 2026-10-13) **no
