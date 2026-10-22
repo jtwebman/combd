@@ -1206,6 +1206,27 @@ what it needs, and it runs only where that is.
   different cores or nodes, and it doesn't cut pushes (a viewer of both
   halves gets every change); it spreads them. Test it with most viewers
   at the top, not spread evenly.
+- **A billion checkboxes** (2026-10-22): million times a thousand, on the
+  same three $6 nodes. The bits are only 125 MB (64,000 chunks at million's
+  size), so it works only if almost every chunk sleeps, and it has to hold
+  against someone who writes to every chunk as fast as we allow. That
+  needs four things, each good for every app; measure first (waking cost
+  when every write lands on a cold chunk, bucket writes per click), then
+  build them, then the billion:
+  1. **Memory.** Every write wakes its chunk: 64,000 awake at ~50 KB is
+     ~3 GB, more than the fleet has. The whole-machine memory check helps
+     (under pressure, idle chunks sleep again within a second), but how
+     fast can a node wake chunks when every write hits a sleeping one?
+     Not measured yet.
+  2. **Writes per client.** Million caps a socket at 20 changes a second,
+     but an attacker opens thousands of sockets. combd needs per-IP limits
+     at the edge, since it does what Cloudflare would do in front.
+  3. **The bucket bill.** Each awake chunk uploads its changes to R2 in
+     batches, and R2 charges per write: a script touching every chunk is
+     millions of bucket writes an hour. combd needs a floor on how often
+     one object uploads, and a fleet-wide budget.
+  4. **Hot chunks.** Everyone piles onto the first screen: the splitting
+     above.
 
 ## Cheaper sends: kernel TLS, then io_uring (2026-10-21)
 
