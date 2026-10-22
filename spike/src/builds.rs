@@ -190,15 +190,23 @@ pub fn targets(s3: &S3) -> Result<Vec<(String, String)>, String> {
 pub fn all_built(s3: &S3, wasms: &[Vec<u8>]) -> Result<bool, String> {
     let mut done = true;
     for (pin, cpu) in targets(s3)? {
-        for w in wasms {
-            let m = module_id(w);
-            if let Some((e, _)) = s3.get(&key(&pin, &cpu, &m, "err")).map_err(|e| e.to_string())? {
-                return Err(format!("module {m} couldn't be built for {cpu}: {}", String::from_utf8_lossy(&e)));
-            }
-            if s3.get(&key(&pin, &cpu, &m, "sig")).map_err(|e| e.to_string())?.is_none() {
-                want(s3, &pin, &cpu, w)?;
-                done = false;
-            }
+        done &= built_for(s3, &pin, &cpu, wasms)?;
+    }
+    Ok(done)
+}
+
+/// The same for one target: a node's (`pin`, `cpu`), or a new combd's
+/// before a node moves to it.
+pub fn built_for(s3: &S3, pin: &str, cpu: &str, wasms: &[Vec<u8>]) -> Result<bool, String> {
+    let mut done = true;
+    for w in wasms {
+        let m = module_id(w);
+        if let Some((e, _)) = s3.get(&key(pin, cpu, &m, "err")).map_err(|e| e.to_string())? {
+            return Err(format!("module {m} couldn't be built for {cpu}: {}", String::from_utf8_lossy(&e)));
+        }
+        if s3.get(&key(pin, cpu, &m, "sig")).map_err(|e| e.to_string())?.is_none() {
+            want(s3, pin, cpu, w)?;
+            done = false;
         }
     }
     Ok(done)

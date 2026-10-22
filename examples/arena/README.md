@@ -130,7 +130,9 @@ then, about 70,000 now (`spike/RESULTS.md`, "What a node holds").
 6. After that, a push to `main` rolls out by itself: CI says a new version
    is coming (no new matches), waits for live ones to end, and deploys the
    game; a change to combd itself also moves each node to the new
-   release, one at a time. While one restarts (a few seconds) it
+   release, one at a time, and only once the new combd's builds of every
+   compiled module are in the bucket (it asks for them, and the old one
+   serves meanwhile). Builders update by themselves with Watchtower (Builders, below). While one restarts (a few seconds) it
    refuses new connections, and browsers try another of the name's nodes;
    holding them instead (the socket kept open across the restart) is next.
    A change to docs alone does nothing.
@@ -141,9 +143,38 @@ then, about 70,000 now (`spike/RESULTS.md`, "What a node holds").
    `cloud/tls.sh` gives every node the new one; combd picks it up within
    seconds, for new connections. With more
    than one app on the nodes, each names its domains in its manifest.
-8. **A push sends the bundle before the nodes move to the new combd.** So a
-   change the old combd can't read (the manifest's format, 2026-10-19) is
-   refused by the nodes still on it, and the new combd then can't load the
-   old bundles: after the nodes have moved, deploy each app again (through
-   a node already on the new combd). Next time: the new combd reads the old
-   format through the rollout.
+8. **A new combd reads bundles an older one deployed** (it meets them in the
+   bucket through every update). `deploy.rs`'s test of frozen bundles
+   (`spike/src/testdata`) fails if a change can't; on 2026-10-19 one
+   couldn't, and every app had to be deployed again. The other way round, a
+   bundle the old combd can't read is refused by the nodes still on it: a
+   new format ships in two steps, a combd that reads it, then one that writes it.
+
+### Builders
+
+Compiled modules are built by a builder: any Linux machine with Docker (a
+Windows box's WSL works) that pulls jobs from the bucket and signs what it
+builds with `builder.key` (made by `cloud/up.sh`, in `cloud/.secrets`; the
+nodes trust its public half). Give it its own R2 token for the bucket, in
+`~/combd-builder/env` (chmod 600): `COMBD_S3`, `COMBD_S3_BUCKET`,
+`COMBD_S3_KEY`, `COMBD_S3_SECRET`, `COMBD_S3_REGION=auto`,
+`COMBD_BUILDER_ID`, `COMBD_BUILDER_KEY=/keys/builder.key`,
+`COMBD_AOT_SRC=/combd/spike/aot`, `COMBD_BUILD_WORK=/work`. Then:
+
+```sh
+docker run -d --name combd-builder --restart unless-stopped --env-file ~/combd-builder/env \
+  -v ~/combd-builder/builder.key:/keys/builder.key:ro -v combd-build-work:/work \
+  ghcr.io/jtwebman/combd-builder:latest /combd/spike/target/release/combd-spike builder
+```
+
+A builder builds for the combd it was made with, so it must move when
+combd does. Watchtower moves it (checks every 2 minutes, this container
+only):
+
+```sh
+docker run -d --name watchtower --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock \
+  nickfedor/watchtower --interval 120 --cleanup combd-builder
+```
+
+Until it has, nodes keep the combd they run (they wait for the new one's
+builds), so a late builder delays an update; it doesn't take an app down.

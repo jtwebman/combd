@@ -1210,6 +1210,24 @@ fn main_with(args: &[&str]) {
             let work = std::env::var_os("COMBD_BUILD_WORK").map_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds"), Into::into);
             builds::builder(&s3, &id, &key, &aot, &work, &std::sync::atomic::AtomicBool::new(false));
         }
+        // Before an update: exit 0 if every compiled module the fleet runs is
+        // built for this binary (asking for those that aren't), 1 if not yet,
+        // 2 if it can't tell. The node's own env: COMBD_S3..., COMBD_DATA.
+        #[cfg(feature = "aot-lite")]
+        ["builds-ready"] => {
+            let r = s3::S3::from_env().ok_or_else(|| "no bucket (COMBD_S3)".to_string()).and_then(|s3| http::builds_ready(&s3, &http::Config::from_env().data));
+            match r {
+                Ok(true) => println!("combd     builds-ready: every compiled module is built for {}", builds::pin_id(combd_aot::PIN)),
+                Ok(false) => {
+                    println!("combd     builds-ready: not yet: builds for {} asked for", builds::pin_id(combd_aot::PIN));
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("combd     builds-ready: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         // A new admin token, and its line for COMBD_ADMIN_TOKENS.
         ["admin-token", ref scopes @ ..] if !scopes.is_empty() => {
             let (token, line) = admin::new_token(scopes);
@@ -2725,12 +2743,18 @@ mod tests {
         for k in bucket.list("_combd/builds/").unwrap() {
             bucket.delete(&k).unwrap();
         }
+        // What combd-update asks a new binary before a node moves to it: not
+        // yet (and the build is asked for), from node 0's copy of the catalog.
+        assert_eq!(http::builds_ready(&bucket, &dir.0.join("d0")), Ok(false), "no builds: not ready");
+        assert!(bucket.list("_combd/builds/").unwrap().iter().any(|k| k.ends_with(".wasm")), "and the job is in");
+        assert_eq!(http::builds_ready(&bucket, &dir.0.join("nowhere")), Ok(true), "a new node has nothing to wait for");
         start(2, ports[2], "builds2");
         assert!(eventually(60_000, || std::net::TcpStream::connect(("127.0.0.1", ports[2])).is_ok()), "node 2 is up");
         assert_eq!(http_to(ports[2], "fast.test", "POST", "/room/r/incr", "").0, 404, "not live on it while it builds");
         let stop = Arc::new(AtomicBool::new(false));
         builder(&stop);
         assert!(eventually(300_000, || http_to(ports[2], "fast.test", "POST", "/room/r/incr", "").0 == 200), "live on it once built");
+        assert_eq!(http::builds_ready(&bucket, &dir.0.join("d0")), Ok(true), "built: ready");
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 

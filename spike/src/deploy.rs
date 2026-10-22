@@ -225,6 +225,23 @@ mod tests {
         assert!(decode(&cut).is_err());
     }
 
+    /// A new combd meets the bundles an older one deployed (in the bucket,
+    /// through every update), so they must still load: on 2026-10-19 a
+    /// manifest change meant deploying every app again. These are frozen
+    /// (the arena's and million's manifests that day, stand-in modules): if
+    /// this fails, read the old format too; don't change the files.
+    #[test]
+    fn bundles_from_before_still_load() {
+        let old: [(&str, &[u8]); 2] = [("arena", include_bytes!("testdata/arena-2026-10-22.bundle")), ("million", include_bytes!("testdata/million-2026-10-22.bundle"))];
+        for (app, b) in old {
+            let d = crate::store::tempdir::Dir::new();
+            unpack(b, &d.0).unwrap();
+            let m = crate::manifest::load(&d.0).unwrap().unwrap();
+            assert_eq!(m.app, app);
+            m.resolve(&EnvValues::default()).unwrap_or_else(|e| panic!("{app}: {e}"));
+        }
+    }
+
     /// Bundles come from clients: damaged at random, the decoder must never
     /// panic, and never accept a name it shouldn't.
     #[test]

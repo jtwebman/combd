@@ -1186,6 +1186,29 @@ fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, kn
     Ok((applied.then_some(next), building))
 }
 
+/// Before a node moves to this binary (`combd-update`): is every compiled
+/// module the fleet runs built for it? Missing builds are asked for, so a
+/// builder starts on them while the node waits its turn. The apps come from
+/// the node's own copy of the catalog (`catalog.snap` in `data`), unpacked
+/// in a scratch folder (this runs as root, beside the node's own files).
+/// No copy (a new node): nothing to wait for.
+#[cfg(feature = "aot-lite")]
+pub fn builds_ready(s3: &crate::s3::S3, data: &std::path::Path) -> Result<bool, String> {
+    let Some(state) = std::fs::read(data.join("catalog.snap")).ok().and_then(|b| crate::catalog::decode_snap(&b)) else { return Ok(true) };
+    let scratch = std::env::temp_dir().join(format!("combd-builds-ready-{}", std::process::id()));
+    let wasms = (|| {
+        let (changes, _) = crate::deploy::changes(&state, s3, &scratch, &crate::deploy::Known::new(), None)?;
+        let mut wasms = vec![];
+        for c in &changes {
+            let m = crate::manifest::load(&c.dir)?.ok_or(format!("{}/{}: no manifest", c.org, c.app))?;
+            wasms.extend(compiled_wasms(&m, &c.dir)?);
+        }
+        Ok::<_, String>(wasms)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    crate::builds::built_for(s3, &crate::builds::pin_id(combd_aot::PIN), crate::builds::cpu(), &wasms?)
+}
+
 /// The bytes of an app's compiled modules.
 fn compiled_wasms(m: &crate::manifest::Manifest, dir: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
     m.modules.iter().filter(|(_, k)| **k == crate::engine::Kind::Compiled).map(|(n, _)| std::fs::read(crate::manifest::module_path(dir, n)).map_err(|e| format!("modules/{n}.wasm: {e}"))).collect()
