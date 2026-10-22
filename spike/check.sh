@@ -35,6 +35,18 @@ if [ -f aot/src/gen_rust.rs ]; then
     cargo test --release -q --features aot >"$out" 2>&1 || true
     grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { grep -E "FAILED|panicked" "$out"; echo "check: the compiled tier's tests failed"; exit 1; }
 fi
+# No secrets in what's about to be pushed (gitleaks; .gitleaks.toml), and no
+# dependency with a known hole (cargo audit; .cargo/audit.toml says what's
+# accepted, and why).
+if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+    range=$(git rev-parse -q --verify origin/main >/dev/null && echo "origin/main..HEAD" || echo "--all")
+    docker run --rm -v "$(git rev-parse --show-toplevel)":/repo -w /repo ghcr.io/gitleaks/gitleaks:v8.30.1 git --no-banner --redact --log-opts="$range" . >"$out" 2>&1 || { grep -v "^$" "$out" | tail -20; echo "check: gitleaks found a secret"; exit 1; }
+fi
+if command -v cargo-audit >/dev/null; then
+    cargo audit -q >"$out" 2>&1 || { tail -30 "$out"; echo "check: cargo audit found a vulnerable dependency"; exit 1; }
+else
+    echo "check: no cargo-audit (cargo install cargo-audit): dependencies not checked"
+fi
 [ "$1" = quick ] && { echo "check: ok (quick)"; exit 0; }
 # Compiled modules (slow: they compile): a build loaded the way a node does,
 # a deploy that waits for a builder, and builds' signatures.

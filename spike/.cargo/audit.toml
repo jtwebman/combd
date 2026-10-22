@@ -1,0 +1,29 @@
+# cargo audit (check.sh runs it). Accepted, with why:
+[advisories]
+ignore = [
+    # wasmtime: only the baseline combd's own engines are raced against
+    # (feature "wasmtime"); node builds (aot-lite, no default features)
+    # don't have it, and it runs only our own test modules. The fixes need
+    # Rust 1.95+: they come with the next toolchain bump.
+    "RUSTSEC-2026-0315",
+    "RUSTSEC-2026-0316",
+    "RUSTSEC-2026-0325",
+    "RUSTSEC-2026-0326",
+    "RUSTSEC-2026-0327",
+    "RUSTSEC-2026-0353",
+    "RUSTSEC-2026-0354",
+    "RUSTSEC-2026-0355",
+    "RUSTSEC-2026-0356",
+    "RUSTSEC-2026-0357",
+    "RUSTSEC-2026-0358",
+    "RUSTSEC-2026-0359",
+    "RUSTSEC-2026-0361",
+    "RUSTSEC-2026-0362",
+    "RUSTSEC-2026-0363",
+    "RUSTSEC-2026-0364",
+    "RUSTSEC-2026-0378",
+    "RUSTSEC-2026-0379",
+    # unsafe-libyaml, unmaintained: under serde_yaml_ng, for combd.yaml
+    # manifests (from a deployer with a token, not the public).
+    "RUSTSEC-2024-0449",
+]

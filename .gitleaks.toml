@@ -1,0 +1,8 @@
+# gitleaks (check.sh runs it on what's about to be pushed): its rules, and
+# what isn't a secret.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "RFC 6455's sample Sec-WebSocket-Key, in tests and load tools"
+regexes = ['''dGhlIHNhbXBsZSBub25jZQ==''']
