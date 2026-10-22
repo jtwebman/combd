@@ -145,19 +145,27 @@ HAProxy in front. An idle connection costs about 10 KB there, against about
 Frankfurt, Singapore), one 1 vCPU, 1 GB droplet each, over an R2 bucket:
 [a real-time 1 vs 1 game](examples/arena/) and
 [One Million Checkboxes](https://million.combd.dev) ([source](examples/million/)).
-What one node that size does:
-- **105,000 idle WebSockets** held, with the node answering as fast as when
-  idle (about 60,000 fit without swap).
+Each node runs combd under systemd as its own user, no Docker, and moves
+to a new release by itself, only one signed with the release key. What
+one node that size does (measured 2026-10-22):
+- **About 58,000 idle WebSockets**, each with million's 3.9 KB snapshot
+  (~10 KB a connection, all told). Then it turns new ones away and stays
+  fast: pings 4 to 20 ms, no swapping.
 - **10,000 people clicking at once** on million, every click sent to
-  everyone watching it: p50 echo about 400 ms, nothing lost, 65% CPU.
-- **The ceiling is between 20,000 and 30,000** active users. Past it the
-  box runs out of memory and swaps. The reason: the kernel's memory for
-  each connection isn't in combd's count, and the OS and Docker take
-  about 400 MB of the 1 GB before combd starts. Fixing that is next.
+  everyone watching it: nothing lost, p50 echo under 420 ms, 62% CPU.
+  20,000: 0.04% of clicks lost.
+- **Past about 30,000 active users it turns the rest away and keeps
+  serving the ones it has**: 40,000 arriving, ~30,000 held, 0.5% of their
+  clicks lost, the node answering throughout.
 
-When a node gets more than it can do, it says so: a full mailbox refuses
-at once (503 `overloaded`) instead of queueing forever, and requests that
-pile up for an object run together as one batch, in one transaction.
+When a node gets more than it can do, it says so instead of falling over:
+- it watches the whole machine's memory, not just its own count, and
+  refuses new connections before it would swap;
+- at most `COMBD_MAX_AWAKE` cells at work at once (1,000): past it,
+  sleeping sessions wait their turn, still asleep;
+- a full mailbox refuses at once (503 `overloaded`) instead of queueing
+  forever, and requests that pile up for an object run together as one
+  batch, in one transaction.
 
 ## What surprised us
 

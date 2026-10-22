@@ -5,6 +5,8 @@
 # binary, the app, and the test cell), at the same paths. Tens of MB, not
 # 2 GB: a node pulls a new version without stealing its one CPU for a minute.
 FROM rust:1.99.1-slim-bookworm AS build
+# Debian's fixes since the base image was made (it's also the builders' image).
+RUN apt-get update && apt-get -y upgrade && rm -rf /var/lib/apt/lists/*
 RUN rustup target add wasm32-unknown-unknown
 # Docker Desktop's network often breaks cargo's HTTP/2 downloads ("Error in
 # the HTTP2 framing layer"); one request at a time is reliable.
@@ -24,7 +26,7 @@ RUN cd spike && cargo build --locked --release --no-default-features --features 
 RUN examples/arena/build.sh
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get -y upgrade && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
 COPY --from=build /combd/spike/target/release/combd-spike /combd/spike/target/release/combd-spike
 COPY --from=build /combd/guest/target/wasm32-unknown-unknown/release/combd_guest.wasm /combd/guest/target/wasm32-unknown-unknown/release/combd_guest.wasm
 COPY --from=build /combd/examples/arena/app /combd/examples/arena/app

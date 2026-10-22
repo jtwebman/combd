@@ -2531,6 +2531,44 @@ to a new combd only once that combd's builds are in, so a pin change never
 takes an app down. gitleaks can't see into binary files (it missed the
 plan), so `.gitignore` is the guard there.
 
+## Overload, without Docker (2026-10-22)
+
+The same one-node ramp (million compiled, every page clicking, a fresh
+server each run, 1 vCPU, 1 GB, 1 GB swap), combd now as the nodes run it:
+under systemd, no Docker (~700 MB free before it starts), the whole
+machine's memory watched.
+
+| Users | In Docker (2026-10-21) | Without Docker | And the overload guard |
+|---|---|---|---|
+| 10,000 | 0% lost, 70% CPU | 0% lost, p50 419 ms, 62% CPU | |
+| 20,000 | 0.45% lost | 0.04% lost, p50 1.6 s | |
+| 30,000 | 83% lost (swapping) | 13 to 20% lost | 1.5% lost, p50 1.5 s |
+| 40,000 | 87% lost | 94 to 98% lost, then killed for memory | ~30,000 held, the rest refused; 0.5% of their clicks lost, p50 913 ms |
+
+**Without the guard, 40,000 ran a node out of memory with none of them
+swapping in first.** Every message to a sleeping viewer woke it at once (a
+cell back in memory, ~67 KB), and once the loop fell behind, more and more
+were awake at the same time: swap went from 90 MB to 1 GB in three minutes
+and the kernel killed combd. The memory check couldn't help: it runs on
+the same loop, and pressure never reached "refuse".
+
+**The guard** (`COMBD_MAX_AWAKE`, 1,000 a loop): no more cells at work
+than that, running or waiting on a host call. A sleeping session with work
+waits its turn, asleep; while that line is as long as the cap, the node
+takes no new connections, and each session's mailbox is 8, not 1,000.
+`sessions_ready` and `sessions_waited` show it working. A refused TLS
+client is just closed (a plain 503 was noise to it), and this machine
+itself is never refused, so its own checks see a full node.
+
+**Idle, without Docker:** 57,854 idle million viewers held, then new ones
+refused (memory pressure), with the node answering in 4 to 20 ms and swap
+flat. In Docker it held 105,000, 1 GB deep in swap; now it refuses before
+it swaps.
+
+**Found on the way:** `ws-click` panicked on the first connection that
+failed (a busy node's full accept queue) and took its pages with it; now
+it waits a second and tries again, as a browser would.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A

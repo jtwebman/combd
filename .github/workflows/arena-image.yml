@@ -32,6 +32,8 @@ jobs:
           context: .
           file: examples/arena/Dockerfile
           push: true
+          # Fresh base images (Debian's security fixes), not the runner's cache.
+          pull: true
           build-args: |
             ARENA_VERSION=${{ github.sha }}
             COMBD_SOURCE=${{ steps.src.outputs.hash }}
@@ -67,6 +69,7 @@ jobs:
           file: examples/arena/Dockerfile
           target: build
           push: true
+          pull: true
           build-args: |
             ARENA_VERSION=${{ github.sha }}
           tags: |
