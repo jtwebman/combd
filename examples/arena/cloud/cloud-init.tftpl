@@ -1,9 +1,8 @@
 #cloud-config
-# One arena node: Docker, the fleet's files, and combd. Secrets arrive here
-# (user data is readable only from the droplet itself) and stay root-only.
+# One arena node: the fleet's files, and combd as its own user (no Docker).
+# Secrets arrive here (user data is readable only from the droplet itself);
+# root and the combd group read them.
 package_update: true
-packages:
-  - docker.io
 write_files:
   - path: /etc/combd/certs/ca.pem
     encoding: b64
@@ -40,15 +39,18 @@ write_files:
     permissions: "0600"
     encoding: b64
     content: ${base64encode(env)}
-  # New images roll out by themselves, one node at a time (combd-update).
+  # New versions roll out by themselves, one node at a time (combd-update).
   - path: /usr/local/bin/combd-update
     permissions: "0755"
     encoding: b64
     content: ${base64encode(update)}
   - path: /etc/combd/update
     content: |
-      COMBD_IMAGE=${image}
-  # Kernel limits and a trimmed OS, at every boot, before Docker (combd-tune).
+      COMBD_RELEASE=${release}
+  - path: /etc/systemd/system/combd.service
+    encoding: b64
+    content: ${base64encode(service)}
+  # Kernel limits and a trimmed OS, at every boot, before combd (combd-tune).
   - path: /usr/local/bin/combd-tune
     permissions: "0755"
     encoding: b64
@@ -57,7 +59,7 @@ write_files:
     content: |
       [Unit]
       Description=Kernel limits and a trimmed OS for combd
-      Before=docker.service
+      Before=combd.service
       [Service]
       Type=oneshot
       ExecStart=/usr/local/bin/combd-tune
@@ -67,8 +69,11 @@ write_files:
     content: |
       * * * * * root /usr/local/bin/combd-update
 runcmd:
-  # A little swap: 1 GB is tight for combd, Docker, and the OS together.
+  # A little swap: 1 GB is tight.
   - fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  - systemctl daemon-reload && systemctl enable --now combd-tune
-  - systemctl enable --now docker
-  - docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro ${image} ./target/release/combd-spike serve-fleet both 443
+  - useradd --system --home-dir /var/lib/combd --shell /usr/sbin/nologin combd
+  - mkdir -p /var/lib/combd /opt/combd && chown combd:combd /var/lib/combd
+  - chgrp combd /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node${node}.key /etc/combd/tls/key.pem && chmod 640 /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node${node}.key /etc/combd/tls/key.pem
+  - systemctl daemon-reload && systemctl enable --now combd-tune && systemctl enable combd
+  # The newest combd, and start it (if GitHub doesn't answer, cron tries again).
+  - /usr/local/bin/combd-update now

@@ -46,8 +46,9 @@ variable "regions" {
 variable "size" {
   default = "s-1vcpu-1gb"
 }
-variable "image" {
-  default = "ghcr.io/jtwebman/combd-arena:latest"
+variable "release" {
+  description = "Where nodes fetch combd (combd-arena.txt and its tarball; CI's arena release)"
+  default     = "https://github.com/jtwebman/combd/releases/download/arena"
 }
 variable "admin_cidr" {
   description = "Who may reach SSH and the admin API: your IP, as a.b.c.d/32"
@@ -150,7 +151,7 @@ resource "digitalocean_droplet" "node" {
   ssh_keys = [digitalocean_ssh_key.me.fingerprint]
   user_data = templatefile("${path.module}/cloud-init.tftpl", {
     node  = each.key
-    image = var.image
+    release = var.release
     env = join("\n", [
       "COMBD_NODE=${each.key}",
       "COMBD_PEERS=${local.peers}",
@@ -160,7 +161,7 @@ resource "digitalocean_droplet" "node" {
       "COMBD_WIRE_CERTS=/etc/combd/certs",
       "COMBD_REPLICAS=2",
       "COMBD_THREADS=1",
-      "COMBD_DATA=/data",
+      "COMBD_DATA=/var/lib/combd",
       "COMBD_LEASE_MS=3000",
       "COMBD_S3=https://${var.cloudflare_account_id}.r2.cloudflarestorage.com",
       "COMBD_S3_BUCKET=${var.r2_bucket}",
@@ -177,10 +178,10 @@ resource "digitalocean_droplet" "node" {
       "COMBD_TLS_CERT=/etc/combd/tls/cert.pem",
       "COMBD_TLS_KEY=/etc/combd/tls/key.pem",
       "COMBD_REDIRECT_PORT=80",
-      # What combd may use of the droplet's 1 GB: the OS and Docker take
-      # ~400 MB, so this is about what's left in RAM. Past 85% it reclaims,
-      # past 95% it refuses new work. 700M (which counts swap) let a node
-      # swap itself into a crawl before it refused anything.
+      # What combd may use of the droplet's 1 GB, by its own count. Past 85%
+      # it reclaims, past 95% it refuses new work; it watches the whole
+      # machine's free memory the same way, since the kernel's part of its
+      # connections isn't in its count.
       "COMBD_MEMORY_BUDGET=550M",
       # TLS in the kernel once a connection's handshake is done: an idle
       # one is ~3.7 KB, not ~7.5 (combd-tune loads the module).
@@ -198,10 +199,11 @@ resource "digitalocean_droplet" "node" {
     tls_key  = acme_certificate.arena.private_key_pem
     builders = file("${local.secrets}/builder-keys")
     update   = file("${path.module}/combd-update.sh")
+    service  = file("${path.module}/combd.service")
     tune     = file("${path.module}/combd-tune.sh")
   })
   # Running nodes keep what they started with: a change here is for new
-  # droplets (the image itself rolls out through combd-update).
+  # droplets (combd itself rolls out through combd-update).
   lifecycle {
     ignore_changes = [user_data]
   }

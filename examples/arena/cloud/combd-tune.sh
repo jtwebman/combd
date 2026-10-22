@@ -15,8 +15,15 @@ done
 # Kernel TLS (COMBD_KTLS): combd hands a connection's session to it.
 modprobe tls
 
-# What Ubuntu runs that a node doesn't need: ~95 MB of the 1 GB.
-systemctl disable --now -q fwupd fwupd-refresh.timer multipathd multipathd.socket udisks2 ModemManager 2>/dev/null
+# What Ubuntu runs that a node doesn't need: ~95 MB of the 1 GB, and the
+# timers that wake now and then for a man page index or a message of the
+# day (apt's and unattended-upgrades', the security updates, stay).
+# One at a time: a unit this Ubuntu doesn't have stops the rest otherwise.
+for u in fwupd fwupd-refresh.timer multipathd multipathd.socket udisks2 ModemManager rsyslog \
+    man-db.timer motd-news.timer update-notifier-download.timer update-notifier-motd.timer \
+    sysstat sysstat-collect.timer sysstat-summary.timer; do
+    systemctl disable --now -q "$u" 2>/dev/null
+done
 mkdir -p /etc/systemd/journald.conf.d
 if [ ! -f /etc/systemd/journald.conf.d/combd.conf ]; then
     printf '[Journal]\nSystemMaxUse=50M\nRuntimeMaxUse=20M\n' >/etc/systemd/journald.conf.d/combd.conf

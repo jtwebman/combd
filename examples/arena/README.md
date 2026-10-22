@@ -114,8 +114,11 @@ on each node (single mode: it ends TLS on 443, and 80 redirects there).
 Until 2026-10-20 Caddy did, in front: a node held about 9,500 connections
 then, about 70,000 now (`spike/RESULTS.md`, "What a node holds").
 
-1. GitHub builds the image (`.github/workflows/arena-image.yml`) on each
-   push; make the `combd-arena` package public once so droplets can pull it.
+1. GitHub builds combd (`.github/workflows/arena-image.yml`) on each push
+   and puts it on the repo's `arena` release, where nodes fetch it. Nodes
+   run it as its own user under systemd (`cloud/combd.service`), no Docker
+   (Docker took ~100 MB of a node's 1 GB; nodes before 2026-10-21 moved
+   with `cloud/to-native.sh`).
 2. Make the bucket and its key: `wrangler r2 bucket create combd-arena`,
    then an R2 API token with Object Read & Write on it.
 3. `cp cloud/terraform.tfvars.example cloud/terraform.tfvars` and fill it in.
@@ -126,8 +129,8 @@ then, about 70,000 now (`spike/RESULTS.md`, "What a node holds").
    all down (about $18 a month while it's up, plus the load balancer).
 6. After that, a push to `main` rolls out by itself: CI says a new version
    is coming (no new matches), waits for live ones to end, and deploys the
-   game; a change to combd itself also moves each node to the new image
-   (about 40 MB), one at a time. While one restarts (a few seconds) it
+   game; a change to combd itself also moves each node to the new
+   release, one at a time. While one restarts (a few seconds) it
    refuses new connections, and browsers try another of the name's nodes;
    holding them instead (the socket kept open across the restart) is next.
    A change to docs alone does nothing.
@@ -138,9 +141,9 @@ then, about 70,000 now (`spike/RESULTS.md`, "What a node holds").
    `cloud/tls.sh` gives every node the new one; combd picks it up within
    seconds, for new connections. With more
    than one app on the nodes, each names its domains in its manifest.
-8. **A push sends the bundle before the nodes move to the new image.** So a
+8. **A push sends the bundle before the nodes move to the new combd.** So a
    change the old combd can't read (the manifest's format, 2026-10-19) is
    refused by the nodes still on it, and the new combd then can't load the
    old bundles: after the nodes have moved, deploy each app again (through
-   a node already on the new image). Next time: the new combd reads the old
+   a node already on the new combd). Next time: the new combd reads the old
    format through the rollout.
