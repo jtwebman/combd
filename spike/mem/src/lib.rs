@@ -176,10 +176,10 @@ fn reserve(n: usize) -> io::Result<*mut u8> {
 
 /// The memory this process costs the machine, in bytes (`None` where we
 /// can't tell). On Linux, its cgroup's (a container's, or a service's): its
-/// own memory and what the kernel holds for it (sockets' buffers, about 4
-/// KB a connection, which RSS leaves out), and what of it went to swap,
-/// less file cache it would give back. Elsewhere, or with no cgroup to
-/// read, its resident memory.
+/// own memory and the part of the kernel's the cgroup is charged for, and
+/// what of it went to swap, less file cache it would give back. Most of
+/// the kernel's memory for its connections isn't charged (`machine`).
+/// Elsewhere, or with no cgroup to read, its resident memory.
 pub fn resident() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -252,6 +252,24 @@ pub fn cgroup_used(current: &str, stat: &str, swap: Option<&str>) -> Option<u64>
     let inactive = stat.lines().find_map(|l| l.strip_prefix("inactive_file ")).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
     let swapped = swap.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
     Some(total.saturating_sub(inactive) + swapped)
+}
+
+/// The machine's memory, in bytes: its total, and what the kernel can still
+/// hand out without swapping (`MemAvailable`). `None` where we can't tell.
+/// Unlike a cgroup's count, it sees the kernel's own memory for every
+/// connection (its socket, its TCP and kTLS state, ~3 to 7 KB), which no
+/// cgroup is charged for, and the OS's.
+pub fn machine() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    return meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?);
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// `/proc/meminfo`'s total and available, in bytes.
+pub fn meminfo(s: &str) -> Option<(u64, u64)> {
+    let kb = |k: &str| s.lines().find_map(|l| l.strip_prefix(k))?.trim().strip_suffix(" kB")?.trim().parse::<u64>().ok().map(|n| n * 1024);
+    Some((kb("MemTotal:")?, kb("MemAvailable:")?))
 }
 
 /// Bytes the allocator has handed out and not had back (glibc only: 0
@@ -376,6 +394,9 @@ mod tests {
         assert_eq!(cgroup_used("800000000\n", stat, Some("270000000\n")), Some(1_000_000_000), "and what went to swap");
         assert_eq!(cgroup_used("max", stat, None), None);
         assert_eq!(cgroup_used("1000", "", None), Some(1000), "no stat: all of it");
+        let mi = "MemTotal:         984556 kB\nMemFree:           88000 kB\nMemAvailable:     251936 kB\n";
+        assert_eq!(meminfo(mi), Some((984556 * 1024, 251936 * 1024)));
+        assert_eq!(meminfo("MemTotal: 1 kB\n"), None, "no available, no answer");
         #[cfg(target_os = "linux")]
         assert!(resident().is_some_and(|n| n > 0));
     }

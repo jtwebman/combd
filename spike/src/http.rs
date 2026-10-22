@@ -244,6 +244,13 @@ fn pressure(used: u64, budget: u64, was: u64) -> u64 {
     }
 }
 
+/// The same lines for the whole machine, with a tenth of it kept free
+/// (where the kernel starts to swap): on 1 GB, reclaim under ~225 MB
+/// available, refuse under ~140 MB.
+fn machine_pressure(total: u64, available: u64, was: u64) -> u64 {
+    pressure(total.saturating_sub(available), total - total / 10, was)
+}
+
 impl Config {
     pub fn from_env() -> Config {
         let num = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
@@ -308,8 +315,10 @@ struct Stats {
     conns_open: AtomicU64,
     conns_refused: AtomicU64,
     accept_failed: AtomicU64,
-    /// Memory: what the node uses, and its pressure (`pressure`).
+    /// Memory: what the node uses, what the machine has left, and the
+    /// pressure (`pressure`).
     memory_used: AtomicU64,
+    machine_available: AtomicU64,
     pressure: AtomicU64,
     /// Socket processes' sessions, how many of them are hibernating, and
     /// how many times one has woken.
@@ -3432,10 +3441,22 @@ impl<E: Engine> Loop<'_, E> {
     /// `hibernate_ms` give up their cell for their state. Loop 0 also
     /// measures the node's memory; while it's short, all of this goes sooner.
     fn sweep_cells(&mut self) {
-        if let (0, Some(budget), Some(used)) = (self.me, self.sh.cfg.memory_budget, combd_mem::resident()) {
+        if self.me == 0 {
             let st = &self.sh.stats;
-            st.memory_used.store(used, Relaxed);
-            st.pressure.store(pressure(used, budget, st.pressure.load(Relaxed)), Relaxed);
+            let was = st.pressure.load(Relaxed);
+            let mut p = 0;
+            if let (Some(budget), Some(used)) = (self.sh.cfg.memory_budget, combd_mem::resident()) {
+                st.memory_used.store(used, Relaxed);
+                p = pressure(used, budget, was);
+            }
+            // The whole machine too: combd's own count misses the kernel's
+            // memory for its connections (no cgroup pays for it) and the
+            // OS's, and a node that swaps stops answering.
+            if let Some((total, available)) = combd_mem::machine() {
+                st.machine_available.store(available, Relaxed);
+                p = p.max(machine_pressure(total, available, was));
+            }
+            st.pressure.store(p, Relaxed);
         }
         if let (0, Some((cert, key))) = (self.me, &self.sh.cfg.tls) {
             self.reload_tls(cert, key);
@@ -3734,7 +3755,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"batched\":{},\"ktls\":{},\"ring_sends\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"mailbox_refused\":{},\"batched\":{},\"ktls\":{},\"ring_sends\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3772,6 +3793,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.accept_failed.load(Relaxed),
                     s.memory_used.load(Relaxed),
                     self.sh.cfg.memory_budget.unwrap_or(0),
+                    s.machine_available.load(Relaxed),
                     s.pressure.load(Relaxed),
                     s.ev_instances.load(Relaxed),
                     s.ev_requests.load(Relaxed)
@@ -5146,6 +5168,14 @@ mod tests {
     fn pressure_rises_at_85_and_95_and_falls_under_90() {
         let p = |used, was| pressure(used, 100, was);
         assert_eq!([p(50, 0), p(85, 0), p(94, 1), p(95, 1), p(92, 2), p(89, 2), p(80, 2)], [0, 1, 1, 2, 2, 1, 0]);
+    }
+
+    /// The machine's lines, from the 1 GB droplet's numbers (MB): 20,000
+    /// active held with 255 free; 30,000 swapped from ~80.
+    #[test]
+    fn the_machine_presses_before_it_swaps() {
+        let m = |avail, was| machine_pressure(961, avail, was);
+        assert_eq!([m(600, 0), m(255, 0), m(200, 0), m(130, 1), m(160, 2), m(200, 2)], [0, 0, 1, 2, 2, 1]);
     }
 
     #[test]
