@@ -2508,6 +2508,29 @@ better: 255 MB free with it, 271 MB without.
 Both kTLS and io_uring are out of combd since (2026-10-22): no gain for
 their Linux-only unsafe code.
 
+## A security review, and what it changed (2026-10-22)
+
+A review by Fable 5.1 (high effort) of every attack surface: the public
+front, the admin API, the wire between nodes, the sandbox and host calls,
+builds, bundles, secrets, storage, the update path, and CI. It found no way
+in from the internet; the front's smuggling defenses, the admin tokens
+(hashed, constant time, scoped), the wire's mutual TLS, signed builds, the
+SQLite limits, and CI (no `pull_request` trigger on the self-hosted runner)
+held. What it found, and what changed:
+
+| Finding | Severity | Now |
+|---|---|---|
+| A DigitalOcean token in git history (a Terraform plan, committed by mistake) | critical | rotated (the old one is refused); plans and state are gitignored |
+| Node updates trusted a sha256 from the same release | medium | the release note is signed (ed25519); nodes check it against a pinned key |
+| Builds named by 64-bit FNV, not a cryptographic hash | low | SHA-256 (128 bits) |
+| Postgres connections couldn't use TLS | low | `sslmode=require`: TLS with the certificate checked, or no connection |
+
+Also: check.sh runs gitleaks on what's about to be pushed and `cargo
+audit`; Rust 1.99.1 (wasmtime 50, its advisories fixed); and a node moves
+to a new combd only once that combd's builds are in, so a pin change never
+takes an app down. gitleaks can't see into binary files (it missed the
+plan), so `.gitignore` is the guard there.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A
