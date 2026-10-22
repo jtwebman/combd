@@ -1,6 +1,5 @@
 target/
 reference/
 .git/
-jsc/out/
 spike/aot/src/gen_*.rs
 langs/out/

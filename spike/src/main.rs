@@ -53,8 +53,6 @@ use host::HostState;
 use std::time::{Duration, Instant};
 
 const GUEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../guest/target/wasm32-unknown-unknown/release/combd_guest.wasm");
-/// `langs/js/app.js`, compiled by jsc (`jsc/build.sh`).
-const JS_CELL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../jsc/out/app/target/wasm32-unknown-unknown/release/combd_js_app.wasm");
 /// Reductions (loop iterations and calls) per slice for our interpreter.
 const SLICE: u32 = 2_500;
 /// Fuel (about one per wasm op) per slice for Wasmtime. Both are tuned so a
@@ -70,9 +68,6 @@ const LANGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../langs/out");
 /// The Rust cell, plus every cell built by `langs/Dockerfile`.
 fn lang_cells() -> Vec<(String, Vec<u8>)> {
     let mut out = vec![("rust".to_string(), wasm())];
-    if let Ok(js) = std::fs::read(JS_CELL) {
-        out.push(("js".to_string(), js));
-    }
     let mut files: Vec<_> = std::fs::read_dir(LANGS).into_iter().flatten().flatten().map(|e| e.path()).collect();
     files.sort();
     for f in files.into_iter().filter(|f| f.extension().is_some_and(|x| x == "wasm")) {
@@ -301,12 +296,11 @@ fn fleet_load(secs: u64, threads: usize, objects: usize, nodes: &str) -> bool {
     good
 }
 
-/// The Rust cell or the JS one.
+/// The Rust cell (the only one, since jsc's JS cell retired).
 fn cell(name: &str) -> Vec<u8> {
     match name {
         "rust" => wasm(),
-        "js" => std::fs::read(JS_CELL).expect("build the JS cell first: jsc/build.sh"),
-        _ => panic!("cell must be rust or js"),
+        _ => panic!("cell must be rust"),
     }
 }
 
@@ -1597,22 +1591,6 @@ mod tests {
         assert!(matches!(run_wat(src, "f"), Outcome::Done(r) if r == [7]));
     }
 
-    /// jsc's build of app.js must answer every request byte-for-byte like Node.
-    #[test]
-    fn js_matches_node() {
-        let Ok(js) = std::fs::read(JS_CELL) else {
-            eprintln!("skipping: build the JS cell first (jsc/build.sh)");
-            return;
-        };
-        let eng = interp::Interp { max_pages: 16384 };
-        let prog = eng.load(&js).unwrap();
-        for (r, want) in requests().iter().zip(expected()) {
-            let (mut vm, mut st) = (eng.spawn(&prog).unwrap(), HostState::default());
-            init(&mut vm, &mut st).unwrap();
-            assert_eq!(request(&mut vm, r, &mut st).unwrap(), want, "{r}");
-        }
-    }
-
     /// The Rust API routes must answer byte-for-byte like Node running app.js.
     #[test]
     fn rust_api_matches_node() {
@@ -1627,10 +1605,8 @@ mod tests {
     /// A compiled cell yields mid-call (on a fiber) and resumes to the right answer.
     #[cfg(feature = "aot-guard")]
     #[test]
-    /// The JS cell's fib is plain recursion with no loop: it must yield too.
     fn aot_yields_mid_call_and_resumes() {
-        let mut cells = vec![("rust", wasm())];
-        cells.extend(std::fs::read(JS_CELL).ok().map(|js| ("js", js)));
+        let cells = vec![("rust", wasm())];
         for (lang, wasm) in cells {
             let Ok(prog) = aot::Aot.load(&wasm) else { continue };
             let mut vm = aot::Aot.spawn(&prog).unwrap();

@@ -80,14 +80,15 @@ compiler that turns Wasm into plain safe Rust. The Rust compiler then proves
 the sandbox holds, and it becomes machine code for any CPU.
 
 **Languages.** Cells run in Rust, C, Zig, Go (TinyGo), and AssemblyScript
-(see [langs/](langs/)). JavaScript runs through our own JS-to-Rust compiler,
-[jsc](jsc/), and its answers match Node byte for byte.
+(see [langs/](langs/)). JavaScript is next: a Workers-compatible library
+over combd's host, on a JS-to-Wasm compiler (our own first try, jsc, is
+retired; its results below stand).
 
 **Speed over HTTP**, one CPU core each, the same small API app everywhere:
 - **A combd cell in Rust** handled 1.3x to 1.6x more requests than Bun. It
   beat celld by up to 5x and workerd by up to 7x, with tail latency under
   half a millisecond.
-- **The same app in JavaScript**, compiled by jsc, beat Node on every route
+- **The same app in JavaScript**, compiled by jsc (since retired), beat Node on every route
   and celld and workerd by 2x to 4x. It's still 9% to 32% behind Bun.
 - **With a CPU-heavy neighbor on the same core**, it kept 35x to 56x Bun's
   throughput, because combd keeps yielding and Bun can't.
@@ -163,7 +164,7 @@ pile up for an object run together as one batch, in one transaction.
 Building changed the plan. The [plan](plan.md#what-building-taught-us) has
 the full story; the short version:
 
-- **Interpreting JavaScript can't beat Bun,** so we compile it instead.
+- **Interpreting JavaScript can't beat Bun,** so JS has to be compiled.
 - **fsync was 90% of a write.** Sharing one fsync across many writes made
   hot writes 8.3x faster.
 - **"S3-compatible" isn't one standard.** One popular server let several
