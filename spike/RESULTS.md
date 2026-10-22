@@ -2460,6 +2460,22 @@ run, 3 minutes:
 No difference beyond the noise: the system calls weren't the cost, TCP's
 work per packet is. Off by default; the arena doesn't run it.
 
+The same ramp as above, now with kTLS, io_uring off and on at each step
+(a fresh server each run, 3 minutes, 1 GB swap):
+
+| Users | Lost (off / on) | Worst p50 (off / on) | Swap used (off / on) |
+|---|---|---|---|
+| 10,000 | 0% / 0% | 950 ms / 840 ms | 1 / 9 MB |
+| 20,000 | 0.45% / 0.91% | 3.7 s / 2.7 s | 87 / 83 MB |
+| 30,000 | 83% / 51% | 7.9 s / 5.7 s | 511 / 245 MB |
+| 40,000 | 87% / 71% | 9.8 s / 6.4 s | 511 / 312 MB |
+
+The wall is still between 20,000 and 30,000, both ways. At 30,000 the
+server swaps and its CPU falls toward idle (it's waiting on pages, not
+working): memory, not CPU. combd's own count stays under its budget,
+so what fills the box is outside it, most likely the kernel's socket
+buffers for frames queued to clients that fell behind.
+
 ## What these numbers do not cover
 
 - **Busy cells use more memory.** 21 KB is a small cell paused mid-loop. A
