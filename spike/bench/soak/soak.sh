@@ -13,6 +13,7 @@ IMG=ghcr.io/jtwebman/combd-arena:latest
 O="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
 case "$1" in
 start)
+    PAGES=${2:?pages per client}
     for n in $NODES; do
         scp -q $O sample.sh "root@$n:/usr/local/bin/combd-soak-sample"
         ssh $O "root@$n" 'chmod 755 /usr/local/bin/combd-soak-sample; rm -f /var/lib/combd-soak.csv; echo "*/5 * * * * root /usr/local/bin/combd-soak-sample" > /etc/cron.d/combd-soak; /usr/local/bin/combd-soak-sample'
@@ -25,13 +26,16 @@ start)
         n=$(eval echo "\${$(( i % 3 + 1 ))}"); ip=$(dig +short "$n" | head -1); i=$((i + 1))
         ssh-keygen -R "$c" >/dev/null 2>&1 || true
         ssh $O "root@$c" "iptables -t raw -C OUTPUT -p tcp --dport 443 -j NOTRACK 2>/dev/null || { iptables -t raw -A OUTPUT -p tcp --dport 443 -j NOTRACK; iptables -t raw -A PREROUTING -p tcp --sport 443 -j NOTRACK; }
-            docker rm -f load >/dev/null 2>&1; docker run -d --name load --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v /etc/ssl/certs/ca-certificates.crt:/ca.pem:ro $IMG ./target/release/combd-spike ws-click $ip:443 million.combd.dev /ws ${2:?pages per client} /ca.pem 30 20 >/dev/null
+            docker rm -f load >/dev/null 2>&1; docker run -d --name load --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v /etc/ssl/certs/ca-certificates.crt:/ca.pem:ro $IMG ./target/release/combd-spike ws-click $ip:443 million.combd.dev /ws $PAGES /ca.pem 30 20 >/dev/null
             echo '*/30 * * * * root docker restart load >/dev/null' > /etc/cron.d/soak-churn"
-        echo "$c: ${2} pages on $n ($ip)"
+        echo "$c: $PAGES pages on $n ($ip)"
     done
     # From outside the fleet: the pages answer, every 30 s, to probe.log.
+    # (A [b]racket keeps pkill -f from matching its own ssh command.)
     c=$(echo $CLIENTS | cut -d' ' -f1)
-    ssh $O "root@$c" "nohup sh -c 'while true; do for u in https://million.combd.dev/ https://arena.combd.dev/; do echo \"\$(date +%s) \$u \$(curl -s -m 10 -o /dev/null -w %{http_code} \$u)\"; done; sleep 30; done' > /root/probe.log 2>&1 &"
+    scp -q $O probe.sh "root@$c:/root/probe.sh"
+    ssh $O "root@$c" 'pkill -f "[p]robe.sh" || true'
+    ssh $O "root@$c" 'nohup sh /root/probe.sh > /root/probe.log 2>&1 < /dev/null &'
     echo "soak started $(date)"
     ;;
 chaos)
@@ -44,7 +48,7 @@ chaos)
     echo "chaos at +6h (n1: combd killed), +12h (n2: no bucket for 10 min), +18h (n0: reboot), from $(date)"
     ;;
 stop)
-    for c in $CLIENTS; do ssh $O "root@$c" 'rm -f /etc/cron.d/soak-churn; docker rm -f load >/dev/null 2>&1; pkill -f "probe.log" || true; pkill -f "while true; do for u" || true'; done
+    for c in $CLIENTS; do ssh $O "root@$c" 'rm -f /etc/cron.d/soak-churn; docker rm -f load >/dev/null 2>&1; pkill -f "[p]robe.sh" || true'; done
     mkdir -p out
     for n in $NODES; do
         ssh $O "root@$n" 'rm -f /etc/cron.d/combd-soak; systemctl stop soak-kill.timer soak-cut.timer soak-uncut.timer soak-reboot.timer 2>/dev/null || true'

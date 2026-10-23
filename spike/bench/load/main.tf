@@ -36,7 +36,7 @@ resource "digitalocean_droplet" "load" {
   count    = var.count_of
   name     = "combd-load-${count.index}"
   region   = var.region
-  size     = "s-1vcpu-1gb-amd"
+  size     = "s-1vcpu-1gb"
   image    = "ubuntu-24-04-x64"
   tags     = ["combd-load"]
   ssh_keys = [data.digitalocean_ssh_key.me.fingerprint]

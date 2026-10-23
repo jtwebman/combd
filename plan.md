@@ -40,7 +40,10 @@ and the rest of the plan is updated to match.
 1. **The soak test** (spike/bench/soak/README.md): six load droplets
    (`spike/bench/load`, `terraform apply -var count_of=6`), `./soak.sh
    start 500`, then `./soak.sh chaos`, 24 to 48 h, then `./soak.sh stop`.
-   It's ready and its sampler is tested; JT said to run it after 1, 2, 4.
+   **Running since 2026-10-23 04:45 PDT** (500 pages a client, 3,000 in
+   all; chaos armed 04:55: n1 kill 10:55, n2 bucket cut 16:55, n0 reboot
+   22:55). Stop no earlier than 2026-10-24 05:00 PDT, then `terraform
+   destroy` the load droplets.
 2. **Overload, the follow-ups:** a full node refusing at TCP (stop
    listening for a moment), so browsers move to the next of the name's
    addresses by themselves; and a client helper that, on a 503, tries
