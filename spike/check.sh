@@ -6,15 +6,15 @@
 # last two.
 set -e
 cd "$(dirname "$0")"
-start() { # name, image, port, env...
+start() { # name, image (and its command), port, env...
     name=$1 image=$2 port=$3; shift 3
     docker ps --format '{{.Names}}' | grep -qx "$name" && return
-    docker start "$name" >/dev/null 2>&1 || docker run -d --name "$name" -p "127.0.0.1:$port" "$@" "$image" >/dev/null
+    docker start "$name" >/dev/null 2>&1 || docker run -d --name "$name" -p "127.0.0.1:$port" "$@" $image >/dev/null
 }
 env_of() { docker inspect "$1" --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n "s/^$2=//p"; }
 if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     start combd-pg-test postgres:16-alpine 25432:5432 -e POSTGRES_PASSWORD="$(openssl rand -hex 12)"
-    start combd-s3-test pgsty/silo:RELEASE.2026-09-16T00-00-00Z 29000:9000 -e MINIO_ROOT_USER=combd -e MINIO_ROOT_PASSWORD="$(openssl rand -hex 12)"
+    start combd-s3-test "pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data" 29000:9000 -e MINIO_ROOT_USER=combd -e MINIO_ROOT_PASSWORD="$(openssl rand -hex 12)"
     export COMBD_PG_TEST="postgres://postgres:$(env_of combd-pg-test POSTGRES_PASSWORD)@127.0.0.1:25432/postgres"
     export COMBD_S3=http://127.0.0.1:29000 COMBD_S3_REGION=us-east-1
     COMBD_S3_KEY=$(env_of combd-s3-test MINIO_ROOT_USER); COMBD_S3_SECRET=$(env_of combd-s3-test MINIO_ROOT_PASSWORD)

@@ -2,13 +2,13 @@
 
 Status: hardening before we tell people about it. A working runtime,
 live on a three-node fleet of $6 droplets (the arena and million).
-Updated: 2026-10-22
+Updated: 2026-10-24
 
 This plan was written before we built anything. Most of it held up. Where
 building taught us something, the section below says what changed and why,
 and the rest of the plan is updated to match.
 
-## Where we are, and what's next (2026-10-22)
+## Where we are, and what's next (2026-10-24)
 
 **Done in the hardening round** (the order we agreed: 1, 2, 4, then 3):
 1. **Updates that never take an app down.** A node moves to a new combd
@@ -37,31 +37,39 @@ and the rest of the plan is updated to match.
    (`examples/arena/cloud/combd.service`). kTLS, io_uring and jsc removed.
 
 **Next, in order:**
-1. **The soak test** (spike/bench/soak/README.md): six load droplets
-   (`spike/bench/load`, `terraform apply -var count_of=6`), `./soak.sh
-   start 500`, then `./soak.sh chaos`, 24 to 48 h, then `./soak.sh stop`.
-   **Running since 2026-10-23 04:45 PDT** (500 pages a client, 3,000 in
-   all; chaos armed 04:55: n1 kill 10:55, n2 bucket cut 16:55, n0 reboot
-   22:55). Stop no earlier than 2026-10-24 05:00 PDT, then `terraform
-   destroy` the load droplets.
+1. **The soak test: passed** (2026-10-23 04:45 to 10-24 07:30 PDT,
+   26.7 h, 3,000 pages; spike/bench/soak/README.md). No swap, no growth
+   between chaos events (flat for the 8 h after the last), the only
+   restart the chaos kill, nothing refused. The n0 reboot: combd up in
+   27 s, its 1,000 connections back within 10 minutes. The outside probe:
+   6,234 checks, one not 200 (arena, an instant `000` at 23:19:40, no node
+   logged anything; the probe didn't keep curl's error). Before the next
+   soak: `report.py` measures growth only after the last chaos event (each
+   one moves objects, a step it reads as a slope), and `probe.sh` logs
+   `%{errormsg}`. What it showed: after a failure, objects never go home
+   (n0 held none for 8 h, its users forwarded across an ocean); see
+   "Placement: where an object lives".
 2. **Overload, the follow-ups:** a full node refusing at TCP (stop
    listening for a moment), so browsers move to the next of the name's
    addresses by themselves; and a client helper that, on a 503, tries
    another node from `/_combd/nodes` (it belongs in `@combd/js`). Then
    decide whether idle sessions may live in swap (105,000 held that way,
    in Docker) or the node refuses first (58,000, as now).
-3. **Getting ready to tell people:** a real `combd` binary (not
+3. **Placement: objects move to their home** ("Placement: where an object
+   lives"): `nearest`, `spread`, `pin`, one hand-off, the target may say
+   no. The hand-off in `own.rs` and the simulator first.
+4. **Getting ready to tell people:** a real `combd` binary (not
    `combd-spike`), releases for Linux and Mac, a 10-minute quickstart,
    and the race against celld, workerd, and Cloudflare (queued below,
    under "Compile on deploy") as the launch post.
-4. **The X clone on Postgres**, v0.1's last item.
-5. **JavaScript: `@combd/js`**, a Workers-compatible library over
+5. **The X clone on Postgres**, v0.1's last item.
+6. **JavaScript: `@combd/js`**, a Workers-compatible library over
    combd's host (`fetch` handler, Request/Response, `DurableObject`,
    `storage.sql`, WebSockets; it answers to `cloudflare:workers`), on a
    JS-to-Wasm compiler: try scriptc (vercel-labs/scriptc) first: can its
    Wasm import combd's host calls, what does its runtime cost a cell, and
    how fast is it on `langs/js/app.js`.
-6. **A billion checkboxes** and the four things it needs first (per-IP
+7. **A billion checkboxes** and the four things it needs first (per-IP
    limits, a bucket-write budget with push-back, cheap cold wakes, hot
    chunks): under "Compile on deploy", queued.
 
@@ -352,7 +360,7 @@ slice, every host call, and every byte of memory.
 | `weight` | Fair share of CPU against other Workers, like BEAM process priority. |
 | `memory_max` | Hard memory cap per instance. |
 | `snapshot_after_init` | Run init once, snapshot the instance, and start every new instance from that snapshot. New instances come up already warm. Only our engine can do this. |
-| placement | Pin to nodes or regions, or spread. |
+| `placement` | `nearest` (the default), `spread`, or `pin` to regions or an area. See "Placement: where an object lives". |
 | egress | Allowlist of hosts the Worker may call. |
 
 ### Auto mode: set a target, not a number
@@ -1440,6 +1448,53 @@ What changes as the fleet grows:
   - **Timeouts are measured per peer**, in TCP's way (smoothed round trip
     plus 4x its variation), never fixed. Safety never depends on a timeout;
     only availability does.
+
+## Placement: where an object lives (2026-10-24)
+
+Today the first node to get a request for an idle object claims it, and
+keeps it until it dies or goes idle. Nothing moves an object back. The
+soak showed the cost: after n0 rebooted, its 63 objects went to Frankfurt
+and Singapore and stayed there, and every message from n0's 1,000
+connections crossed an ocean twice for the next 8 hours.
+
+**The author picks a placement per process class** (the manifest):
+
+| Placement | Home is | Its home is down | Its home is back |
+|---|---|---|---|
+| `nearest` (default) | the node most of its requests come in through | it stays where it is | |
+| `spread` | its rendezvous hash over the live nodes: even by count, nothing shared between nodes | the next node by hash | it moves back |
+| `pin = ["fra1"]` or `pin = "eu"` | the nearest live node in those regions | `fallback = "nearest"`: it moves out; `"none"`: it waits (data that must not leave) | it moves back |
+
+**One loop for all three.** Every window (30 minutes to start), each owner
+works out each object's home. Not this node: it asks the home to take it.
+`nearest` asks only when one node sent most of the requests (about 2/3,
+with a minimum count) two windows running, so an object doesn't bounce.
+
+**The target may say no,** from what it knows of itself, so no load goes
+over the wire: below its free-memory floor (30% to start, so a move never
+trips the overload guard), under pressure, sessions waiting their turn, or
+N moves already taken this window. The cap matters after a failure: n0
+back from its reboot would have had 63 objects ask at once. Refused, the
+object stays and asks again next window.
+
+**The hand-off.** `Release` already does most of it (flush, mark the epoch
+sealed, drop), but only for an idle object. New: hold new requests, let
+the running ones finish, flush, drop, tell the target to claim at once,
+and send the held requests there. No new safety proof: the ownership spec
+lets anyone claim at any time, so a hand-off is a polite claim. The
+simulator gets a step that moves objects, and its checks must still hold
+(nothing lost, nothing answered twice). A move costs one cold restore,
+for that object's users once; "cheap cold wakes" makes it cheaper.
+
+**Needs:** `COMBD_REGION` on each node (terraform knows it), areas as
+named sets of regions in the fleet config, and, for `nearest` to mean
+near the users, people landing on their nearest node: the arena's game
+does (it measures); million's name is round robin until the load
+balancer is on, or the client picks from `/_combd/nodes`.
+
+**Not yet:** a full node pushing objects out (the overload guard refuses
+new connections instead; add it if that isn't enough), and a `spread`
+that weighs by memory, not count (it needs load in the heartbeat).
 
 ## The finish lines (set 2026-10-15)
 
