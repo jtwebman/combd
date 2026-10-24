@@ -527,7 +527,8 @@ pub fn restore(path: &Path, segs: &[Vec<u8>]) -> std::io::Result<()> {
 }
 
 pub fn checkpoint(path: &Path) -> rusqlite::Result<()> {
-    let conn = Connection::open(path)?;
+    // Never create it: the object may have gone (and its file with it).
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
 }

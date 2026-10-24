@@ -321,6 +321,10 @@ struct Stats {
     accept_failed: AtomicU64,
     /// 1 while the node is full and not listening (refused at TCP).
     tcp_refusing: AtomicU64,
+    /// 1 while the data folder's disk has less free than a tenth of it or
+    /// 2 GB, whichever is less: no new objects (a client naming a new one
+    /// per request filled a disk).
+    disk_low: AtomicU64,
     /// Memory: what the node uses, what the machine has left, and the
     /// pressure (`pressure`).
     memory_used: AtomicU64,
@@ -386,6 +390,9 @@ struct Shared {
     port: u16,
     /// Loops behind: as many sessions waiting to wake as may be at work.
     behind: AtomicUsize,
+    /// Objects this node said yes to taking (`take`), and when: only these
+    /// may be claimed (`CLAIM`).
+    expecting: Mutex<HashMap<String, Instant>>,
 }
 
 /// How long a cell runs before others get a turn: a slice, and the host
@@ -455,10 +462,18 @@ const FORWARD_FIRST: Duration = Duration::from_secs(5);
 
 /// Bucket I/O is slow and parallel; these threads do it.
 const BUCKET_THREADS: usize = 32;
-/// How many times a request may be forwarded between nodes.
-const MAX_HOPS: u8 = 1;
+/// How many times a request may be forwarded between nodes: entry, a
+/// spread object's home, its owner (or a move's new node). Counted on the
+/// wire (`HOP_SHIFT`), so no path between nodes can loop.
+const MAX_HOPS: u8 = 3;
+/// A forward's hops so far ride in its frame id's top byte (ids are a
+/// counter, far below 2^56, and come back as they went in the reply). A
+/// node that doesn't count sends 0 there: one hop, as it meant.
+const HOP_SHIFT: u32 = 56;
 /// Times a request that never ran is routed again before the client hears 503.
 const MAX_NOT_RUN: u8 = 3;
+/// The most an event-cell instance may have in flight (open tickets).
+const MAX_EV_TICKETS: usize = 10_000;
 /// Placement: an object moves only if one node sent it at least this many
 /// requests in a window (and two thirds of them), two windows running.
 const PLACE_MIN: u32 = 20;
@@ -468,6 +483,9 @@ const MOVES_IN: u32 = 16;
 const TAKE: &str = "_combd/take";
 /// The name a "claim it now" goes by, once a move is done (`Effect::Handed`).
 const CLAIM: &str = "_combd/claim";
+/// A claim counts only for an object this node said yes to taking, this
+/// long ago at most: a peer can't make it claim whatever it names.
+const EXPECT: Duration = Duration::from_secs(300);
 
 /// Which connection a request answers: (slot, generation).
 type Who = (usize, u64);
@@ -1129,6 +1147,8 @@ where
     }
 
     fn remove(&self, org: &str, app: &str) -> Result<(), String> {
+        // `blog#vars` as an app would be blog's vars, gone.
+        idents(org, app)?;
         self.cat.submit(&format!("{org}/{app}"), vec![]).map(|_| ())
     }
 
@@ -1531,6 +1551,7 @@ where
         listen_gen: AtomicU64::new(0),
         port,
         behind: AtomicUsize::new(0),
+        expecting: Mutex::new(HashMap::new()),
     };
     let sh = &sh;
     std::thread::scope(|sc| {
@@ -2218,10 +2239,14 @@ impl<E: Engine> Loop<'_, E> {
                     self.reconcile(&name);
                 }
                 Msg::AlarmsDue { due } => self.alarms_due(due),
-                Msg::WireIn { conn, id, name, .. } if name == TAKE => self.take(conn, id)?,
+                Msg::WireIn { conn, id, name, req, .. } if name == TAKE => self.take(conn, id, req)?,
                 // Handed to us: claim it now. (The object's loop, by its name.)
                 Msg::WireIn { conn, id, name, req, .. } if name == CLAIM => {
                     if owner(&req, self.sh.cfg.threads) == self.me {
+                        if !self.sh.expecting.lock().unwrap().remove(&req).is_some_and(|t| t.elapsed() < EXPECT) {
+                            self.deliver(Origin::Wire(conn, id, None), (403, "{\"error\":\"not offered\"}".into()))?;
+                            continue;
+                        }
                         let obj = own::obj_id(&req);
                         self.names.insert(obj, req);
                         self.core_on(own::Event::Claim { obj });
@@ -2242,7 +2267,10 @@ impl<E: Engine> Loop<'_, E> {
                 Msg::WireReply { id, reply } => {
                     if let Some((name, to)) = self.asks.remove(&id) {
                         // A yes: move it, if it's still ours to move.
-                        if reply.0 == 200 && self.objects.contains_key(&name) {
+                        // Not if it started a beat or took a database
+                        // session since the offer (`place` checked then).
+                        let still = self.objects.get(&name).is_some_and(|o| o.pg.is_empty()) && !self.ticks.contains_key(&name);
+                        if reply.0 == 200 && still {
                             self.core_on(own::Event::Move { obj: own::obj_id(&name), to });
                         }
                     } else if let Some((origin, node, sent, ..)) = self.wire_out.remove(&id) {
@@ -2426,6 +2454,14 @@ impl<E: Engine> Loop<'_, E> {
             return self.ev_crash(i);
         }
         let actions = std::mem::take(&mut cell.host().ev_out);
+        // Open tickets, capped per instance: each callback may ask for
+        // 10,000 things, timers included, and each timer's callback for
+        // 10,000 more. Past the cap it's broken, or an attack: it crashes.
+        let asks = actions.iter().filter(|a| matches!(a, EvAction::Async { .. })).count();
+        if inst.tickets.len() + asks > MAX_EV_TICKETS {
+            eprintln!("event cell: over {MAX_EV_TICKETS} things in flight: crashed");
+            return self.ev_crash(i);
+        }
         inst.cell = Some(cell);
         if let Some(q) = inst.running.take().and_then(|r| inst.reqs.get_mut(&r)) {
             q.open = q.open.saturating_sub(1);
@@ -2872,6 +2908,11 @@ impl<E: Engine> Loop<'_, E> {
         // A session ends with its socket: nothing to tell.
         if session_sock(name).is_some() {
             return;
+        }
+        // ponytail: forgotten wholesale past 64K, not per socket; a socket
+        // lost after that may be told of twice (a second close: harmless).
+        if self.ws_lost.len() >= 1 << 16 {
+            self.ws_lost.clear();
         }
         if self.ws_gone.get(name).is_some_and(|g| g.contains(&id)) || !self.ws_lost.insert(id) {
             return;
@@ -3641,6 +3682,10 @@ impl<E: Engine> Loop<'_, E> {
                 p = p.max(machine_pressure(total, available, was));
             }
             st.pressure.store(p, Relaxed);
+            if let Ok(d) = rustix::fs::statvfs(&self.sh.cfg.data) {
+                let (free, size) = (d.f_bavail.saturating_mul(d.f_frsize), d.f_blocks.saturating_mul(d.f_frsize));
+                st.disk_low.store((free < (size / 10).min(2 << 30)) as u64, Relaxed);
+            }
         }
         self.follow_listener();
         if let (0, Some((cert, key))) = (self.me, &self.sh.cfg.tls) {
@@ -3924,7 +3969,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"moves\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"moves\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"disk_low\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3961,6 +4006,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.conns_open.load(Relaxed),
                     s.conns_refused.load(Relaxed),
                     s.tcp_refusing.load(Relaxed),
+                    s.disk_low.load(Relaxed),
                     s.accept_failed.load(Relaxed),
                     s.memory_used.load(Relaxed),
                     self.sh.cfg.memory_budget.unwrap_or(0),
@@ -4259,7 +4305,7 @@ impl<E: Engine> Loop<'_, E> {
             return self.overloaded(origin);
         }
         if self.core.is_some() && !matches!(origin, Origin::Fleet(_)) {
-            let hops = if matches!(origin, Origin::Wire(..)) { 1 } else { 0 };
+            let hops = if let Origin::Wire(_, id, _) = origin { ((id >> HOP_SHIFT) as u8).saturating_add(1) } else { 0 };
             // Spread: a new object starts where its name says, not here.
             // (A name with no app here, as before any deploy: no process to ask.)
             if let (0, Some(scope)) = (hops, self.app.procs.get(self.app.object_proc(&name)).and_then(|p| p.spread)) {
@@ -4278,6 +4324,10 @@ impl<E: Engine> Loop<'_, E> {
                 return; // dropped while its request waited; the core failed it
             }
             let path = store::path_for(&self.sh.cfg.data, &name);
+            if !path.exists() && self.sh.stats.disk_low.load(Relaxed) == 1 {
+                let _ = self.deliver(origin, (507, "{\"error\":\"no room for new objects\"}".into()));
+                return;
+            }
             let dirs = if path.exists() { Ok(vec![]) } else { store::make_dirs(&self.sh.cfg.data, &path) };
             let db = match dirs.and_then(|d| Db::open(&path).map(|db| (db, d)).map_err(std::io::Error::other)) {
                 Ok(db) => db,
@@ -4490,11 +4540,10 @@ impl<E: Engine> Loop<'_, E> {
                         return self.core_on(own::Event::Request { obj, req });
                     }
                     own::Answer::NotRun => (503, "{\"error\":\"retry\"}".into()),
-                    own::Answer::Redirect(n) if fr.hops < MAX_HOPS => return self.forward(n, fr),
-                    own::Answer::Redirect(_) => (503, "{\"error\":\"retry\"}".into()),
-                    // Moved while it waited: on to its new node, even past
-                    // MAX_HOPS (it happens once, as the move ends).
-                    own::Answer::Moved(n) => return self.forward(n, fr),
+                    // Elsewhere (or moved there while it waited): on, a hop
+                    // like any other, so nothing bounces between nodes.
+                    own::Answer::Redirect(n) | own::Answer::Moved(n) if fr.hops < MAX_HOPS => return self.forward(n, fr),
+                    own::Answer::Redirect(_) | own::Answer::Moved(_) => (503, "{\"error\":\"retry\"}".into()),
                 };
                 let _ = self.deliver(fr.origin, reply);
             }
@@ -4584,10 +4633,17 @@ impl<E: Engine> Loop<'_, E> {
                     f.wire.send(to, Frame::Forward { id, name: CLAIM.into(), req: name.clone() }, self.me);
                 }
             }
+            // In a fleet the bucket has it all, and the file is only this
+            // node's copy: it goes too, or every object ever served here
+            // would stay on its disk.
             Effect::Drop { obj } => {
                 if let Some(name) = self.names.get(&obj).cloned() {
                     if self.remove_object(&name).is_some() {
                         self.sh.stats.objects_live.fetch_sub(1, Relaxed);
+                    }
+                    let path = store::path_for(&self.sh.cfg.data, &name);
+                    for ext in ["", "-wal", "-shm"] {
+                        let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
                     }
                 }
             }
@@ -4833,11 +4889,16 @@ impl<E: Engine> Loop<'_, E> {
     /// to spare, so moves never fill a node: no memory pressure, not
     /// refusing connections, 30% of the machine's memory free, and at most
     /// `MOVES_IN` this window.
-    fn take(&mut self, conn: usize, id: u64) -> std::io::Result<()> {
+    fn take(&mut self, conn: usize, id: u64, name: String) -> std::io::Result<()> {
         let st = &self.sh.stats;
         let room = combd_mem::machine().is_none_or(|(total, available)| available * 10 >= total * 3);
         let yes = room && st.pressure.load(Relaxed) == 0 && st.tcp_refusing.load(Relaxed) == 0 && self.taken < MOVES_IN;
         self.taken += yes as u32;
+        if yes {
+            let mut e = self.sh.expecting.lock().unwrap();
+            e.retain(|_, t| t.elapsed() < EXPECT);
+            e.insert(name, Instant::now());
+        }
         self.deliver(Origin::Wire(conn, id, None), if yes { (200, "{}".into()) } else { (503, "{\"error\":\"full\"}".into()) })
     }
 
@@ -4870,7 +4931,7 @@ impl<E: Engine> Loop<'_, E> {
     /// Send a request to the node that owns its object, over the wire.
     fn forward(&mut self, node: own::Node, fr: FReq) {
         let f = self.sh.fleet.as_ref().unwrap();
-        let id = f.next_id.fetch_add(1, Relaxed);
+        let id = (f.next_id.fetch_add(1, Relaxed) & ((1 << HOP_SHIFT) - 1)) | (fr.hops as u64) << HOP_SHIFT;
         self.sh.stats.forwarded.fetch_add(1, Relaxed);
         let limit = self.forward_limit(node);
         self.wire_out.insert(id, (fr.origin, node, Instant::now(), limit, fr.name.clone()));

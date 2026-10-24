@@ -57,16 +57,21 @@ and the rest of the plan is updated to match.
    land on another node). The 503 helper moved to `@combd/js`. Then
    decide whether idle sessions may live in swap (105,000 held that way,
    in Docker) or the node refuses first (58,000, as now).
-3. **Placement: objects move to their home** ("Placement: where an object
+3. **Security review loops** (Fable 5.1, 2026-10-24; "Security review,
+   in rounds"): round 1 fixed, round 2 running. Then the decisions it
+   left (domains per org, per-node credentials, the unit's hardening).
+4. **Placement: objects move to their home** ("Placement: where an object
    lives"): `nearest`, `spread`, `pin`, one hand-off, the target may say
-   no. The hand-off is built in `own.rs` and the simulator (2026-10-24);
-   next, the node: counting, the policy, the target's yes, sessions.
-4. **Getting ready to tell people:** a real `combd` binary (not
+   no. Built (2026-10-24): the hand-off (`own.rs`, the simulator), and on
+   the node `nearest` (the default) and `spread` going home, with the
+   target's yes (`_combd/take`) and its claim at once (`_combd/claim`).
+   Left: `pin` and areas, and seeing moves on the fleet.
+5. **Getting ready to tell people:** a real `combd` binary (not
    `combd-spike`), releases for Linux and Mac, a 10-minute quickstart,
    and the race against celld, workerd, and Cloudflare (queued below,
    under "Compile on deploy") as the launch post.
-5. **The X clone on Postgres**, v0.1's last item.
-6. **JavaScript: `@combd/js`**, a Workers-compatible library over
+6. **The X clone on Postgres**, v0.1's last item.
+7. **JavaScript: `@combd/js`**, a Workers-compatible library over
    combd's host (`fetch` handler, Request/Response, `DurableObject`,
    `storage.sql`, WebSockets; it answers to `cloudflare:workers`), on a
    JS-to-Wasm compiler: try scriptc (vercel-labs/scriptc) first: can its
@@ -74,7 +79,7 @@ and the rest of the plan is updated to match.
    how fast is it on `langs/js/app.js`. With it, a browser-side helper
    (`@combd/js/client`): on a 503, or a WebSocket that can't connect, try
    another node from `/_combd/nodes` (see "JavaScript").
-7. **A billion checkboxes** and the four things it needs first (per-IP
+8. **A billion checkboxes** and the four things it needs first (per-IP
    limits, a bucket-write budget with push-back, cheap cold wakes, hot
    chunks): under "Compile on deploy", queued.
 
@@ -1464,6 +1469,80 @@ What changes as the fleet grows:
   - **Timeouts are measured per peer**, in TCP's way (smoothed round trip
     plus 4x its variation), never fixed. Safety never depends on a timeout;
     only availability does.
+
+## Security review, in rounds (2026-10-24)
+
+Reviewers (Fable 5.1, one per surface, each in its own worktree, proving
+what it finds with a failing test) attack; we fix what's confirmed; the
+next round attacks the fixes. The surfaces: the compile-to-native path
+against ten years of Wasm runtime exploits (V8, SpiderMonkey, JSC,
+Wasmtime/Cranelift, Wasmer, WAMR), the compiler and builder, the
+interpreter and host calls with SQLite, the public edge and admin, and
+the fleet wire and bucket.
+
+**What holds, and why.** A module can't run machine code of its own: Wasm
+has no instruction that executes data, linear memory is mapped
+read/write and never executable, every load and store is a checked slice
+(no `addr + offset` overflow: the Cranelift 2023 class can't happen),
+`call_indirect` goes through a dispatcher per signature, and the
+generated Rust is `forbid(unsafe_code)`, so a compiler bug gives a wrong
+answer or a failed build, not memory unsafety. A module has no file,
+process, or network calls; SQLite denies `ATTACH`, `PRAGMA`, `VACUUM
+INTO`, `load_extension`, and the host's tables. Builds are signed
+(ed25519 over the build's hash, module, pin and CPU) and verified before
+a node loads them. HTTP: no smuggling (Transfer-Encoding refused), no
+response splitting, admin tokens hashed and compared in constant time,
+the panel all `textContent`.
+
+**Round 1, fixed** (32a418d, 7f77a2b): a module's function names went
+raw into a `//` comment in the generated Rust, so a line break injected
+code the builder compiled (`compile_error!(include_str!(..))` would put a
+builder's key file in the deploy's error: with that key, signed native
+code on every node); tables weren't capped in the compiled tier (16 GB
+per cell from one line of WAT); a panic in a compiled cell wasn't
+contained, and a crafted module could panic or overflow the builder; an
+event cell's callback could queue gigabytes, and never got a fresh
+host-time budget; a peer's catalog push was applied unchecked (one
+compromised node could rewrite every node's catalog and knock it out of
+step: a push is now only news, the bucket is the truth); vars and
+secrets didn't check org and app names.
+
+**Round 2, fixed:** objects filled a node's disk (a client naming a new
+object per request: memory stayed bounded by eviction, files didn't, ~25
+KB each; a $6 node full in 10 to 30 minutes): a node takes no new objects
+with less free than a tenth of its disk or 2 GB, and in a fleet an
+object's file goes when the object does (the bucket has it). Spread
+objects off their home answered 503 through every other node, and two
+nodes' move hints could bounce a request between them: a forward's hops
+now ride in its frame id's top byte (no wire change; an older node's 0
+reads as one hop), three at most, moves included. `_combd/claim` took any
+peer's word: now only for an object the node said yes to taking. An event
+cell's instance holds at most 10,000 things in flight (its timers could
+each ask for 10,000 more). The admin `remove` checks names too (an app
+`blog#vars` was blog's vars).
+
+**Still open (for later rounds):** a tenant's objects, disk, and wakes
+are capped per node, not per tenant: one tenant can fill the node for
+everyone, or trip its overload refusal (quotas per org: objects, bytes,
+awake cells). No bucket-write budget yet (each object a tenant makes is
+bucket writes and storage forever).
+
+**Decisions it left (JT's):**
+- **Domains per org.** Any org with a deploy token can claim any domain
+  first, fleet-wide, and lock its owner out. Either the token issuer is
+  trusted to only issue tokens to orgs that own their domains (as now),
+  or the cluster keeps an org -> domains list, or a domain is proven (a
+  DNS TXT record) before it's claimed.
+- **One compromised node is the whole fleet** today: every node holds the
+  bucket's credentials, and mTLS proves "a fleet member", not which one
+  (a node's id is what its heartbeat says). Binding a connection to its
+  certificate's node pays only with per-node bucket credentials.
+- **The unit's backstop:** `MemoryDenyWriteExecute=yes` (the kernel
+  refuses to make writable memory executable: combd has no JIT) and a
+  `SystemCallFilter`; to try on one node first.
+- **Builders isolated:** a builder runs rustc over Rust made from a
+  stranger's module; it should hold no bucket credentials it doesn't
+  need, and its key in a file rustc can't name.
 
 ## Placement: where an object lives (2026-10-24)
 

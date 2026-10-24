@@ -2607,6 +2607,7 @@ mod tests {
         let bucket = test_bucket();
         let wports = free_ports(n as usize);
         let peers: HashMap<own::Node, String> = (0..n).map(|k| (k, format!("127.0.0.1:{}", wports[k as usize]))).collect();
+        std::fs::write(dir.join("peers.json"), serde_json::to_vec(&peers).unwrap()).unwrap();
         let dir = dir.to_path_buf();
         move |k: own::Node| {
             let fc = fleet::FleetCfg {
@@ -2626,6 +2627,11 @@ mod tests {
             let make = make.clone();
             server_app(interp::Interp { max_pages: 16384 }, http::Config { fleet: Some(fc), ..cfg(&dir.join(format!("d{k}")), 1) }, move |eng| make(eng))
         }
+    }
+
+    /// The wire addresses `fleet_placing` gave its nodes.
+    fn fleet_peers_of(dir: &std::path::Path) -> HashMap<own::Node, String> {
+        serde_json::from_slice(&std::fs::read(dir.join("peers.json")).unwrap()).unwrap()
     }
 
     /// Placement (`nearest`, the default): an object whose requests come in
@@ -2654,6 +2660,10 @@ mod tests {
         }
         assert_eq!((stat(ports[0], "objects_live"), stat(ports[1], "objects_live")), (0, 1), "moved to node 1");
         assert_eq!(stat(ports[0], "moves"), 1);
+        // Its file left node 0 with it (the bucket has it all): a node
+        // doesn't keep a copy of everything it ever served.
+        let file = |k: u32| store::path_for(&dir.0.join(format!("d{k}")), "mv");
+        assert!(file(1).exists() && !file(0).exists(), "on node 1 only");
         for _ in 0..5 {
             sent += 1;
             ok += (http(ports[1], "POST", "/do/mv/incr", "").0 == 200) as i64;
@@ -2694,6 +2704,79 @@ mod tests {
         for i in 0..12 {
             assert_eq!(http(two, "GET", &format!("/do/home{i}/count"), ""), (200, "{\"count\":1}".into()), "home{i}, with its write");
         }
+    }
+
+    /// A spread object that isn't on its home (it was down when the object
+    /// started) answers through every node: entry, home, owner is three hops
+    /// (it was a 503 at the home, with one, until placement moved it home).
+    #[test]
+    fn spread_objects_off_home_answer_from_every_node() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        // Placement looks only once an hour: the objects stay where they started.
+        let node = fleet_placing(&dir.0, base, 3, 3_600_000, |eng| {
+            let mut a = app::App::single(eng.load(&wasm()).unwrap(), 4);
+            a.procs.iter_mut().for_each(|p| p.spread = Some(fleet::Scope::Region));
+            a
+        });
+        let ports: Vec<u16> = (0..2).map(|k| node(k).0).collect();
+        std::thread::sleep(Duration::from_millis(1500));
+        for i in 0..12 {
+            assert!(eventually(10_000, || http(ports[0], "POST", &format!("/do/home{i}/incr"), "") == (200, "{\"count\":1}".into())), "home{i}");
+        }
+        let two = node(2).0;
+        std::thread::sleep(Duration::from_millis(1500)); // every node has heard node 2
+        let mut bad = vec![];
+        for i in 0..12 {
+            for &p in &ports {
+                let (status, body) = http(p, "GET", &format!("/do/home{i}/count"), "");
+                if status != 200 {
+                    bad.push(format!("home{i} via {p}: {status} {body}"));
+                }
+            }
+        }
+        assert_eq!(stat(two, "objects_live"), 0, "nothing moved");
+        assert!(bad.is_empty(), "spread objects off their home don't answer through every node:\n{}", bad.join("\n"));
+    }
+
+    /// `_combd/claim` is only for what the node said yes to (`take`): a
+    /// peer with the fleet's certificate can't make it claim whatever it
+    /// names (any tenant's object, or names that never existed, each a
+    /// record and manifest in the bucket, a database, memory).
+    #[test]
+    fn a_peer_cannot_make_a_node_claim_what_it_likes() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        let node = fleet_placing(&dir.0, base, 3, 0, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4));
+        let ports: Vec<u16> = (0..2).map(|k| node(k).0).collect();
+        assert_eq!(stat(ports[0], "objects_live"), 0);
+        // "Node 2" is a rogue with the fleet's certificate: it never serves,
+        // it only talks.
+        struct Quiet;
+        impl wire::Sink for Quiet {
+            fn forward(&self, _: usize, _: u64, _: String, _: String, _: Option<own::Node>) {}
+            fn reply(&self, _: usize, _: u64, _: (u16, String)) {}
+            fn peer(&self, _: usize, _: u64, _: own::PeerCall) {}
+            fn peer_reply(&self, _: usize, _: u64, _: Option<own::PeerRes>) {}
+            fn ws_push(&self, _: String, _: u64, _: u8, _: Vec<u8>) {}
+            fn ws_lost(&self, _: String, _: u64) {}
+            fn catalog(&self, _: u64, _: Vec<u8>) {}
+            fn heartbeat(&self, _: own::Node, _: u64) {}
+            fn pool(&self, _: Vec<u8>) {}
+        }
+        let certs = dir.0.join("certs");
+        let rogue = wire::start(0, fleet_peers_of(&dir.0), Some(wire::load_tls(&certs, 2).unwrap()), Quiet).unwrap();
+        for i in 0..40 {
+            rogue.send(0, fleet::Frame::Forward { id: i, name: "_combd/claim".into(), req: format!("nobody/asked/for/this{i}") }, 0);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(stat(ports[0], "objects_live"), 0, "claimed what a peer merely named");
     }
 
     /// `placement = "spread"`: objects asked for on one node start across

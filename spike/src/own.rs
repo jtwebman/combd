@@ -251,7 +251,7 @@ pub enum Answer {
     /// again as is, even for a write.
     NotRun,
     /// Never ran: the object moved to this node (`Event::Move`) while it
-    /// waited. Send it there, even past the usual hop: it happens once.
+    /// waited, or this node handed it there lately. Send it there.
     Moved(Node),
 }
 
