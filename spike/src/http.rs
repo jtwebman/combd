@@ -4397,7 +4397,9 @@ impl<E: Engine> Loop<'_, E> {
         let obj = own::obj_id(&name);
         self.names.insert(obj, name.clone());
         self.freqs.insert(req, FReq { origin, name, cell_req, hops, act: 0, resp: None, ws: vec![], retries: 0 });
-        self.core_on(own::Event::Request { obj, req });
+        // Sent here by another node: it thinks we own it, so read the
+        // record, not a hint that may point straight back.
+        self.core_on(if hops > 0 { own::Event::Forwarded { obj, req } } else { own::Event::Request { obj, req } });
     }
 
     fn job(&self, job: Job) {
@@ -4428,6 +4430,9 @@ impl<E: Engine> Loop<'_, E> {
                     own::Answer::NotRun => (503, "{\"error\":\"retry\"}".into()),
                     own::Answer::Redirect(n) if fr.hops < MAX_HOPS => return self.forward(n, fr),
                     own::Answer::Redirect(_) => (503, "{\"error\":\"retry\"}".into()),
+                    // Moved while it waited: on to its new node, even past
+                    // MAX_HOPS (it happens once, as the move ends).
+                    own::Answer::Moved(n) => return self.forward(n, fr),
                 };
                 let _ = self.deliver(fr.origin, reply);
             }

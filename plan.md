@@ -59,7 +59,8 @@ and the rest of the plan is updated to match.
    in Docker) or the node refuses first (58,000, as now).
 3. **Placement: objects move to their home** ("Placement: where an object
    lives"): `nearest`, `spread`, `pin`, one hand-off, the target may say
-   no. The hand-off in `own.rs` and the simulator first.
+   no. The hand-off is built in `own.rs` and the simulator (2026-10-24);
+   next, the node: counting, the policy, the target's yes, sessions.
 4. **Getting ready to tell people:** a real `combd` binary (not
    `combd-spike`), releases for Linux and Mac, a 10-minute quickstart,
    and the race against celld, workerd, and Cloudflare (queued below,
@@ -1501,11 +1502,32 @@ simulator gets a step that moves objects, and its checks must still hold
 (nothing lost, nothing answered twice). A move costs one cold restore,
 for that object's users once; "cheap cold wakes" makes it cheaper.
 
-**Needs:** `COMBD_REGION` on each node (terraform knows it), areas as
-named sets of regions in the fleet config, and, for `nearest` to mean
-near the users, people landing on their nearest node: the arena's game
-does (it measures); million's name is round robin until the load
-balancer is on, or the client picks from `/_combd/nodes`.
+**There already** (found 2026-10-24): every node knows where every node
+is (`COMBD_REGIONS`: `0=nyc3/a,...`, region/zone), and `placement =
+"spread"` (with `scope`: zone, region, or fleet) starts a new object on
+its rendezvous pick (`Core::place`). So `spread`'s start and `pin`'s
+regions need nothing new; what's missing is moving a live object.
+
+**Built (2026-10-24): the hand-off, in the core and the simulator.**
+`Event::Move { obj, to }`: new requests wait, what's in hand settles and
+uploads, then the object drops and the record is sealed (with no peers
+too: sealed is what lets `to` claim at once), and what waited is
+answered `Moved(to)`, which the node forwards there even past the usual
+hop. A move that hasn't settled in a lease is given up (the waiting
+requests run here). A request that came over the wire is `Forwarded`: it
+reads the record, never a routing hint, which after a move points
+straight back. The simulator moves objects at random under every fault
+(`moves`), and every check holds (`moves_keep_every_invariant`; ~650
+moves per 300 seeds; a move costs a request or two a failure under that
+load). Next: what moves (per object, requests counted by the node they
+came in through; the policy, `nearest`/`spread`/`pin`), the target's
+"yes" (a `_combd/` request, as "who has node N?" is: no wire change),
+and what the executor does with an object's sessions and sockets.
+
+**Needs:** areas as named sets of regions in the fleet config, and, for
+`nearest` to mean near the users, people landing on their nearest node:
+the arena's game does (it measures); million's name is round robin until
+the load balancer is on, or the client picks from `/_combd/nodes`.
 
 **Not yet:** a full node pushing objects out (the overload guard refuses
 new connections instead; add it if that isn't enough), and a `spread`

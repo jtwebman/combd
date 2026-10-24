@@ -224,6 +224,16 @@ pub enum Event {
     /// Let an idle object go (eviction). Ignored unless nothing is running,
     /// waiting, or not yet uploaded. The next request claims it again.
     Release { obj: Obj },
+    /// Hand the object to `to` (placement): take no new requests, finish
+    /// what's in hand, upload it all, then step down with the record sealed,
+    /// so `to` may claim it at once, and send what waited there (`Moved`).
+    /// Ignored unless it's served here; given up if it hasn't settled
+    /// within a lease.
+    Move { obj: Obj, to: Node },
+    /// A request another node sent on, believing we own the object (or
+    /// should, after a move). As `Request`, but read the record, never a
+    /// routing hint: ours may point straight back.
+    Forwarded { obj: Obj, req: ReqId },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -237,6 +247,9 @@ pub enum Answer {
     /// Never ran (it was still waiting when the object went): safe to try
     /// again as is, even for a write.
     NotRun,
+    /// Never ran: the object moved to this node (`Event::Move`) while it
+    /// waited. Send it there, even past the usual hop: it happens once.
+    Moved(Node),
 }
 
 #[derive(Debug)]
@@ -551,6 +564,9 @@ enum Wait {
     Prove(Obj, u32, u64, u64),
     /// Marking the record sealed; nothing waits on it.
     SealRec,
+    /// Sealing it as the object leaves for a node (`Event::Move`): its
+    /// waiting requests go there once it's done.
+    Leave(Obj, Node),
     /// Compaction: listing an object to delete what its image replaced, and
     /// the deletes. Nothing waits on them.
     GcList(Obj, u32, u64),
@@ -565,7 +581,7 @@ impl Wait {
             | List(o, _) | PrevManifest(o, ..) | TailSeg(o, ..) | Manifest(o, _) | Upload(o, ..) | Append(o, ..) | Prove(o, ..) => {
                 Some(*o)
             }
-            SealRec | GcList(..) | GcDelete => None,
+            SealRec | Leave(..) | GcList(..) | GcDelete => None,
         }
     }
 }
@@ -576,6 +592,9 @@ enum Phase {
     /// Claiming, fencing, loading, writing the manifest, or restoring.
     Starting,
     Serving(Serve),
+    /// Moving to a node (`Event::Move`): dropped here, the record being
+    /// sealed. Requests wait.
+    Leaving(Node),
 }
 
 #[derive(Debug)]
@@ -651,6 +670,9 @@ struct Serve {
     /// Asked for a seal for these; waiting for the changes.
     sealing: Option<Vec<ReqId>>,
     pends: VecDeque<Pend>,
+    /// Moving to this node (`Event::Move`), since then (our clock): new
+    /// requests wait until it has settled.
+    moving: Option<(Node, u64)>,
 }
 
 impl Serve {
@@ -712,6 +734,8 @@ pub struct CoreStats {
     pub fence_waits: u64,
     /// Keys deleted by compaction (what an image replaced).
     pub gc_deleted: u64,
+    /// Objects handed to another node (`Event::Move`), sealed and gone.
+    pub moves: u64,
 }
 
 pub struct Core {
@@ -912,9 +936,16 @@ impl Core {
                 let lease_ms = self.lease_ms;
                 for o in live {
                     let mut late = vec![];
+                    let mut stay = false;
                     if let Phase::Serving(s) = &mut self.st(o).phase {
                         s.peers.iter_mut().for_each(|p| p.retry = p.down);
                         s.upload_wait = false;
+                        // A move that hasn't settled in a lease (the bucket
+                        // out of reach, say): stay, and serve what waited.
+                        if s.moving.is_some_and(|(_, t)| now.saturating_sub(t) > lease_ms) {
+                            s.moving = None;
+                            stay = true;
+                        }
                         // Unconfirmed for a whole lease: we're likely cut
                         // off. Don't hold the clients; "retry" sends them
                         // elsewhere. (It may still commit: that's allowed.)
@@ -925,15 +956,33 @@ impl Core {
                     for r in late {
                         self.answer(r, Answer::Failed);
                     }
+                    if stay {
+                        let waiting: Vec<ReqId> = self.st(o).waiting.drain(..).collect();
+                        for r in waiting {
+                            self.run(o, r);
+                        }
+                    }
                     self.kick(o);
                 }
             }
-            Event::Request { obj, req } => self.request(now, obj, req),
+            Event::Request { obj, req } => self.request(now, obj, req, false),
+            Event::Forwarded { obj, req } => self.request(now, obj, req, true),
+            Event::Move { obj, to } => {
+                let me = self.node;
+                if let Phase::Serving(s) = &mut self.st(obj).phase {
+                    if to != me && s.moving.is_none() {
+                        s.moving = Some((to, now));
+                        s.flush = true;
+                        self.kick(obj);
+                    }
+                }
+            }
             Event::Ran { obj, act, req, changed, proof } => {
                 if let Some(s) = self.serving(obj, act) {
                     if !proof && !changed && s.pends.is_empty() && s.sealing.is_none() && !s.dirty && s.running.remove(&req) {
                         let epoch = s.epoch;
                         self.answer(req, Answer::Done { epoch });
+                        self.try_leave(obj);
                         return std::mem::take(&mut self.out);
                     }
                     if s.running.remove(&req) {
@@ -951,6 +1000,8 @@ impl Core {
                     s.bytes += changes.len();
                     s.since.get_or_insert(now);
                     s.ents.push_back(changes);
+                    // Leaving: the bucket must have everything, now.
+                    s.flush |= s.moving.is_some();
                     s.round += 1;
                     s.pends.push_back(Pend { need: s.made, round: s.round, since: now, reqs, gc: None });
                     self.flush(obj);
@@ -1045,6 +1096,7 @@ impl Core {
             dirty: false,
             sealing: None,
             pends: VecDeque::new(),
+            moving: None,
         });
         let waiting: Vec<ReqId> = st.waiting.drain(..).collect();
         for r in waiting {
@@ -1052,8 +1104,8 @@ impl Core {
         }
     }
 
-    fn request(&mut self, now: u64, o: Obj, req: ReqId) {
-        if matches!(self.st(o).phase, Phase::Idle) {
+    fn request(&mut self, now: u64, o: Obj, req: ReqId, forwarded: bool) {
+        if !forwarded && matches!(self.st(o).phase, Phase::Idle) {
             if let Some(&(n, t)) = self.hints.get(&o) {
                 if now.saturating_sub(t) < self.lease_ms {
                     return self.answer(req, Answer::Redirect(n));
@@ -1063,8 +1115,9 @@ impl Core {
         }
         let st = self.st(o);
         match &st.phase {
+            Phase::Serving(s) if s.moving.is_some() => st.waiting.push_back(req),
             Phase::Serving(_) => self.run(o, req),
-            Phase::Starting => st.waiting.push_back(req),
+            Phase::Starting | Phase::Leaving(_) => st.waiting.push_back(req),
             Phase::Idle => {
                 st.waiting.push_back(req);
                 st.phase = Phase::Starting;
@@ -1248,6 +1301,25 @@ impl Core {
         if let Some(n) = gc {
             self.gc_list(o, e, n);
         }
+        self.try_leave(o);
+    }
+
+    /// A move (`Event::Move`) that has settled: everything that ran is
+    /// acknowledged and uploaded. Drop it, and seal the record (with no
+    /// peers too: sealed is what lets the new node claim at once instead of
+    /// sending requests back to us).
+    fn try_leave(&mut self, o: Obj) {
+        let seal_early = self.bugs.seal_early;
+        let st = self.st(o);
+        let Phase::Serving(s) = &st.phase else { return };
+        let Some((to, _)) = s.moving else { return };
+        if !s.idle(seal_early) {
+            return;
+        }
+        let Phase::Serving(s) = std::mem::replace(&mut st.phase, Phase::Leaving(to)) else { unreachable!() };
+        self.out.push(Effect::Drop { obj: o });
+        let r = Rec { node: self.node, epoch: s.epoch, sealed: true, peers: s.peers.iter().map(|p| p.node).collect() };
+        self.call(Wait::Leave(o, to), Call::Put(own_key(o), Val::Rec(r), Cond::IfMatch(s.etag)));
     }
 
     /// Give the object up: fail what's in hand, send waiters away.
@@ -1285,6 +1357,22 @@ impl Core {
     fn reply(&mut self, now: u64, w: Wait, res: Res) {
         match (w, res) {
             (Wait::SealRec, _) => {}
+            // Sealed: it's `to`'s to claim, and what waited goes there. Not
+            // (someone took it over, or we can't tell): what waited is
+            // routed again from scratch.
+            (Wait::Leave(o, to), res) => {
+                let st = self.st(o);
+                st.phase = Phase::Idle;
+                let waiting: Vec<ReqId> = st.waiting.drain(..).collect();
+                let moved = matches!(res, Res::Put(Ok(_)));
+                if moved {
+                    self.hints.insert(o, (to, now));
+                    self.stats.moves += 1;
+                }
+                for r in waiting {
+                    self.answer(r, if moved { Answer::Moved(to) } else { Answer::NotRun });
+                }
+            }
 
             // ---- 1. claim ----
             (Wait::ReadRec(o), Res::Got(None)) => {

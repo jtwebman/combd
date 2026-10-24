@@ -110,12 +110,15 @@ pub struct Settings {
     pub beats: bool,
     /// Peer round trips in this range, ms (`None`: 1 to 5, a data center).
     pub peer_ms: Option<(u64, u64)>,
+    /// Now and then a process hands an object it serves to another node
+    /// (`Event::Move`), as placement does.
+    pub moves: bool,
     pub bugs: Bugs,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, lease: true, uploads: None, beats: false, peer_ms: None, bugs: Bugs::default() }
+        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, lease: true, uploads: None, beats: false, peer_ms: None, moves: false, bugs: Bugs::default() }
     }
 }
 
@@ -138,6 +141,8 @@ pub struct Stats {
     pub lease_reads: u64,
     /// Keys compaction deleted.
     pub gc_deleted: u64,
+    /// Objects moved to another node, done.
+    pub moves: u64,
     /// The longest a probe took to get a write in, from when they start.
     pub probe_ms: u64,
     pub splits: u64,
@@ -427,7 +432,7 @@ impl Sim {
         let node = nodes[self.rng.below(nodes.len() as u64) as usize];
         self.next_w += 1;
         let w = self.next_w;
-        self.client_send(client, Some((obj, Some(w), node)));
+        self.client_send(client, Some((obj, Some(w), node)), false);
     }
 
     fn step(&mut self, m: Msg) -> Result<(), String> {
@@ -487,6 +492,12 @@ impl Sim {
                     let obj = self.rng.below(self.s.objects as u64) as Obj;
                     self.deliver(p, Event::Release { obj });
                 }
+                // Placement: now and then, hand an object to another node.
+                if self.s.moves && self.faulty() && self.rng.chance(0.05) {
+                    let obj = self.rng.below(self.s.objects as u64) as Obj;
+                    let to = self.rng.below(self.s.nodes as u64) as Node;
+                    self.deliver(p, Event::Move { obj, to });
+                }
             }
             Msg::Bucket(p, op, call, lose_reply) => {
                 let n = Some(self.procs[p].node);
@@ -521,7 +532,7 @@ impl Sim {
             }
             Msg::Client(req, ans, p) => self.client_answer(req, ans, p)?,
             Msg::ClientNext(c) if c >= PROBE => self.probe(c),
-            Msg::ClientNext(c) => self.client_send(c, None),
+            Msg::ClientNext(c) => self.client_send(c, None, false),
             Msg::ClientTimeout(req) => {
                 if let Some(pd) = self.pending.remove(&req) {
                     self.stats.failed += 1;
@@ -763,7 +774,9 @@ impl Sim {
         }
     }
 
-    fn client_send(&mut self, client: u32, to: Option<(Obj, Option<W>, Node)>) {
+    /// `forwarded`: sent on by a node (a redirect, a move), as a real node
+    /// forwards it over the wire.
+    fn client_send(&mut self, client: u32, to: Option<(Obj, Option<W>, Node)>, forwarded: bool) {
         if self.now >= self.s.duration && to.is_none() {
             return; // traffic is over
         }
@@ -784,7 +797,8 @@ impl Sim {
         self.at(CLIENT_TIMEOUT, Msg::ClientTimeout(req));
         let p = self.current[&node];
         let d = self.latency();
-        self.at(d, Msg::Proc(p, Event::Request { obj, req }));
+        let ev = if forwarded { Event::Forwarded { obj, req } } else { Event::Request { obj, req } };
+        self.at(d, Msg::Proc(p, ev));
     }
 
     fn client_answer(&mut self, req: ReqId, ans: Answer, p: usize) -> Result<(), String> {
@@ -841,7 +855,13 @@ impl Sim {
             }
             Answer::Redirect(n) => {
                 self.stats.redirects += 1;
-                self.client_send(pd.client, Some((pd.obj, pd.write, n)));
+                self.client_send(pd.client, Some((pd.obj, pd.write, n)), true);
+            }
+            Answer::Moved(n) => {
+                if saw.is_some() {
+                    return Err(format!("request {req} answered \"moved\", but it ran"));
+                }
+                self.client_send(pd.client, Some((pd.obj, pd.write, n)), true);
             }
             Answer::NotRun => {
                 if saw.is_some() {
@@ -960,6 +980,7 @@ pub fn run_with(seeds: std::ops::Range<u64>, settings: &dyn Fn() -> Settings) ->
             total.uploads += p.core.stats.uploads;
             total.lease_reads += p.core.stats.lease_reads;
             total.gc_deleted += p.core.stats.gc_deleted;
+            total.moves += p.core.stats.moves;
         }
         let s = &sim.stats;
         total.writes_acked += s.writes_acked;
@@ -1097,6 +1118,26 @@ mod tests {
         // Near peers, with splits.
         let (_, bad) = run_with(0..500, &|| Settings { replicas: 2, beats: true, splits: true, ..Settings::default() });
         assert!(bad.is_none(), "{bad:?}");
+    }
+
+    /// Placement hands objects to other nodes mid-traffic (`Event::Move`):
+    /// every invariant holds, with every fault on, and moves really finish.
+    /// A step-down that seals before the bucket has everything is caught
+    /// at once with moves (about one seed in 5,000 without).
+    #[test]
+    fn moves_keep_every_invariant() {
+        for replicas in [0, 2] {
+            let (s, bad) = run_with(0..300, &|| Settings { replicas, moves: true, ..Settings::default() });
+            assert!(bad.is_none(), "replicas {replicas}: {bad:?}");
+            assert!(s.moves > 400 && s.writes_acked > 10_000, "{s:?}");
+            let (s, bad) = run_with(0..300, &|| Settings { replicas, moves: true, splits: true, loss: true, ..Settings::default() });
+            assert!(bad.is_none(), "replicas {replicas}, splits and a lost node: {bad:?}");
+            assert!(s.moves > 300, "{s:?}");
+        }
+        let (_, bad) = run_with(0..300, &|| Settings { replicas: 2, moves: true, beats: true, peer_ms: Some((100, 250)), splits: true, wipes: true, ..Settings::default() });
+        assert!(bad.is_none(), "far peers, beats, splits, wipes: {bad:?}");
+        let (_, bad) = run_with(0..100, &|| Settings { replicas: 2, moves: true, uploads: Some((5000, 1 << 20)), bugs: Bugs { seal_early: true, ..Bugs::default() }, ..Settings::default() });
+        assert!(bad.is_some(), "seal_early wasn't caught through a move");
     }
 
     /// Each known-bad version must be caught, or the oracle is blind.
