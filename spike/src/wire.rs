@@ -556,10 +556,10 @@ mod tests {
         let dir = crate::store::tempdir::Dir::new();
         make_certs(&dir.0.join("fleet"), 2).unwrap();
         make_certs(&dir.0.join("other"), 2).unwrap(); // another fleet's CA
-        let base = 23000 + (std::process::id() % 1000) as u16 * 4;
-        let peers: HashMap<Node, String> = (0..2).map(|n| (n, format!("127.0.0.1:{}", base + n as u16))).collect();
-        let (a, ra) = hub(base, &peers, Some(load_tls(&dir.0.join("fleet"), 0).unwrap()));
-        let (_b, _rb) = hub(base + 1, &peers, Some(load_tls(&dir.0.join("fleet"), 1).unwrap()));
+        let port = crate::tests::free_ports(4);
+        let peers: HashMap<Node, String> = (0..2).map(|n| (n, format!("127.0.0.1:{}", port[n as usize]))).collect();
+        let (a, ra) = hub(port[0], &peers, Some(load_tls(&dir.0.join("fleet"), 0).unwrap()));
+        let (_b, _rb) = hub(port[1], &peers, Some(load_tls(&dir.0.join("fleet"), 1).unwrap()));
         a.send(1, Frame::Forward { id: 7, name: "room".into(), req: "do GET /count".into() }, 0);
         assert_eq!(ra.recv_timeout(Duration::from_secs(5)).unwrap(), (7, (200, "room:do GET /count".into())));
         // Big frames both ways (rustls's default 64 KB send cap broke them).
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(ra.recv_timeout(Duration::from_secs(5)).unwrap(), (10, (200, "peer".into())));
 
         // A node with a certificate from another CA gets nothing through.
-        let (x, rx) = hub(base + 2, &peers, Some(load_tls(&dir.0.join("other"), 0).unwrap()));
+        let (x, rx) = hub(port[2], &peers, Some(load_tls(&dir.0.join("other"), 0).unwrap()));
         x.send(1, Frame::Forward { id: 8, name: "room".into(), req: "do GET /count".into() }, 0);
         let (id, (status, _)) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!((id, status), (8, 503), "a stranger's request must fail");
@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), (11, (503, "peer".into())), "a stranger's peer call is lost");
 
         // Nor does a plain-TCP node.
-        let (p, rp) = hub(base + 3, &peers, None);
+        let (p, rp) = hub(port[3], &peers, None);
         p.send(1, Frame::Forward { id: 9, name: "room".into(), req: "do GET /count".into() }, 0);
         let (id, (status, _)) = rp.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!((id, status), (9, 503), "a plain-TCP request must fail");

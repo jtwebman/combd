@@ -2240,7 +2240,7 @@ mod tests {
     /// outgoing connections (32768 and up on Linux, 49152 on macOS): a port
     /// picked there could be taken, between picking and listening, as some
     /// test client's local port. Each test binary starts at its own place.
-    fn free_ports(n: usize) -> Vec<u16> {
+    pub(crate) fn free_ports(n: usize) -> Vec<u16> {
         static NEXT: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
         let mut next = NEXT.lock().unwrap();
         if *next == 0 {
