@@ -2558,7 +2558,11 @@ waits its turn, asleep; while that line is as long as the cap, the node
 takes no new connections, and each session's mailbox is 8, not 1,000.
 `sessions_ready` and `sessions_waited` show it working. A refused TLS
 client is just closed (a plain 503 was noise to it), and this machine
-itself is never refused, so its own checks see a full node.
+itself is never refused, so its own checks see a full node. Since
+2026-10-24 a full node also stops listening (at least a second each way),
+so new connections are refused at TCP and a browser tries the name's next
+address by itself; a listener on 127.0.0.1 stays (`a_full_node_refuses_at_tcp`;
+not yet measured on the fleet).
 
 **Idle, without Docker:** 57,854 idle million viewers held, then new ones
 refused (memory pressure), with the node answering in 4 to 20 ms and swap

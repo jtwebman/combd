@@ -49,10 +49,12 @@ and the rest of the plan is updated to match.
    `%{errormsg}`. What it showed: after a failure, objects never go home
    (n0 held none for 8 h, its users forwarded across an ocean); see
    "Placement: where an object lives".
-2. **Overload, the follow-ups:** a full node refusing at TCP (stop
-   listening for a moment), so browsers move to the next of the name's
-   addresses by themselves; and a client helper that, on a 503, tries
-   another node from `/_combd/nodes` (it belongs in `@combd/js`). Then
+2. **Overload, the follow-ups:** a full node refusing at TCP: built
+   (2026-10-24; it stops listening while memory is short, at
+   `max_conns`, or every loop is behind, a second at least each way; a
+   127.0.0.1 listener stays; `tcp_refusing` in stats). Left: see it on
+   the fleet under load (the overload run again: refused browsers should
+   land on another node). The 503 helper moved to `@combd/js`. Then
    decide whether idle sessions may live in swap (105,000 held that way,
    in Docker) or the node refuses first (58,000, as now).
 3. **Placement: objects move to their home** ("Placement: where an object
@@ -68,7 +70,9 @@ and the rest of the plan is updated to match.
    `storage.sql`, WebSockets; it answers to `cloudflare:workers`), on a
    JS-to-Wasm compiler: try scriptc (vercel-labs/scriptc) first: can its
    Wasm import combd's host calls, what does its runtime cost a cell, and
-   how fast is it on `langs/js/app.js`.
+   how fast is it on `langs/js/app.js`. With it, a browser-side helper
+   (`@combd/js/client`): on a 503, or a WebSocket that can't connect, try
+   another node from `/_combd/nodes` (see "JavaScript").
 7. **A billion checkboxes** and the four things it needs first (per-IP
    limits, a bucket-write budget with push-back, cheap cold wakes, hot
    chunks): under "Compile on deploy", queued.
@@ -571,6 +575,17 @@ over combd's host, on a JS-to-Wasm compiler that isn't ours to maintain:
 scriptc first (see "Where we are, and what's next"). Compatibility with
 Cloudflare comes from the library, not the compiler. What follows is the
 plan as it stood, kept for the reasoning.
+
+**The browser side too: `@combd/js/client`** (2026-10-24), plain JS in the
+page, not compiled. A full node refuses at TCP so a browser tries the
+name's next address by itself, but that misses a node that answers 503
+over plain HTTP, a page already loaded whose fetch or WebSocket meets a
+full node, and a name with one address (a load balancer). The helper
+wraps `fetch` and `WebSocket`: on a 503 (or a socket that can't open) it
+asks `/_combd/nodes` once, then tries the others in order of its measured
+round trip (the arena's game already measures), with backoff, and
+remembers the one that worked. Small, no dependencies, and it works with
+any combd app, Rust or JS.
 
 Most Workers code is JS and TypeScript, so combd needs it to grow past Rust
 developers. No V8, no JS engine in the host, and (decided 2026-10-13) **no

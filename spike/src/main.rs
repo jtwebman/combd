@@ -1777,6 +1777,30 @@ mod tests {
         assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
     }
 
+    /// Full, a node stops listening: a connection from elsewhere is refused
+    /// at TCP (so a browser tries the name's next address), while this
+    /// machine itself still gets in. With room again, it listens again.
+    #[test]
+    fn a_full_node_refuses_at_tcp() {
+        // One of this machine's own addresses that isn't loopback (a UDP
+        // "connect" sends nothing). None: nothing to test from.
+        let Some(me) = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|u| u.connect("192.0.2.1:9").and(u.local_addr())).ok().map(|a| a.ip()).filter(|ip| !ip.is_loopback() && !ip.is_unspecified()) else {
+            eprintln!("skipping: no address but loopback");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { max_conns: 2, ..cfg(&dir.0, 1) });
+        let from_elsewhere = || std::net::TcpStream::connect_timeout(&(me, port).into(), Duration::from_secs(2)).map(|_| ()).map_err(|e| e.kind());
+        assert_eq!(from_elsewhere(), Ok(()), "listening while there's room");
+        let keep = || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let held = (keep(), keep());
+        assert!(eventually(3000, || from_elsewhere() == Err(std::io::ErrorKind::ConnectionRefused)), "at max_conns, it stops listening");
+        drop(held);
+        assert!(eventually(3000, || from_elsewhere() == Ok(())), "room again: it listens");
+        assert_eq!(stat(port, "tcp_refusing"), 0);
+        assert_eq!(http(port, "GET", "/_combd/ping", "").0, 200);
+    }
+
     /// A socket closes while its session is mid-request, with `on_close =
     /// "drop"`: the session goes, and when the request finishes, the node
     /// goes on (it once took the loop down: "object of a running task").

@@ -75,7 +75,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -83,6 +83,10 @@ use std::time::{Duration, Instant};
 const LISTENER: Token = Token(usize::MAX);
 const WAKER: Token = Token(usize::MAX - 1);
 const REDIRECT: Token = Token(usize::MAX - 2);
+const LOCAL: Token = Token(usize::MAX - 3);
+/// A full node stops listening for at least this long, and listens again
+/// for at least this long, so it doesn't flap.
+const REFUSE_MIN: Duration = Duration::from_secs(1);
 /// A WebSocket's unsent bytes. A client that reads too slowly is closed past this.
 const MAX_WS_WRITE: usize = 8 << 20;
 /// A socket's messages queued at its object, before we stop reading it.
@@ -313,6 +317,8 @@ struct Stats {
     conns_open: AtomicU64,
     conns_refused: AtomicU64,
     accept_failed: AtomicU64,
+    /// 1 while the node is full and not listening (refused at TCP).
+    tcp_refusing: AtomicU64,
     /// Memory: what the node uses, what the machine has left, and the
     /// pressure (`pressure`).
     memory_used: AtomicU64,
@@ -370,6 +376,14 @@ struct Shared {
     /// calls included, and the slices they ran in. Each loop adds its own
     /// every 250 ms.
     procs: Mutex<BTreeMap<String, (u64, u64, crate::engine::Kind)>>,
+    /// The listening socket, while the node takes connections (`None`
+    /// while it's full); `listen_gen` counts changes, and every loop
+    /// follows (`follow_listener`).
+    public: Mutex<Option<std::net::TcpListener>>,
+    listen_gen: AtomicU64,
+    port: u16,
+    /// Loops behind: as many sessions waiting to wake as may be at work.
+    behind: AtomicUsize,
 }
 
 /// How long a cell runs before others get a turn: a slice, and the host
@@ -1414,8 +1428,10 @@ where
         cfg.max_conns = cfg.max_conns.min(fds * 3 / 4);
         println!("combd     {fds} files open at most: up to {} connections", cfg.max_conns);
     }
-    let listener = listen(port).unwrap_or_else(|e| panic!("listen on :{port}: {e}"));
-    let redirect = cfg.redirect_port.map(|p| listen(p).unwrap_or_else(|e| panic!("listen on :{p}: {e}")));
+    let listener = listen(ANY, port).unwrap_or_else(|e| panic!("listen on :{port}: {e}"));
+    // This machine itself, always: its checks get in while the node is full.
+    let local = listen(LOOPBACK, port).unwrap_or_else(|e| panic!("listen on 127.0.0.1:{port}: {e}"));
+    let redirect = cfg.redirect_port.map(|p| listen(ANY, p).unwrap_or_else(|e| panic!("listen on :{p}: {e}")));
     let tls = cfg.tls.as_ref().map(|(cert, key)| load_tls(cert, key).unwrap_or_else(|e| panic!("TLS: {e}")));
     let how = if tls.is_some() { "HTTPS" } else { "HTTP" };
     let also = cfg.redirect_port.map_or(String::new(), |p| format!(" (and :{p}, to HTTPS)"));
@@ -1490,11 +1506,16 @@ where
         fleet,
         tls: Mutex::new(tls),
         procs: Mutex::new(BTreeMap::new()),
+        public: Mutex::new(Some(listener)),
+        listen_gen: AtomicU64::new(0),
+        port,
+        behind: AtomicUsize::new(0),
     };
     let sh = &sh;
     std::thread::scope(|sc| {
         for (me, (poll, inbox)) in polls.into_iter().zip(inboxes).enumerate() {
-            let l = listener.try_clone().expect("clone listener");
+            let l = sh.public.lock().unwrap().as_ref().unwrap().try_clone().expect("clone listener");
+            let local = local.try_clone().expect("clone listener");
             let r = redirect.as_ref().map(|r| r.try_clone().expect("clone listener"));
             let app = app.clone();
             sc.spawn(move || {
@@ -1558,8 +1579,12 @@ where
                     calls: HashMap::new(),
                     next_call: 0,
                     ticks: HashMap::new(),
+                    public: None,
+                    listen_gen: 0,
+                    listen_changed: Instant::now(),
+                    behind: false,
                 };
-                if let Err(e) = lp.run(TcpListener::from_std(l), r.map(TcpListener::from_std)) {
+                if let Err(e) = lp.run(TcpListener::from_std(l), TcpListener::from_std(local), r.map(TcpListener::from_std)) {
                     eprintln!("event loop stopped: {e}");
                 }
             });
@@ -1592,6 +1617,13 @@ struct Loop<'a, E: Engine> {
     free: Vec<usize>,
     next_gen: u64,
     last_sweep: Instant,
+    /// This loop's copy of the listening socket (`Shared::public`), the
+    /// change it follows, and (loop 0) when listening last changed.
+    public: Option<TcpListener>,
+    listen_gen: u64,
+    listen_changed: Instant,
+    /// Counted in `Shared::behind`.
+    behind: bool,
     // Fleet mode only.
     core: Option<Core>,
     freqs: HashMap<own::ReqId, FReq>,
@@ -1877,9 +1909,11 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
 }
 
 impl<E: Engine> Loop<'_, E> {
-    fn run(&mut self, mut listener: TcpListener, mut redirect: Option<TcpListener>) -> std::io::Result<()> {
+    fn run(&mut self, mut listener: TcpListener, mut local: TcpListener, mut redirect: Option<TcpListener>) -> std::io::Result<()> {
         let mut events = Events::with_capacity(1024);
         self.poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
+        self.public = Some(listener);
+        self.poll.registry().register(&mut local, LOCAL, Interest::READABLE)?;
         if let Some(r) = redirect.as_mut() {
             self.poll.registry().register(r, REDIRECT, Interest::READABLE)?;
         }
@@ -1916,7 +1950,14 @@ impl<E: Engine> Loop<'_, E> {
             touched.clear();
             for ev in events.iter() {
                 match ev.token() {
-                    LISTENER => self.accept(&mut listener, false)?,
+                    LISTENER => {
+                        if let Some(mut l) = self.public.take() {
+                            let r = self.accept(&mut l, false);
+                            self.public = Some(l);
+                            r?
+                        }
+                    }
+                    LOCAL => self.accept(&mut local, false)?,
                     REDIRECT => self.accept(redirect.as_mut().unwrap(), true)?,
                     WAKER => self.read_inbox()?,
                     Token(id) => {
@@ -3459,6 +3500,49 @@ impl<E: Engine> Loop<'_, E> {
         self.sh.stats.pressure.load(Relaxed) >= 2 || self.ready.len() >= self.sh.cfg.max_awake
     }
 
+    /// A full node stops listening, so a new connection is refused at TCP
+    /// and a browser tries the name's next address by itself (one it
+    /// accepted could only be hung up on). Full: memory short, at
+    /// `max_conns`, or every loop behind. Loop 0 decides, holding each
+    /// way for `REFUSE_MIN`; every loop follows. The loopback listener
+    /// stays, and `accept` still turns away what gets in meanwhile.
+    fn follow_listener(&mut self) {
+        let sh = self.sh;
+        let behind = self.ready.len() >= sh.cfg.max_awake;
+        if behind != self.behind {
+            self.behind = behind;
+            if behind { sh.behind.fetch_add(1, Relaxed) } else { sh.behind.fetch_sub(1, Relaxed) };
+        }
+        if self.me == 0 && self.listen_changed.elapsed() >= REFUSE_MIN {
+            let full = sh.stats.pressure.load(Relaxed) >= 2 || sh.stats.conns_open.load(Relaxed) >= sh.cfg.max_conns || sh.behind.load(Relaxed) == sh.cfg.threads;
+            let mut public = sh.public.lock().unwrap();
+            if full == public.is_some() {
+                match if full { Ok(None) } else { listen(ANY, sh.port).map(Some) } {
+                    Ok(l) => {
+                        *public = l;
+                        sh.listen_gen.fetch_add(1, Relaxed);
+                        sh.stats.tcp_refusing.store(full as u64, Relaxed);
+                        self.listen_changed = Instant::now();
+                    }
+                    Err(e) => eprintln!("combd     can't listen again on :{}: {e}", sh.port),
+                }
+            }
+        }
+        let gen = sh.listen_gen.load(Relaxed);
+        if gen != self.listen_gen {
+            self.listen_gen = gen;
+            if let Some(mut l) = self.public.take() {
+                let _ = self.poll.registry().deregister(&mut l);
+            }
+            if let Some(l) = sh.public.lock().unwrap().as_ref() {
+                match l.try_clone().map(TcpListener::from_std).and_then(|mut l| self.poll.registry().register(&mut l, LISTENER, Interest::READABLE).map(|_| l)) {
+                    Ok(l) => self.public = Some(l),
+                    Err(e) => eprintln!("combd     loop {}: can't take the listener: {e}", self.me),
+                }
+            }
+        }
+    }
+
     /// Wake sleeping sessions with work, in order, while there's room.
     fn wake_ready(&mut self) {
         while self.tasks.len() + self.parked.len() < self.sh.cfg.max_awake {
@@ -3498,6 +3582,7 @@ impl<E: Engine> Loop<'_, E> {
             }
             st.pressure.store(p, Relaxed);
         }
+        self.follow_listener();
         if let (0, Some((cert, key))) = (self.me, &self.sh.cfg.tls) {
             self.reload_tls(cert, key);
         }
@@ -3779,7 +3864,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3814,6 +3899,7 @@ impl<E: Engine> Loop<'_, E> {
                     combd_mem::heap_in_use(),
                     s.conns_open.load(Relaxed),
                     s.conns_refused.load(Relaxed),
+                    s.tcp_refusing.load(Relaxed),
                     s.accept_failed.load(Relaxed),
                     s.memory_used.load(Relaxed),
                     self.sh.cfg.memory_budget.unwrap_or(0),
@@ -5059,15 +5145,20 @@ fn pending(c: &Conn) -> bool {
 }
 
 
+const ANY: [u8; 4] = [0, 0, 0, 0];
+/// Bound beside `ANY`, it gets this machine's own connections (the kernel
+/// picks the more specific address), so it can stay while `ANY` closes.
+const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+
 /// A listening socket others may share (`SO_REUSEPORT`): a new combd
 /// starts on the port before the old one stops, and no connection is
 /// refused in between.
-fn listen(port: u16) -> std::io::Result<std::net::TcpListener> {
+fn listen(ip: [u8; 4], port: u16) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Socket, Type};
     let s = Socket::new(Domain::IPV4, Type::STREAM, None)?;
     s.set_reuse_address(true)?;
     s.set_reuse_port(true)?;
-    s.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+    s.bind(&std::net::SocketAddr::from((ip, port)).into())?;
     s.listen(4096)?;
     s.set_nonblocking(true)?;
     Ok(s.into())
