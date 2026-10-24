@@ -58,6 +58,10 @@ pub struct Proc {
     /// among the nodes in `scope` of the one that asked (its zone, its
     /// region, or the whole fleet).
     pub spread: Option<crate::fleet::Scope>,
+    /// `placement = "nearest"` (the default): in a fleet, an object moves to
+    /// the node most of its requests come in through (`COMBD_PLACE_MS`).
+    /// `"first"`: it stays where it started.
+    pub nearest: bool,
     /// `memory_kb`, in Wasm pages: the most a cell may grow to.
     pub memory_pages: Option<u32>,
     /// How its module runs (`[modules.<name>] engine`).
@@ -148,7 +152,7 @@ pub struct AppDir<'a> {
 impl<P> App<P> {
     /// One program, the old routes.
     pub fn single(prog: P, max_concurrent: usize) -> App<P> {
-        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, mailbox: usize::MAX, batch: 100, spread: None, memory_pages: None, engine: crate::engine::Kind::Interpreted, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
+        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, mailbox: usize::MAX, batch: 100, spread: None, nearest: true, memory_pages: None, engine: crate::engine::Kind::Interpreted, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
         let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default(), pools: vec![] };
         App { progs: vec![Arc::new(prog)], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
     }
@@ -258,6 +262,7 @@ impl<P> App<P> {
                         _ => Sleep::Auto,
                     },
                     state_max: n("state_kb") as usize * 1024,
+                    nearest: matches!(p.settings.get("placement").and_then(serde_json::Value::as_str), None | Some("nearest")),
                     spread: (p.settings.get("placement").and_then(serde_json::Value::as_str) == Some("spread")).then(|| match p.settings.get("scope").and_then(serde_json::Value::as_str) {
                         Some("zone") => crate::fleet::Scope::Zone,
                         Some("fleet") => crate::fleet::Scope::Fleet,

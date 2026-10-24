@@ -2387,7 +2387,7 @@ mod tests {
                 upload_ms: 0,
                 upload_bytes: 1 << 20,
                 read_lease: true,
-                regions: HashMap::new(),
+                regions: HashMap::new(), place_ms: 0,
             };
             let c = http::Config { idle: Duration::from_millis(idle_ms), fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
             do_server(interp::Interp { max_pages: 16384 }, c)
@@ -2446,7 +2446,7 @@ mod tests {
             upload_ms: 0,
             upload_bytes: 1 << 20,
             read_lease: true,
-                regions: HashMap::new(),
+                regions: HashMap::new(), place_ms: 0,
         };
         let c = http::Config { idle: Duration::from_millis(300), fleet: Some(fc), ..cfg(&dir.0.join("d0"), 1) };
         let (p, _, _) = do_server(interp::Interp { max_pages: 16384 }, c);
@@ -2500,7 +2500,7 @@ mod tests {
             upload_ms: 0,
             upload_bytes: 1 << 20,
             read_lease: true,
-                regions: HashMap::new(),
+                regions: HashMap::new(), place_ms: 0,
         };
         let c = http::Config { idle: Duration::from_millis(1500), fleet: Some(fc), ..cfg(&dir.0.join("d0"), 1) };
         let (p, _, _) = do_server(interp::Interp { max_pages: 16384 }, c);
@@ -2554,7 +2554,7 @@ mod tests {
                 upload_ms: 60_000,
                 upload_bytes: 1 << 20,
                 read_lease: true,
-                regions: HashMap::new(),
+                regions: HashMap::new(), place_ms: 0,
             };
             let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 2) };
             do_server(interp::Interp { max_pages: 16384 }, c)
@@ -2599,6 +2599,11 @@ mod tests {
     /// `n` fleet nodes on one bucket, each serving `make`'s app: start one
     /// with the closure returned, by number.
     fn fleet_of(dir: &std::path::Path, base: s3::S3, n: u32, make: impl Fn(&interp::Interp) -> app::App<<interp::Interp as Engine>::Program> + Clone + Send + 'static) -> impl Fn(own::Node) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        fleet_placing(dir, base, n, 0, make)
+    }
+
+    /// `fleet_of`, with placement looking every `place_ms` (0: never).
+    fn fleet_placing(dir: &std::path::Path, base: s3::S3, n: u32, place_ms: u64, make: impl Fn(&interp::Interp) -> app::App<<interp::Interp as Engine>::Program> + Clone + Send + 'static) -> impl Fn(own::Node) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         wire::make_certs(&dir.join("certs"), n).unwrap();
         let bucket = test_bucket();
         let wports = free_ports(n as usize);
@@ -2617,10 +2622,78 @@ mod tests {
                 upload_ms: 60_000,
                 upload_bytes: 1 << 20,
                 read_lease: true,
-                regions: HashMap::new(),
+                regions: HashMap::new(), place_ms,
             };
             let make = make.clone();
             server_app(interp::Interp { max_pages: 16384 }, http::Config { fleet: Some(fc), ..cfg(&dir.join(format!("d{k}")), 1) }, move |eng| make(eng))
+        }
+    }
+
+    /// Placement (`nearest`, the default): an object whose requests come in
+    /// through another node moves there after two windows, keeping every
+    /// write, and answers from there.
+    #[test]
+    fn objects_move_to_where_their_requests_come_in() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        let node = fleet_placing(&dir.0, base, 3, 500, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4));
+        let ports: Vec<u16> = (0..3).map(|k| node(k).0).collect();
+        for &p in &ports {
+            stat(p, "fences");
+        }
+        assert!(eventually(10_000, || http(ports[0], "POST", "/do/mv/incr", "").0 == 200), "started on node 0");
+        assert_eq!((stat(ports[0], "objects_live"), stat(ports[1], "objects_live")), (1, 0));
+        // From now on, everything comes in through node 1.
+        let (mut sent, mut ok) = (1, 1);
+        let until = Instant::now() + Duration::from_secs(20);
+        while stat(ports[1], "objects_live") == 0 && Instant::now() < until {
+            sent += 1;
+            ok += (http(ports[1], "POST", "/do/mv/incr", "").0 == 200) as i64;
+        }
+        assert_eq!((stat(ports[0], "objects_live"), stat(ports[1], "objects_live")), (0, 1), "moved to node 1");
+        assert_eq!(stat(ports[0], "moves"), 1);
+        for _ in 0..5 {
+            sent += 1;
+            ok += (http(ports[1], "POST", "/do/mv/incr", "").0 == 200) as i64;
+        }
+        // Every write it answered is there (one it failed may have landed too).
+        let count = |p| serde_json::from_str::<serde_json::Value>(&http(p, "GET", "/do/mv/count", "").1).unwrap()["count"].as_i64().unwrap();
+        let n = count(ports[1]);
+        assert!(n >= ok && n <= sent, "{n} counted, {ok} answered, {sent} sent");
+        assert_eq!(count(ports[2]), n, "and found from anywhere");
+        assert_eq!(stat(ports[1], "objects_live"), 1, "it stays");
+    }
+
+    /// `placement = "spread"`: objects that started while their home was
+    /// down go home once it's up, with every write.
+    #[test]
+    fn spread_objects_go_home_once_it_is_up() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        let node = fleet_placing(&dir.0, base, 3, 500, |eng| {
+            let mut a = app::App::single(eng.load(&wasm()).unwrap(), 4);
+            a.procs.iter_mut().for_each(|p| p.spread = Some(fleet::Scope::Region));
+            a
+        });
+        // Node 2 isn't up: once the others have gone a lease without hearing
+        // from it, every object starts on 0 or 1.
+        let ports: Vec<u16> = (0..2).map(|k| node(k).0).collect();
+        std::thread::sleep(Duration::from_millis(1500));
+        for i in 0..12 {
+            assert!(eventually(10_000, || http(ports[0], "POST", &format!("/do/home{i}/incr"), "") == (200, "{\"count\":1}".into())), "home{i}");
+        }
+        assert_eq!(stat(ports[0], "objects_live") + stat(ports[1], "objects_live"), 12);
+        let two = node(2).0;
+        assert!(eventually(15_000, || stat(two, "objects_live") >= 1), "some go home to node 2");
+        assert!(stat(ports[0], "moves") + stat(ports[1], "moves") >= 1);
+        for i in 0..12 {
+            assert_eq!(http(two, "GET", &format!("/do/home{i}/count"), ""), (200, "{\"count\":1}".into()), "home{i}, with its write");
         }
     }
 
@@ -2724,7 +2797,7 @@ mod tests {
         std::fs::write(dir.0.join("builds0").join(format!("{}.so", builds::module_id(&wasm))), b"an old pin's build").unwrap();
         // Node n on `port`, its builds in `builds`: its stop, and its thread.
         let start = |n: u32, port: u16, builds: &str| {
-            let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 1, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new() };
+            let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 1, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new(), place_ms: 0 };
             let b = builds::Builds::new(bucket.clone(), dir.0.join(builds), keys.clone(), n).unwrap();
             let eng = both::Both { builds: Some(Arc::new(b)), ..both() };
             let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), ..cfg(&dir.0.join(format!("d{n}")), 1) };
@@ -2981,7 +3054,7 @@ mod tests {
                 upload_ms: 0,
                 upload_bytes: 1 << 20,
                 read_lease: true,
-                regions: HashMap::new(),
+                regions: HashMap::new(), place_ms: 0,
             };
             let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
             do_server(interp::Interp { max_pages: 16384 }, c)
@@ -3632,7 +3705,7 @@ callers = ["api"]
                 upload_ms: 0,
                 upload_bytes: 1 << 20,
                 read_lease: true,
-                regions: HashMap::new(),
+                regions: HashMap::new(), place_ms: 0,
             };
             let eng = interp::Interp { max_pages: 16384 };
             let (a, pg) = http::load_apps(&eng, &dirs).unwrap_or_else(|e| panic!("{e}"));
@@ -3790,7 +3863,7 @@ callers = ["api"]
         secrets::new_master(&master).unwrap();
         let nodes: Vec<u16> = (0..3u32)
             .map(|n| {
-                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new() };
+                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new(), place_ms: 0 };
                 let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), public: public.clone(), ..cfg(&dir.0.join(format!("d{n}")), 2) };
                 // Nodes 0 and 1 take deploys (to race them against each other).
                 let admin = (n < 2).then(|| admin::AdminCfg { port: admin_ports[n as usize], public: true, tls: Some(wire::admin_tls(&certs, n).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}\n{ops_line}")).unwrap() });
@@ -3950,7 +4023,7 @@ callers = ["api"]
         // A second node 1 would fight the first over everything it owns:
         // its peers have been hearing the first one's heartbeats, so it must
         // see the id is taken (after waiting three leases), and not start.
-        let twin = fleet::FleetCfg { node: 1, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: 0, wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new() };
+        let twin = fleet::FleetCfg { node: 1, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: 0, wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new(), place_ms: 0 };
         let t = Instant::now();
         assert!(http::node_id_free(&twin, 12345).unwrap_err().contains("node id 1 is already in use"));
         assert!(t.elapsed() >= Duration::from_secs(3), "it waits for a just-restarted node to go quiet first: {:?}", t.elapsed());
@@ -4129,7 +4202,7 @@ callers = ["api"]
         let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
         let nodes: Vec<u16> = (0..3u32)
             .map(|n| {
-                let fc = fleet::FleetCfg { node: n, lease_ms: 3000, replicas: 2, s3: s3::S3 { bucket: bucket.clone(), ..base.clone() }, peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(dir.0.join("certs")), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new() };
+                let fc = fleet::FleetCfg { node: n, lease_ms: 3000, replicas: 2, s3: s3::S3 { bucket: bucket.clone(), ..base.clone() }, peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(dir.0.join("certs")), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new(), place_ms: 0 };
                 let eng = interp::Interp { max_pages: 16384 };
                 let (a, pg) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
                 let c = http::Config { pg, fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
@@ -4256,7 +4329,7 @@ callers = ["api"]
         let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
         let nodes: Vec<u16> = (0..3u32)
             .map(|n| {
-                let fc = fleet::FleetCfg { node: n, lease_ms: 3000, replicas: 2, s3: s3::S3 { bucket: bucket.clone(), ..base.clone() }, peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(dir.0.join("certs")), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new() };
+                let fc = fleet::FleetCfg { node: n, lease_ms: 3000, replicas: 2, s3: s3::S3 { bucket: bucket.clone(), ..base.clone() }, peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(dir.0.join("certs")), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new(), place_ms: 0 };
                 let eng = interp::Interp { max_pages: 16384 };
                 let (a, pg) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
                 let c = http::Config { pg, fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
@@ -4422,7 +4495,7 @@ callers = ["api"]
         let stops: Vec<Arc<AtomicBool>> = (0..3).map(|_| Arc::default()).collect();
         let nodes: Vec<u16> = (0..3u32)
             .map(|n| {
-                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new() };
+                let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new(), place_ms: 0 };
                 let c = http::Config { fleet: Some(fc), stop: stops[n as usize].clone(), ..cfg(&dir.0.join(format!("d{n}")), 2) };
                 let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: false, tls: None, tokens: admin::parse_tokens(&line).unwrap() });
                 let port = free_ports(1)[0];

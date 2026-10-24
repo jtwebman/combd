@@ -234,6 +234,9 @@ pub enum Event {
     /// should, after a move). As `Request`, but read the record, never a
     /// routing hint: ours may point straight back.
     Forwarded { obj: Obj, req: ReqId },
+    /// Start serving the object here now, with no request: it was just
+    /// handed to us (`Effect::Handed`). Ignored unless it's idle here.
+    Claim { obj: Obj },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -272,6 +275,10 @@ pub enum Effect {
     PutImage { obj: Obj, act: Act },
     /// Forget the object's state: we don't own it now.
     Drop { obj: Obj },
+    /// A move is done (`Event::Move`): tell `to` to claim it now
+    /// (`Event::Claim`), not at its next request, or a quiet object would
+    /// sit unserved, and come back to us on the next request we see.
+    Handed { obj: Obj, to: Node },
 }
 
 /// Known-bad versions, for proving the simulator can catch them. Never set
@@ -767,9 +774,10 @@ pub struct Core {
     /// started (a node never heard from counts from then).
     heard: HashMap<Node, u64>,
     born: Option<u64>,
-    /// Who owned an object when we last checked, and when (our clock). For
-    /// routing only: a fresh hint skips the bucket and redirects at once.
-    hints: HashMap<Obj, (Node, u64)>,
+    /// Who owned an object when we last checked, when (our clock), and
+    /// whether we handed it there ourselves (a move). For routing only: a
+    /// fresh hint skips the bucket and redirects at once.
+    hints: HashMap<Obj, (Node, u64, bool)>,
     pub stats: CoreStats,
     /// The time of the event being handled.
     now: u64,
@@ -903,13 +911,19 @@ impl Core {
         if self.objs.get(&o).is_some_and(|s| !matches!(s.phase, Phase::Idle)) {
             return None;
         }
-        if self.hints.get(&o).is_some_and(|&(_, t)| now.saturating_sub(t) < self.lease_ms) {
+        if self.hints.get(&o).is_some_and(|&(_, t, _)| now.saturating_sub(t) < self.lease_ms) {
             return None;
         }
+        self.home(now, o, among).filter(|&n| n != self.node)
+    }
+
+    /// A spread object's home: the node rendezvous hashing picks among
+    /// `among` heard from within a lease (this one counts). Wherever the
+    /// object is now: placement moves one that isn't home once it's back.
+    pub fn home(&self, now: u64, o: Obj, among: &[Node]) -> Option<Node> {
         let born = self.born.unwrap_or(now);
         let alive = |n: Node| n == self.node || now.saturating_sub(self.heard.get(&n).copied().unwrap_or(born)) < self.lease_ms;
-        let pick = among.iter().copied().filter(|&n| alive(n)).max_by_key(|&n| spread_score(o, n))?;
-        (pick != self.node).then_some(pick)
+        among.iter().copied().filter(|&n| alive(n)).max_by_key(|&n| spread_score(o, n))
     }
 
     pub fn on(&mut self, now: u64, ev: Event) -> Vec<Effect> {
@@ -967,6 +981,13 @@ impl Core {
             }
             Event::Request { obj, req } => self.request(now, obj, req, false),
             Event::Forwarded { obj, req } => self.request(now, obj, req, true),
+            Event::Claim { obj } => {
+                let st = self.st(obj);
+                if matches!(st.phase, Phase::Idle) {
+                    st.phase = Phase::Starting;
+                    self.call(Wait::ReadRec(obj), Call::Get(own_key(obj)));
+                }
+            }
             Event::Move { obj, to } => {
                 let me = self.node;
                 if let Phase::Serving(s) = &mut self.st(obj).phase {
@@ -1105,12 +1126,19 @@ impl Core {
     }
 
     fn request(&mut self, now: u64, o: Obj, req: ReqId, forwarded: bool) {
-        if !forwarded && matches!(self.st(o).phase, Phase::Idle) {
-            if let Some(&(n, t)) = self.hints.get(&o) {
-                if now.saturating_sub(t) < self.lease_ms {
+        // A hint we read may be stale, so a forwarded request reads the
+        // record instead. One we made by moving the object is the truth: it
+        // sends even a forwarded request on, or the sealed record would let
+        // us claim the object straight back.
+        if matches!(self.st(o).phase, Phase::Idle) {
+            if let Some(&(n, t, moved)) = self.hints.get(&o) {
+                if now.saturating_sub(t) >= self.lease_ms {
+                    self.hints.remove(&o);
+                } else if moved {
+                    return self.answer(req, Answer::Moved(n));
+                } else if !forwarded {
                     return self.answer(req, Answer::Redirect(n));
                 }
-                self.hints.remove(&o);
             }
         }
         let st = self.st(o);
@@ -1366,8 +1394,9 @@ impl Core {
                 let waiting: Vec<ReqId> = st.waiting.drain(..).collect();
                 let moved = matches!(res, Res::Put(Ok(_)));
                 if moved {
-                    self.hints.insert(o, (to, now));
+                    self.hints.insert(o, (to, now, true));
                     self.stats.moves += 1;
+                    self.out.push(Effect::Handed { obj: o, to });
                 }
                 for r in waiting {
                     self.answer(r, if moved { Answer::Moved(to) } else { Answer::NotRun });
@@ -1393,7 +1422,7 @@ impl Core {
                     // whole lease of our own time: it's gone, take over.
                     let last = if self.bugs.assume_alive { now } else { self.heard.get(&r.node).copied().unwrap_or(self.born.unwrap_or(now)) };
                     if now.saturating_sub(last) < self.lease_ms {
-                        self.hints.insert(o, (r.node, now));
+                        self.hints.insert(o, (r.node, now, false));
                         let st = self.st(o);
                         st.phase = Phase::Idle;
                         let rs: Vec<ReqId> = st.waiting.drain(..).collect();

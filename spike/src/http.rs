@@ -307,6 +307,8 @@ struct Stats {
     lease_reads: AtomicU64,
     fence_waits: AtomicU64,
     gc_deleted: AtomicU64,
+    /// Objects handed to another node (placement).
+    moves: AtomicU64,
     /// WebSockets open, and messages in from them.
     sockets_open: AtomicU64,
     ws_messages: AtomicU64,
@@ -457,6 +459,15 @@ const BUCKET_THREADS: usize = 32;
 const MAX_HOPS: u8 = 1;
 /// Times a request that never ran is routed again before the client hears 503.
 const MAX_NOT_RUN: u8 = 3;
+/// Placement: an object moves only if one node sent it at least this many
+/// requests in a window (and two thirds of them), two windows running.
+const PLACE_MIN: u32 = 20;
+/// The most objects a node takes from others in a window.
+const MOVES_IN: u32 = 16;
+/// The name a placement offer goes by (`Loop::place`, `Loop::take`).
+const TAKE: &str = "_combd/take";
+/// The name a "claim it now" goes by, once a move is done (`Effect::Handed`).
+const CLAIM: &str = "_combd/claim";
 
 /// Which connection a request answers: (slot, generation).
 type Who = (usize, u64);
@@ -472,8 +483,9 @@ enum Origin {
     Alarm { at: i64, tries: u32 },
     /// Fleet mode: a request the decision core started.
     Fleet(own::ReqId),
-    /// Fleet mode: a request another node forwarded (connection, frame id).
-    Wire(usize, u64),
+    /// Fleet mode: a request another node forwarded (connection, frame id,
+    /// and the node, once known: placement counts by it).
+    Wire(usize, u64, Option<own::Node>),
     /// A WebSocket event: its connection, socket id, and whether it's the
     /// handshake (`WSOPEN`, answered with 101 to accept).
     Socket(Who, u64, bool),
@@ -517,7 +529,7 @@ enum Msg {
     /// Fleet mode: due alarms from the index: (name, due).
     AlarmsDue { due: Vec<(String, i64)> },
     /// Fleet mode: another node forwarded us a request.
-    WireIn { conn: usize, id: u64, name: String, req: String },
+    WireIn { conn: usize, id: u64, name: String, req: String, from: Option<own::Node> },
     /// Fleet mode: a heartbeat from `node`.
     Heard { node: own::Node },
     /// Fleet mode: the answer to a request we forwarded.
@@ -1567,6 +1579,11 @@ where
                         u64::from_le_bytes(b) ^ now_ms() as u64
                     },
                     ws_gone: HashMap::new(),
+                    traffic: HashMap::new(),
+                    picks: HashMap::new(),
+                    asks: HashMap::new(),
+                    last_place: Instant::now(),
+                    taken: 0,
                     ws_lost: Default::default(),
                     parked: HashMap::new(),
                     next_park: 0,
@@ -1668,6 +1685,15 @@ struct Loop<'a, E: Engine> {
     /// Sockets that are gone, per object, until a committed request has
     /// taken them off the object's list (`_combd_sockets`).
     ws_gone: HashMap<String, BTreeSet<u64>>,
+    /// Placement (`place`): per object run here, its requests by the node
+    /// they came in through, this window; last window's pick per object;
+    /// offers out (wire id -> the object and the node); when this window
+    /// began; and (`take`) how many objects we said yes to in it.
+    traffic: HashMap<String, BTreeMap<own::Node, u32>>,
+    picks: HashMap<String, own::Node>,
+    asks: HashMap<u64, (String, own::Node)>,
+    last_place: Instant,
+    taken: u32,
     /// Lost sockets we've told their object about already.
     ws_lost: std::collections::HashSet<u64>,
     /// Cells waiting on the database, by park number; and the Postgres
@@ -1705,7 +1731,7 @@ pub fn node_id_free(fc: &FleetCfg, boot: u64) -> Result<(), String> {
     }
     struct Ask(Mutex<Sender<(u16, String)>>);
     impl wire::Sink for Ask {
-        fn forward(&self, _: usize, _: u64, _: String, _: String) {}
+        fn forward(&self, _: usize, _: u64, _: String, _: String, _: Option<own::Node>) {}
         fn reply(&self, _: usize, _: u64, reply: (u16, String)) {
             let _ = self.0.lock().unwrap().send(reply);
         }
@@ -2183,14 +2209,34 @@ impl<E: Engine> Loop<'_, E> {
                     self.reconcile(&name);
                 }
                 Msg::AlarmsDue { due } => self.alarms_due(due),
-                Msg::WireIn { conn, id, name, req } => self.submit(Origin::Wire(conn, id), name, req),
+                Msg::WireIn { conn, id, name, .. } if name == TAKE => self.take(conn, id)?,
+                // Handed to us: claim it now. (The object's loop, by its name.)
+                Msg::WireIn { conn, id, name, req, .. } if name == CLAIM => {
+                    if owner(&req, self.sh.cfg.threads) == self.me {
+                        let obj = own::obj_id(&req);
+                        self.names.insert(obj, req);
+                        self.core_on(own::Event::Claim { obj });
+                    } else {
+                        let (tx, waker) = &self.sh.peers[owner(&req, self.sh.cfg.threads)];
+                        let _ = tx.send(Msg::WireIn { conn, id, name, req, from: None });
+                        let _ = waker.wake();
+                        continue;
+                    }
+                    self.deliver(Origin::Wire(conn, id, None), (200, "{}".into()))?;
+                }
+                Msg::WireIn { conn, id, name, req, from } => self.submit(Origin::Wire(conn, id, from), name, req),
                 Msg::Heard { node } => {
                     if self.core.is_some() {
                         self.core_on(own::Event::Heard { node });
                     }
                 }
                 Msg::WireReply { id, reply } => {
-                    if let Some((origin, node, sent, ..)) = self.wire_out.remove(&id) {
+                    if let Some((name, to)) = self.asks.remove(&id) {
+                        // A yes: move it, if it's still ours to move.
+                        if reply.0 == 200 && self.objects.contains_key(&name) {
+                            self.core_on(own::Event::Move { obj: own::obj_id(&name), to });
+                        }
+                    } else if let Some((origin, node, sent, ..)) = self.wire_out.remove(&id) {
                         self.measured(node, sent.elapsed());
                         self.deliver(origin, reply)?;
                     }
@@ -2225,7 +2271,7 @@ impl<E: Engine> Loop<'_, E> {
                 waker.wake()
             }
             Origin::Alarm { .. } | Origin::Fleet(_) => Ok(()), // `finish_task` already handled it
-            Origin::Wire(conn, id) => {
+            Origin::Wire(conn, id, _) => {
                 if let Some(f) = &self.sh.fleet {
                     f.wire.reply(conn, Frame::Reply { id, status: reply.0, body: reply.1 });
                 }
@@ -3864,7 +3910,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"moves\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -3884,6 +3930,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.lease_reads.load(Relaxed),
                     s.fence_waits.load(Relaxed),
                     s.gc_deleted.load(Relaxed),
+                    s.moves.load(Relaxed),
                     s.sockets_open.load(Relaxed),
                     s.ws_messages.load(Relaxed),
                     s.ws_handoffs.load(Relaxed),
@@ -4386,6 +4433,7 @@ impl<E: Engine> Loop<'_, E> {
         st.lease_reads.fetch_add(now.lease_reads - was.lease_reads, Relaxed);
         st.fence_waits.fetch_add(now.fence_waits - was.fence_waits, Relaxed);
         st.gc_deleted.fetch_add(now.gc_deleted - was.gc_deleted, Relaxed);
+        st.moves.fetch_add(now.moves - was.moves, Relaxed);
         for e in effects {
             self.effect(e);
         }
@@ -4440,6 +4488,17 @@ impl<E: Engine> Loop<'_, E> {
                 let Some(fr) = self.freqs.get_mut(&req) else { return };
                 fr.act = act;
                 let (name, cell_req) = (fr.name.clone(), fr.cell_req.clone());
+                // Placement counts what people send, by the node it came in
+                // through: not the host's own alarms and beats.
+                let f = self.sh.fleet.as_ref().unwrap();
+                let via = match fr.origin {
+                    Origin::Wire(_, _, from) => from,
+                    Origin::Alarm { .. } | Origin::Fleet(_) | Origin::Tick => None,
+                    _ => Some(f.cfg.node),
+                };
+                if let Some(n) = via.filter(|_| f.cfg.place_ms > 0 && self.app.procs.get(self.app.object_proc(&name)).is_some_and(|p| p.nearest && p.spread.is_none())) {
+                    *self.traffic.entry(name.clone()).or_default().entry(n).or_default() += 1;
+                }
                 self.submit(Origin::Fleet(req), name, cell_req);
             }
             Effect::Seal { obj, act, image } => {
@@ -4503,6 +4562,12 @@ impl<E: Engine> Loop<'_, E> {
                     let _ = f.peer_store.lock().unwrap().send((call, PeerBack::Loop(self.me, id)));
                 } else {
                     f.wire.send(node, Frame::Peer { id, call }, self.me);
+                }
+            }
+            Effect::Handed { obj, to } => {
+                if let (Some(name), Some(f)) = (self.names.get(&obj), &self.sh.fleet) {
+                    let id = f.next_id.fetch_add(1, Relaxed);
+                    f.wire.send(to, Frame::Forward { id, name: CLAIM.into(), req: name.clone() }, self.me);
                 }
             }
             Effect::Drop { obj } => {
@@ -4688,6 +4753,78 @@ impl<E: Engine> Loop<'_, E> {
                 self.sh.stats.evictions.fetch_add(1, Relaxed);
             }
         }
+        let place_ms = self.sh.fleet.as_ref().unwrap().cfg.place_ms;
+        if place_ms > 0 && self.last_place.elapsed() >= Duration::from_millis(place_ms) {
+            self.place();
+        }
+    }
+
+    /// Placement, once a window (`COMBD_PLACE_MS`): an object run here whose
+    /// requests came in mostly through one other node (two thirds, and at
+    /// least `PLACE_MIN`), or a spread one whose home is another node, two
+    /// windows running, is offered to that node,
+    /// and moves on its yes (`take`, then `Event::Move`). Not one that's
+    /// ticking or holds a database session: a game in play stays put, as
+    /// eviction leaves those too. An offer not answered by the next window
+    /// is a no.
+    fn place(&mut self) {
+        self.last_place = Instant::now();
+        self.taken = 0;
+        self.asks.clear();
+        let f = self.sh.fleet.as_ref().unwrap();
+        let mut picks = HashMap::new();
+        for (name, by) in std::mem::take(&mut self.traffic) {
+            let total: u32 = by.values().sum();
+            let Some((&top, &n)) = by.iter().max_by_key(|&(_, &n)| n) else { continue };
+            if top == f.cfg.node || total < PLACE_MIN || n * 3 < total * 2 {
+                continue;
+            }
+            let again = self.picks.get(&name) == Some(&top);
+            picks.insert(name.clone(), top);
+            let busy = self.objects.get(&name).is_none_or(|o| !o.pg.is_empty()) || self.ticks.contains_key(&name);
+            if !again || busy {
+                continue;
+            }
+            let id = f.next_id.fetch_add(1, Relaxed);
+            f.wire.send(top, Frame::Forward { id, name: TAKE.into(), req: name.clone() }, self.me);
+            self.asks.insert(id, (name, top));
+        }
+        // Spread objects not on their home, now that it's up (it was down
+        // when they started, say): home, the same way.
+        let all: Vec<own::Node> = f.cfg.peers.keys().copied().chain([f.cfg.node]).collect::<BTreeSet<_>>().into_iter().collect();
+        let now = self.core_now();
+        let spread: Vec<(String, own::Node)> = self
+            .objects
+            .iter()
+            .filter(|(name, o)| o.pg.is_empty() && !self.ticks.contains_key(*name))
+            .filter_map(|(name, _)| {
+                let scope = self.app.procs.get(self.app.object_proc(name))?.spread?;
+                let home = self.core.as_ref()?.home(now, own::obj_id(name), &crate::fleet::among(&f.cfg.regions, f.cfg.node, &all, scope))?;
+                (home != f.cfg.node).then(|| (name.clone(), home))
+            })
+            .collect();
+        for (name, home) in spread {
+            let again = self.picks.get(&name) == Some(&home);
+            picks.insert(name.clone(), home);
+            if again {
+                let id = f.next_id.fetch_add(1, Relaxed);
+                f.wire.send(home, Frame::Forward { id, name: TAKE.into(), req: name.clone() }, self.me);
+                self.asks.insert(id, (name, home));
+            }
+        }
+        self.picks = picks;
+    }
+
+    /// Another node offers us an object (`place`). Yes while there's room
+    /// to spare, so moves never fill a node: no memory pressure, not
+    /// refusing connections, 30% of the machine's memory free, and at most
+    /// `MOVES_IN` this window.
+    fn take(&mut self, conn: usize, id: u64) -> std::io::Result<()> {
+        let st = &self.sh.stats;
+        let room = combd_mem::machine().is_none_or(|(total, available)| available * 10 >= total * 3);
+        let yes = room && st.pressure.load(Relaxed) == 0 && st.tcp_refusing.load(Relaxed) == 0 && self.taken < MOVES_IN;
+        self.taken += yes as u32;
+        self.deliver(Origin::Wire(conn, id, None), if yes { (200, "{}".into()) } else { (503, "{\"error\":\"full\"}".into()) })
     }
 
     /// Due alarms from the index: fire each as an ordinary request, routed to
@@ -4763,7 +4900,7 @@ struct LoopSink {
 }
 
 impl wire::Sink for LoopSink {
-    fn forward(&self, conn: usize, id: u64, name: String, req: String) {
+    fn forward(&self, conn: usize, id: u64, name: String, req: String, from: Option<own::Node>) {
         // A node starting up asks when we last heard its id (`node_id_free`).
         if name == "_combd/node" {
             let n: own::Node = req.trim().parse().unwrap_or(u32::MAX);
@@ -4777,7 +4914,7 @@ impl wire::Sink for LoopSink {
             return;
         }
         let (tx, waker) = &self.loops[owner(&name, self.threads)];
-        let _ = tx.send(Msg::WireIn { conn, id, name, req });
+        let _ = tx.send(Msg::WireIn { conn, id, name, req, from });
         let _ = waker.wake();
     }
     fn reply(&self, back: usize, id: u64, reply: (u16, String)) {

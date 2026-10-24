@@ -740,6 +740,16 @@ impl Sim {
             Effect::Drop { obj } => {
                 self.procs[p].data.remove(&obj);
             }
+            // Over the network, like anything else: lost, late, or cut.
+            Effect::Handed { obj, to } => {
+                let from = self.procs[p].node;
+                if let Some(&q) = self.current.get(&to) {
+                    if !self.cut(Some(from), Some(to)) && !(self.faulty() && self.rng.chance(self.s.lost)) {
+                        let d = self.peer_latency();
+                        self.at(d, Msg::Proc(q, Event::Claim { obj }));
+                    }
+                }
+            }
         }
     }
 

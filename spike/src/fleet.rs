@@ -49,6 +49,10 @@ pub struct FleetCfg {
     /// region and, after a slash, a zone), for placement's scope. A node
     /// not listed is in the region (and zone) of every other one not listed.
     pub regions: HashMap<Node, String>,
+    /// Placement: how often an owner looks at where its objects' requests
+    /// come in, and moves one whose traffic is elsewhere (`COMBD_PLACE_MS`,
+    /// default 30 minutes; 0: never).
+    pub place_ms: u64,
 }
 
 /// Placement's scope: which nodes a spread object may start on, seen from
@@ -105,7 +109,8 @@ impl FleetCfg {
                 Some((n.trim().parse().ok()?, place.trim().to_string()))
             })
             .collect();
-        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure, upload_ms, upload_bytes, read_lease, regions })
+        let place_ms = std::env::var("COMBD_PLACE_MS").ok().and_then(|p| p.parse().ok()).unwrap_or(30 * 60_000);
+        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure, upload_ms, upload_bytes, read_lease, regions, place_ms })
     }
 }
 

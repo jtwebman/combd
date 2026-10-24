@@ -144,7 +144,8 @@ pub fn make_certs(dir: &Path, nodes: u32) -> Result<(), String> {
 /// Where the hub hands what arrives.
 pub trait Sink: Send + 'static {
     /// A peer forwarded us a request; answer with `Wire::reply(conn, ..)`.
-    fn forward(&self, conn: usize, id: u64, name: String, req: String);
+    /// `from`: the node at the other end, once it has sent a heartbeat.
+    fn forward(&self, conn: usize, id: u64, name: String, req: String, from: Option<Node>);
     /// The answer to a request loop `back` forwarded (a 503 if the link broke).
     fn reply(&self, back: usize, id: u64, reply: (u16, String));
     /// A peer called our peer store; answer with `Wire::reply(conn, ..)`.
@@ -207,6 +208,9 @@ struct Conn {
     /// Outgoing links: the node, and calls waiting for a reply (id -> loop,
     /// and whether it's a peer call).
     node: Option<Node>,
+    /// Incoming links: the node at the other end, once it has sent a
+    /// heartbeat (every frame of a node comes on its one link).
+    from: Option<Node>,
     waiting: HashMap<u64, (usize, bool)>,
     writing: bool,
 }
@@ -280,7 +284,7 @@ impl<S: Sink> Hub<S> {
         self.next += 1;
         self.poll.registry().register(&mut sock, Token(id), Interest::READABLE).ok()?;
         let _ = sock.set_nodelay(true);
-        self.conns.insert(id, Conn { sock, tls, rbuf: vec![], wbuf: vec![], node, waiting: HashMap::new(), writing: false });
+        self.conns.insert(id, Conn { sock, tls, rbuf: vec![], wbuf: vec![], node, from: None, waiting: HashMap::new(), writing: false });
         Some(id)
     }
 
@@ -457,7 +461,7 @@ impl<S: Sink> Hub<S> {
             let frame = Frame::read(&mut &c.rbuf[..4 + n]);
             c.rbuf.drain(..4 + n);
             match frame {
-                Ok(Frame::Forward { id: fid, name, req }) if c.node.is_none() => self.sink.forward(id, fid, name, req),
+                Ok(Frame::Forward { id: fid, name, req }) if c.node.is_none() => self.sink.forward(id, fid, name, req, c.from),
                 Ok(Frame::Reply { id: fid, status, body }) if c.node.is_some() => {
                     if let Some((back, _)) = c.waiting.remove(&fid) {
                         self.sink.reply(back, fid, (status, body));
@@ -466,7 +470,10 @@ impl<S: Sink> Hub<S> {
                 Ok(Frame::Peer { id: fid, call }) if c.node.is_none() => self.sink.peer(id, fid, call),
                 Ok(Frame::WsPush { name, sock, op, payload }) if c.node.is_none() => self.sink.ws_push(name, sock, op, payload),
                 Ok(Frame::Catalog { seq, entry }) if c.node.is_none() => self.sink.catalog(seq, entry),
-                Ok(Frame::Heartbeat { node, boot }) if c.node.is_none() => self.sink.heartbeat(node, boot),
+                Ok(Frame::Heartbeat { node, boot }) if c.node.is_none() => {
+                    c.from = Some(node);
+                    self.sink.heartbeat(node, boot)
+                }
                 Ok(Frame::Pool { body }) if c.node.is_none() => self.sink.pool(body),
                 Ok(Frame::PeerReply { id: fid, res }) if c.node.is_some() => {
                     if let Some((back, _)) = c.waiting.remove(&fid) {
@@ -515,7 +522,7 @@ mod tests {
     }
 
     impl Sink for Echo {
-        fn forward(&self, conn: usize, id: u64, name: String, req: String) {
+        fn forward(&self, conn: usize, id: u64, name: String, req: String, _: Option<Node>) {
             if let Some(w) = self.wire.lock().unwrap().as_ref() {
                 w.reply(conn, Frame::Reply { id, status: 200, body: format!("{name}:{req}") });
             }
