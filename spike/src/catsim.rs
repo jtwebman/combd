@@ -351,7 +351,6 @@ mod tests {
         let all = [
             ("ack_before_write", Bugs { ack_before_write: true, ..Bugs::default() }),
             ("blind_slot", Bugs { blind_slot: true, ..Bugs::default() }),
-            ("apply_any_order", Bugs { apply_any_order: true, ..Bugs::default() }),
             ("uncovered_check", Bugs { uncovered_check: true, ..Bugs::default() }),
             ("trim_no_gate", Bugs { trim_no_gate: true, ..Bugs::default() }),
             ("trim_early", Bugs { trim_early: true, ..Bugs::default() }),

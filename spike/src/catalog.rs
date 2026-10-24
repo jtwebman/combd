@@ -18,8 +18,10 @@
 //! up, check again, retry. A lost reply to the write is followed by reading
 //! the slot back (entries carry an id), never a blind retry.
 //!
-//! A node applies a push only if it's the next slot; a later one makes it
-//! catch up from the bucket. Catching up has the same trap as writing: a
+//! A push is only news that the log grew: a node catches up from the
+//! bucket, and never applies what the push carries (a node that could push
+//! is no node that could write the log: one compromised peer must not be
+//! able to rewrite every node's catalog, or knock it out of step). Catching up has the same trap as writing: a
 //! slot read may be a trimmed one that a slow writer has just filled with an
 //! entry that will never count. So what's read is held, then the snapshot
 //! is read again: if it now covers any of it, that's thrown away and the
@@ -103,7 +105,6 @@ pub enum Event {
 pub struct Bugs {
     pub ack_before_write: bool,
     pub blind_slot: bool,
-    pub apply_any_order: bool,
     pub uncovered_check: bool,
     pub trim_no_gate: bool,
     pub trim_early: bool,
@@ -192,10 +193,8 @@ impl Catalog {
                     self.reply(w, res);
                 }
             }
-            Event::Push { seq, entry } => {
-                if seq == self.copy.at + 1 || (self.bugs.apply_any_order && seq > self.copy.at) {
-                    self.copy.apply(&entry);
-                } else if seq > self.copy.at + 1 {
+            Event::Push { seq, .. } => {
+                if seq > self.copy.at {
                     self.catch_up(false);
                 }
             }
@@ -440,5 +439,16 @@ mod tests {
             let (a, b) = (crate::sim::mangle(&mut rng, &good_e), crate::sim::mangle(&mut rng, &good_s));
             std::panic::catch_unwind(|| (decode(&a), decode_snap(&b))).expect("a catalog decoder panicked");
         }
+    }
+    /// A push from another node is news, not truth: the node reads the
+    /// bucket, and what the push carried never lands (a peer could claim
+    /// another app's domain with it, and knock the node out of step).
+    #[test]
+    fn a_push_is_only_news() {
+        let mut c = Catalog::new(State::default(), Box::new(|_: &State, _: &Entry| Ok(())), Bugs::default());
+        let forged = Entry { id: 1, app: "evil/phish".into(), value: br#"{"version":"v1","domains":["shop.test"]}"#.to_vec() };
+        let fx = c.on(Event::Push { seq: 1, entry: forged });
+        assert_eq!(c.copy, State::default(), "nothing applied");
+        assert!(fx.iter().any(|f| matches!(f, Effect::Call { call: Call::Get(k), .. } if k == SNAP_KEY)), "it catches up from the bucket");
     }
 }

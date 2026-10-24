@@ -27,7 +27,8 @@ const MAX_FRAMES: usize = 10_000;
 /// `u16`) needs no bounds check. A function's locals and operands must fit.
 const W: usize = 1 << 16;
 const MAX_STACK: usize = (1 << 20) + W;
-const MAX_TABLE: u64 = 1 << 20;
+/// The most table entries a module may declare (the compiled tier too).
+pub const MAX_TABLE: u64 = 1 << 20;
 /// Spare stack slots past a function's max height, for host call results.
 const SLACK: usize = 8;
 /// In `Target::keep`: the branch goes back to a loop, so it spends a reduction.

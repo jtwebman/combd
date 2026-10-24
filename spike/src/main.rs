@@ -975,7 +975,6 @@ fn main_with(args: &[&str]) {
             match rest.first().copied() {
                 Some("ack_before_write") => bugs.ack_before_write = true,
                 Some("blind_slot") => bugs.blind_slot = true,
-                Some("apply_any_order") => bugs.apply_any_order = true,
                 Some("uncovered_check") => bugs.uncovered_check = true,
                 Some("trim_no_gate") => bugs.trim_no_gate = true,
                 Some("trim_early") => bugs.trim_early = true,

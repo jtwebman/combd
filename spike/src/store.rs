@@ -167,8 +167,12 @@ impl Db {
                 | AuthAction::CreateVtable { .. }
                 | AuthAction::DropVtable { .. }
                 | AuthAction::Unknown { .. } => Authorization::Deny,
-                // fts3_tokenizer with two arguments can run native code.
-                AuthAction::Function { function_name } if function_name.eq_ignore_ascii_case("fts3_tokenizer") => {
+                // fts3_tokenizer with two arguments can run native code, and
+                // load_extension loads it (off in SQLite already: denied here
+                // too, so that never rests on one default).
+                AuthAction::Function { function_name }
+                    if function_name.eq_ignore_ascii_case("fts3_tokenizer") || function_name.eq_ignore_ascii_case("load_extension") =>
+                {
                     Authorization::Deny
                 }
                 _ => Authorization::Allow,
@@ -681,6 +685,10 @@ mod tests {
             "COMMIT",
             "SAVEPOINT s",
             "SELECT fts3_tokenizer('simple')",
+            "SELECT load_extension('/tmp/x')",
+            "SELECT LOAD_EXTENSION('/tmp/x', 'init')",
+            "VACUUM INTO '/tmp/combd-escape.db'",
+            "VACUUM",
             "SELECT at FROM _combd_alarm",
             "DELETE FROM _COMBD_alarm",
             "CREATE TRIGGER t AFTER INSERT ON _combd_alarm BEGIN SELECT 1; END",

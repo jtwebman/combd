@@ -1135,6 +1135,7 @@ where
     /// Set (or, with `null`, unset) vars. With a version live, each is
     /// checked against its declared type, so a bad value never reaches it.
     fn set_vars(&self, org: &str, app: &str, set: std::collections::BTreeMap<String, serde_json::Value>) -> Result<(), String> {
+        idents(org, app)?;
         let state = self.cat.now().0;
         let manifest = self.manifest(&state, org, app)?;
         // ponytail: two vars changes at once on two nodes: the later one
@@ -1159,6 +1160,7 @@ where
     /// one it requires can't be deleted.
     fn set_secret(&self, org: &str, app: &str, name: &str, value: Option<&[u8]>) -> Result<(), String> {
         use crate::secrets::{key_entry, new_key, open_key, seal, secret_entry, valid_name, MAX_VALUE};
+        idents(org, app)?;
         if !valid_name(name) {
             return Err("secret names are a-z, 0-9, -, _ and ., up to 128".into());
         }
@@ -1269,11 +1271,18 @@ fn load_one(dir: &std::path::Path, env: &crate::manifest::EnvValues) -> Result<(
 /// its write checks the domains again, against the log's head, so two
 /// deploys on two nodes can never both claim one. Every node picks it up.
 #[allow(clippy::too_many_arguments)]
+/// An org's or app's name: they go into catalog and bucket keys.
+fn ident(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Every admin write checks the names it was given, not only deploys.
+fn idents(org: &str, app: &str) -> Result<(), String> {
+    if ident(org) && ident(app) { Ok(()) } else { Err("org and app: lowercase letters, digits, - and _".into()) }
+}
+
 pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::catnode::CatNode, s3: &crate::s3::S3, scratch: &std::path::Path, master: Option<&crate::secrets::Key>, org: &str, app: &str, bundle: &[u8]) -> Result<Deployed, String> {
-    let ident = |s: &str| !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
-    if !ident(org) || !ident(app) {
-        return Err("org and app: lowercase letters, digits, - and _".into());
-    }
+    idents(org, app)?;
     let v = crate::deploy::version_of(bundle);
     let dir = scratch.join(format!("{org}-{app}-{v}"));
     crate::deploy::unpack(bundle, &dir)?;
@@ -2369,6 +2378,11 @@ impl<E: Engine> Loop<'_, E> {
         let h = cell.host();
         h.ev_reqs = ids;
         h.ev_out.clear();
+        h.ev_bytes = 0;
+        // A fresh host-time budget per callback, as a classic cell gets one
+        // per request: an instance lives long, and it would run out.
+        h.host_time = Default::default();
+        cell.st.host_time = Default::default();
         let started = match call {
             EvCall::Request(id, req) => {
                 inst.running = None;

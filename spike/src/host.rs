@@ -48,6 +48,9 @@ pub struct HostState {
     /// the data that came with the event being handled.
     pub ev_reqs: Vec<u64>,
     pub ev_out: Vec<EvAction>,
+    /// The bytes `ev_out` holds: capped as a classic cell's sends are
+    /// (`MAX_WS_OUT`), or one callback could queue gigabytes.
+    pub ev_bytes: usize,
     pub ev_payload: Vec<u8>,
     pub next_ticket: u64,
 }
@@ -343,6 +346,15 @@ fn run(imp: &Import, args: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> Res
             } else if st.ev_out.len() >= MAX_EV_OUT {
                 return Err(format!("{name}: too many at once"));
             } else {
+                let len = match name {
+                    "pg_query_async" => arg(3)?,
+                    "respond" | "pg_open_async" | "call_async" | "send_async" => arg(2)?,
+                    _ => 0,
+                };
+                if st.ev_bytes.saturating_add(len as usize) > MAX_WS_OUT {
+                    return Err(format!("{name}: too much at once"));
+                }
+                st.ev_bytes += len as usize;
                 let read = |p: u64, l: u64, max: usize| -> Result<Vec<u8>, String> {
                     if l as usize > max {
                         return Err(format!("{name}: too large"));
@@ -489,5 +501,40 @@ fn wasi_run(name: &str, a: &[u64], mem: &mut dyn Mem, st: &mut HostState) -> u64
         "args_get" => OK,
         n if n.starts_with("path_") => ENOTCAPABLE,
         _ => ENOSYS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reads give `len` zero bytes; writes land nowhere.
+    struct Fake;
+    impl Mem for Fake {
+        fn read(&self, _: u32, len: u32) -> Option<Vec<u8>> {
+            Some(vec![0; len as usize])
+        }
+        fn write(&mut self, _: u32, _: &[u8]) -> bool {
+            true
+        }
+    }
+
+    /// An event cell's callback can queue only as many bytes as a classic
+    /// cell can send (`MAX_WS_OUT`), not 10,000 messages of a megabyte each
+    /// (it once could: one callback took a node's memory).
+    #[test]
+    fn a_callback_queues_at_most_max_ws_out() {
+        let send_async = Import { module: "combd".into(), name: "send_async".into(), results: 1 };
+        let mut st = HostState { ev_reqs: vec![1], ..HostState::default() };
+        let per = 1u64 << 20;
+        let mut queued = 0;
+        while call(&send_async, &[1, 0, per], &mut Fake, &mut st).is_ok() {
+            queued += per as usize;
+            assert!(queued <= MAX_WS_OUT, "queued {queued} bytes");
+        }
+        assert_eq!(queued, MAX_WS_OUT);
+        // The next callback starts from nothing (the loop resets `ev_bytes`).
+        st.ev_bytes = 0;
+        assert!(call(&send_async, &[1, 0, per], &mut Fake, &mut st).is_ok());
     }
 }

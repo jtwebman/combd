@@ -63,7 +63,13 @@ fn const_val(expr: &ConstExpr, globals: &[u64]) -> Result<u64, String> {
 }
 
 /// Rust for the module, or why it can't be compiled.
+/// A module, as Rust. Its bytes are the attacker's: any input that trips a
+/// bug here must be a clean error on the builder, not a builder down.
 pub fn generate(wasm: &[u8], source: &str) -> Result<String, String> {
+    std::panic::catch_unwind(|| generate_in(wasm, source)).unwrap_or_else(|_| Err("the module couldn't be compiled (a bug in combd: please report it)".into()))
+}
+
+fn generate_in(wasm: &[u8], source: &str) -> Result<String, String> {
     let mut v = Validator::new();
     let mut m = Info { mem: (0, 0), ..Default::default() };
     let mut funcs = String::new();
@@ -104,7 +110,13 @@ pub fn generate(wasm: &[u8], source: &str) -> Result<String, String> {
                     if m.table.is_some() {
                         return Err("only one table is supported".into());
                     }
-                    m.table = Some(t.map_err(e)?.ty.initial as u32);
+                    // Capped as the interpreter caps it: every cell
+                    // allocates its table at start.
+                    let initial = t.map_err(e)?.ty.initial;
+                    if initial > crate::interp::MAX_TABLE {
+                        return Err("table too large".into());
+                    }
+                    m.table = Some(initial as u32);
                 }
             }
             Payload::MemorySection(r) => {
@@ -233,7 +245,13 @@ fn module_text(m: &Info, funcs: &str, source: &str, hash: u64) -> String {
         o.push_str("\",\n");
     }
     o.push_str("];\n\n");
-    let _ = writeln!(o, "fn new(host: Box<dyn rt::Host>) -> Result<(Ctx, rt::Mem), Trap> {{");
+    // The entry points catch a panic (none should be reachable: every
+    // fallible op is a `Trap`) as a trap, so it ends the cell, never the
+    // node, as the interpreter's `catch_unwind` does. `Unreachable`: a new
+    // trap kind would change the pin, and every builder with it.
+    o.push_str("fn new(host: Box<dyn rt::Host>) -> Result<(Ctx, rt::Mem), Trap> {\n    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| new_in(host))).unwrap_or(Err(Trap::Unreachable))\n}\n\n");
+    o.push_str("fn call(c: &mut Ctx, m: &mut rt::Mem, f: u32, a: &[u64]) -> Result<Vec<u64>, Trap> {\n    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call_in(c, m, f, a))).unwrap_or(Err(Trap::Unreachable))\n}\n\n");
+    let _ = writeln!(o, "fn new_in(host: Box<dyn rt::Host>) -> Result<(Ctx, rt::Mem), Trap> {{");
     let _ = writeln!(o, "    let (mut c, mut m) = Ctx::new({}, {}, DATA, host)?;", m.mem.0, m.mem.1);
     for (i, g) in m.globals.iter().enumerate() {
         let _ = writeln!(o, "    c.globals[{i}] = {g:#x};");
@@ -251,7 +269,7 @@ fn module_text(m: &Info, funcs: &str, source: &str, hash: u64) -> String {
         let _ = writeln!(o, "        {n:?} => Some({i}),");
     }
     o.push_str("        _ => None,\n    }\n}\n\n");
-    o.push_str("fn call(c: &mut Ctx, m: &mut rt::Mem, f: u32, a: &[u64]) -> Result<Vec<u64>, Trap> {\n    c.start();\n    match f {\n");
+    o.push_str("fn call_in(c: &mut Ctx, m: &mut rt::Mem, f: u32, a: &[u64]) -> Result<Vec<u64>, Trap> {\n    c.start();\n    match f {\n");
     for (_, i) in &m.exports {
         let ty = &m.types[m.func_types[*i as usize] as usize];
         let (np, nr) = (ty.params().len(), ty.results().len());
@@ -734,21 +752,38 @@ fn place_ticks(m: &Info, funcs: &str) -> String {
         scc: Vec<usize>,
         order: Vec<Vec<usize>>,
     }
-    fn visit(t: &mut T, v: usize) {
+    fn start(t: &mut T, v: usize) {
         t.index[v] = t.next;
         t.low[v] = t.next;
         t.next += 1;
         t.stack.push(v);
         t.on[v] = true;
-        for &g in &t.fns[v].2 {
-            let w = (g - t.off) as usize;
-            if t.index[w] == usize::MAX {
-                visit(t, w);
-                t.low[v] = t.low[v].min(t.low[w]);
-            } else if t.on[w] {
-                t.low[v] = t.low[v].min(t.index[w]);
+    }
+    // With a stack of its own, not recursion: a module's call chain can be
+    // a million deep, and the builder's thread stack can't.
+    fn visit(t: &mut T, root: usize) {
+        start(t, root);
+        let mut work = vec![(root, 0usize)];
+        while let Some(&(v, i)) = work.last() {
+            if let Some(&g) = t.fns[v].2.get(i) {
+                work.last_mut().unwrap().1 += 1;
+                let w = (g - t.off) as usize;
+                if t.index[w] == usize::MAX {
+                    start(t, w);
+                    work.push((w, 0));
+                } else if t.on[w] {
+                    t.low[v] = t.low[v].min(t.index[w]);
+                }
+                continue;
             }
+            work.pop();
+            if let Some(&(p, _)) = work.last() {
+                t.low[p] = t.low[p].min(t.low[v]);
+            }
+            finish(t, v);
         }
+    }
+    fn finish(t: &mut T, v: usize) {
         if t.low[v] == t.index[v] {
             let mut comp = vec![];
             loop {
@@ -859,5 +894,29 @@ mod tests {
         for line in src.lines().filter(|l| l.contains("compile_error")) {
             assert!(line.trim_start().starts_with("//"), "out of its comment: {line:?}");
         }
+    }
+
+    /// A call chain 100,000 deep: the call graph's walk takes no stack per
+    /// level (it overflowed the builder's, recursing).
+    #[test]
+    fn a_deep_call_chain_compiles() {
+        let n = 100_000;
+        let mut w = String::from("(module\n");
+        for i in 0..n - 1 {
+            w.push_str(&format!("(func call {})\n", i + 1));
+        }
+        w.push_str("(func) (export \"f\" (func 0)))");
+        let src = super::generate(&wat::parse_str(&w).unwrap(), "test").unwrap();
+        assert!(src.contains(&format!("fn f{}(", n - 1)));
+    }
+
+    /// Every cell allocates its table at start: a huge one is refused, as
+    /// the interpreter refuses it, not allocated (16 GB for 2e9 entries).
+    #[test]
+    fn a_huge_table_is_refused() {
+        let wasm = wat::parse_str("(module (table 2000000000 funcref))").unwrap();
+        assert_eq!(super::generate(&wasm, "test").err().as_deref(), Some("table too large"));
+        let ok = wat::parse_str("(module (table 1024 funcref))").unwrap();
+        assert!(super::generate(&ok, "test").is_ok());
     }
 }
