@@ -116,6 +116,9 @@ pub struct Config {
     pub max_objects: usize,
     /// Set it to stop the server.
     pub stop: Arc<AtomicBool>,
+    /// Tests only: the data disk reads as nearly full (`disk_low`).
+    #[cfg(test)]
+    pub disk_low_forced: Arc<AtomicBool>,
     /// Tests only: every fsync takes at least this long, to prove the output
     /// gate waits for it.
     pub sync_delay: Duration,
@@ -258,6 +261,8 @@ impl Config {
     pub fn from_env() -> Config {
         let num = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         Config {
+            #[cfg(test)]
+            disk_low_forced: Default::default(),
             threads: num("COMBD_THREADS", std::thread::available_parallelism().map_or(1, |n| n.get())),
             data: PathBuf::from(std::env::var("COMBD_DATA").unwrap_or_else(|_| "data".into())),
             idle: Duration::from_millis(num("COMBD_IDLE_MS", 60_000) as u64),
@@ -3684,7 +3689,13 @@ impl<E: Engine> Loop<'_, E> {
             st.pressure.store(p, Relaxed);
             if let Ok(d) = rustix::fs::statvfs(&self.sh.cfg.data) {
                 let (free, size) = (d.f_bavail.saturating_mul(d.f_frsize), d.f_blocks.saturating_mul(d.f_frsize));
-                st.disk_low.store((free < (size / 10).min(2 << 30)) as u64, Relaxed);
+                #[allow(unused_mut)]
+                let mut low = free < (size / 10).min(2 << 30);
+                #[cfg(test)]
+                {
+                    low |= self.sh.cfg.disk_low_forced.load(Relaxed);
+                }
+                st.disk_low.store(low as u64, Relaxed);
             }
         }
         self.follow_listener();
@@ -4653,9 +4664,17 @@ impl<E: Engine> Loop<'_, E> {
     /// An object's segments arrived: rebuild its database, then serve.
     fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>, image: Option<String>) {
         let Some(name) = self.names.get(&obj).cloned() else { return };
+        // A new object (nothing to restore) on a disk nearly full: refused,
+        // as alone (`submit`). One that exists still comes back.
+        let data = match data {
+            Ok(segs) if segs.is_empty() && self.sh.stats.disk_low.load(Relaxed) == 1 => Err("no room for new objects".to_string()),
+            d => d,
+        };
         let path = store::path_for(&self.sh.cfg.data, &name);
         // Its folder; durability here comes from the peers and the bucket.
-        let _ = store::make_dirs(&self.sh.cfg.data, &path);
+        if data.is_ok() {
+            let _ = store::make_dirs(&self.sh.cfg.data, &path);
+        }
         if self.remove_object(&name).is_some() {
             self.sh.stats.objects_live.fetch_sub(1, Relaxed);
         }

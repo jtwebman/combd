@@ -2288,6 +2288,7 @@ mod tests {
             max_objects: 10_000,
             max_awake: 1000,
             stop: Arc::default(),
+            disk_low_forced: Arc::default(),
             sync_delay: Duration::ZERO,
             fleet: None,
             pg: None,
@@ -2777,6 +2778,45 @@ mod tests {
         }
         std::thread::sleep(Duration::from_secs(2));
         assert_eq!(stat(ports[0], "objects_live"), 0, "claimed what a peer merely named");
+    }
+
+    /// A node with its disk nearly full takes no new objects, alone (507)
+    /// or in a fleet (its files are made restoring: a new object, nothing
+    /// to restore, is refused there).
+    #[test]
+    fn a_fleet_node_refuses_new_objects_with_its_disk_nearly_full() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        let low = Arc::new(AtomicBool::new(true));
+        // Control: alone, the floor holds.
+        let (single, ..) = server_app(interp::Interp { max_pages: 16384 }, http::Config { disk_low_forced: low.clone(), ..cfg(&dir.0.join("single"), 1) }, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4));
+        assert!(eventually(2000, || stat(single, "disk_low") == 1));
+        assert_eq!(http(single, "POST", "/do/full/incr", "").0, 507, "single node");
+        // A fleet of one, the same disk.
+        wire::make_certs(&dir.0.join("certs"), 1).unwrap();
+        let wport = free_ports(1)[0];
+        let fc = fleet::FleetCfg {
+            node: 0,
+            lease_ms: 1000,
+            replicas: 0,
+            s3: s3::S3 { bucket: test_bucket(), ..base },
+            peers: HashMap::from([(0, format!("127.0.0.1:{wport}"))]),
+            wire_port: wport,
+            wire_certs: Some(dir.0.join("certs")),
+            insecure: false,
+            upload_ms: 0,
+            upload_bytes: 1 << 20,
+            read_lease: true,
+            regions: HashMap::new(),
+            place_ms: 0,
+        };
+        let (port, ..) = server_app(interp::Interp { max_pages: 16384 }, http::Config { fleet: Some(fc), disk_low_forced: low, ..cfg(&dir.0.join("d0"), 1) }, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4));
+        assert!(eventually(2000, || stat(port, "disk_low") == 1));
+        let (status, body) = http(port, "POST", "/do/full/incr", "");
+        assert!(status != 200 && !store::path_for(&dir.0.join("d0"), "full").exists(), "fleet node: {status} {body}");
     }
 
     /// `placement = "spread"`: objects asked for on one node start across

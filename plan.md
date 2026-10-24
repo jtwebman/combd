@@ -1516,10 +1516,18 @@ objects off their home answered 503 through every other node, and two
 nodes' move hints could bounce a request between them: a forward's hops
 now ride in its frame id's top byte (no wire change; an older node's 0
 reads as one hop), three at most, moves included. `_combd/claim` took any
-peer's word: now only for an object the node said yes to taking. An event
+peer's word: now only for an object the node said yes to taking (that
+stops a stray claim, not a compromised node, which can offer and claim 16
+a window, or just forward a request for any name: see below). An event
 cell's instance holds at most 10,000 things in flight (its timers could
 each ask for 10,000 more). The admin `remove` checks names too (an app
 `blog#vars` was blog's vars).
+
+**Round 3** (attacking round 2's fixes) found the disk floor covered only
+a single node (a fleet makes files restoring): a new object, nothing to
+restore, is refused there too. The hop byte, deleting files on drop (no
+race with a restore or a checkpoint; nothing acknowledged lost), the
+tickets cap, and the admin name checks held.
 
 **Still open (for later rounds):** a tenant's objects, disk, and wakes
 are capped per node, not per tenant: one tenant can fill the node for
@@ -1535,7 +1543,9 @@ bucket writes and storage forever).
   DNS TXT record) before it's claimed.
 - **One compromised node is the whole fleet** today: every node holds the
   bucket's credentials, and mTLS proves "a fleet member", not which one
-  (a node's id is what its heartbeat says). Binding a connection to its
+  (a node's id is what its heartbeat says). It can also make any node
+  claim any object, by forwarding it a request: that's how requests
+  reach owners. Binding a connection to its
   certificate's node pays only with per-node bucket credentials.
 - **The unit's backstop:** `MemoryDenyWriteExecute=yes` (the kernel
   refuses to make writable memory executable: combd has no JIT) and a
