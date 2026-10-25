@@ -80,8 +80,10 @@ and the rest of the plan is updated to match.
    under "Compile on deploy") as the launch post.
    **Done (2026-10-25):** the binary is `combd` (package `combd`; the
    folder is still `spike/`), with `combd help`, and `combd new`, `build`,
-   `dev` for an app; the images keep a `combd-spike` link until the
-   nodes' units and update script use the new name. `combd-sdk`
+   `dev` for an app. The nodes run it as `combd` (their unit and update
+   script moved over 2026-10-25, one at a time); the images keep a
+   `combd-spike` link only for the Windows builder, pulled by hand: once
+   it runs `combd builder`, the link goes (examples/arena/Dockerfile). `combd-sdk`
    (`sdk/rust/`): a Rust crate for apps (`cell!`, `Request`, `Response`,
    `sql::run`, alarms, `call`, `send`, `env`), with no proc macro.
    `docs/quickstart.md`, each step run as written (new, dev, change it,
