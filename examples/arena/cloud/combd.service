@@ -37,6 +37,20 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 SystemCallArchitectures=native
+# A backstop under Wasm's own rules, if a bug ever let code loose in combd:
+# no memory both writable and executable (no JIT here; builds load from
+# files), only the calls a service makes (a call outside them fails, EPERM,
+# and combd goes on), and nothing on the machine it can run but itself, its
+# libraries, and its builds: no shell, no curl. (The filter can't refuse
+# execve: systemd needs it to start combd.)
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+# Each place it can write is a mount of its own, which / doesn't cover:
+# named, or a program dropped there would run. Its builds must load.
+NoExecPaths=/ /tmp /var/tmp /dev/shm /var/lib/combd
+ExecPaths=/opt/combd /usr/lib /usr/lib64 /var/lib/combd/builds
 
 [Install]
 WantedBy=multi-user.target

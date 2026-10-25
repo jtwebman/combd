@@ -135,27 +135,48 @@ impl Builds {
         Ok(b)
     }
 
-    /// This node's build of `wasm`: here already, or from the bucket (its
-    /// signature checked first), or asked for.
+    /// Is `sig` (hex) a trusted builder's signature over this build?
+    fn trusted(&self, m: &str, so: &[u8], sig: &[u8]) -> bool {
+        let msg = signed(&self.pin, &self.cpu, m, so);
+        unhex(String::from_utf8_lossy(sig).trim()).is_some_and(|sig| self.keys.iter().any(|k| UnparsedPublicKey::new(&ED25519, k).verify(&msg, &sig).is_ok()))
+    }
+
+    /// The build of `m` already here, if its signature (kept beside it)
+    /// still checks out: one put there by anything but a fetch, or changed
+    /// since, isn't loaded (and goes, to be fetched again).
+    fn local(&self, m: &str) -> Option<PathBuf> {
+        let (so, sig) = (self.dir.join(format!("{m}.so")), self.dir.join(format!("{m}.so.sig")));
+        let ok = matches!((std::fs::read(&so), std::fs::read(&sig)), (Ok(b), Ok(s)) if self.trusted(m, &b, &s));
+        if !ok {
+            let _ = std::fs::remove_file(&so);
+            let _ = std::fs::remove_file(&sig);
+        }
+        ok.then_some(so)
+    }
+
+    /// This node's build of `wasm`: here already (its signature checked
+    /// again), or from the bucket (checked first), or asked for.
     pub fn fetch(&self, wasm: &[u8]) -> Result<Fetch, String> {
         let m = module_id(wasm);
-        let local = self.dir.join(format!("{m}.so"));
-        if local.exists() {
+        if let Some(local) = self.local(&m) {
             return Ok(Fetch::Ready(local));
         }
+        let local = self.dir.join(format!("{m}.so"));
         let get = |ext: &str| self.s3.get(&key(&self.pin, &self.cpu, &m, ext)).map_err(|e| e.to_string());
         if let Some((err, _)) = get("err")? {
             return Err(format!("module {m} couldn't be built: {}", String::from_utf8_lossy(&err)));
         }
         match (get("so")?, get("sig")?) {
             (Some((so, _)), Some((sig, _))) => {
-                let sig = unhex(String::from_utf8_lossy(&sig).trim()).ok_or("a signature that isn't hex")?;
-                let msg = signed(&self.pin, &self.cpu, &m, &so);
-                if !self.keys.iter().any(|k| UnparsedPublicKey::new(&ED25519, k).verify(&msg, &sig).is_ok()) {
+                if !self.trusted(&m, &so, &sig) {
                     return Err(format!("module {m}: its build isn't signed by a builder this node trusts (COMBD_BUILDER_KEYS)"));
                 }
+                // The signature first: a build is only ever here with it.
                 let tmp = self.dir.join(format!("{m}.so.part"));
-                std::fs::write(&tmp, &so).and_then(|()| std::fs::rename(&tmp, &local)).map_err(|e| format!("{}: {e}", local.display()))?;
+                std::fs::write(self.dir.join(format!("{m}.so.sig")), &sig)
+                    .and_then(|()| std::fs::write(&tmp, &so))
+                    .and_then(|()| std::fs::rename(&tmp, &local))
+                    .map_err(|e| format!("{}: {e}", local.display()))?;
                 Ok(Fetch::Ready(local))
             }
             _ => {
@@ -341,5 +362,41 @@ mod tests {
         assert!(!ok("p", "x86-64-v3", "n", b"so"), "another module");
         assert!(!ok("p", "x86-64-v3", "m", b"os"), "another build");
         assert_eq!(parse_keys(&format!("# builders\n{}\nnot hex\n", hex(&public))), [public]);
+    }
+
+    /// A build already on the node is loaded only with a trusted builder's
+    /// signature beside it, checked again: one dropped there (unsigned),
+    /// changed since, or signed by a key the node doesn't trust, isn't, and
+    /// goes.
+    #[test]
+    fn a_build_on_disk_loads_only_if_its_signature_still_checks() {
+        let dir = crate::store::tempdir::Dir::new();
+        let public = unhex(&new_key(&dir.0.join("k")).unwrap()).unwrap();
+        let k = load_key(&dir.0.join("k")).unwrap();
+        let s3 = S3 { pool: Default::default(), host: "unused".into(), tls: false, bucket: "unused".into(), key: String::new(), secret: String::new(), region: "us-east-1".into() };
+        let b = Builds { s3, dir: dir.0.join("builds"), keys: vec![public], pin: "p".into(), cpu: "generic".into() };
+        std::fs::create_dir_all(&b.dir).unwrap();
+        let put = |so: &[u8], sig: Option<String>| {
+            std::fs::write(b.dir.join("m.so"), so).unwrap();
+            match sig {
+                Some(s) => std::fs::write(b.dir.join("m.so.sig"), s).unwrap(),
+                None => drop(std::fs::remove_file(b.dir.join("m.so.sig"))),
+            }
+        };
+        let good = hex(k.sign(&signed("p", "generic", "m", b"so")).as_ref());
+        put(b"so", None);
+        assert!(b.local("m").is_none(), "unsigned");
+        assert!(!b.dir.join("m.so").exists(), "and gone");
+        put(b"evil", Some(good.clone()));
+        assert!(b.local("m").is_none(), "changed since it was signed");
+        let stranger = load_key(&{
+            new_key(&dir.0.join("k2")).unwrap();
+            dir.0.join("k2")
+        })
+        .unwrap();
+        put(b"so", Some(hex(stranger.sign(&signed("p", "generic", "m", b"so")).as_ref())));
+        assert!(b.local("m").is_none(), "a builder it doesn't trust");
+        put(b"so", Some(good));
+        assert_eq!(b.local("m"), Some(b.dir.join("m.so")));
     }
 }

@@ -36,6 +36,7 @@ mod wire;
 mod ws;
 mod manifest;
 mod pg;
+mod policy;
 mod pool;
 #[cfg(test)]
 mod spectest;

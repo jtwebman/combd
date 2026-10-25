@@ -47,7 +47,13 @@ const SNAP_EVERY: u64 = 100;
 ///
 /// A pool's manager (`#pool/`, see `pg.rs`) goes up one epoch at a time: a
 /// claim is "epoch e + 1, if it's still e", so of two at once, one wins.
+/// Then the policy hook (`policy::catalog_write`), for a service's rules.
 pub fn check(s: &State, e: &Entry) -> Result<(), String> {
+    rules(s, e)?;
+    crate::policy::catalog_write(s, e)
+}
+
+fn rules(s: &State, e: &Entry) -> Result<(), String> {
     if e.app.contains("#pool/") {
         let cur = s.apps.get(&e.app).and_then(|v| crate::pg::manager_of(v)).map_or(0, |m| m.1);
         return match crate::pg::manager_of(&e.value) {
@@ -158,7 +164,7 @@ impl CatNode {
                     waiting.push((id, reply));
                     core.on(Event::Submit { write: id, entry: e })
                 }
-                Ok(In::Push(seq, entry)) => core.on(Event::Push { seq, entry }),
+                Ok(In::Push(seq, _)) => core.on(Event::Push { seq }),
                 Ok(In::Reply(op, res)) => core.on(Event::Reply { op, res }),
                 Err(RecvTimeoutError::Timeout) => core.on(Event::Tick),
                 Err(RecvTimeoutError::Disconnected) => return,

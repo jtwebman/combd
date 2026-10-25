@@ -1529,27 +1529,50 @@ restore, is refused there too. The hop byte, deleting files on drop (no
 race with a restore or a checkpoint; nothing acknowledged lost), the
 tickets cap, and the admin name checks held.
 
-**Still open (for later rounds):** a tenant's objects, disk, and wakes
-are capped per node, not per tenant: one tenant can fill the node for
-everyone, or trip its overload refusal (quotas per org: objects, bytes,
-awake cells). No bucket-write budget yet (each object a tenant makes is
-bucket writes and storage forever).
+**Still open (for later rounds):** no bucket-write budget yet (each object
+made is bucket writes, and storage forever: an app that lets anyone name
+objects pays for that).
+
+**Decided (JT, 2026-10-24): combd runs your own apps; a service is a
+fork.** No built-in policy between tenants: which org may claim which
+domain (any org with a deploy token can claim any domain not taken), and
+quotas per tenant (objects, bytes, awake cells), are a service's rules,
+written into the hooks in `spike/src/policy.rs` (`catalog_write`: every
+deploy, vars, secret, removal; `new_object`: every object about to start
+on a node), which allow everything as shipped. combd keeps only what
+keeps a node up: two apps can't hold one domain, the disk floor, the
+memory guard. Placement's modes go the same way next: a `policy::home`
+that `place()` asks, the built-ins its default; the hand-off, the
+target's "no", and the two-window guard stay combd's.
 
 **Decisions it left (JT's):**
-- **Domains per org.** Any org with a deploy token can claim any domain
-  first, fleet-wide, and lock its owner out. Either the token issuer is
-  trusted to only issue tokens to orgs that own their domains (as now),
-  or the cluster keeps an org -> domains list, or a domain is proven (a
-  DNS TXT record) before it's claimed.
 - **One compromised node is the whole fleet** today: every node holds the
   bucket's credentials, and mTLS proves "a fleet member", not which one
   (a node's id is what its heartbeat says). It can also make any node
   claim any object, by forwarding it a request: that's how requests
   reach owners. Binding a connection to its
   certificate's node pays only with per-node bucket credentials.
-- **The unit's backstop:** `MemoryDenyWriteExecute=yes` (the kernel
-  refuses to make writable memory executable: combd has no JIT) and a
-  `SystemCallFilter`; to try on one node first.
+- **The unit's backstop: done (2026-10-24, on all three nodes).**
+  `MemoryDenyWriteExecute=yes` (no memory both writable and executable:
+  combd has no JIT, its builds load from files), `SystemCallFilter=
+  @system-service ~@privileged` (others fail with EPERM; denying execve
+  there stopped systemd starting combd at all), and `NoExecPaths=` every
+  place it can write (`/`, `/tmp`, `/var/tmp`, `/dev/shm`, its data: each
+  is a mount of its own that `/` doesn't cover, found by running a
+  program from each), `ExecPaths=` its binary, libraries, and builds.
+  Checked on each node: nothing runs from /usr/bin or anywhere it writes
+  but builds; builds map and load. `systemd-analyze security`: 3.3 -> 1.8.
+  And a build on disk loads only if its signature, kept beside it, still
+  checks against a trusted builder's key (it was checked once, fetching:
+  anything that could write the folder could plant one for the next
+  restart). Left, as the kernel sees it: builds is writable and
+  runnable, so code already loose in combd could drop a program there and
+  start it (the kernel checks no signatures).
+- **Maybe: a syscall filter combd installs itself once it has started**
+  (seccomp, e.g. `seccompiler`, in a small crate of its own: the main one
+  forbids `unsafe`), refusing `execve` outright, which the unit can't do
+  (systemd needs it to start combd). Closes the last way to run another
+  program; little to gain while that already takes code loose in combd.
 - **Builders isolated:** a builder runs rustc over Rust made from a
   stranger's module; it should hold no bucket credentials it doesn't
   need, and its key in a file rustc can't name.

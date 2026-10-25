@@ -93,7 +93,8 @@ pub enum Effect {
 pub enum Event {
     Submit { write: WriteId, entry: Entry },
     Reply { op: OpId, res: Res },
-    Push { seq: Seq, entry: Entry },
+    /// The log grew to `seq` (another node wrote it): news, not the entry.
+    Push { seq: Seq },
     /// Look at the bucket in case a push was missed (the slow backstop).
     Tick,
     /// Write a snapshot of this node's copy, then trim the log under it.
@@ -193,7 +194,7 @@ impl Catalog {
                     self.reply(w, res);
                 }
             }
-            Event::Push { seq, .. } => {
+            Event::Push { seq } => {
                 if seq > self.copy.at {
                     self.catch_up(false);
                 }
@@ -441,13 +442,13 @@ mod tests {
         }
     }
     /// A push from another node is news, not truth: the node reads the
-    /// bucket, and what the push carried never lands (a peer could claim
-    /// another app's domain with it, and knock the node out of step).
+    /// bucket (what a push carries isn't even handed to the core: a peer
+    /// could claim another app's domain with it, or knock the node out of
+    /// step).
     #[test]
     fn a_push_is_only_news() {
         let mut c = Catalog::new(State::default(), Box::new(|_: &State, _: &Entry| Ok(())), Bugs::default());
-        let forged = Entry { id: 1, app: "evil/phish".into(), value: br#"{"version":"v1","domains":["shop.test"]}"#.to_vec() };
-        let fx = c.on(Event::Push { seq: 1, entry: forged });
+        let fx = c.on(Event::Push { seq: 1 });
         assert_eq!(c.copy, State::default(), "nothing applied");
         assert!(fx.iter().any(|f| matches!(f, Effect::Call { call: Call::Get(k), .. } if k == SNAP_KEY)), "it catches up from the bucket");
     }

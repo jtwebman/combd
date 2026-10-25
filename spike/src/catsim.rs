@@ -262,7 +262,7 @@ impl Sim {
                     }
                 }
                 Msg::Push { node, seq, entry } => {
-                    let fx = self.nodes[node].core.on(Event::Push { seq, entry });
+                    let fx = self.nodes[node].core.on(Event::Push { seq });
                     self.effects(node, fx);
                 }
                 Msg::Submit { node } => {

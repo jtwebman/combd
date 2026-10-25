@@ -4335,9 +4335,15 @@ impl<E: Engine> Loop<'_, E> {
                 return; // dropped while its request waited; the core failed it
             }
             let path = store::path_for(&self.sh.cfg.data, &name);
-            if !path.exists() && self.sh.stats.disk_low.load(Relaxed) == 1 {
-                let _ = self.deliver(origin, (507, "{\"error\":\"no room for new objects\"}".into()));
-                return;
+            if !path.exists() {
+                if self.sh.stats.disk_low.load(Relaxed) == 1 {
+                    let _ = self.deliver(origin, (507, "{\"error\":\"no room for new objects\"}".into()));
+                    return;
+                }
+                if let Err(why) = crate::policy::new_object(&name) {
+                    let _ = self.deliver(origin, (403, serde_json::json!({ "error": why }).to_string()));
+                    return;
+                }
             }
             let dirs = if path.exists() { Ok(vec![]) } else { store::make_dirs(&self.sh.cfg.data, &path) };
             let db = match dirs.and_then(|d| Db::open(&path).map(|db| (db, d)).map_err(std::io::Error::other)) {
@@ -4664,10 +4670,12 @@ impl<E: Engine> Loop<'_, E> {
     /// An object's segments arrived: rebuild its database, then serve.
     fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>, image: Option<String>) {
         let Some(name) = self.names.get(&obj).cloned() else { return };
-        // A new object (nothing to restore) on a disk nearly full: refused,
-        // as alone (`submit`). One that exists still comes back.
+        // A new object (nothing to restore) on a disk nearly full, or one
+        // the policy refuses (`policy::new_object`): refused, as alone
+        // (`submit`). One that exists still comes back.
         let data = match data {
             Ok(segs) if segs.is_empty() && self.sh.stats.disk_low.load(Relaxed) == 1 => Err("no room for new objects".to_string()),
+            Ok(segs) if segs.is_empty() => crate::policy::new_object(&name).map(|()| segs),
             d => d,
         };
         let path = store::path_for(&self.sh.cfg.data, &name);
