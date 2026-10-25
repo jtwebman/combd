@@ -50,12 +50,11 @@ bug in our fast-write design, and the simulator found one the spec
 couldn't see. Both were fixed before any real node ran that code.
 
 **Reviewed for security in rounds.** Reviewers (an AI model, one per
-surface, each in its own copy of the code) attacked the
-compiler and builder, the interpreter and host calls, the public edge, and
-the wire between nodes, each proving findings with a failing test. We
-fixed what they confirmed, and the next round attacked the fixes. What they
-found and what changed is written up in the plan, including what is still
-open.
+surface, each in its own copy of the code) attacked the compiler and
+builder, the interpreter and host calls, the public edge, and the wire
+between nodes, each proving findings with a failing test. We fixed what
+they confirmed, and the next round attacked the fixes. What they found and
+what changed is written up in the plan, including what is still open.
 
 **Small.** A sleeping WebSocket session is about 2 KB in combd. A whole
 idle connection, socket and kernel included, is about 6 KB.
@@ -95,15 +94,15 @@ Clicking pages, one CPU:
 | 20,000 | 445,000 changes a second, p99 under 0.9 s, nothing lost, 440 MB, 82% CPU | killed for memory | couldn't open the pages |
 
 Where workerd held on, it kept up: at 1,000 pages it delivered the same
-changes as combd, nearly as fast. What ended it was memory. An open page costs
-it 20 to 50 times what it costs combd.
+changes as combd, nearly as fast. What ended it was memory. An open page
+costs it 20 to 50 times what it costs combd.
 
 There's a design reason for part of this, and it's worth saying plainly.
 On Workers, a WebSocket belongs to the object that accepted it. A chunk
 can't write to a page's socket; it has to call the object holding it.
-combd lets a chunk send straight to its watchers' sockets, without
-waking the sessions that hold them. We measured two ways to write the Workers version,
-and both are in the repository.
+combd lets a chunk send straight to its watchers' sockets, without waking
+the sessions that hold them. We measured two ways to write the Workers
+version, and both are in the repository.
 
 We also estimated what the same load would cost on Cloudflare, from its
 published prices (we deployed nothing there). At 10,000 clicking pages
@@ -111,8 +110,7 @@ it's about $2.80 an hour with the cheaper design and about $34 an hour
 with an object per socket, where each push is a billed call. combd ran
 that load in a box the size of a $6-a-month droplet, with over 40% of its
 CPU free. Cloudflare wouldn't fall over at this load: it spreads objects
-across many machines. That's
-what you pay it for.
+across many machines. That's what you pay it for.
 
 ## What these numbers don't say
 
@@ -139,7 +137,7 @@ what you pay it for.
 
 ## Try it
 
-Start with the quickstart: [docs/quickstart.md](TODO-QUICKSTART-LINK).
+Start with the quickstart: [combd in ten minutes](../docs/quickstart.md).
 
 Everything here is in the repository: the plan with what building taught
 us, every measurement with how it was made, the specs, and the race

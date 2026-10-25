@@ -71,6 +71,24 @@ and the rest of the plan is updated to match.
    `combd-spike`), releases for Linux and Mac, a 10-minute quickstart,
    and the race against celld, workerd, and Cloudflare (queued below,
    under "Compile on deploy") as the launch post.
+   **Done (2026-10-25):** the binary is `combd` (package `combd`; the
+   folder is still `spike/`), with `combd help`, and `combd new`, `build`,
+   `dev` for an app; the images keep a `combd-spike` link until the
+   nodes' units and update script use the new name. `combd-sdk`
+   (`sdk/rust/`): a Rust crate for apps (`cell!`, `Request`, `Response`,
+   `sql::run`, alarms, `call`, `send`, `env`), with no proc macro.
+   `docs/quickstart.md`, each step run as written (new, dev, change it,
+   serve-apps). `.github/workflows/release.yml`: Linux x86_64 and arm64,
+   macOS arm64 and x86_64; a `v*` tag makes a draft release (all four
+   built and ran on GitHub's runners). The race (`bench/click/`, one
+   command; RESULTS.md, "The click race"): on one CPU and 1 GB, combd
+   held ~156,000 idle pages to workerd's and celld's 3,000 to 6,000, and
+   20,000 clicking pages with none lost, where they were killed for memory
+   by 5,000 to 10,000. The post: `launch/post.md`, a draft for JT. Left: a
+   first tag (JT), `combd-sdk` on crates.io, the `spike/` folder's name,
+   and what the race found in combd: pages arriving ~14,000 a second
+   outran the memory guard (killed for memory, 2 of 4 tries; at 1,000 a
+   second it refused cleanly).
 6. **The X clone on Postgres**, v0.1's last item.
 7. **JavaScript: `@combd/js`**, a Workers-compatible library over
    combd's host (`fetch` handler, Request/Response, `DurableObject`,

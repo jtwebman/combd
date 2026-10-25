@@ -20,16 +20,16 @@ RUN rm -rf examples/million/app/modules && examples/million/build.sh
 # A build is found by its module's id: the first 16 bytes of its SHA-256.
 RUN mkdir /aot && cd spike && for m in million viewer; do \
       w=../examples/million/app/modules/$m.wasm; \
-      ./target/release/combd-spike aot-build $w /aot/$(sha256sum $w | cut -c1-32).so; \
+      ./target/release/combd aot-build $w /aot/$(sha256sum $w | cut -c1-32).so; \
     done && ls -la /aot
 
 FROM debian:bookworm-slim AS combd
-COPY --from=combd-build /combd/spike/target/release/combd-spike /usr/local/bin/combd-spike
+COPY --from=combd-build /combd/spike/target/release/combd /usr/local/bin/combd
 COPY --from=combd-build /combd/examples/million/app /app
 COPY --from=combd-build /aot /aot
 ENV MALLOC_MMAP_THRESHOLD_=131072 MALLOC_MMAP_MAX_=4000000
 ENV COMBD_AOT_DIR=/aot COMBD_DATA=/tmp/data COMBD_THREADS=1 COMBD_MAX_CONNS=1000000
-CMD ["combd-spike", "serve-app", "both", "/app", "8080"]
+CMD ["combd", "serve-app", "both", "/app", "8080"]
 
 # The Workers version (examples/million-workers), with million's own page.
 FROM node:24.21.0-slim AS workerd

@@ -33,7 +33,7 @@ docker network create $NET >/dev/null 2>&1
 # client <k> <pages> <max clicks> <max gap s>: one ws-click container, cli<k>.
 client() {
     docker run -d --name cli$1 --network $NET --ulimit nofile=1048576:1048576 \
-        bench-click-combd combd-spike ws-click srv:8080 million.localhost /ws "$2" - "$3" "$4" >/dev/null
+        bench-click-combd combd ws-click srv:8080 million.localhost /ws "$2" - "$3" "$4" >/dev/null
 }
 stop_all() {
     docker ps -aq --filter name='^cli[0-9]' | xargs docker rm -f >/dev/null 2>&1
@@ -123,7 +123,7 @@ idle() {
     done
     # Still serving? A new page must get its echo.
     if up; then
-        docker run -d --name cli0 --network $NET bench-click-combd combd-spike ws-click srv:8080 million.localhost /ws 1 - 1 1 >/dev/null
+        docker run -d --name cli0 --network $NET bench-click-combd combd ws-click srv:8080 million.localhost /ws 1 - 1 1 >/dev/null
         sleep 15
         if docker logs cli0 2>&1 | grep -q 'clicks 1 .*lost 0'; then why="$why; a new page works"; else why="$why; a new page got no echo in 15 s"; fi
     fi
