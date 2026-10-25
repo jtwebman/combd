@@ -1,0 +1,14 @@
+{
+  "name": "million",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-09-01",
+  "rules": [{ "type": "Text", "globs": ["**/*.html"] }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "CHUNK", "class_name": "Chunk" },
+      { "name": "BOXES", "class_name": "Boxes" },
+      { "name": "VIEWER", "class_name": "Viewer" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chunk", "Boxes", "Viewer"] }]
+}
