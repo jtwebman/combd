@@ -2811,3 +2811,60 @@ What this doesn't cover:
   production mode (a bucket and peers) wasn't measured.
 - **No TLS, no latency to Cloudflare.** Echo times here are all on one
   machine; the 150 ms beat is the floor for all three.
+
+## On the fleet: moves, and refusing at TCP (2026-10-25)
+
+The live fleet (three $6 nodes: n0 nyc3, n1 fra1, n2 sgp1; million
+compiled), loaded from droplets in nyc3 with `ws-click` (pages that click
+in their first minutes, then hold their socket and renew what they watch).
+
+**Moves (placement, `nearest`).** With every chunk live on n0 and both
+clients (1,000 pages) sending through n1, n0 handed n1 **16 chunks at the
+end of its second 30-minute window** (07:43), exactly the most a node takes
+in a window (`MOVES_IN`). The rest didn't wait for the next windows: the
+overload below put n0 under pressure, where it let idle chunks go (858
+times), and n1 claimed each with the next request through it. By 08:01, 60
+chunks lived on n1 and 4 on n0, and later windows moved nothing more. What
+moved them was each page's subscription renewal
+(every 20 s): `ws-click` clicks only in its first minutes, so no clicks
+were in flight at a move, and this run says nothing about losing one (the
+simulator's `moves_keep_every_invariant` does).
+
+**Overload: refusing at TCP.** Four more droplets, 32,000 more pages, all
+at n0's address:
+
+| Time | Sessions on n0 | Memory | Pressure | Refusing at TCP |
+|---|---|---|---|---|
+| +0:08 | 2,884 | 148 MB | 0 | no |
+| +2:15 | 20,930 | 273 MB | 0 | no |
+| +3:05 | 29,344 | 421 MB | 1 | yes |
+| +4 to +11 min | 29,500 to 29,576 | 450 to 540 MB (of a 550 MB budget) | 2 | yes |
+
+n0 held about 29,500 clicking pages (as the single node did, 2026-10-22),
+never restarted, and turned the rest away at TCP: only 8 connections were
+accepted and closed, all in the seconds it filled. From outside, `curl
+https://million.combd.dev/` once a second for ten minutes: once n0 was
+refusing, **439 of 441 answered from n1** (curl tried the name's next
+address by itself, as a browser does; 0.54 s on average), one was served by
+n0 itself and one failed (`000`), both in a second when n0 listened again
+and filled at once (`REFUSE_MIN`: a full node listens again after a second,
+takes one more, and hangs up on it). Over the ten minutes, 597 of 600
+answered. Load off, n0 was listening again within 30 s.
+
+**What the first try found: a cold start in a storm.** The first run began
+with every chunk idle since the soak, all 64 claimed by n0 at once under
+1,000 new sockets. Their restores pulled long histories from the bucket
+together: fetches timed out (`os error 11`), and n0 went to 490 MB, then
+pressure 1, where an object idle for a second is let go. So the chunks
+went, came back, and went: 3,639 opened and as many evicted in 17 minutes,
+and 29 times a chunk trapped (its own panic) in the middle of that. After a
+restart, the same load: 170 to 185 MB, 65 objects live, none evicted, no
+trap. (We blamed the new syscall filter first; with it and without it, after
+a restart, both were clean. It was the start, not the filter.) What it
+asks for, with "cheap cold wakes": a cap on restores at once, an object used
+in the last second not let go for memory, and a trapped object's reason in
+the log.
+
+**Not covered:** the browsers here are `curl` and `ws-click`, not browsers;
+one overload, from one region; moves of chunks only (no sessions move: they
+live where their sockets are).
