@@ -85,6 +85,11 @@ and workerd started through `npx`.
   on celld (CPU 50% against 58%), and 1.0 s against 2.1 s on workerd
   (15% against 17%). At 5,000 celld lost clicks either way (11% and 5%:
   past its limit, the runs are noisy). Kept.
+- **Watchers on disk.** At 10 clicking pages, workerd lost a third of the
+  clicks: a chunk with nothing to do is evicted after 10 s, forgetting its
+  watchers, and a Hub renews only every 20 s. A chunk now keeps who's
+  watching in its SQLite (a row a Hub or Viewer; renewals write nothing),
+  and nothing was lost after (the race's numbers are all with this).
 - **How many Hubs.** At 5,000 clicking pages (60 s): one Hub, workerd
   p50 382 ms / p99 1.6 s at 50% CPU and 524 MB, celld p50 1.8 s / p99
   8.9 s, 0.02% lost, 80% CPU; four Hubs (the table above, and a second

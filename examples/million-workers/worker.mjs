@@ -95,8 +95,13 @@ export class Chunk extends DurableObject {
       this.bits[i >> 3] |= 1 << (i & 7);
       this.checked++;
     }
-    /** Hubs and Viewers watching, by id: until when, a stub, and if a Hub. */
+    /** Hubs and Viewers watching, by id: until when, a stub, and if a Hub.
+     * Who (not until when) is on disk too: an idle chunk is evicted after
+     * 10 s on workerd, and its watchers' next renewal may be 20 s away. */
+    this.sql.exec('CREATE TABLE IF NOT EXISTS subs (id TEXT PRIMARY KEY, hub INTEGER)');
     this.subs = new Map();
+    const until = Date.now() + SUB_MS;
+    for (const { id, hub } of this.sql.exec('SELECT id, hub FROM subs')) this.watch(id, !!hub, until);
     this.pruned = 0;
     /** Every box, as a new watcher gets it: built again only after a change. */
     this.all = null;
@@ -129,21 +134,26 @@ export class Chunk extends DurableObject {
     this.learn(n);
     const now = Date.now();
     if (now - this.pruned >= PRUNE_MS) {
-      for (const [k, s] of this.subs) if (s.until <= now) this.subs.delete(k);
+      for (const [k, s] of this.subs) if (s.until <= now) this.unsub(k);
       this.pruned = now;
     }
     const s = this.subs.get(id);
     if (s) s.until = now + SUB_MS;
     else {
-      const ns = hub ? this.env.HUB : this.env.VIEWER;
-      this.subs.set(id, { until: now + SUB_MS, stub: ns.get(ns.idFromString(id)), hub });
+      this.watch(id, hub, now + SUB_MS);
+      this.sql.exec('INSERT OR REPLACE INTO subs (id, hub) VALUES (?, ?)', id, hub ? 1 : 0);
     }
     if (s && !want) return null;
     return hub ? this.bits.slice() : this.snapshot();
   }
 
+  watch(id, hub, until) {
+    const ns = hub ? this.env.HUB : this.env.VIEWER;
+    this.subs.set(id, { until, stub: ns.get(ns.idFromString(id)), hub });
+  }
+
   unsub(id) {
-    this.subs.delete(id);
+    if (this.subs.delete(id)) this.sql.exec('DELETE FROM subs WHERE id = ?', id);
   }
 
   /** Watch over a socket (SESSIONS = "worker"): every box, then each change. */
