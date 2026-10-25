@@ -60,3 +60,23 @@ COPY --from=esbuild /vars-object ./.dev.vars
 
 FROM celld AS celld-worker
 COPY --from=esbuild /vars-worker ./.dev.vars
+
+# million on the BEAM (examples/million-phoenix): Bandit, Plug and WebSock,
+# a release built and run in the same pinned image.
+FROM elixir:1.20.4-otp-28 AS phoenix-build
+ENV MIX_ENV=prod
+WORKDIR /src
+RUN mix local.hex --force && mix local.rebar --force
+COPY examples/million-phoenix/mix.exs examples/million-phoenix/mix.lock ./
+RUN mix deps.get --only prod && mix deps.compile
+COPY examples/million-phoenix/lib lib
+COPY examples/million-phoenix/rel rel
+COPY examples/million/client/index.html priv/index.html
+RUN mix release
+
+FROM elixir:1.20.4-otp-28 AS phoenix
+COPY --from=phoenix-build /src/_build/prod/rel/million /app
+# No distribution (no epmd): one node, nothing to connect to.
+# Modules load as first used, not all at boot (26 MB less code in memory).
+ENV RELEASE_DISTRIBUTION=none RELEASE_MODE=interactive MILLION_DATA=/tmp/data PORT=8080
+CMD ["/app/bin/million", "start"]

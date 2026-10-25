@@ -1,0 +1,14 @@
+## The VM for many sockets on one CPU (the race's box: 1 CPU, 1 GB).
+
+## Processes (one per socket) and ports (sockets), sized to the box: a GB
+## holds tens of thousands of sockets, not millions, and both tables are
+## allocated whole at boot (the defaults, 1,048,576 processes and 65,536
+## ports, are too big and too small).
++P 262144
++Q 262144
+## One scheduler, for one CPU.
++S 1:1
+## No busy-waiting when idle: spinning schedulers burn the CPU quota.
++sbwt none
++sbwtdcpu none
++sbwtdio none
