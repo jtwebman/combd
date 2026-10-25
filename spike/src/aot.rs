@@ -42,6 +42,8 @@ impl Mem for SliceMem<'_> {
 struct AotHost {
     imports: Vec<Import>,
     st: HostState,
+    // Read only by the guard build's fibers (a call parked mid-run).
+    #[cfg_attr(not(feature = "aot-guard"), allow(dead_code))]
     mail: Arc<Mutex<Mail>>,
 }
 
@@ -108,14 +110,17 @@ type Ran = (Ctx, AotMem, Option<Result<Vec<u64>, combd_aot::rt::Trap>>);
 
 /// Compiled-cell ticks per interpreter reduction. A run of 2,500 reductions is
 /// about 50 us either way.
+#[cfg(feature = "aot-guard")]
 const TICKS_PER_REDUCTION: i64 = 20;
 
 /// `COMBD_NO_YIELD=1` turns pausing off (run each call to the end), to compare.
+#[cfg(feature = "aot-guard")]
 fn no_yield() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("COMBD_NO_YIELD").is_some())
 }
 
+#[cfg(feature = "aot-guard")]
 fn slice_for(reductions: u32) -> i64 {
     if reductions == u32::MAX || no_yield() { i64::MAX } else { reductions as i64 * TICKS_PER_REDUCTION }
 }

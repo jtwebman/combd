@@ -36,6 +36,7 @@
 use crate::own::*;
 use std::collections::{BTreeMap, HashMap};
 
+#[cfg(test)]
 /// Fuzzing: `good`, damaged 1 to 4 ways at random (a bit flipped, cut
 /// short, a byte added, a huge length pasted in).
 pub fn mangle(rng: &mut Rng, good: &[u8]) -> Vec<u8> {
@@ -972,6 +973,7 @@ fn parse_part(k: &str, part: &str) -> Option<(Obj, u32)> {
     }
 }
 
+#[cfg(test)]
 /// Run `seeds` seeds; the first failing seed and why.
 pub fn run_many(seeds: std::ops::Range<u64>, replicas: usize, bugs: Bugs) -> (Stats, Option<(u64, String)>) {
     run_with(seeds, &|| Settings { replicas, bugs, ..Settings::default() })

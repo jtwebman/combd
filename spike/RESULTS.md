@@ -2868,3 +2868,46 @@ the log.
 **Not covered:** the browsers here are `curl` and `ws-click`, not browsers;
 one overload, from one region; moves of chunks only (no sessions move: they
 live where their sockets are).
+
+## The memory guard under a burst, and cold starts (2026-10-25)
+
+**The burst.** The race saw pages arriving ~14,000 a second outrun the
+guard (killed for memory, 2 of 4 tries). `bench/click/burst.sh` repeats it:
+one CPU and 1 GB, no swap, six clients opening idle pages as fast as they
+can for a minute, and it reads what the kernel can't take back (combd's
+own memory plus the kernel's, socket buffers mostly), the cgroup's peak,
+and whether it was killed. Six tries each, alternating:
+
+| | Unreclaimable peak | cgroup peak (of 1,024 MiB) | Connections held | Killed |
+|---|---|---|---|---|
+| before (8e04713) | 950 to 959 MiB | 978 to 1,024 (at the limit in 2 of 6) | 161,281 to 162,536 | 0 of 6 |
+| after | 906 to 913 MiB | 926 to 984 | 152,060 to 153,414 | 0 of 6 |
+
+What changed: the node measures its memory every 64 accepts, not only once
+a sweep (a second); under pressure a session freezes as soon as its event
+is done, not after the hibernate delay; and the lines moved down, reclaim
+at 80% of the budget and refuse at 90% (until back under 85%), from 85 and
+95. The A/B of each alone (earlier sets): measuring on accept alone was
+still killed 2 of 3 tries; measuring and freezing, killed 0 of 8 but at the
+same peaks. The margin is what did it: at ~160,000 sockets, a third of the
+cgroup is the kernel's, which combd can't see until it's spent. The price:
+about 5.5% fewer idle pages held (153,000, not 162,000). The machine's own
+check keeps its lines (85, 95): it already keeps a tenth of the machine
+back.
+
+**Cold starts in a storm** ("On the fleet", above). Restores now wait
+their turn, `COMBD_RESTORES_AT_ONCE` (4) at a time; an object under
+pressure is let go after 10 s idle (`SQUEEZED_IDLE`), not 1 s, so it isn't
+evicted while its neighbors are still coming back; and a trapped object's
+log line carries what the guest printed (a Rust panic's message, through
+`combd-sdk`'s panic hook). The A/B (`cold_start_in_a_storm`, ignored by
+default: 64 objects with 200 writes each, all woken at once) didn't
+reproduce the fleet's failure: with no cap, all 64 back in 560 ms, none
+failed, +13 MB; capped at 4, 314 ms, none failed, +12 MB. The local bucket
+answers in microseconds, and the fleet's was R2 across an ocean with
+512 GETs at once. So the cap is the cheap, safe call, and the fleet is
+where it gets proven.
+
+**The flaky test.** `fuzz_host`'s cost checks timed host calls by the wall
+clock and failed when the machine was busy; they use the thread's CPU time
+now (passed 3 of 3 under 20 busy loops).

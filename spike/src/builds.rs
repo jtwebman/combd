@@ -115,8 +115,8 @@ pub struct Builds {
 }
 
 pub enum Fetch {
-    /// The build, checked, on disk.
-    Ready(PathBuf),
+    /// The build, checked, on disk (`aot::built` loads it).
+    Ready,
     /// Not built yet: the job is in.
     Building,
 }
@@ -158,8 +158,8 @@ impl Builds {
     /// again), or from the bucket (checked first), or asked for.
     pub fn fetch(&self, wasm: &[u8]) -> Result<Fetch, String> {
         let m = module_id(wasm);
-        if let Some(local) = self.local(&m) {
-            return Ok(Fetch::Ready(local));
+        if self.local(&m).is_some() {
+            return Ok(Fetch::Ready);
         }
         let local = self.dir.join(format!("{m}.so"));
         let get = |ext: &str| self.s3.get(&key(&self.pin, &self.cpu, &m, ext)).map_err(|e| e.to_string());
@@ -177,7 +177,7 @@ impl Builds {
                     .and_then(|()| std::fs::write(&tmp, &so))
                     .and_then(|()| std::fs::rename(&tmp, &local))
                     .map_err(|e| format!("{}: {e}", local.display()))?;
-                Ok(Fetch::Ready(local))
+                Ok(Fetch::Ready)
             }
             _ => {
                 want(&self.s3, &self.pin, &self.cpu, wasm)?;

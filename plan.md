@@ -70,10 +70,13 @@ and the rest of the plan is updated to match.
    then `pin` with areas and a fallback, and `policy::home`, the hook a
    fork writes its own placement in. Seen on the fleet (2026-10-25):
    million's chunks moved to the node their traffic came through, 16 at
-   a window (`MOVES_IN`). Left: cold starts in a storm (RESULTS.md: all of
-   a node's objects restored at once ran it out of memory, and pressure's
-   1 s eviction made it churn); a cap on restores at once, and no
-   eviction of an object used a second ago.
+   a window (`MOVES_IN`). Cold starts in a storm (all of a node's objects
+   restored at once ran it out of memory, and pressure's 1 s eviction made
+   it churn): built (2026-10-25), restores 4 at a time
+   (`COMBD_RESTORES_AT_ONCE`), 10 s idle before an object is let go for
+   memory, a trap's reason in the log. Left: see it on the fleet (the
+   local bucket is too fast to reproduce it; RESULTS.md, "The memory guard
+   under a burst").
 5. **Getting ready to tell people:** a real `combd` binary (not
    `combd-spike`), releases for Linux and Mac, a 10-minute quickstart,
    and the race against celld, workerd, and Cloudflare (queued below,
@@ -96,8 +99,11 @@ and the rest of the plan is updated to match.
    by 5,000 to 10,000. The post: `launch/post.md`, a draft for JT. Left: a
    first tag (JT), `combd-sdk` on crates.io, the `spike/` folder's name,
    and what the race found in combd: pages arriving ~14,000 a second
-   outran the memory guard (killed for memory, 2 of 4 tries; at 1,000 a
-   second it refused cleanly).
+   outran the memory guard (killed for memory, 2 of 4 tries): fixed
+   (2026-10-25: measured on accept, sessions freeze at once under
+   pressure, reclaim at 80% and refuse at 90%; 0 kills in 6 bursts, the
+   cgroup's peak never at its limit; RESULTS.md, "The memory guard under a
+   burst").
 6. **The X clone on Postgres**, v0.1's last item.
 7. **JavaScript: `@combd/js`**, a Workers-compatible library over
    combd's host (`fetch` handler, Request/Response, `DurableObject`,

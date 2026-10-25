@@ -31,7 +31,7 @@ pub struct Stats {
 
 enum Msg {
     Reply { node: usize, life: u64, op: OpId, res: Res },
-    Push { node: usize, seq: Seq, entry: Entry },
+    Push { node: usize, seq: Seq },
     Submit { node: usize },
     Tick { node: usize },
     Snapshot { node: usize },
@@ -183,7 +183,7 @@ impl Sim {
                     let d = self.latency();
                     self.at(d, Msg::Reply { node, life, op, res });
                 }
-                Effect::Push { seq, entry } => {
+                Effect::Push { seq, .. } => {
                     for to in (0..self.nodes.len()).filter(|&t| t != node) {
                         if self.faults() && self.rng.chance(0.2) {
                             continue; // lost
@@ -191,7 +191,7 @@ impl Sim {
                         let copies = if self.rng.chance(0.1) { 2 } else { 1 };
                         for _ in 0..copies {
                             let d = 1 + self.rng.below(100);
-                            self.at(d, Msg::Push { node: to, seq, entry: entry.clone() });
+                            self.at(d, Msg::Push { node: to, seq });
                         }
                     }
                 }
@@ -261,7 +261,7 @@ impl Sim {
                         self.effects(node, fx);
                     }
                 }
-                Msg::Push { node, seq, entry } => {
+                Msg::Push { node, seq } => {
                     let fx = self.nodes[node].core.on(Event::Push { seq });
                     self.effects(node, fx);
                 }

@@ -198,7 +198,6 @@ enum Msg {
     Ask(LeaseReply),
     /// From its own members.
     Started(Key, Result<(), bool>),
-    Resetting(Key),
     Free(Key),
     Gone(Key),
     /// From another node (or itself).
@@ -634,15 +633,6 @@ impl Agent {
                     }
                 }
                 self.to_mgr(key.0, Net::Started { member: key.1, ok: r.is_ok(), full: r == Err(true) });
-            }
-            Msg::Resetting(key) => {
-                let kept = self.members.get_mut(&key).map(|m| {
-                    m.resetting = true;
-                    m.kept
-                });
-                if kept == Some(false) {
-                    self.to_mgr(key.0, Net::Resetting { member: key.1 });
-                }
             }
             Msg::Free(key) => {
                 let old = self.old(key.0);

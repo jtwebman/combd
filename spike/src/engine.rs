@@ -102,6 +102,7 @@ pub trait CellVm {
     /// The answer to that call: the import's result, and what `pg_read` gets.
     fn db_done(&mut self, _value: u64, _out: Vec<u8>) {}
     /// A full copy of the cell, even mid-call. `None` if the engine can't.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn snapshot(&self) -> Option<Self>
     where
         Self: Sized;

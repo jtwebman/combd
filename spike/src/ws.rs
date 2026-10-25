@@ -257,10 +257,6 @@ pub fn unbase64(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub fn binary(b: &[u8]) -> Vec<u8> {
-    encode(0x2, b)
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;

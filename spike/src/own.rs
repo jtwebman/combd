@@ -599,9 +599,9 @@ enum Phase {
     /// Claiming, fencing, loading, writing the manifest, or restoring.
     Starting,
     Serving(Serve),
-    /// Moving to a node (`Event::Move`): dropped here, the record being
-    /// sealed. Requests wait.
-    Leaving(Node),
+    /// Moving to another node (`Event::Move`): dropped here, the record
+    /// being sealed. Requests wait.
+    Leaving,
 }
 
 #[derive(Debug)]
@@ -1145,7 +1145,7 @@ impl Core {
         match &st.phase {
             Phase::Serving(s) if s.moving.is_some() => st.waiting.push_back(req),
             Phase::Serving(_) => self.run(o, req),
-            Phase::Starting | Phase::Leaving(_) => st.waiting.push_back(req),
+            Phase::Starting | Phase::Leaving => st.waiting.push_back(req),
             Phase::Idle => {
                 st.waiting.push_back(req);
                 st.phase = Phase::Starting;
@@ -1344,7 +1344,7 @@ impl Core {
         if !s.idle(seal_early) {
             return;
         }
-        let Phase::Serving(s) = std::mem::replace(&mut st.phase, Phase::Leaving(to)) else { unreachable!() };
+        let Phase::Serving(s) = std::mem::replace(&mut st.phase, Phase::Leaving) else { unreachable!() };
         self.out.push(Effect::Drop { obj: o });
         let r = Rec { node: self.node, epoch: s.epoch, sealed: true, peers: s.peers.iter().map(|p| p.node).collect() };
         self.call(Wait::Leave(o, to), Call::Put(own_key(o), Val::Rec(r), Cond::IfMatch(s.etag)));

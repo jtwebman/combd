@@ -1,40 +1,40 @@
-# combd: Durable Objects on your own machines
+# combd 0.1: Durable Objects on a $6 server
 
-*Draft, 2026-10-25. Numbers are from `spike/RESULTS.md`, "The click race".*
+*Draft, 2026-10-25. Numbers are from `spike/RESULTS.md`.*
 
 combd runs Cloudflare-style Durable Objects on machines you own. Every
 chat room, game, or document is its own small server with its own SQLite
 database. State lives on local disk and in a bucket you already pay for
-(S3, R2, or anything that honors conditional writes). There is no control
-plane and no consensus cluster. It's one Rust binary, open source under
-Apache-2.0.
+(S3, R2, or anything that honors conditional writes). No control plane, no
+consensus cluster: one 13 MB binary, open source under Apache-2.0.
 
-Today we're publishing it, with a race against the two other ways to run
-Durable Objects yourself: Cloudflare's workerd and Deno's celld.
+The point of this release is how little it needs. On one CPU and 1 GB, the
+size of a $6-a-month droplet, combd holds about 156,000 idle WebSocket
+pages, or 20,000 pages clicking with nothing lost. We raced it against the
+two other ways to run Durable Objects yourself, Cloudflare's workerd and
+Deno's celld, on the same box. The numbers are below.
 
-## Why we built it
+## Why it fits
 
-In October, Cloudflare bought Deno. The part that caught our eye was celld,
-which the Deno team had shipped that summer: Durable Objects on your own
-machines, with a bucket as the only coordinator. It's a good idea. celld
-also carried a full V8, tens of thousands of lines of Node.js shims, and a
-security model that trusts every line of code it runs. And it's now headed
-into Cloudflare's runtime.
+**WebAssembly, and no JavaScript engine.** Workers runtimes are built on
+V8: every isolate brings a heap, a garbage collector, and a JIT. combd
+runs WebAssembly on its own engine instead: an interpreter, or
+ahead-of-time compiled to machine code through plain, safe Rust. A cell is
+a Wasm module's memory and a few host tables. Starting one takes
+microseconds. A sleeping WebSocket session is about 2 KB; a whole idle
+connection, socket and kernel included, about 6 KB. Today you write cells
+in Rust, with `combd-sdk`; our test cell is also written in
+AssemblyScript, TinyGo, C, and Zig, and each passes the same checks:
+anything that compiles to Wasm can be a cell.
 
-So we started over and kept the idea. We read celld closely, wrote a plan,
-and used none of its code.
+**Every object is a process, Erlang style.** The scheduler can pause a cell
+at any point, so a cell stuck in a loop costs its neighbors microseconds,
+not the core. A cell that breaks goes down alone, restarts clean, and the
+request that hit the crash is rolled back.
 
-## How it differs
-
-**Every object is a sandboxed process, Erlang style.** User code is
-WebAssembly. combd runs it on its own interpreter, or compiles it ahead of
-time to machine code through safe Rust. Either way the scheduler can pause
-a cell at any point, so a cell stuck in a loop costs its neighbors
-microseconds, not the whole core.
-
-**Let it crash.** When a cell breaks, only that cell goes down. It restarts
-clean in microseconds, and its data is safe in SQLite. A request that hit
-the crash is rolled back.
+**Pushes go straight to sockets.** A chunk of checkboxes that changes
+writes to its watchers' sockets directly, without waking the sessions that
+hold them. A watching page never runs.
 
 **Your SQLite, your bucket.** Each object has its own SQLite file. Writes
 are confirmed by peer nodes on disk and reach the bucket in batches. The
@@ -42,22 +42,28 @@ bucket decides who owns each object, by conditional write. Every node
 tests its bucket for that at startup, because one popular S3-compatible
 server let several writers win the same conditional write.
 
-**Checked before it was trusted.** The ownership, replication, and catalog
-designs each have a TLA+ spec. A deterministic simulator runs hundreds of
-thousands of crash, split, and lost-message schedules against the real
-decision code. Known-bad versions must fail both. The spec found a real
-bug in our fast-write design, and the simulator found one the spec
-couldn't see. Both were fixed before any real node ran that code.
+**Objects move to their users.** In a fleet, an object moves to the node
+most of its requests come in through, or stays spread evenly, or pinned to
+a region. A full node turns new connections away at TCP, so browsers try
+the next node by themselves.
 
-**Reviewed for security in rounds.** Reviewers (an AI model, one per
-surface, each in its own copy of the code) attacked the compiler and
-builder, the interpreter and host calls, the public edge, and the wire
-between nodes, each proving findings with a failing test. We fixed what
-they confirmed, and the next round attacked the fixes. What they found and
-what changed is written up in the plan, including what is still open.
+## Checked before it was trusted
 
-**Small.** A sleeping WebSocket session is about 2 KB in combd. A whole
-idle connection, socket and kernel included, is about 6 KB.
+The ownership, replication, and catalog designs each have a TLA+ spec. A
+deterministic simulator runs hundreds of thousands of crash, split, and
+lost-message schedules against the real decision code, and known-bad
+versions must fail both. The spec found a real bug in our fast-write
+design, and the simulator found one the spec couldn't see. Both were fixed
+before any real node ran that code.
+
+We attacked it too, in rounds: the compiler and builder, the interpreter
+and its host calls, the public edge, and the wire between nodes, each
+finding proven with a failing test, fixed, then attacked again. Untrusted
+Wasm has no instruction that runs data as code, and combd maps its memory
+read and write, never executable. Under that, the nodes run with the kernel
+refusing writable executable memory, a system call filter, and nothing on
+the machine combd may start. What we found and what is still open is in
+the plan.
 
 It runs live on three $6 droplets (New York, Frankfurt, Singapore): a
 real-time game and a copy of One Million Checkboxes.

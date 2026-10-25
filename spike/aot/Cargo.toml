@@ -24,3 +24,9 @@ experiment-unchecked = []
 # Guard pages instead of bounds checks: `guard.rs` and `trap.c` hold the only
 # unsafe code. Generated code stays `forbid(unsafe_code)`.
 guard = ["dep:libc", "dep:corosensei"]
+
+# Here, not as #[allow] in rt.rs: rt.rs is in the pin (build.rs), and
+# moving the pin rebuilds every compiled module. Move it into the source at
+# the next change that moves the pin anyway.
+[lints.rust]
+dead_code = "allow"

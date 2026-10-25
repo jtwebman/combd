@@ -127,6 +127,7 @@ macro_rules! cell {
             /// The answer, as (ptr << 32) | len.
             #[no_mangle]
             pub extern "C" fn handle(ptr: *mut u8, len: u32) -> u64 {
+                $crate::report_panics();
                 let req = unsafe { ::std::vec::Vec::from_raw_parts(ptr, len as usize, len as usize) };
                 let line = ::std::str::from_utf8(&req).unwrap_or("");
                 let answer = super::$handler($crate::Request::parse(line)).into_answer();
@@ -154,6 +155,26 @@ mod host {
     extern "C" {
         pub fn environ_sizes_get(count: *mut u32, size: *mut u32) -> u32;
         pub fn environ_get(ptrs: *mut *mut u8, buf: *mut u8) -> u32;
+        pub fn fd_write(fd: u32, iovs: *const [u32; 2], n: u32, written: *mut u32) -> u32;
+    }
+}
+
+/// A panic's message goes to stderr, which combd puts in its log beside
+/// the trap ("trapped: unreachable (panicked at src/lib.rs:12: ...)"):
+/// with `panic = "abort"` a cell otherwise dies without a word. `cell!`
+/// calls it; once is enough.
+pub fn report_panics() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            std::panic::set_hook(Box::new(|info| {
+                let msg = format!("{info}\n");
+                let iov = [msg.as_ptr() as u32, msg.len() as u32];
+                let mut written = 0u32;
+                unsafe { host::fd_write(2, &iov, 1, &mut written) };
+            }))
+        });
     }
 }
 

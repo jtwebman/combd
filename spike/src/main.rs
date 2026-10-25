@@ -59,6 +59,7 @@ const GUEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../guest/target/wasm32
 const SLICE: u32 = 2_500;
 /// Fuel (about one per wasm op) per slice for Wasmtime. Both are tuned so a
 /// spinning cell's slice is about 50 us on an M4 Max.
+#[cfg(feature = "wasmtime")]
 const WT_FUEL: u64 = 1_000_000;
 /// How many cells the density and fairness tests use. `COMBD_CELLS` overrides it.
 fn cells() -> usize {
@@ -906,7 +907,7 @@ Keys and certificates:
   combd master-key <file>   combd builder-key <file>   combd admin-token <scope>...
   combd wire-certs <dir> <nodes>
 
-combd also has its own benchmarks, simulators and fuzzers (spike/RESULTS.md).
+combd version    combd also has its own benchmarks, simulators and fuzzers.
 ";
 
 fn main_with(args: &[&str]) {
@@ -918,6 +919,10 @@ fn main_with(args: &[&str]) {
     };
     match args[..] {
         [] | ["help"] | ["-h"] | ["--help"] => print!("{HELP}"),
+        ["version"] | ["--version"] | ["-V"] => match option_env!("COMBD_VERSION") {
+            Some(v) if v != env!("CARGO_PKG_VERSION") && v != format!("v{}", env!("CARGO_PKG_VERSION")) => println!("combd {} ({v})", env!("CARGO_PKG_VERSION")),
+            _ => println!("combd {}", env!("CARGO_PKG_VERSION")),
+        },
         ["new", name] => done(dev::new(std::path::Path::new("."), name)),
         ["build"] => done(dev::build(std::path::Path::new("."))),
         ["build", dir] => done(dev::build(std::path::Path::new(dir))),
@@ -1359,11 +1364,9 @@ fn main_with(args: &[&str]) {
             }
         }
         ["langs"] => {
-            let mut ok = langs("interp", &interp::Interp { max_pages: 16384 });
+            let ok = langs("interp", &interp::Interp { max_pages: 16384 });
             #[cfg(feature = "wasmtime")]
-            {
-                ok &= langs("wasmtime", &wt::Wt::new(WT_FUEL, None));
-            }
+            let ok = langs("wasmtime", &wt::Wt::new(WT_FUEL, None)) && ok;
             std::process::exit(if ok { 0 } else { 1 });
         }
         [test, "interp"] => run(test, "interp", &interp::Interp { max_pages: 16384 }),
@@ -2336,6 +2339,7 @@ mod tests {
             data: data.to_path_buf(),
             idle: Duration::from_secs(60),
             max_objects: 10_000,
+            restores_at_once: 4,
             max_awake: 1000,
             stop: Arc::default(),
             disk_low_forced: Arc::default(),
@@ -2924,6 +2928,108 @@ mod tests {
         let fra = node(1).0;
         assert!(eventually(15_000, || stat(fra, "objects_live") == 1 && stat(ports[0], "objects_live") == 0), "home to fra1");
         assert_eq!(count(ports[1], "eu2"), (200, "{\"count\":1}".into()), "with its write");
+    }
+
+    /// A cold start in a storm (RESULTS.md, "On the fleet"): every object a
+    /// node had, restored from the bucket at once, each with a long history
+    /// (a write a segment). Unlimited restores at once, then the default
+    /// (4): how long until all answer, how many requests failed on the way,
+    /// and how far memory rose. Every object must come back with every
+    /// write. By hand, with a test bucket (see check.sh):
+    /// `cargo test --release -- --ignored cold_start_in_a_storm --nocapture`
+    #[test]
+    #[ignore]
+    fn cold_start_in_a_storm() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let (objects, writes) = (64usize, 200usize);
+        for cap in [10_000, 4] {
+            let dir = store::tempdir::Dir::new();
+            wire::make_certs(&dir.0.join("certs"), 1).unwrap();
+            let bucket = test_bucket();
+            let node = |data: &str| {
+                let wport = free_ports(1)[0];
+                let fc = fleet::FleetCfg {
+                    node: 0,
+                    lease_ms: 1000,
+                    replicas: 0,
+                    s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
+                    peers: HashMap::from([(0, format!("127.0.0.1:{wport}"))]),
+                    wire_port: wport,
+                    wire_certs: Some(dir.0.join("certs")),
+                    insecure: false,
+                    upload_ms: 0,
+                    upload_bytes: 1 << 20,
+                    read_lease: true,
+                    regions: HashMap::new(),
+                    place_ms: 0,
+                    areas: HashMap::new(),
+                };
+                server_app(interp::Interp { max_pages: 16384 }, http::Config { fleet: Some(fc), restores_at_once: cap, ..cfg(&dir.0.join(data), 1) }, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4))
+            };
+            // The history: each write a segment of its own.
+            let (port, stop, t) = node("first");
+            assert!(eventually(10_000, || http(port, "POST", "/do/c0/incr", "").0 == 200));
+            std::thread::scope(|sc| {
+                for k in 0..16 {
+                    sc.spawn(move || {
+                        for i in (k..objects).step_by(16) {
+                            for _ in usize::from(i == 0)..writes {
+                                // A 503 is "retry" (a client does): each write
+                                // waits on the bucket here.
+                                assert!(eventually(10_000, || http(port, "POST", &format!("/do/c{i}/incr"), "").0 == 200));
+                            }
+                        }
+                    });
+                }
+            });
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = t.join();
+            // The same node, its disk gone: every object comes from the bucket.
+            let (port, _stop, _t) = node("second");
+            assert!(eventually(10_000, || http(port, "GET", "/_combd/ping", "").0 == 200));
+            let base_rss = combd_mem::resident().unwrap_or(0);
+            let (peak, done) = (Arc::new(std::sync::atomic::AtomicU64::new(base_rss)), Arc::new(AtomicBool::new(false)));
+            let sampler = {
+                let (peak, done) = (peak.clone(), done.clone());
+                std::thread::spawn(move || {
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        peak.fetch_max(combd_mem::resident().unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                })
+            };
+            let started = Instant::now();
+            let failed = std::sync::atomic::AtomicU64::new(0);
+            std::thread::scope(|sc| {
+                for i in 0..objects {
+                    let failed = &failed;
+                    sc.spawn(move || {
+                        let until = Instant::now() + Duration::from_secs(120);
+                        loop {
+                            let (st, body) = http(port, "POST", &format!("/do/c{i}/incr"), "");
+                            if st == 200 {
+                                // No write lost (a retried one may have
+                                // landed twice: "retry" isn't "didn't").
+                                let n: usize = serde_json::from_str::<serde_json::Value>(&body).unwrap()["count"].as_u64().unwrap() as usize;
+                                assert!(n > writes, "c{i} came back with {n} of its {} writes", writes + 1);
+                                break;
+                            }
+                            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            assert!(Instant::now() < until, "c{i}: still {st} after 2 minutes");
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    });
+                }
+            });
+            let took = started.elapsed();
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = sampler.join();
+            let rose = peak.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(base_rss) >> 20;
+            eprintln!("restores at once {cap:>5}: all {objects} back in {took:.2?}, {} requests failed on the way, memory up {rose} MB", failed.load(std::sync::atomic::Ordering::Relaxed));
+        }
     }
 
     /// `placement = "spread"`: objects asked for on one node start across

@@ -17,7 +17,7 @@ use crate::host::{self, HostState, Mem};
 use crate::sim::Rng;
 use crate::store::Db;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Well above the 100 ms a single SQL statement may take (plus its
 /// rollback). The test allows more: a busy machine can pause it for 200 ms.
@@ -221,9 +221,11 @@ fn one(seed: u64, slow: Duration, st: &mut Stats) {
         }
         let imp = Import { module: module.into(), name: name.into(), results: 1 };
         let what = format!("{module}.{name}({args:x?})");
-        let t = Instant::now();
+        // This thread's CPU time, not the wall clock: what a call can take
+        // from other cells, and not what a busy machine's scheduler adds.
+        let t = thread_cpu();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host::call(&imp, &args, &mut vm, &mut hs)));
-        let took = t.elapsed();
+        let took = thread_cpu().saturating_sub(t);
         st.calls += 1;
         match r {
             Err(_) => st.problems.push(format!("seed {seed}: the host panicked on {what}")),
@@ -272,6 +274,12 @@ fn one(seed: u64, slow: Duration, st: &mut Stats) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The CPU time this thread has used.
+fn thread_cpu() -> Duration {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+}
+
 pub fn run(seeds: std::ops::Range<u64>, slow: Duration) -> Stats {
     let mut st = Stats { calls: 0, crashed: 0, slowest: (Duration::ZERO, String::new()), problems: vec![] };
     for seed in seeds {
@@ -283,6 +291,7 @@ pub fn run(seeds: std::ops::Range<u64>, slow: Duration) -> Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// A probe, not a rule: how long the worst calls we can think of take.
     #[test]

@@ -22,7 +22,8 @@ use std::time::Duration;
 
 enum In {
     Submit(Entry, Sender<Result<Seq, String>>),
-    Push(Seq, Entry),
+    /// The log grew to this slot (the entry pushed with it isn't trusted).
+    Push(Seq),
     Reply(u64, Res),
 }
 
@@ -164,7 +165,7 @@ impl CatNode {
                     waiting.push((id, reply));
                     core.on(Event::Submit { write: id, entry: e })
                 }
-                Ok(In::Push(seq, _)) => core.on(Event::Push { seq }),
+                Ok(In::Push(seq)) => core.on(Event::Push { seq }),
                 Ok(In::Reply(op, res)) => core.on(Event::Reply { op, res }),
                 Err(RecvTimeoutError::Timeout) => core.on(Event::Tick),
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -181,10 +182,11 @@ impl CatNode {
         rx.recv_timeout(Duration::from_secs(60)).map_err(|_| "the catalog didn't answer in time".to_string())?
     }
 
-    /// A push from another node.
+    /// A push from another node: news that the log grew to `seq` (a frame
+    /// that isn't an entry isn't news). What it carries isn't used.
     pub fn push(&self, seq: Seq, entry: &[u8]) {
-        if let Some(e) = decode(entry) {
-            let _ = self.tx.lock().unwrap().send(In::Push(seq, e));
+        if decode(entry).is_some() {
+            let _ = self.tx.lock().unwrap().send(In::Push(seq));
         }
     }
 

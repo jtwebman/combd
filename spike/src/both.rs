@@ -44,7 +44,7 @@ impl Engine for Both {
                 (Ok(c), _) => Ok(Program::Compiled(c)),
                 (Err(e), None) => Err(e),
                 (Err(_), Some(b)) => match b.fetch(wasm)? {
-                    crate::builds::Fetch::Ready(_) => crate::aot::built(&b.dir, wasm).map(Program::Compiled),
+                    crate::builds::Fetch::Ready => crate::aot::built(&b.dir, wasm).map(Program::Compiled),
                     crate::builds::Fetch::Building => Err(format!("module {} {}", crate::builds::module_id(wasm), crate::engine::BEING_BUILT)),
                 },
             },

@@ -207,10 +207,13 @@ the full story; the short version:
 
 ## Next
 
-- **Count the whole machine's memory**, so a node sheds load before it swaps.
-- **The same apps on celld, workerd, and Cloudflare**, raced on the same
-  machines.
 - **A bigger real app:** an X clone on combd and Postgres.
+- **JavaScript, without a JS engine:** a Workers-compatible library over
+  combd's host, compiled to Wasm.
+- **A billion checkboxes** on the same three $6 servers, and what it needs
+  first: per-IP limits, a budget for bucket writes, and cheaper cold starts.
+- **One node's keys for one node:** today every node holds the bucket's
+  credentials.
 
 ## Standing on shoulders
 

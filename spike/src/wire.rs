@@ -69,6 +69,7 @@ pub fn load_tls(dir: &Path, node: Node) -> Result<Tls, String> {
     Ok(Tls { server: Arc::new(server), client: Arc::new(client) })
 }
 
+#[cfg(test)]
 /// The admin API's TLS: this node's certificate, and no client
 /// certificate (clients show a token instead).
 pub fn admin_tls(dir: &Path, node: Node) -> Result<Arc<rustls::ServerConfig>, String> {

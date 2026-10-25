@@ -1,6 +1,6 @@
 [package]
 name = "combd"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 publish = false
 # Cargo picks the newest deps that build on this Rust.
@@ -24,7 +24,7 @@ fuzz = ["wasmtime", "dep:wasm-smith", "dep:arbitrary", "dep:wat"]
 [dependencies]
 combd-guest = { path = "../guest" }
 # The data folder's free space (statvfs), without unsafe here.
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "time"] }
 combd-aot = { path = "aot", optional = true, default-features = false }
 # Loading compiled modules' builds into a running node (the AOT tier's unsafe).
 combd-load = { path = "load", optional = true }

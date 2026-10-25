@@ -12,7 +12,6 @@ pub trait Store: Send + Sync {
     /// `Ok(Ok(etag))`, or `Ok(Err(()))` when the condition failed.
     fn put(&self, key: &str, value: &[u8], cond: &Cond) -> Result<Result<String, ()>, String>;
     fn delete(&self, key: &str) -> Result<(), String>;
-    fn list(&self, prefix: &str) -> Result<Vec<String>, String>;
 }
 
 impl Store for S3 {
@@ -24,8 +23,5 @@ impl Store for S3 {
     }
     fn delete(&self, key: &str) -> Result<(), String> {
         S3::delete(self, key).map_err(|e| e.to_string())
-    }
-    fn list(&self, prefix: &str) -> Result<Vec<String>, String> {
-        S3::list(self, prefix).map_err(|e| e.to_string())
     }
 }

@@ -84,6 +84,7 @@ impl Core {
         Core { cfg, members: HashMap::new(), queue: VecDeque::new(), next: 0, full_until: 0 }
     }
 
+    #[cfg(test)]
     pub fn live(&self) -> usize {
         self.members.len()
     }

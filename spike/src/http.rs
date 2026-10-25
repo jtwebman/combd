@@ -36,9 +36,10 @@
 //! - **Limits.** At most `COMBD_MAX_CONNS` connections (200,000); past it a
 //!   new one gets 503 and `retry-after`. The node's memory budget is
 //!   `COMBD_MEMORY_BUDGET` (bytes, or 512M, 4G), else its container's limit,
-//!   else the machine's RAM: past 85% it reclaims (idle sessions freeze, idle
-//!   objects and warm cells go after a second, not a minute), past 95% new
-//!   connections and sockets get 503 too, until it's back under 90%.
+//!   else the machine's RAM: past 80% it reclaims (idle sessions freeze, idle
+//!   objects go after 10 s and warm cells after a second, not a minute),
+//!   past 90% new connections and sockets are refused, until it's back
+//!   under 85%.
 //!
 //! `GET /_combd/stats` shows what the node is doing.
 //!
@@ -114,6 +115,9 @@ pub struct Config {
     pub idle: Duration,
     /// The most objects in memory, per loop.
     pub max_objects: usize,
+    /// Objects restored from the bucket at once, per loop
+    /// (`COMBD_RESTORES_AT_ONCE`, default 4): each holds its segments.
+    pub restores_at_once: usize,
     /// Set it to stop the server.
     pub stop: Arc<AtomicBool>,
     /// Tests only: the data disk reads as nearly full (`disk_low`).
@@ -139,8 +143,8 @@ pub struct Config {
     /// opens the apps' secrets. Every node needs the same one.
     pub master_key: Option<PathBuf>,
     /// How much memory this node may use (`COMBD_MEMORY_BUDGET`, else the
-    /// container's limit, else the machine's RAM): past 85% it reclaims,
-    /// past 95% it refuses new work (`Pressure`).
+    /// container's limit, else the machine's RAM): past 80% it reclaims,
+    /// past 90% it refuses new work (`pressure`).
     pub memory_budget: Option<u64>,
     /// The most connections open at once (`COMBD_MAX_CONNS`); past it, 503.
     pub max_conns: u64,
@@ -205,6 +209,17 @@ impl Limits {
     }
 }
 
+/// What a cell wrote (stdout, stderr) in the request that trapped, for the
+/// log: a panic's message, from a guest that prints one (combd-sdk does).
+fn said<E: Engine>(cell: &mut Cell<E>) -> String {
+    let out = &cell.host().out;
+    if out.is_empty() {
+        return String::new();
+    }
+    let tail = String::from_utf8_lossy(&out[out.len().saturating_sub(500)..]).trim().replace('\n', " | ");
+    format!(" ({tail})")
+}
+
 /// The status line for a request we refuse before it runs.
 fn refusal(code: u16) -> &'static [u8] {
     match code {
@@ -237,16 +252,25 @@ fn memory_budget() -> Option<u64> {
     Some(kb * 1024)
 }
 
-/// How hard a node is pressed for memory: 0 fine; 1 (85% of its budget)
-/// reclaim, sooner than usual; 2 (95%) refuse new connections and sockets,
-/// until it's back under 90%.
+/// How hard a node is pressed for memory: 0 fine; 1 (80% of its budget)
+/// reclaim, sooner than usual; 2 (90%) refuse new connections and sockets,
+/// until it's back under 85%. A tenth kept back: connections already taken
+/// still grow (their sessions open, and the kernel's buffers for each, a
+/// third of a 1 GB node at 160,000 sockets), and at 95% a burst of new
+/// ones ran a node out (RESULTS.md, "The click race").
 fn pressure(used: u64, budget: u64, was: u64) -> u64 {
+    lines(used, budget, was, (80, 90, 85))
+}
+
+/// 0, 1 past `reclaim`%, 2 past `refuse`% until back under `back`%.
+fn lines(used: u64, budget: u64, was: u64, (reclaim, refuse, back): (u64, u64, u64)) -> u64 {
     let pct = used.saturating_mul(100) / budget.max(1);
-    match pct {
-        95.. => 2,
-        90.. if was == 2 => 2,
-        85.. => 1,
-        _ => 0,
+    if pct >= refuse || (was == 2 && pct >= back) {
+        2
+    } else if pct >= reclaim {
+        1
+    } else {
+        0
     }
 }
 
@@ -254,7 +278,10 @@ fn pressure(used: u64, budget: u64, was: u64) -> u64 {
 /// (where the kernel starts to swap): on 1 GB, reclaim under ~225 MB
 /// available, refuse under ~140 MB.
 fn machine_pressure(total: u64, available: u64, was: u64) -> u64 {
-    pressure(total.saturating_sub(available), total - total / 10, was)
+    // Its own lines (85, 95, 90): what the kernel holds for connections is
+    // in what it calls available already, and these were measured on the
+    // droplets (the_machine_presses_before_it_swaps).
+    lines(total.saturating_sub(available), total - total / 10, was, (85, 95, 90))
 }
 
 impl Config {
@@ -267,6 +294,7 @@ impl Config {
             data: PathBuf::from(std::env::var("COMBD_DATA").unwrap_or_else(|_| "data".into())),
             idle: Duration::from_millis(num("COMBD_IDLE_MS", 60_000) as u64),
             max_objects: num("COMBD_MAX_OBJECTS", 10_000),
+            restores_at_once: num("COMBD_RESTORES_AT_ONCE", 4).max(1),
             stop: Arc::default(),
             sync_delay: Duration::ZERO,
             fleet: FleetCfg::from_env(),
@@ -477,6 +505,10 @@ const MAX_HOPS: u8 = 3;
 const HOP_SHIFT: u32 = 56;
 /// Times a request that never ran is routed again before the client hears 503.
 const MAX_NOT_RUN: u8 = 3;
+/// While connections pour in, memory is measured every this many.
+const ACCEPT_MEASURE: u32 = 64;
+/// How long an idle object stays while memory is short (`idle_limit`).
+const SQUEEZED_IDLE: Duration = Duration::from_secs(10);
 /// The most an event-cell instance may have in flight (open tickets).
 const MAX_EV_TICKETS: usize = 10_000;
 /// Placement: an object moves only if one node sent it at least this many
@@ -513,7 +545,7 @@ enum Origin {
     /// handshake (`WSOPEN`, answered with 101 to accept).
     Socket(Who, u64, bool),
     /// An event cell's callback (on instance N): its answers go by `respond`.
-    Ev(usize),
+    Ev,
     /// A `call` from another process: (the caller's loop, the call's id).
     Call(usize, u64),
     /// A `send`: nobody hears the answer.
@@ -1376,6 +1408,7 @@ fn builders(_: &crate::s3::S3) -> Vec<serde_json::Value> {
     vec![]
 }
 
+#[cfg(test)]
 /// Deploy the app in `dir` (org `org`) onto a running node: checked and
 /// loaded in full first, so a bad version never goes live and the old one
 /// keeps serving.
@@ -1405,6 +1438,7 @@ fn check_caps<E: Engine>(eng: &E, app: App<E::Program>) -> Result<App<E::Program
     Ok(app)
 }
 
+#[cfg(test)]
 /// One app in `dir` (org `local`), ready to serve.
 pub fn load_app<E: Engine>(eng: &E, dir: &std::path::Path) -> Result<(App<E::Program>, Option<crate::pg::PgCfg>), String> {
     load_apps(eng, &[("local".into(), dir.to_path_buf())])
@@ -1619,6 +1653,8 @@ where
                     asks: HashMap::new(),
                     last_place: Instant::now(),
                     taken: 0,
+                    restoring: 0,
+                    restores: VecDeque::new(),
                     ws_lost: Default::default(),
                     parked: HashMap::new(),
                     next_park: 0,
@@ -1729,6 +1765,9 @@ struct Loop<'a, E: Engine> {
     asks: HashMap<u64, (String, own::Node)>,
     last_place: Instant,
     taken: u32,
+    /// Restores out (`Config::restores_at_once`), and those waiting.
+    restoring: usize,
+    restores: VecDeque<Job>,
     /// Lost sockets we've told their object about already.
     ws_lost: std::collections::HashSet<u64>,
     /// Cells waiting on the database, by park number; and the Postgres
@@ -2158,9 +2197,17 @@ impl<E: Engine> Loop<'_, E> {
     }
 
     fn accept(&mut self, listener: &mut TcpListener, redirect: bool) -> std::io::Result<()> {
+        let mut taken = 0u32;
         loop {
             match listener.accept() {
                 Ok((mut s, from)) => {
+                    // A burst: measure as it comes, not only on the sweep
+                    // (~14,000 connections a second ran past it to the
+                    // container's limit).
+                    taken += 1;
+                    if taken % ACCEPT_MEASURE == 0 {
+                        self.measure();
+                    }
                     // Full: say so, and close. The client tries again (or
                     // another node: DNS and load balancers pick another).
                     // Over TLS a plain 503 is only noise to the client, so
@@ -2232,7 +2279,14 @@ impl<E: Engine> Loop<'_, E> {
                     self.kick_sync(&obj);
                 }
                 Msg::Bucket { op, res } => self.core_on(own::Event::Reply { op, res }),
-                Msg::Fetched { obj, act, data, index, image } => self.fetched(obj, act, data, index, image),
+                Msg::Fetched { obj, act, data, index, image } => {
+                    self.restoring = self.restoring.saturating_sub(1);
+                    if let Some(job) = self.restores.pop_front() {
+                        self.restoring += 1;
+                        self.job(job);
+                    }
+                    self.fetched(obj, act, data, index, image)
+                }
                 Msg::Imaged { obj, act, key } => self.core_on(own::Event::Imaged { obj, act, key }),
                 Msg::Indexed { name, new, ok } => {
                     if let Some(o) = self.objects.get_mut(&name) {
@@ -2319,7 +2373,7 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Ok(())
             }
-            Origin::Ev(_) | Origin::Discard | Origin::Tick => Ok(()),
+            Origin::Ev | Origin::Discard | Origin::Tick => Ok(()),
             Origin::Call(l, id) if l == self.me => {
                 self.call_done(id, reply);
                 Ok(())
@@ -2435,7 +2489,7 @@ impl<E: Engine> Loop<'_, E> {
                 cell.vm.begin("on_event", &[ticket, n])
             }
         };
-        let t = Task { origin: Origin::Ev(i), cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: Some(i), more: vec![] };
+        let t = Task { origin: Origin::Ev, cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: Some(i), more: vec![] };
         match started {
             Ok(()) => self.tasks.push_back(t),
             Err(e) => {
@@ -3143,6 +3197,7 @@ impl<E: Engine> Loop<'_, E> {
         };
         cell.host().ws_ids = if open { vec![s.sock] } else { vec![] };
         cell.host().ws_out.clear();
+        cell.host().out.clear();
         cell.host().ws_in = ws_in;
         if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
             eprintln!("session {name:?} trapped starting an event: {trap}");
@@ -3158,7 +3213,7 @@ impl<E: Engine> Loop<'_, E> {
     /// A session's event is done. No output gate: it has no storage, so its
     /// answer and sends go now. A `HIBERNATE` answered `200 <state>` puts it
     /// to sleep; a crash, a close, or a refused handshake ends it.
-    fn session_finish(&mut self, name: &str, cell: Cell<E>, answer: Result<String, String>, mut ws: Vec<WsOut>) -> Option<((u16, String), Vec<WsOut>)> {
+    fn session_finish(&mut self, name: &str, mut cell: Cell<E>, answer: Result<String, String>, mut ws: Vec<WsOut>) -> Option<((u16, String), Vec<WsOut>)> {
         let p = &self.app.procs[cell.proc];
         let (hibernate, sleep, state_max) = (p.hibernate, p.sleep, p.state_max);
         let s = self.sessions.get_mut(name)?;
@@ -3168,7 +3223,7 @@ impl<E: Engine> Loop<'_, E> {
         let (reply, ok) = match answer {
             Ok(a) => (split_answer(&a), true),
             Err(trap) => {
-                eprintln!("session {name:?} trapped: {trap}");
+                eprintln!("session {name:?} trapped: {trap}{}", said(&mut cell));
                 ((500, format!("{{\"error\":{trap:?}}}")), false)
             }
         };
@@ -3183,8 +3238,12 @@ impl<E: Engine> Loop<'_, E> {
                 eprintln!("session {name:?}: {} bytes of state is over state_kb, so it stays warm", reply.1.len());
             }
             s.cell = Some(cell);
-            // `hibernate_ms = 0`: asleep after every event.
-            if hibernate.is_zero() && !gone && method != "HIBERNATE" && s.waiting.is_empty() && !self.ticks.contains_key(name) {
+            // `hibernate_ms = 0`, or memory short: asleep after every event.
+            // (A burst of new sockets otherwise keeps a cell awake for each
+            // until its idle time, or the next sweep: thousands of them,
+            // tens of KB each, past a 1 GB node's limit.)
+            let short = self.sh.stats.pressure.load(Relaxed) >= 1;
+            if (hibernate.is_zero() || short) && !gone && method != "HIBERNATE" && s.waiting.is_empty() && !self.ticks.contains_key(name) {
                 match sleep {
                     Sleep::App => s.waiting.push_back((Origin::Discard, HIBERNATE.into())),
                     Sleep::Auto => freeze = true,
@@ -3312,7 +3371,7 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Err(trap) => {
                     // Let it crash: this cell is dropped; the pool makes a fresh one when needed.
-                    eprintln!("cell trapped: {trap}");
+                    eprintln!("cell trapped: {trap}{}", said(&mut cell));
                     (500, format!("{{\"error\":{trap:?}}}"))
                 }
             }, vec![]));
@@ -3367,7 +3426,7 @@ impl<E: Engine> Loop<'_, E> {
                     }
                 }
                 Err(trap) => {
-                    eprintln!("object {name:?} trapped: {trap}");
+                    eprintln!("object {name:?} trapped: {trap}{}", said(&mut cell));
                     db.rollback();
                     (500, format!("{{\"error\":{trap:?}}}"))
                 }
@@ -3662,31 +3721,42 @@ impl<E: Engine> Loop<'_, E> {
     }
 
     /// How long idle is too long: shorter while memory is short.
+    /// How long an idle object stays: shorter while memory is short, but
+    /// not a second (letting an object go and bringing it back costs more
+    /// than keeping it: on a node, every chunk went and came back in turn).
     fn idle_limit(&self) -> Duration {
-        if self.sh.stats.pressure.load(Relaxed) >= 1 { Duration::from_secs(1).min(self.sh.cfg.idle) } else { self.sh.cfg.idle }
+        if self.sh.stats.pressure.load(Relaxed) >= 1 { SQUEEZED_IDLE.min(self.sh.cfg.idle) } else { self.sh.cfg.idle }
     }
 
     /// What every sweep does, one node or a fleet: warm worker cells back to
     /// what's been needed lately, and sessions idle past their
     /// `hibernate_ms` give up their cell for their state. Loop 0 also
     /// measures the node's memory; while it's short, all of this goes sooner.
+    /// How short memory is (`pressure`): this node's use against its
+    /// budget, and the whole machine. On loop 0's sweep, and while
+    /// connections pour in (`accept`), where a burst outran the sweep.
+    fn measure(&self) {
+        let st = &self.sh.stats;
+        let was = st.pressure.load(Relaxed);
+        let mut p = 0;
+        if let (Some(budget), Some(used)) = (self.sh.cfg.memory_budget, combd_mem::resident()) {
+            st.memory_used.store(used, Relaxed);
+            p = pressure(used, budget, was);
+        }
+        // The whole machine too: combd's own count misses the kernel's
+        // memory for its connections (no cgroup pays for it) and the
+        // OS's, and a node that swaps stops answering.
+        if let Some((total, available)) = combd_mem::machine() {
+            st.machine_available.store(available, Relaxed);
+            p = p.max(machine_pressure(total, available, was));
+        }
+        st.pressure.store(p, Relaxed);
+    }
+
     fn sweep_cells(&mut self) {
         if self.me == 0 {
             let st = &self.sh.stats;
-            let was = st.pressure.load(Relaxed);
-            let mut p = 0;
-            if let (Some(budget), Some(used)) = (self.sh.cfg.memory_budget, combd_mem::resident()) {
-                st.memory_used.store(used, Relaxed);
-                p = pressure(used, budget, was);
-            }
-            // The whole machine too: combd's own count misses the kernel's
-            // memory for its connections (no cgroup pays for it) and the
-            // OS's, and a node that swaps stops answering.
-            if let Some((total, available)) = combd_mem::machine() {
-                st.machine_available.store(available, Relaxed);
-                p = p.max(machine_pressure(total, available, was));
-            }
-            st.pressure.store(p, Relaxed);
+            self.measure();
             if let Ok(d) = rustix::fs::statvfs(&self.sh.cfg.data) {
                 let (free, size) = (d.f_bavail.saturating_mul(d.f_frsize), d.f_blocks.saturating_mul(d.f_frsize));
                 #[allow(unused_mut)]
@@ -3708,7 +3778,8 @@ impl<E: Engine> Loop<'_, E> {
             self.publish_ran();
         }
         let squeeze = self.sh.stats.pressure.load(Relaxed) >= 1;
-        let idle = self.idle_limit();
+        // Warm worker cells are cheap to make again: they go after a second.
+        let idle = if squeeze { Duration::from_secs(1).min(self.sh.cfg.idle) } else { self.sh.cfg.idle };
         for pool in &mut self.pools {
             trim_idle(pool, idle);
         }
@@ -4061,6 +4132,7 @@ impl<E: Engine> Loop<'_, E> {
             Some(cell) => cell,
             None => fresh(self.eng, &self.app, p, &self.environ_for(p))?,
         };
+        cell.host().out.clear();
         if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
             eprintln!("cell trapped starting a request: {trap}");
             return self.deliver(origin, (500, String::new()));
@@ -4494,6 +4566,7 @@ impl<E: Engine> Loop<'_, E> {
         };
         cell.host().ws_ids = ids;
         cell.host().ws_out.clear();
+        cell.host().out.clear();
         cell.host().ws_in = ws_in;
         let export = if more.is_empty() { "handle" } else { "handle_batch" };
         if let Err(trap) = crate::start_export(&mut cell.vm, export, &req, &mut cell.st) {
@@ -4655,7 +4728,18 @@ impl<E: Engine> Loop<'_, E> {
                     self.job(Job::Image { obj, act, key, entry, back: self.me });
                 }
             }
-            Effect::Restore { obj, act, segs, image } => self.job(Job::Fetch { obj, act, segs, image, back: self.me }),
+            // A few at a time: each fetches its segments 16 at once and
+            // holds them all. 64 cold objects at once on a 1-CPU node were
+            // 512 bucket calls together: they timed out, and memory ran short.
+            Effect::Restore { obj, act, segs, image } => {
+                let job = Job::Fetch { obj, act, segs, image, back: self.me };
+                if self.restoring < self.sh.cfg.restores_at_once {
+                    self.restoring += 1;
+                    self.job(job);
+                } else {
+                    self.restores.push_back(job);
+                }
+            }
             Effect::Peer { op, node, call } => {
                 let f = self.sh.fleet.as_ref().unwrap();
                 let id = f.next_id.fetch_add(1, Relaxed);
@@ -4746,7 +4830,7 @@ impl<E: Engine> Loop<'_, E> {
     /// is what makes it durable), hold the answer, and tell the core.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    fn fleet_finish(&mut self, name: String, req: own::ReqId, cell: Cell<E>, answer: Result<String, String>, ws: Vec<WsOut>, ws_open: Option<u64>, ws_drop: Vec<u64>, rest: Vec<(Origin, Result<String, String>)>) -> Option<(u16, String)> {
+    fn fleet_finish(&mut self, name: String, req: own::ReqId, mut cell: Cell<E>, answer: Result<String, String>, ws: Vec<WsOut>, ws_open: Option<u64>, ws_drop: Vec<u64>, rest: Vec<(Origin, Result<String, String>)>) -> Option<(u16, String)> {
         let Some(o) = self.objects.get_mut(&name) else { return None };
         o.busy = false;
         o.last_used = Instant::now();
@@ -4771,7 +4855,7 @@ impl<E: Engine> Loop<'_, E> {
                     }
                 },
                 Err(trap) => {
-                    eprintln!("object {name:?} trapped: {trap}");
+                    eprintln!("object {name:?} trapped: {trap}{}", said(&mut cell));
                     db.rollback();
                     ((500, format!("{{\"error\":{trap:?}}}")), false)
                 }
@@ -5538,9 +5622,9 @@ mod tests {
     }
 
     #[test]
-    fn pressure_rises_at_85_and_95_and_falls_under_90() {
+    fn pressure_rises_at_80_and_90_and_falls_under_85() {
         let p = |used, was| pressure(used, 100, was);
-        assert_eq!([p(50, 0), p(85, 0), p(94, 1), p(95, 1), p(92, 2), p(89, 2), p(80, 2)], [0, 1, 1, 2, 2, 1, 0]);
+        assert_eq!([p(50, 0), p(80, 0), p(89, 1), p(90, 1), p(87, 2), p(84, 2), p(79, 2)], [0, 1, 1, 2, 2, 1, 0]);
     }
 
     /// The machine's lines, from the 1 GB droplet's numbers (MB): 20,000

@@ -91,8 +91,8 @@ fn smith_config(seed: u64) -> wasm_smith::Config {
 #[derive(Debug)]
 enum Got {
     Done(Vec<u64>),
-    /// Why, for the report; any two traps match.
-    Trap(String),
+    /// Why, for the report (printed with `{:?}`); any two traps match.
+    Trap(#[allow(dead_code)] String),
     /// Out of stack or budget: limits differ between engines.
     Limit,
 }
@@ -321,6 +321,7 @@ pub fn run(seeds: std::ops::Range<u64>, save: bool) -> Stats {
 }
 
 /// Any engine's answer, through the engine interface.
+#[cfg(feature = "aot-lite")]
 fn cell<V: CellVm>(vm: &mut V, name: &str, args: &[u64]) -> Result<Got, String> {
     vm.begin(name, args)?;
     let mut spent = 0;
@@ -341,6 +342,7 @@ fn cell<V: CellVm>(vm: &mut V, name: &str, args: &[u64]) -> Result<Got, String> 
     }
 }
 
+#[cfg(feature = "aot-lite")]
 /// All of a cell's memory, a page at a time.
 fn all_memory<V: CellVm>(vm: &V) -> Vec<u8> {
     let mut out = vec![];
@@ -355,14 +357,17 @@ fn all_memory<V: CellVm>(vm: &V) -> Vec<u8> {
 /// fault (`aot-cases/precise_traps.wat`, `dead_store`). That's invisible in
 /// combd, because a trapped cell is never used again (`http::finish_task`);
 /// results, traps, and memory after every call that succeeds must still match.
+#[cfg(feature = "aot-lite")]
 const MEMORY_AT_TRAP: bool = !cfg!(feature = "aot-guard");
 
+#[cfg(feature = "aot-lite")]
 /// One seed on two engines, `a` (ours) and `b`, compared call by call.
 fn pair<A: Engine, B: Engine>(seed: u64, a: &A, b: &B, types: &wasmtime::Engine, st: &mut Stats) -> Result<(), String> {
     let (bin, rng) = module(seed)?;
     pair_bin(&bin, rng, a, b, types, st)
 }
 
+#[cfg(feature = "aot-lite")]
 fn pair_bin<A: Engine, B: Engine>(bin: &[u8], mut rng: Rng, a: &A, b: &B, types: &wasmtime::Engine, st: &mut Stats) -> Result<(), String> {
     let (Ok(ma), Ok(mb)) = (a.load(bin), b.load(bin)) else { return Ok(()) };
     st.modules += 1;
