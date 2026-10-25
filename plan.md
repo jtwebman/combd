@@ -52,9 +52,11 @@ and the rest of the plan is updated to match.
 2. **Overload, the follow-ups:** a full node refusing at TCP: built
    (2026-10-24; it stops listening while memory is short, at
    `max_conns`, or every loop is behind, a second at least each way; a
-   127.0.0.1 listener stays; `tcp_refusing` in stats). Left: see it on
-   the fleet under load (the overload run again: refused browsers should
-   land on another node). The 503 helper moved to `@combd/js`. Then
+   127.0.0.1 listener stays; `tcp_refusing` in stats). Seen on the fleet
+   (2026-10-25, RESULTS.md, "On the fleet"): n0 at ~29,500 clicking pages
+   refused at TCP and stayed up, and 439 of 441 requests to the name went
+   to another node by themselves. Left: a full node listening again after
+   `REFUSE_MIN` takes one more and hangs up on it (1 in ~440 failed). The 503 helper moved to `@combd/js`. Then
    decide whether idle sessions may live in swap (105,000 held that way,
    in Docker) or the node refuses first (58,000, as now).
 3. **Security review loops: done** (Fable 5.1, 2026-10-24; three rounds,
@@ -66,7 +68,12 @@ and the rest of the plan is updated to match.
    the node `nearest` (the default) and `spread` going home, with the
    target's yes (`_combd/take`) and its claim at once (`_combd/claim`);
    then `pin` with areas and a fallback, and `policy::home`, the hook a
-   fork writes its own placement in. Left: seeing moves on the fleet.
+   fork writes its own placement in. Seen on the fleet (2026-10-25):
+   million's chunks moved to the node their traffic came through, 16 at
+   a window (`MOVES_IN`). Left: cold starts in a storm (RESULTS.md: all of
+   a node's objects restored at once ran it out of memory, and pressure's
+   1 s eviction made it churn); a cap on restores at once, and no
+   eviction of an object used a second ago.
 5. **Getting ready to tell people:** a real `combd` binary (not
    `combd-spike`), releases for Linux and Mac, a 10-minute quickstart,
    and the race against celld, workerd, and Cloudflare (queued below,
