@@ -2655,3 +2655,159 @@ cells.
    the per-process map limit.
 4. A real Linux x86 server with pinned threads.
 5. Add celld to the scoreboard (needs a yes to install and run it).
+
+## The click race: combd, workerd, celld (2026-10-25)
+
+Million on all three, on the same box, one at a time (`bench/click/run.sh`,
+one command; summaries in `bench/click/results/`).
+- **The apps:** combd runs `examples/million` with its chunks and viewers
+  compiled (the nodes' build, `aot-lite`; the builds made by `aot-build`,
+  the builder's command) and its page interpreted, as its manifest says.
+  workerd 1.20260929.1 and celld v0.6.2 run `examples/million-workers`: the
+  same app as a Workers app with Durable Objects (same page, protocol,
+  chunk size, 20 sets a second, 150 ms beat, 60 s subscriptions), written
+  for this race. Two ways to hold a page's socket on Workers:
+  - **a Viewer object per socket** (hibernatable, as million's viewer
+    session): a chunk can't write to a socket another object holds, so it
+    calls each watcher's Viewer over RPC, every beat;
+  - **the Worker holds it** (workerd only), with a hibernatable socket per
+    watched chunk, so a beat is one `send` per watcher. celld v0.6.2 drops
+    the Worker's end of such a socket right after the upgrade (the chunk's
+    `getWebSockets()` is empty at its next beat), so it runs the first way.
+- **The box:** each server in Docker with `--cpus=1 --memory=1g
+  --memory-swap=1g` (a $6 droplet's size, no swap). celld as `celld dev`
+  (one node, local storage), as in the Durable Object race. Plain
+  WebSockets for all three: celld can't end TLS, so `ws-click` learned
+  plain `ws://` (`ca` as `-`). On the droplets combd ends TLS itself
+  (~4 KB more an idle connection).
+- **This is not a droplet.** An Apple M4 Max (macOS 27), Docker Desktop
+  29.9.2: a Linux arm64 VM with 8 CPUs and 16 GB for Docker, other
+  containers idling beside it (databases, emulators), the load clients on
+  the same VM. Droplets are x86 with a real NIC; their numbers will differ.
+- **The load:** `ws-click` in containers of 2,000 pages, a new container
+  every 2 s (~1,000 new pages a second at most). Idle pages never click (a
+  first click due in about a week) but renew every 20 s as million's page
+  does; clicking pages click 1 to 30 boxes 1 to 20 s apart, then watch.
+  Memory is the server's cgroup less inactive page cache (as docker stats
+  counts it), every second (idle) or 5 s (clicking); held sockets are
+  counted in the server's own network namespace.
+- **Two full runs** (a, b) of everything, a fresh server for each test.
+  Where they differ, both are shown.
+
+**Idle pages, until the server refuses or falls over:**
+
+| Server | Held | Its memory then | A page | How it ended |
+|---|---|---|---|---|
+| **combd** | **156,000 / 156,565** | 932 / 931 MiB | **6.1 KB** | refused new ones at TCP (its memory guard) and kept serving the rest |
+| workerd, a Viewer object per socket | 3,151 / 2,870 | 984 / 912 MiB | 270 to 300 KB | killed for memory |
+| workerd, the Worker holds the socket | 6,000 / 6,000 | 841 / 869 MiB | 133 KB | killed for memory (in the next 2,000) |
+| celld, a Viewer object per socket | 2,803 / 3,061 | 698 / 721 MiB | 216 to 222 KB | answered 500 to the rest ("shedding on the absolute memory cap") and stayed up, at 75% CPU (a new page got in on run a, not b) |
+
+So in a GB: combd about 156,000 pages, workerd 3,000 to 6,000, celld about
+3,000. With combd at 156,000, its CPU was 40 to 60%, most of it the
+renewals (7,800 a second).
+
+**Clicking pages** (changes delivered a second: every click times its
+watchers, averaged over the 180 s and in the best 10 s; echo times are the
+worst 10 s window's worst client; lost: no echo in 10 s):
+
+| 1,000 pages | Changes/s (avg, best 10 s) | Echo p50 / p99 | Lost | Memory | CPU |
+|---|---|---|---|---|---|
+| **combd** | 1,200, 1,770 | **152 / 161 ms** | 0 | **63 MiB** | **4%** |
+| workerd, Viewer objects | 1,180, 1,730 | 155 / 217 to 258 ms | 0 / 0.12% | 594 to 613 MiB | 10% |
+| workerd, Worker-held | 1,190, 1,720 | 154 / 239 to 281 ms | 0 | 292 MiB | 7% |
+| celld, Viewer objects | 1,200, 1,540 | 8.0 to 9.3 s / 9.7 to 10.0 s | 7.3% / 0.07% | 790 MiB | 95 to 99% |
+
+| 5,000 pages | Changes/s | Echo p50 / p99 | Lost | Memory | CPU |
+|---|---|---|---|---|---|
+| **combd** | 28,700, 40,000 | **112 to 153 / 362 to 572 ms** | 0 | **140 to 146 MiB** | **24 to 25%** |
+| workerd, Viewer objects | | | | killed for memory as pages arrived | |
+| workerd, Worker-held | 28,700, 40,000 | 0.6 to 5.4 s / 4.0 to 8.3 s | 0 | 919 to 944 MiB | 49 to 57% |
+| celld, Viewer objects | | | 27% / 61% | killed for memory mid-run | |
+
+| 10,000 pages | Changes/s | Echo p50 / p99 | Lost | Memory | CPU |
+|---|---|---|---|---|---|
+| **combd** | 113,000, 151,000 to 161,000 | 115 ms to 1.2 s / 476 ms to 5.9 s | **0** | **206 to 221 MiB** | 55 to 57% |
+| workerd, both ways | | | | killed for memory as pages arrived | |
+| celld | 63 to 231 | 9.3 to 9.7 s / 10 s | 51% to 56% | up, at 99 to 100% CPU, most sockets closed | |
+
+| 20,000 pages | Changes/s | Echo p50 / p99 | Lost | Memory | CPU |
+|---|---|---|---|---|---|
+| **combd** | **445,000, 580,000 to 587,000** | **299 to 302 / 810 to 865 ms** | **0** | **385 to 440 MiB** | 81 to 82% |
+| workerd, both ways | | | | killed for memory as pages arrived | |
+| celld | | | | no client got its 2,000 pages open in 10 minutes | |
+
+What the numbers mean:
+- **Memory is the difference.** An idle million page is 6 KB on combd and
+  130 to 300 KB on workerd and celld: 20 to 50 times as many pages in the
+  same GB. Clicking, combd at 20,000 pages used less memory than workerd
+  at 1,000.
+- **Where workerd held on, it kept up.** At 1,000 and (Worker-held) 5,000
+  pages it delivered the same changes as combd and lost nothing; at 5,000
+  its echoes were slower (p50 0.6 to 5.4 s against 112 to 153 ms) and it
+  was at 920 to 940 MiB of 1,024. Then memory ended it.
+- **celld fell behind at 1,000 pages,** CPU-bound (95 to 99%) with
+  echoes 8 to 10 s late. Its Viewer objects pay an RPC per watcher per
+  beat, the only way to reach a page's socket that works on celld.
+- **combd's 10,000 run a** had one bad stretch (40 s with p50 1.2 s and
+  p99 5.9 s, its CPU dropping to 11% in one sample: waiting, not working);
+  run b, and 20,000 in both runs, didn't. Not investigated; we'd guess the
+  VM.
+- **combd at 20,000 clicking pages** delivered 445,000 changes a second on
+  one core with nothing lost: about 4x the 10,000 pages' rate, as fan-out
+  grows with pages times watchers.
+
+**A burst that outran combd's guard.** Before the arrivals were paced, four
+clients opened idle pages as fast as they could (~14,000 a second). In two
+of four tries combd was killed for memory (at ~100,000 and ~115,000
+pages: the cgroup's peak touched its 1 GiB within a second); in the other
+two it held 162,800 and 163,270 and refused the rest, at 98% of its
+memory. Paced at 1,000 a second it refused cleanly both times. The guard
+checks memory on the loop, and a second of new connections at that rate is
+~85 MB of sockets and snapshots: it needs a margin for the rate, or a cap
+on new connections a second.
+
+**Cloudflare, an estimate from public pricing** (not deployed, not
+measured; developers.cloudflare.com/durable-objects/platform/pricing and
+/workers/platform/pricing, checked 2026-10-24): Durable Object requests
+$0.15 a million (an RPC call is one; incoming WebSocket messages count 1
+in 20; outgoing are free), duration $12.50 a million GB-s at 128 MB an
+object (hibernatable idle objects aren't billed), SQLite rows written $1 a
+million; Workers $0.30 a million requests and $0.02 a million CPU-ms; $5 a
+month minimum. Using the click rates measured above (67 to 1,360 clicks a
+second), 64 chunks always busy, and the fan-out million does (a message
+per watcher per beat with a change):
+
+| Load | Viewer objects (RPC per watcher) | Worker-held sockets | combd |
+|---|---|---|---|
+| 1,000 pages | ~$1.20 an hour | ~$0.60 an hour | one $6/month droplet |
+| 5,000 pages | ~$12.50 an hour | ~$1.60 an hour | the same droplet (25% CPU) |
+| 10,000 pages | ~$34 an hour | ~$2.80 an hour | the same |
+| 20,000 pages | ~$80 an hour | ~$5.30 an hour | the same (81% CPU) |
+
+The RPC pushes are most of the first column (136,000 a second at 20,000
+pages: ~$73 an hour); the second is mostly SQLite writes ($4.90) and the
+chunks' duration ($0.36). Left out: Viewer objects' own duration while
+they run a push, and the Worker's CPU for passing messages on (at 0.05 ms
+a message, ~$0.50 an hour at 20,000 pages). On Cloudflare neither design
+would fall over: objects spread over many machines. What it would cost to
+run million's real traffic (bursty, mostly idle) is lower; these are the
+rates while that many people click.
+
+What this doesn't cover:
+- **Not a droplet.** One Mac, arm64 in a VM, the clients on the same VM.
+  Two runs each; earlier work here saw a busy laptop swing results 2x to
+  5x. The droplet ramp (2026-10-21 and 22, TLS, real network) is the one
+  to quote for a node's capacity; this one is for the comparison.
+- **The Workers app is ours.** A better port may exist. The Viewer-object
+  way is the faithful one (a session per socket, hibernating), and the
+  Worker-held way trades hibernation for fewer calls; both are measured.
+- **Hibernation on workerd didn't free memory here.** 2,000 sockets to
+  Viewer objects, each sent one message and then left alone: 640 MB
+  before and after 3 minutes. workerd as shipped, no settings changed; we
+  didn't find out why. On Cloudflare a hibernated object leaves memory, so
+  workerd's idle numbers say nothing about what Cloudflare holds.
+- **celld ran as `celld dev`:** one node, its local storage. Its
+  production mode (a bucket and peers) wasn't measured.
+- **No TLS, no latency to Cloudflare.** Echo times here are all on one
+  machine; the 150 ms beat is the floor for all three.

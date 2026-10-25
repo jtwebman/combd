@@ -3,7 +3,8 @@
 //! `max_sets` of them (each flipped from what it sees) a random 1 s to
 //! `max_gap` s apart, then sits and watches. It keeps the TLS state (it
 //! reads every change), and times each click to its echo: the chunk sends
-//! a change to every watcher, the clicker too.
+//! a change to every watcher, the clicker too. With `ca` as `-` it speaks
+//! plain WebSockets (ws://), for servers that don't end TLS themselves.
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -17,7 +18,9 @@ const RENEW: Duration = Duration::from_secs(20);
 const LOST: Duration = Duration::from_secs(10);
 
 struct Page {
-    tls: rustls::ClientConnection,
+    /// None: plain, and `out` holds what's still to send.
+    tls: Option<rustls::ClientConnection>,
+    out: Vec<u8>,
     tcp: mio::net::TcpStream,
     up: bool,
     from: u64,
@@ -77,13 +80,24 @@ struct Tally {
 
 impl Page {
     fn send(&mut self, msg: &str) {
-        let _ = self.tls.writer().write_all(&frame(msg));
+        match &mut self.tls {
+            Some(tls) => drop(tls.writer().write_all(&frame(msg))),
+            None => self.out.extend(frame(msg)),
+        }
         self.flush();
     }
 
+    fn wants_write(&self) -> bool {
+        self.tls.as_ref().map_or(!self.out.is_empty(), |t| t.wants_write())
+    }
+
     fn flush(&mut self) {
-        while self.up && self.tls.wants_write() {
-            match self.tls.write_tls(&mut self.tcp) {
+        while self.up && self.wants_write() {
+            let r = match &mut self.tls {
+                Some(tls) => tls.write_tls(&mut self.tcp).map(drop),
+                None => self.tcp.write(&self.out).map(|n| drop(self.out.drain(..n))),
+            };
+            match r {
                 Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => self.up = false,
@@ -92,15 +106,25 @@ impl Page {
     }
 
     fn read(&mut self, t: &mut Tally) {
+        let mut buf = [0u8; 16384];
         loop {
-            match self.tls.read_tls(&mut self.tcp) {
+            let got = match &mut self.tls {
+                Some(tls) => tls.read_tls(&mut self.tcp),
+                None => self.tcp.read(&mut buf),
+            };
+            match got {
                 Ok(0) => self.up = false,
-                Ok(_) => {
-                    if self.tls.process_new_packets().is_err() {
-                        self.up = false;
+                Ok(n) => {
+                    match &mut self.tls {
+                        Some(tls) => {
+                            if tls.process_new_packets().is_err() {
+                                self.up = false;
+                            }
+                            // Drained as it goes: rustls holds only so much.
+                            let _ = tls.reader().read_to_end(&mut self.plain);
+                        }
+                        None => self.plain.extend_from_slice(&buf[..n]),
                     }
-                    // Drained as it goes: rustls holds only so much.
-                    let _ = self.tls.reader().read_to_end(&mut self.plain);
                     continue;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
@@ -173,7 +197,7 @@ fn pct(sorted: &[u32], p: usize) -> u32 {
 }
 
 pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64, max_gap: u64) {
-    let cfg = crate::wire::admin_client(std::path::Path::new(ca)).unwrap();
+    let cfg = (ca != "-").then(|| crate::wire::admin_client(std::path::Path::new(ca)).unwrap());
     let name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
     let mut rng = Rng(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64 | 1);
     let mut poll = mio::Poll::new().unwrap();
@@ -183,10 +207,8 @@ pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64
     // A node that's busy refuses (or can't take the connection yet): as a
     // browser would, wait the second it asks for and try again.
     let mut refused = 0u64;
-    let open = |i: usize| -> Result<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>, String> {
-        let tcp = std::net::TcpStream::connect(addr).map_err(|e| e.to_string())?;
-        let mut s = rustls::StreamOwned::new(rustls::ClientConnection::new(cfg.clone(), name.clone()).unwrap(), tcp);
-        write!(s, "GET {path} HTTP/1.1\r\nhost: {host}\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n").map_err(|e| e.to_string())?;
+    // The upgrade, over TLS or not; then the connection and its socket.
+    fn upgrade(s: &mut impl Read, i: usize) -> Result<(), String> {
         let mut head = vec![];
         let mut b = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
@@ -198,7 +220,21 @@ pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64
         if !head.starts_with(b"HTTP/1.1 101") {
             return Err(format!("socket {i}: {}", String::from_utf8_lossy(&head).lines().next().unwrap_or("closed")));
         }
-        Ok(s)
+        Ok(())
+    }
+    let open = |i: usize| -> Result<(Option<rustls::ClientConnection>, std::net::TcpStream), String> {
+        let mut tcp = std::net::TcpStream::connect(addr).map_err(|e| e.to_string())?;
+        let req = format!("GET {path} HTTP/1.1\r\nhost: {host}\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n");
+        let Some(cfg) = &cfg else {
+            tcp.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+            upgrade(&mut tcp, i)?;
+            return Ok((None, tcp));
+        };
+        let mut s = rustls::StreamOwned::new(rustls::ClientConnection::new(cfg.clone(), name.clone()).unwrap(), tcp);
+        s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+        upgrade(&mut s, i)?;
+        let (tls, tcp) = s.into_parts();
+        Ok((Some(tls), tcp))
     };
     for i in 0..n {
         let s = loop {
@@ -213,12 +249,13 @@ pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64
                 }
             }
         };
-        let (tls, tcp) = s.into_parts();
+        let (tls, tcp) = s;
         tcp.set_nonblocking(true).unwrap();
         let mut tcp = mio::net::TcpStream::from_std(tcp);
         poll.registry().register(&mut tcp, mio::Token(i), mio::Interest::READABLE).unwrap();
         let mut p = Page {
             tls,
+            out: vec![],
             tcp,
             up: true,
             from: rng.below(BOXES - VIEW),
@@ -273,7 +310,7 @@ pub fn run(addr: &str, host: &str, path: &str, n: usize, ca: &str, max_sets: u64
                         keep
                     });
                 }
-                if p.tls.wants_write() {
+                if p.wants_write() {
                     p.flush();
                 }
             }
