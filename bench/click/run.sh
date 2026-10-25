@@ -8,14 +8,16 @@
 #
 # Tests: `idle` (pages that only watch and renew, added until the server
 # refuses or falls over) and a number of clicking pages (each clicks 1 to 30
-# boxes 1 to 20 s apart, then watches). Raw logs and a summary go to $OUT.
+# boxes 1 to 20 s apart, then watches). Pages arrive at RATE a second, STEP
+# to a client container. Raw logs and a summary go to $OUT.
 set -u
 cd "$(dirname "$0")/../.."
 SERVERS=${SERVERS:-"combd workerd workerd-worker celld"}
 TESTS=${TESTS:-"idle 1000 5000 10000 20000"}
-CLIENTS=${CLIENTS:-4}          # load containers (one IP each: ~60,000 sockets apiece)
+RATE=${RATE:-1000}             # new pages a second
+STEP=${STEP:-2000}             # pages to a client container
 SECS=${SECS:-180}              # clicking, once every page is open
-IDLE_MAX=${IDLE_MAX:-240000}   # idle pages to try for, across the clients
+IDLE_MAX=${IDLE_MAX:-240000}   # idle pages to try for
 IDLE_SECS=${IDLE_SECS:-900}    # longest an idle ramp may take
 OUT=${OUT:-/tmp/click-race-$(date +%Y%m%d-%H%M%S)}
 NET=combd-click
@@ -28,9 +30,27 @@ if [ "${BUILD:-1}" = 1 ]; then
 fi
 docker network create $NET >/dev/null 2>&1
 
-# start <server>: a fresh server container, `srv`, limited like the droplet.
+# client <k> <pages> <max clicks> <max gap s>: one ws-click container, cli<k>.
+client() {
+    docker run -d --name cli$1 --network $NET --ulimit nofile=1048576:1048576 \
+        bench-click-combd combd-spike ws-click srv:8080 million.localhost /ws "$2" - "$3" "$4" >/dev/null
+}
+stop_all() {
+    docker ps -aq --filter name='^cli[0-9]' | xargs docker rm -f >/dev/null 2>&1
+    docker rm -f srv click-net >/dev/null 2>&1
+}
+# logs <prefix>: every client's log, and the server's.
+logs() {
+    for c in $(docker ps -a --format '{{.Names}}' --filter name='^cli[0-9]'); do docker logs $c > "$1-$c.log" 2>&1; done
+    docker logs srv > "$1-srv.log" 2>&1
+}
+# Connections refused, over all the clients.
+refusals() { grep -Ho 'refused [0-9]* times' "$1"-cli*.log 2>/dev/null | awk -F: '{ split($2, a, " "); if (a[2] > n[$1]) n[$1] = a[2] } END { for (f in n) t += n[f]; print t + 0 }'; }
+
+# start <server>: a fresh server container, `srv`, limited like the droplet,
+# and a sidecar in its network namespace (click-net) to count its sockets.
 start() {
-    docker rm -f srv >/dev/null 2>&1
+    stop_all
     rm -f "$OUT/.cpu"
     case $1 in
         combd) args="bench-click-combd" ;;
@@ -40,6 +60,7 @@ start() {
     esac
     docker run -d --name srv --network $NET --cpus=1 --memory=1g --memory-swap=1g \
         --ulimit nofile=1048576:1048576 $args >/dev/null || exit 1
+    docker run -d --name click-net --network container:srv debian:bookworm-slim sleep infinity >/dev/null
     for _ in $(seq 1 120); do
         docker run --rm --network $NET bench-click-combd bash -c \
             'exec 3<>/dev/tcp/srv/8080 && printf "GET /api/count HTTP/1.1\r\nhost: million.localhost\r\nconnection: close\r\n\r\n" >&3 && head -1 <&3' \
@@ -47,21 +68,6 @@ start() {
         sleep 1
     done
     echo "$1 never answered"; exit 1
-}
-
-# clients <pages each> <max clicks> <max gap s>: CLIENTS ws-click containers.
-clients() {
-    for c in $(seq 1 "$CLIENTS"); do
-        docker rm -f cli$c >/dev/null 2>&1
-        docker run -d --name cli$c --network $NET --ulimit nofile=1048576:1048576 \
-            --sysctl net.ipv4.ip_local_port_range="1024 65535" bench-click-combd \
-            combd-spike ws-click srv:8080 million.localhost /ws "$1" - "$2" "$3" >/dev/null
-    done
-}
-
-stop_all() {
-    for c in $(seq 1 "$CLIENTS"); do docker rm -f cli$c >/dev/null 2>&1; done
-    docker rm -f srv >/dev/null 2>&1
 }
 
 # The server's memory (MiB: its cgroup's, less inactive page cache, as
@@ -77,43 +83,54 @@ mem() {
             print $3, $4 > f }'
 }
 up() { [ "$(docker inspect -f '{{.State.Running}}' srv 2>/dev/null)" = true ]; }
-# Sockets the clients hold open (established), from their side.
+# WebSockets the server holds (established on :8080, i.e. 1F90).
 held() {
-    n=0
-    for c in $(seq 1 "$CLIENTS"); do
-        k=$(docker exec cli$c sh -c "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '\$4 == \"01\"' | wc -l" 2>/dev/null)
-        n=$((n + ${k:-0}))
-    done
-    echo $n
+    n=$(docker exec click-net sh -c "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '\$2 ~ /:1F90\$/ && \$4 == \"01\"' | wc -l" 2>/dev/null)
+    echo "${n:-0}"
 }
+died() { docker inspect -f 'server died (OOMKilled={{.State.OOMKilled}} exit={{.State.ExitCode}})' srv; }
 
 # idle <server>: pages that never click (their first click is due in ~a
-# week), each renewing every 20 s as million's page does, until all of
-# IDLE_MAX are open, the count stops growing for 60 s, or the server dies.
+# week), each renewing every 20 s as million's page does, until IDLE_MAX
+# have arrived, the server holds two steps fewer than have arrived for
+# 30 s (it refuses, or can't keep up), or it dies. Sampled every second.
 idle() {
-    s=$1 log=$OUT/$1-idle.tsv
+    s=$1 log=$OUT/$1-idle
     start "$s"
     base=$(mem | cut -d' ' -f1)
-    clients $((IDLE_MAX / CLIENTS)) 1 1000000
-    t0=$(date +%s) best=0 best_at=$t0 peak=0 peak_mem=$base why=
-    echo "secs	held	mem_mib	cpu_pct" > "$log"
+    t0=$(date +%s) k=0 sent=0 behind=0 peak=0 peak_mem=$base top=0 h=0 why=
+    echo "secs	arrived	held	mem_mib	cpu_pct" > "$log.tsv"
     while :; do
-        sleep 5
-        now=$(date +%s) h=$(held) m=$(mem)
-        echo "$((now - t0))	$h	${m% *}	${m#* }" >> "$log"
-        if ! up; then why="server died ($(docker inspect -f 'OOMKilled={{.State.OOMKilled}} exit={{.State.ExitCode}}' srv))"; break; fi
-        if [ "$h" -gt "$peak" ]; then peak=$h peak_mem=${m% *}; fi
-        if [ "$h" -gt $((best + best / 100 + 10)) ]; then best=$h best_at=$now; fi
-        if [ "$h" -ge "$IDLE_MAX" ]; then sleep 30; h=$(held) m=$(mem); peak=$h peak_mem=${m% *}; why="all $IDLE_MAX open"; break; fi
-        if [ $((now - best_at)) -ge 60 ]; then why="stopped growing"; break; fi
-        if [ $((now - t0)) -ge "$IDLE_SECS" ]; then why="out of time"; break; fi
+        if [ $sent -lt "$IDLE_MAX" ] && [ $behind -eq 0 ]; then
+            k=$((k + 1)) sent=$((sent + STEP))
+            client $k $STEP 1 1000000
+        fi
+        for _ in $(seq 1 $((STEP / RATE))); do
+            sleep 1
+            h=$(held) m=$(mem)
+            echo "$(($(date +%s) - t0))	$sent	$h	${m% *}	${m#* }" >> "$log.tsv"
+            up || break
+            if [ "$h" -gt "$peak" ]; then peak=$h peak_mem=${m% *}; fi
+            top=$(awk -v a="$top" -v b="${m% *}" 'BEGIN { print (b > a ? b : a) }')
+            if [ "$h" -lt $((sent - 2 * STEP)) ]; then behind=$((behind + 1)); else behind=0; fi
+        done
+        if ! up; then why=$(died); break; fi
+        if [ $behind -ge 30 ]; then why="refusing or behind (held $h of $sent arrived)"; break; fi
+        if [ $sent -ge "$IDLE_MAX" ] && [ $behind -eq 0 ]; then
+            sleep 20; h=$(held) m=$(mem); peak=$h peak_mem=${m% *}; why="all $IDLE_MAX open"; break
+        fi
+        if [ $(($(date +%s) - t0)) -ge "$IDLE_SECS" ]; then why="out of time"; break; fi
     done
-    refused=$(for c in $(seq 1 "$CLIENTS"); do docker logs cli$c 2>&1 | grep -o 'refused [0-9]* times' | tail -1; done | awk '{n += $2} END {print n + 0}')
-    for c in $(seq 1 "$CLIENTS"); do docker logs cli$c > "$OUT/$s-idle-cli$c.log" 2>&1; done
-    docker logs srv > "$OUT/$s-idle-srv.log" 2>&1
+    # Still serving? A new page must get its echo.
+    if up; then
+        docker run -d --name cli0 --network $NET bench-click-combd combd-spike ws-click srv:8080 million.localhost /ws 1 - 1 1 >/dev/null
+        sleep 15
+        if docker logs cli0 2>&1 | grep -q 'clicks 1 .*lost 0'; then why="$why; a new page works"; else why="$why; a new page got no echo in 15 s"; fi
+    fi
+    logs "$log"
     per=$(awk -v m="$peak_mem" -v b="$base" -v h="$peak" 'BEGIN { if (h > 0) printf "%.1f", (m - b) * 1024 / h; else print "-" }')
-    printf "%-15s idle   held %7d  memory %6.0f MiB (base %4.0f)  %5s KB a page  refusals %6d  end: %s\n" \
-        "$s" "$peak" "$peak_mem" "$base" "$per" "$refused" "$why" | tee -a "$OUT/summary.txt"
+    printf "%-15s idle   held %7d  memory %4.0f MiB (base %3.0f, top %4.0f)  %5s KB a page  refusals %6d  end: %s\n" \
+        "$s" "$peak" "$peak_mem" "$base" "$top" "$per" "$(refusals "$log")" "$why" | tee -a "$OUT/summary.txt"
     stop_all
 }
 
@@ -122,12 +139,17 @@ active() {
     s=$1 n=$2 log=$OUT/$1-$2
     start "$s"
     base=$(mem | cut -d' ' -f1)
-    clients $((n / CLIENTS)) 30 20
+    k=0
+    for left in $(seq "$n" -"$STEP" 1); do
+        k=$((k + 1))
+        client $k $((left < STEP ? left : STEP)) 30 20
+        sleep $((STEP / RATE))
+    done
     # Each client's first window line comes once its pages are all open.
     for _ in $(seq 1 600); do
-        k=0
-        for c in $(seq 1 "$CLIENTS"); do docker logs cli$c 2>&1 | grep -q '^ws-click +' && k=$((k + 1)); done
-        [ $k -eq "$CLIENTS" ] && break
+        w=0
+        for c in $(seq 1 $k); do docker logs cli$c 2>&1 | grep -q '^ws-click +' && w=$((w + 1)); done
+        [ $w -eq $k ] && break
         up || break
         sleep 1
     done
@@ -137,9 +159,8 @@ active() {
         echo "$(($(date +%s) - t0))	$(mem | tr ' ' '\t')" >> "$log-mem.tsv"
         sleep 5
     done
-    died=$(up || docker inspect -f 'server died: OOMKilled={{.State.OOMKilled}} exit={{.State.ExitCode}}' srv)
-    for c in $(seq 1 "$CLIENTS"); do docker logs cli$c > "$log-cli$c.log" 2>&1; done
-    docker logs srv > "$log-srv.log" 2>&1
+    dead=$(up || died)
+    logs "$log"
     # Per 10 s window, summed over the clients (the worst client's p50 and
     # p99); windows up to SECS.
     cat "$log"-cli*.log | awk -v secs="$SECS" -v n="$n" -v s="$s" '
@@ -153,7 +174,7 @@ active() {
                 if ($i == "lost") { x = $(i + 1); sub(/,/, "", x); lost[t] += x }
                 if ($i == "seen") changes[t] += $(i + 1)
                 if ($i == "closed") closed[t] += $(i - 1)
-                if ($i == "refused") refused[t] += $(i + 1)
+                if ($i == "up,") up[t] += $(i - 1)
             }
             if (t > last) last = t
         }
@@ -164,17 +185,17 @@ active() {
                 if (p50[t] > w50) w50 = p50[t]
                 if (p99[t] > w99) w99 = p99[t]
             }
-            printf "%-15s %6d pages  changes/s %7.0f avg %7.0f peak  clicks %6d  lost %5d (%.2f%%)  worst p50 %5d ms  p99 %5d ms  closed %d  refused %d\n",
-                s, n, X / (last > 0 ? last : 1), peak, C, L, C ? 100 * L / C : 0, w50, w99, closed[last], refused[last]
+            printf "%-15s %6d pages  changes/s %7.0f avg %7.0f peak  clicks %6d  lost %5d (%.2f%%)  worst p50 %5d ms  p99 %5d ms  up %d closed %d",
+                s, n, X / (last > 0 ? last : 1), peak, C, L, C ? 100 * L / C : 0, w50, w99, up[last], closed[last]
         }' > "$log-sum.txt"
     peak=$(awk 'NR > 1 && $2 > m { m = $2 } END { printf "%.0f", m }' "$log-mem.tsv")
-    cpu=$(awk 'NR > 1 { c += $3; k++ } END { printf "%.0f", k ? c / k : 0 }' "$log-mem.tsv")
-    printf "%s  memory %4.0f MiB peak (base %4.0f)  cpu %3s%% avg %s\n" "$(cat "$log-sum.txt")" "$peak" "$base" "$cpu" "$died" | tee -a "$OUT/summary.txt"
+    cpu=$(awk 'NR > 2 { c += $3; k++ } END { printf "%.0f", k ? c / k : 0 }' "$log-mem.tsv")
+    printf "%s  refused %d  memory %4.0f MiB peak (base %3.0f)  cpu %3s%% avg %s\n" "$(cat "$log-sum.txt")" "$(refusals "$log")" "$peak" "$base" "$cpu" "$dead" | tee -a "$OUT/summary.txt"
     stop_all
 }
 
 {
-    echo "click race: servers [$SERVERS], tests [$TESTS], $CLIENTS clients, ${SECS}s clicking; logs in $OUT"
+    echo "click race: servers [$SERVERS], tests [$TESTS], $RATE new pages a second, $STEP a client, ${SECS}s clicking; logs in $OUT"
     echo "docker $(docker version --format '{{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}'), $(docker info --format '{{.NCPU}} CPUs, {{.MemTotal}} bytes') for docker; $(git rev-parse --short HEAD)"
     for t in combd workerd celld; do echo "bench-click-$t $(docker image inspect -f '{{.Id}}' bench-click-$t | cut -c1-19)"; done
 } | tee "$OUT/summary.txt"
@@ -183,4 +204,5 @@ for t in $TESTS; do
         if [ "$t" = idle ]; then idle "$s"; else active "$s" "$t"; fi
     done
 done
-docker rm -f click-probe >/dev/null 2>&1
+stop_all
+docker rm -f click-probe cli0 >/dev/null 2>&1
