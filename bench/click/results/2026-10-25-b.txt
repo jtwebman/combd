@@ -1,0 +1,25 @@
+click race: servers [combd workerd workerd-worker celld], tests [idle 1000 5000 10000 20000], 1000 new pages a second, 2000 a client, 180s clicking
+docker 29.9.2 linux/arm64, 8 CPUs, 16746086400 bytes for docker; 328b316
+bench-click-combd sha256:505292808293
+bench-click-workerd sha256:2daf2d248383
+bench-click-celld sha256:ab19429e31bc
+combd           idle   held  156565  memory  931 MiB (base   5, top  978)    6.1 KB a page  refusals      4  end: refusing or behind (held 156565 of 162000 arrived); a new page got no echo in 15 s
+workerd         idle   held    2870  memory  912 MiB (base 158, top  912)  269.2 KB a page  refusals      2  end: server died (OOMKilled=true exit=137)
+workerd-worker  idle   held    6000  memory  869 MiB (base  82, top  869)  134.3 KB a page  refusals      1  end: server died (OOMKilled=true exit=137)
+celld           idle   held    3061  memory  721 MiB (base  75, top  721)  216.1 KB a page  refusals      4  end: refusing or behind (held 3061 of 8000 arrived); a new page got no echo in 15 s
+combd             1000 pages  changes/s    1200 avg    1732 peak  clicks  12369  lost     0 (0.00%)  worst p50   151 ms  p99   161 ms  up 1000 closed 0  refused 0  memory   63 MiB peak (base   6)  cpu   4% avg 
+workerd           1000 pages  changes/s    1177 avg    1736 peak  clicks  12164  lost    15 (0.12%)  worst p50   155 ms  p99   258 ms  up 1000 closed 0  refused 0  memory  613 MiB peak (base  85)  cpu  10% avg 
+workerd-worker    1000 pages  changes/s    1190 avg    1702 peak  clicks  12133  lost     0 (0.00%)  worst p50   153 ms  p99   239 ms  up 1000 closed 0  refused 0  memory  292 MiB peak (base  51)  cpu   7% avg 
+celld             1000 pages  changes/s    1175 avg    1556 peak  clicks  12155  lost     9 (0.07%)  worst p50  8036 ms  p99  9687 ms  up 1000 closed 0  refused 0  memory  787 MiB peak (base  26)  cpu  95% avg 
+combd             5000 pages  changes/s   28661 avg   39378 peak  clicks  61456  lost     0 (0.00%)  worst p50   112 ms  p99   362 ms  up 5000 closed 0  refused 0  memory  140 MiB peak (base   5)  cpu  24% avg 
+workerd           5000 pages  changes/s       0 avg       0 peak  clicks      0  lost     0 (0.00%)  worst p50     0 ms  p99     0 ms  up 0 closed 0  refused 2  memory    0 MiB peak (base  91)  cpu   0% avg server died (OOMKilled=true exit=137)
+workerd-worker    5000 pages  changes/s   28721 avg   39075 peak  clicks  61596  lost     0 (0.00%)  worst p50   612 ms  p99  3991 ms  up 5000 closed 0  refused 0  memory  919 MiB peak (base  53)  cpu  57% avg 
+celld             5000 pages  changes/s     490 avg     655 peak  clicks   4268  lost  2621 (61.41%)  worst p50  8482 ms  p99  9977 ms  up 677 closed 323  refused 3  memory    0 MiB peak (base  28)  cpu   0% avg server died (OOMKilled=true exit=1)
+combd            10000 pages  changes/s  113009 avg  150680 peak  clicks 122874  lost     0 (0.00%)  worst p50   115 ms  p99   476 ms  up 10000 closed 0  refused 0  memory  206 MiB peak (base   5)  cpu  55% avg 
+workerd          10000 pages  changes/s       0 avg       0 peak  clicks      0  lost     0 (0.00%)  worst p50     0 ms  p99     0 ms  up 0 closed 0  refused 5  memory    0 MiB peak (base  51)  cpu   0% avg server died (OOMKilled=true exit=137)
+workerd-worker   10000 pages  changes/s    5459 avg    5459 peak  clicks    877  lost     0 (0.00%)  worst p50   150 ms  p99   319 ms  up 0 closed 2000  refused 2  memory    0 MiB peak (base  49)  cpu   0% avg server died (OOMKilled=true exit=137)
+celld            10000 pages  changes/s     231 avg     740 peak  clicks  20186  lost 10240 (50.73%)  worst p50  9332 ms  p99 10015 ms  up 174 closed 3826  refused 5  memory  830 MiB peak (base  30)  cpu  99% avg 
+combd            20000 pages  changes/s  445690 avg  586646 peak  clicks 245460  lost     0 (0.00%)  worst p50   302 ms  p99   865 ms  up 20000 closed 0  refused 0  memory  385 MiB peak (base   5)  cpu  81% avg 
+workerd          20000 pages  changes/s     362 avg     362 peak  clicks    125  lost     0 (0.00%)  worst p50   177 ms  p99   326 ms  up 0 closed 2000  refused 9  memory    0 MiB peak (base  51)  cpu   0% avg server died (OOMKilled=true exit=137)
+workerd-worker   20000 pages  changes/s    5179 avg   10358 peak  clicks   1424  lost     0 (0.00%)  worst p50   150 ms  p99   285 ms  up 0 closed 2000  refused 7  memory    0 MiB peak (base  49)  cpu   0% avg server died (OOMKilled=true exit=137)
+celld            20000 pages  changes/s       0 avg       0 peak  clicks      0  lost     0 (0.00%)  worst p50     0 ms  p99     0 ms  up 0 closed 0  refused 10  memory  716 MiB peak (base  26)  cpu  99% avg 
