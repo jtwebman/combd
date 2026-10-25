@@ -89,7 +89,9 @@ mem() {
             printf "%.1f %.0f\n", ($1 - $2) / 1048576, (p[2] && $4 > p[2]) ? 100000 * ($3 - p[1]) / ($4 - p[2]) : 0
             print $3, $4 > f }'
 }
-up() { [ "$(docker inspect -f '{{.State.Running}}' srv 2>/dev/null)" = true ]; }
+# Down only when docker says so: a busy docker sometimes fails to answer,
+# and that ended clicking runs early.
+up() { [ "$(docker inspect -f '{{.State.Running}}' srv 2>&1)" != false ]; }
 # WebSockets the server holds (established on :8080, i.e. 1F90).
 held() {
     n=$(docker exec click-net sh -c "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '\$2 ~ /:1F90\$/ && \$4 == \"01\"' | wc -l" 2>/dev/null)

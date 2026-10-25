@@ -2656,116 +2656,188 @@ cells.
 4. A real Linux x86 server with pinned threads.
 5. Add celld to the scoreboard (needs a yes to install and run it).
 
-## The click race: combd, workerd, celld (2026-10-25)
+## The click race: combd, workerd, celld, Phoenix (2026-10-25)
 
-Million on all three, on the same box, one at a time (`bench/click/run.sh`,
-one command; summaries in `bench/click/results/`).
-- **The apps:** combd runs `examples/million` with its chunks and viewers
-  compiled (the nodes' build, `aot-lite`; the builds made by `aot-build`,
-  the builder's command) and its page interpreted, as its manifest says.
-  workerd 1.20260929.1 and celld v0.6.2 run `examples/million-workers`: the
-  same app as a Workers app with Durable Objects (same page, protocol,
-  chunk size, 20 sets a second, 150 ms beat, 60 s subscriptions), written
-  for this race. Two ways to hold a page's socket on Workers:
-  - **a Viewer object per socket** (hibernatable, as million's viewer
-    session): a chunk can't write to a socket another object holds, so it
-    calls each watcher's Viewer over RPC, every beat;
-  - **the Worker holds it** (workerd only), with a hibernatable socket per
-    watched chunk, so a beat is one `send` per watcher. celld v0.6.2 drops
-    the Worker's end of such a socket right after the upgrade (the chunk's
-    `getWebSockets()` is empty at its next beat), so it runs the first way.
+Million on four servers, on the same box, one at a time (`bench/click/run.sh`,
+one command; summaries in `bench/click/results/`, this round's in
+`2026-10-25-c.txt` and `-d.txt`).
+- **The apps:**
+  - combd runs `examples/million` with its chunks and viewers compiled
+    (the nodes' build, `aot-lite`; the builds made by `aot-build`, the
+    builder's command) and its page interpreted, as its manifest says.
+  - workerd 1.20260929.1 and celld v0.6.2 run `examples/million-workers`:
+    the same app as a Workers app with Durable Objects (same page,
+    protocol, chunk size, 20 sets a second, 150 ms beat, 60 s
+    subscriptions). This round it holds every page's socket in a Hub
+    object (hibernatable), and a chunk's beat is one RPC per Hub, not per
+    page; a chunk writes a beat's changes in one transaction. That port
+    beat the two designs the first run raced (a Viewer object per socket;
+    the Worker holding the socket) on both runtimes, in memory and in
+    echo times: what each design and change measured is in
+    `examples/million-workers/README.md`.
+  - Phoenix: `examples/million-phoenix`, million on the BEAM (Elixir 1.20.4,
+    OTP 28, Bandit 1.13.1: the server Phoenix runs on; no Phoenix router
+    or Channel, whose envelope isn't million's protocol). A GenServer per
+    chunk with its own SQLite (WAL, `synchronous = FULL`, a beat's changes
+    in one transaction, sent after the commit), a process per socket; a
+    beat is encoded once and the same binary sent to every watcher. One
+    scheduler (`+S 1:1`), no busy-waiting, process and port tables sized
+    to the box, 2 KB socket buffers, a collection after each renewal (Bandit
+    can't hibernate a socket's process): each setting and what it bought
+    is in its README.
 - **The box:** each server in Docker with `--cpus=1 --memory=1g
   --memory-swap=1g` (a $6 droplet's size, no swap). celld as `celld dev`
   (one node, local storage), as in the Durable Object race. Plain
-  WebSockets for all three: celld can't end TLS, so `ws-click` learned
-  plain `ws://` (`ca` as `-`). On the droplets combd ends TLS itself
-  (~4 KB more an idle connection).
+  WebSockets for all four: celld can't end TLS, so `ws-click` speaks plain
+  `ws://` (`ca` as `-`). On the droplets combd ends TLS itself (~4 KB more
+  an idle connection).
 - **This is not a droplet.** An Apple M4 Max (macOS 27), Docker Desktop
   29.9.2: a Linux arm64 VM with 8 CPUs and 16 GB for Docker, other
-  containers idling beside it (databases, emulators), the load clients on
-  the same VM. Droplets are x86 with a real NIC; their numbers will differ.
+  containers idling beside it (databases, emulators; another agent's
+  combd tests ran beside the first of combd's idle tries), the load
+  clients on the same VM. Droplets are x86 with a real NIC; their numbers
+  will differ.
 - **The load:** `ws-click` in containers of 2,000 pages, a new container
   every 2 s (~1,000 new pages a second at most). Idle pages never click (a
   first click due in about a week) but renew every 20 s as million's page
-  does; clicking pages click 1 to 30 boxes 1 to 20 s apart, then watch.
-  Memory is the server's cgroup less inactive page cache (as docker stats
-  counts it), every second (idle) or 5 s (clicking); held sockets are
-  counted in the server's own network namespace.
-- **Two full runs** (a, b) of everything, a fresh server for each test.
-  Where they differ, both are shown.
+  does; they arrive in steps of 2,000 a container at 1,000 a second for
+  combd and Phoenix, and of 500 at 500 a second for workerd and celld,
+  whose limits are lower. Clicking pages click 1 to 30 boxes 1 to 20 s
+  apart, then watch, for 180 s. Memory is the server's cgroup less
+  inactive page cache (as docker stats counts it), every second (idle) or
+  5 s (clicking); held sockets are counted in the server's own network
+  namespace.
+- **Two full runs** (a, b) of everything, a fresh server for each test;
+  Phoenix's two ran after the other three's. Where they differ, both are
+  shown.
+
+**Where each falls over** (the first clicking level where p99 echo time
+passes 1 s, clicks are lost, or the server is killed or refuses; idle:
+where it stops taking pages):
+
+| Server | Clicking: fine up to | First trouble | Idle pages held |
+|---|---|---|---|
+| **combd** | 5,000 (p99 0.7 to 1.0 s) | p99 3.4 s at 10,000 in run a (683 ms in b), 2.1 to 2.5 s at 20,000; never lost a click or fell over | **156,000 to 157,000, then refused new ones at TCP** |
+| workerd (Hub) | 5,000 (p99 220 to 299 ms) | 10,000: at its memory limit (993 to 1,008 MiB), p99 2.3 s in run b (841 ms in a); 20,000: killed for memory at ~10,000 open | 11,500, then killed for memory |
+| celld (Hub) | 500 (p99 243 to 258 ms) | 1,000: p99 1.7 to 5.1 s at 18% CPU (stalls, not work); 10,000: clicks lost; 20,000: killed at ~18,700 open | 39,000 to 40,500, then killed for memory |
+| Phoenix | 10,000 (p99 227 to 251 ms) | 20,000: its one core full (100%), p99 1.02 to 1.05 s, 2 clicks lost in run a | 68,000, then killed for memory |
 
 **Idle pages, until the server refuses or falls over:**
 
 | Server | Held | Its memory then | A page | How it ended |
 |---|---|---|---|---|
-| **combd** | **156,000 / 156,565** | 932 / 931 MiB | **6.1 KB** | refused new ones at TCP (its memory guard) and kept serving the rest |
-| workerd, a Viewer object per socket | 3,151 / 2,870 | 984 / 912 MiB | 270 to 300 KB | killed for memory |
-| workerd, the Worker holds the socket | 6,000 / 6,000 | 841 / 869 MiB | 133 KB | killed for memory (in the next 2,000) |
-| celld, a Viewer object per socket | 2,803 / 3,061 | 698 / 721 MiB | 216 to 222 KB | answered 500 to the rest ("shedding on the absolute memory cap") and stayed up, at 75% CPU (a new page got in on run a, not b) |
+| **combd** | **156,911 / 156,000** | 943 / 949 MiB | **6.1 KB** | refused new ones at TCP (its memory guard) and kept serving the rest |
+| workerd, Hubs | 11,559 / 11,500 | 1,019 / 1,005 MiB | 82 to 88 KB | killed for memory |
+| celld, Hubs | 39,003 / 40,503 | 915 / 939 MiB | 23 KB | killed for memory (its 80% shedding didn't catch it) |
+| Phoenix | 68,000 / 68,000 | 1,018 / 1,017 MiB | 14.5 KB | killed for memory (nothing in it refuses) |
 
-So in a GB: combd about 156,000 pages, workerd 3,000 to 6,000, celld about
-3,000. With combd at 156,000, its CPU was 40 to 60%, most of it the
-renewals (7,800 a second).
+combd's first idle try this round, with another agent's tests running
+beside it, was killed for memory at 114,000 pages (the burst problem
+below); its next two refused cleanly at ~156,000.
 
 **Clicking pages** (changes delivered a second: every click times its
 watchers, averaged over the 180 s and in the best 10 s; echo times are the
-worst 10 s window's worst client; lost: no echo in 10 s):
+worst 10 s window's worst client; lost: no echo in 10 s; runs a / b):
 
-| 1,000 pages | Changes/s (avg, best 10 s) | Echo p50 / p99 | Lost | Memory | CPU |
+| 10 pages | Echo p50 / p99 | Lost | Memory | CPU |
+|---|---|---|---|---|
+| **combd** | 153 / 160 ms | 0 | **9 MiB** | 0% |
+| workerd | 156 to 157 / 209 to 306 ms | 0 | 37 to 108 MiB | 0% |
+| celld | 162 to 169 / 204 to 240 ms | 0 | 42 to 53 MiB | 1% |
+| Phoenix | 159 / 220 to 238 ms | 0 | 59 to 66 MiB | 0% |
+
+| 100 pages | Echo p50 / p99 | Lost | Memory | CPU |
+|---|---|---|---|---|
+| **combd** | 152 to 153 / 160 to 161 ms | 0 | **21 MiB** | 1% |
+| workerd | 154 / 281 to 286 ms | 0 | 61 MiB | 1% |
+| celld | 158 / 220 to 258 ms | 0 | 73 to 78 MiB | 3% |
+| Phoenix | 153 / 202 to 223 ms | 0 | 55 to 56 MiB | 0% |
+
+| 500 pages | Changes/s (avg, best 10 s) | Echo p50 / p99 | Lost | Memory | CPU |
 |---|---|---|---|---|---|
-| **combd** | 1,200, 1,770 | **152 / 161 ms** | 0 | **63 MiB** | **4%** |
-| workerd, Viewer objects | 1,180, 1,730 | 155 / 217 to 258 ms | 0 / 0.12% | 594 to 613 MiB | 10% |
-| workerd, Worker-held | 1,190, 1,720 | 154 / 239 to 281 ms | 0 | 292 MiB | 7% |
-| celld, Viewer objects | 1,200, 1,540 | 8.0 to 9.3 s / 9.7 to 10.0 s | 7.3% / 0.07% | 790 MiB | 95 to 99% |
+| **combd** | 318 to 326, 451 to 460 | 152 / 161 ms | 0 | **42 MiB** | 2% |
+| workerd | 306 to 313, 469 to 478 | 154 to 155 / 257 to 313 ms | 0 | 108 to 110 MiB | 3% |
+| celld | 315 to 326, 444 to 497 | 157 to 158 / 243 to 258 ms | 0 | 126 to 127 MiB | 11% |
+| Phoenix | 312 to 336, 458 to 481 | 152 / 203 to 328 ms | 0 | 67 to 68 MiB | 2% |
+
+| 1,000 pages | Changes/s | Echo p50 / p99 | Lost | Memory | CPU |
+|---|---|---|---|---|---|
+| **combd** | 1,210 to 1,240, 1,780 | 152 / 161 to 162 ms | 0 | **62 MiB** | 4% |
+| workerd | 1,130 to 1,190, 1,710 to 1,750 | 154 / 184 to 191 ms | 0 | 165 to 168 MiB | 5% |
+| celld | 1,190, 1,720 to 1,810 | 157 to 453 ms / 1.7 to 5.1 s | 0 | 181 to 220 MiB | 18 to 19% |
+| Phoenix | 1,190 to 1,200, 1,690 to 1,710 | 152 to 153 / 199 to 229 ms | 0 | 80 to 87 MiB | 4% |
 
 | 5,000 pages | Changes/s | Echo p50 / p99 | Lost | Memory | CPU |
 |---|---|---|---|---|---|
-| **combd** | 28,700, 40,000 | **112 to 153 / 362 to 572 ms** | 0 | **140 to 146 MiB** | **24 to 25%** |
-| workerd, Viewer objects | | | | killed for memory as pages arrived | |
-| workerd, Worker-held | 28,700, 40,000 | 0.6 to 5.4 s / 4.0 to 8.3 s | 0 | 919 to 944 MiB | 49 to 57% |
-| celld, Viewer objects | | | 27% / 61% | killed for memory mid-run | |
+| combd | 28,800 to 28,900, 40,100 to 40,200 | 114 / 712 to 983 ms | 0 | **140 to 152 MiB** | **24%** |
+| workerd | 28,500 to 28,700, 39,800 to 39,900 | 120 to 121 / 220 to 299 ms | 0 | 515 to 519 MiB | 37 to 39% |
+| celld | 28,300 to 28,700, 39,600 to 40,200 | 1.0 to 3.5 s / 5.1 to 7.9 s | 0 | 456 to 558 MiB | 79 to 82% |
+| Phoenix | 28,100 to 28,700, 39,700 to 40,500 | 110 to 111 / **215 to 299 ms** | 0 | 164 to 168 MiB | 29% |
 
 | 10,000 pages | Changes/s | Echo p50 / p99 | Lost | Memory | CPU |
 |---|---|---|---|---|---|
-| **combd** | 113,000, 151,000 to 161,000 | 115 ms to 1.2 s / 476 ms to 5.9 s | **0** | **206 to 221 MiB** | 55 to 57% |
-| workerd, both ways | | | | killed for memory as pages arrived | |
-| celld | 63 to 231 | 9.3 to 9.7 s / 10 s | 51% to 56% | up, at 99 to 100% CPU, most sockets closed | |
+| combd | 113,100 to 113,500, 149,600 to 150,700 | 192 to 241 ms / 0.7 to 3.4 s | 0 | **204 to 207 MiB** | **54 to 55%** |
+| workerd | 109,800 to 111,300, 169,800 to 176,600 | 469 to 479 ms / 0.8 to 2.3 s | 0 | 993 to 1,008 MiB (of 1,024) | 84% |
+| celld | 109,600 to 110,800, 145,100 to 153,300 | 5.2 to 5.8 s / 9.5 to 9.9 s | 0.2 to 0.6% | 722 to 820 MiB | 96 to 97% |
+| Phoenix | 112,400 to 112,700, 149,700 to 151,000 | **108 to 110 / 227 to 251 ms** | 0 | 241 to 248 MiB | 75 to 77% |
 
 | 20,000 pages | Changes/s | Echo p50 / p99 | Lost | Memory | CPU |
 |---|---|---|---|---|---|
-| **combd** | **445,000, 580,000 to 587,000** | **299 to 302 / 810 to 865 ms** | **0** | **385 to 440 MiB** | 81 to 82% |
-| workerd, both ways | | | | killed for memory as pages arrived | |
-| celld | | | | no client got its 2,000 pages open in 10 minutes | |
+| combd | **442,200 to 442,700, 579,300 to 593,600** | 408 to 483 ms / 2.1 to 2.5 s | **0** | **418 to 430 MiB** | 77% |
+| workerd | | | | killed for memory as pages arrived (at ~10,000) | |
+| celld | | | | killed for memory as pages arrived (at ~18,700) | |
+| Phoenix | 394,300 to 407,100, 677,300 to 842,000 | 483 to 506 ms / 1.02 to 1.05 s | 2 of 246,808 / 0 | 435 to 447 MiB | 100% |
 
 What the numbers mean:
-- **Memory is the difference.** An idle million page is 6 KB on combd and
-  130 to 300 KB on workerd and celld: 20 to 50 times as many pages in the
-  same GB. Clicking, combd at 20,000 pages used less memory than workerd
-  at 1,000.
-- **Where workerd held on, it kept up.** At 1,000 and (Worker-held) 5,000
-  pages it delivered the same changes as combd and lost nothing; at 5,000
-  its echoes were slower (p50 0.6 to 5.4 s against 112 to 153 ms) and it
-  was at 920 to 940 MiB of 1,024. Then memory ended it.
-- **celld fell behind at 1,000 pages,** CPU-bound (95 to 99%) with
-  echoes 8 to 10 s late. Its Viewer objects pay an RPC per watcher per
-  beat, the only way to reach a page's socket that works on celld.
-- **combd's 10,000 run a** had one bad stretch (40 s with p50 1.2 s and
-  p99 5.9 s, its CPU dropping to 11% in one sample: waiting, not working);
-  run b, and 20,000 in both runs, didn't. Not investigated; we'd guess the
-  VM.
-- **combd at 20,000 clicking pages** delivered 445,000 changes a second on
-  one core with nothing lost: about 4x the 10,000 pages' rate, as fan-out
-  grows with pages times watchers.
+- **Idle memory is still the biggest difference, but it's smaller.** An
+  idle million page is 6.1 KB on combd, 14.5 KB on Phoenix, 23 KB on celld
+  and 82 to 88 KB on workerd, once the Workers app holds its sockets in a
+  Hub. The first run's Workers app (an object per socket) was 130 to 300
+  KB.
+- **Clicking, the BEAM is combd's match.** Phoenix had the shortest tails
+  at 5,000 (with workerd) and at 10,000 pages (p99 227 to 251 ms,
+  where combd's worst windows were 0.7 to 3.4 s), for a fifth more memory
+  and 40% more CPU than combd (241 to 248 MiB and 75 to 77% at 10,000,
+  against 204 to 207 MiB and 54 to 55%). At 20,000 its one core was full:
+  p99 just past 1 s, 2 clicks lost in one run, and 8 to 11% fewer changes
+  delivered in the 180 s than combd, which ran that load at 77% CPU with
+  nothing lost (and p99 2.1 to 2.5 s).
+- **workerd keeps up until memory ends it.** With Hubs its echoes at
+  5,000 pages (p99 220 to 299 ms) were as short as Phoenix's, and at
+  10,000 it delivered the same changes as combd at 84% CPU and at 1 GB of
+  1 GB; 20,000 pages don't fit.
+- **celld stalls before it runs out of CPU.** At 1,000 pages its CPU was
+  18%, but its worst windows had echoes of 1.7 to 5 s, later in the run
+  (a single node waits for its object store on every write, its docs
+  say). From 5,000 it's CPU-bound too.
+- **combd's tail at 10,000** was 3.4 s in run a's worst window, 683 ms in
+  b; the first round saw the same (5.9 s and 476 ms). Not investigated:
+  it delivered every change, at 55% CPU.
+
+**First run** (the same day, before this round): the Workers app held
+each socket in a Viewer object (or, on workerd, the Worker), wrote each
+set as it came, and workerd ran under `npx`; there was no Phoenix, and the
+levels were 1,000 to 20,000. Then workerd held 2,900 to 6,000 idle pages
+and celld about 3,000 (130 to 300 KB a page), workerd was killed for
+memory from 5,000 clicking pages (or, Worker-held, kept up at 5,000 with
+p50 0.6 to 5.4 s), and celld fell behind at 1,000 (echoes 8 to 10 s, CPU-
+bound). combd held the same idle pages (156,000) and delivered the same
+changes, but its tails were shorter then: p99 362 to 572 ms at 5,000 and
+810 to 865 ms at 20,000, against 712 to 983 ms and 2.1 to 2.5 s now.
+Between the two builds (`eff9a5f`, `8e04713`) only the binary's name and
+new commands changed, and other tests shared the VM at times this round;
+we didn't look further.
 
 **A burst that outran combd's guard.** Before the arrivals were paced, four
 clients opened idle pages as fast as they could (~14,000 a second). In two
 of four tries combd was killed for memory (at ~100,000 and ~115,000
 pages: the cgroup's peak touched its 1 GiB within a second); in the other
 two it held 162,800 and 163,270 and refused the rest, at 98% of its
-memory. Paced at 1,000 a second it refused cleanly both times. The guard
-checks memory on the loop, and a second of new connections at that rate is
-~85 MB of sockets and snapshots: it needs a margin for the rate, or a cap
-on new connections a second.
+memory. Paced at 1,000 a second it refused cleanly in four of five tries
+over both rounds; the fifth (this round, with other tests on the VM) was
+killed at 114,000. The guard checks memory on the loop, and a second of
+new connections at that rate is ~85 MB of sockets and snapshots: it needs
+a margin for the rate, or a cap on new connections a second.
 
 **Cloudflare, an estimate from public pricing** (not deployed, not
 measured; developers.cloudflare.com/durable-objects/platform/pricing and
@@ -2781,36 +2853,49 @@ per watcher per beat with a change):
 | Load | Viewer objects (RPC per watcher) | Worker-held sockets | combd |
 |---|---|---|---|
 | 1,000 pages | ~$1.20 an hour | ~$0.60 an hour | one $6/month droplet |
-| 5,000 pages | ~$12.50 an hour | ~$1.60 an hour | the same droplet (25% CPU) |
+| 5,000 pages | ~$12.50 an hour | ~$1.60 an hour | the same droplet (24% CPU) |
 | 10,000 pages | ~$34 an hour | ~$2.80 an hour | the same |
-| 20,000 pages | ~$80 an hour | ~$5.30 an hour | the same (81% CPU) |
+| 20,000 pages | ~$80 an hour | ~$5.30 an hour | the same (77% CPU) |
 
 The RPC pushes are most of the first column (136,000 a second at 20,000
 pages: ~$73 an hour); the second is mostly SQLite writes ($4.90) and the
 chunks' duration ($0.36). Left out: Viewer objects' own duration while
 they run a push, and the Worker's CPU for passing messages on (at 0.05 ms
-a message, ~$0.50 an hour at 20,000 pages). On Cloudflare neither design
-would fall over: objects spread over many machines. What it would cost to
-run million's real traffic (bursty, mostly idle) is lower; these are the
-rates while that many people click.
+a message, ~$0.50 an hour at 20,000 pages). The Hub design sits between
+them, depending on how many Hubs: each is an RPC per chunk per beat, so
+with a Hub per 1,000 pages, 20,000 pages is ~8,500 pushes a second
+(~$4.60 an hour) plus the same writes, ~$11 an hour. On Cloudflare no
+design would fall over: objects spread over many machines. What it would
+cost to run million's real traffic (bursty, mostly idle) is lower; these
+are the rates while that many people click.
 
 What this doesn't cover:
 - **Not a droplet.** One Mac, arm64 in a VM, the clients on the same VM.
   Two runs each; earlier work here saw a busy laptop swing results 2x to
   5x. The droplet ramp (2026-10-21 and 22, TLS, real network) is the one
   to quote for a node's capacity; this one is for the comparison.
-- **The Workers app is ours.** A better port may exist. The Viewer-object
-  way is the faithful one (a session per socket, hibernating), and the
-  Worker-held way trades hibernation for fewer calls; both are measured.
-- **Hibernation on workerd didn't free memory here.** 2,000 sockets to
-  Viewer objects, each sent one message and then left alone: 640 MB
-  before and after 3 minutes. workerd as shipped, no settings changed; we
-  didn't find out why. On Cloudflare a hibernated object leaves memory, so
+- **The ports are ours.** The Workers app was reworked this round to be
+  the best we could make it (and the Hub design is the one that won);
+  the Phoenix app was written for this race and tuned as BEAM people
+  would. Better ports may exist.
+- **One core for everyone.** Phoenix ran one scheduler, combd one event
+  loop; workerd and celld use what they use inside one CPU's quota. On
+  more cores the BEAM, celld and workerd spread out; combd's nodes run
+  one loop per core.
+- **Hibernation on workerd frees little.** It does evict idle objects
+  (their constructors run again, counted), but most of an idle page's
+  memory there is the connection: a Worker holding a bare socket is ~70
+  KB a page, an object per socket ~195 KB even evicted, and memory freed
+  isn't returned. On Cloudflare a hibernated object leaves memory, so
   workerd's idle numbers say nothing about what Cloudflare holds.
+- **No compression.** `ws-click` doesn't offer `permessage-deflate`;
+  browsers do, and workerd accepts it (~300 KB a socket in a test with
+  Node's client). Phoenix and combd here don't compress.
 - **celld ran as `celld dev`:** one node, its local storage. Its
   production mode (a bucket and peers) wasn't measured.
 - **No TLS, no latency to Cloudflare.** Echo times here are all on one
-  machine; the 150 ms beat is the floor for all three.
+  machine; the 150 ms beat is the floor for all four (a click mid-beat
+  echoes sooner, hence p50s under 150 ms).
 
 ## On the fleet: moves, and refusing at TCP (2026-10-25)
 

@@ -64,8 +64,8 @@ In `rel/vm.args.eex`, the Dockerfile, and the code:
 What they did, with 5,000 idle pages: the BEAM's own memory went from 294
 MB (defaults, `+P 2000000 +Q 1100000`) to 114 MB with the buffer, heap
 and table settings, and 26 MB less again with interactive mode. In the
-race's idle ladder: 22,000 pages (37 KB a page) before, 66,000 (15 KB)
-after.
+race's idle ladder: 22,000 pages (37 KB a page) before, 68,000 (14.5 KB)
+after, in both runs.
 
 ## Run it
 
