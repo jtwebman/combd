@@ -918,7 +918,7 @@ fn main_with(args: &[&str]) {
     };
     match args[..] {
         [] | ["help"] | ["-h"] | ["--help"] => print!("{HELP}"),
-        ["new", name] => done(dev::new(name)),
+        ["new", name] => done(dev::new(std::path::Path::new("."), name)),
         ["build"] => done(dev::build(std::path::Path::new("."))),
         ["build", dir] => done(dev::build(std::path::Path::new(dir))),
         ["dev", ref rest @ ..] if rest.len() <= 2 => {

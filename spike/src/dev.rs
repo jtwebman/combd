@@ -84,12 +84,12 @@ fn count() -> Response {
 cell!(handle);
 "##;
 
-/// `combd new <name>`: a folder with an app that runs.
-pub fn new(name: &str) -> Result<(), String> {
+/// `combd new <name>`: a folder (in `parent`) with an app that runs.
+pub fn new(parent: &Path, name: &str) -> Result<(), String> {
     if !ident(name) {
         return Err(format!("{name:?}: an app's name is lowercase letters, digits, - and _"));
     }
-    let dir = Path::new(name);
+    let dir = parent.join(name);
     if dir.exists() {
         return Err(format!("{name} is already there"));
     }
@@ -137,11 +137,7 @@ mod tests {
     #[test]
     fn a_new_app_is_whole() {
         let dir = crate::store::tempdir::Dir::new();
-        let here = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir.0).unwrap();
-        let r = super::new("hello-app");
-        std::env::set_current_dir(here).unwrap();
-        r.unwrap();
+        super::new(&dir.0, "hello-app").unwrap();
         let app = dir.0.join("hello-app");
         let lib = std::fs::read_to_string(app.join("src/lib.rs")).unwrap();
         assert!(lib.contains("<title>hello-app</title>") && lib.contains("const PAGE: &str = r#\"<!doctype html>") && lib.contains("</script>\n\"#;"), "{lib}");
@@ -150,6 +146,7 @@ mod tests {
         std::fs::write(app.join("modules/hello-app.wasm"), b"").unwrap();
         let m = crate::manifest::load(&app).unwrap().unwrap();
         assert!(m.processes.contains_key("web") && m.processes.contains_key("counter"));
-        assert!(super::new("Bad Name").is_err());
+        assert!(super::new(&dir.0, "Bad Name").is_err());
+        assert!(super::new(&dir.0, "hello-app").is_err(), "already there");
     }
 }

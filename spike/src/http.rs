@@ -1464,7 +1464,7 @@ where
     E::Program: Sync + Send,
 {
     let app = live.now();
-    std::fs::create_dir_all(&cfg.data).expect("create the data directory");
+    std::fs::create_dir_all(&cfg.data).unwrap_or_else(|e| panic!("create the data directory {}: {e}", cfg.data.display()));
     let index = Mutex::new(AlarmIndex::open(&cfg.data).expect("open the alarm index"));
     // Every connection is a file: the limit goes to its ceiling, and the
     // connections stay under three quarters of it (objects' storage files,
