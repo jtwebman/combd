@@ -195,7 +195,9 @@ fn schema(kind: &str) -> Option<&'static str> {
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
             mailbox = { type = "int", min = 1, max = 1000000, default = 1000 }
             batch = { type = "int", min = 1, max = 10000, default = 100 }
-            placement = { type = "enum", values = ["nearest", "first", "spread"], default = "nearest" }
+            placement = { type = "enum", values = ["nearest", "first", "spread", "pin"], default = "nearest" }
+            "pin?" = { type = "string", pattern = "^[a-z0-9-]+(,[a-z0-9-]+)*$" }
+            fallback = { type = "enum", values = ["nearest", "none"], default = "nearest" }
             scope = { type = "enum", values = ["zone", "region", "fleet"], default = "region" }
             "memory_kb?" = { type = "int", min = 64, max = 4194304 }
             "#
@@ -206,7 +208,9 @@ fn schema(kind: &str) -> Option<&'static str> {
             timeout_ms = { type = "int", min = 1, max = 900000, default = 30000 }
             mailbox = { type = "int", min = 1, max = 1000000, default = 1000 }
             batch = { type = "int", min = 1, max = 10000, default = 100 }
-            placement = { type = "enum", values = ["nearest", "first", "spread"], default = "nearest" }
+            placement = { type = "enum", values = ["nearest", "first", "spread", "pin"], default = "nearest" }
+            "pin?" = { type = "string", pattern = "^[a-z0-9-]+(,[a-z0-9-]+)*$" }
+            fallback = { type = "enum", values = ["nearest", "none"], default = "nearest" }
             scope = { type = "enum", values = ["zone", "region", "fleet"], default = "region" }
             max_concurrent = { type = "int", min = 1, max = 1000, default = 32 }
             fresh = { type = "bool", default = false }
@@ -495,6 +499,9 @@ fn from_tree(tree: &Json, has_module: &dyn Fn(&str) -> bool) -> Result<Manifest,
                     }
                 }
             }
+        }
+        if flat.get("placement").and_then(Json::as_str) == Some("pin") && !flat.contains_key("pin") {
+            errs.push(format!("{at}.pin: placement = \"pin\" needs it: which regions (or areas), e.g. pin = \"fra1\""));
         }
         // How it runs, as the host reads it.
         flat.insert("durable".into(), Json::Bool(durable));
@@ -1123,6 +1130,15 @@ pool:
 
     /// Manifests are anyone's text: damaged at random, in all three formats,
     /// the parse and every check (and resolving it) must never panic.
+    /// `placement = "pin"` says where: without a `pin`, it's refused.
+    #[test]
+    fn a_pin_placement_needs_its_regions() {
+        let m = |extra: &str| from_tree(&tree_of("toml", &format!("[app]\nname = \"a\"\n[durable.room]\nmodule = \"m\"\nroutes = [\"/r/:id/*\"]\nplacement = \"pin\"\n{extra}")).unwrap(), &|_| true);
+        assert!(m("").err().is_some_and(|e| e.iter().any(|e| e.contains(".pin:"))), "no pin");
+        assert!(m("pin = \"eu,nyc3\"\nfallback = \"none\"").is_ok());
+        assert!(m("pin = \"EU!\"").is_err(), "not a region's name");
+    }
+
     #[test]
     fn mangled_manifests_never_panic() {
         let e = env(&[("REGION", "us-east".into()), ("PG_MAX", 100.into())], &[("pg-url", "postgres://db/x")]);

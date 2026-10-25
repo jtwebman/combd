@@ -4317,6 +4317,28 @@ impl<E: Engine> Loop<'_, E> {
         }
         if self.core.is_some() && !matches!(origin, Origin::Fleet(_)) {
             let hops = if let Origin::Wire(_, id, _) = origin { ((id >> HOP_SHIFT) as u8).saturating_add(1) } else { 0 };
+            // Pinned, and this node isn't in its regions: there, if one is
+            // up and it isn't running here (a fallback during an outage).
+            // With no fallback, a node outside never claims it.
+            if let Some(pin) = self.app.procs.get(self.app.object_proc(&name)).and_then(|p| p.pin.clone()) {
+                let f = &self.sh.fleet.as_ref().unwrap().cfg;
+                let all: Vec<own::Node> = f.peers.keys().copied().chain([f.node]).collect::<BTreeSet<_>>().into_iter().collect();
+                let ok = crate::fleet::pinned(&f.regions, &f.areas, &all, &pin.places);
+                if !ok.contains(&f.node) {
+                    let (now, obj) = (self.core_now(), own::obj_id(&name));
+                    let core = self.core.as_ref().unwrap();
+                    if !pin.fallback && core.home(now, obj, &ok).is_none() {
+                        return drop(self.deliver(origin, (503, "{\"error\":\"its regions are down\"}".into())));
+                    }
+                    if hops == 0 {
+                        if let Some(n) = core.place(now, obj, &ok) {
+                            return self.forward(n, FReq { origin, name, cell_req: req, hops: 0, act: 0, resp: None, ws: vec![], retries: 0 });
+                        }
+                    } else if !pin.fallback {
+                        return drop(self.deliver(origin, (503, "{\"error\":\"retry\"}".into())));
+                    }
+                }
+            }
             // Spread: a new object starts where its name says, not here.
             // (A name with no app here, as before any deploy: no process to ask.)
             if let (0, Some(scope)) = (hops, self.app.procs.get(self.app.object_proc(&name)).and_then(|p| p.spread)) {
@@ -4856,58 +4878,52 @@ impl<E: Engine> Loop<'_, E> {
         }
     }
 
-    /// Placement, once a window (`COMBD_PLACE_MS`): an object run here whose
-    /// requests came in mostly through one other node (two thirds, and at
-    /// least `PLACE_MIN`), or a spread one whose home is another node, two
-    /// windows running, is offered to that node,
-    /// and moves on its yes (`take`, then `Event::Move`). Not one that's
-    /// ticking or holds a database session: a game in play stays put, as
-    /// eviction leaves those too. An offer not answered by the next window
-    /// is a no.
+    /// Placement, once a window (`COMBD_PLACE_MS`): each object run here
+    /// gets a home from its process's placement (`nearest`: the node two
+    /// thirds of its requests, and at least `PLACE_MIN`, came in through;
+    /// `spread`: its hash home; `pin`: a node in its regions, once one is
+    /// up), then `policy::home` has the last word. A home that isn't this
+    /// node, two windows running, is offered the object, which moves on its
+    /// yes (`take`, then `Event::Move`). Not one that's ticking or holds a
+    /// database session: a game in play stays put, as eviction leaves
+    /// those too. An offer not answered by the next window is a no.
     fn place(&mut self) {
         self.last_place = Instant::now();
         self.taken = 0;
         self.asks.clear();
-        let f = self.sh.fleet.as_ref().unwrap();
+        let (sh, app) = (self.sh, self.app.clone());
+        let f = sh.fleet.as_ref().unwrap();
+        let all: Vec<own::Node> = f.cfg.peers.keys().copied().chain([f.cfg.node]).collect::<BTreeSet<_>>().into_iter().collect();
+        let now = self.core_now();
+        let traffic = std::mem::take(&mut self.traffic);
         let mut picks = HashMap::new();
-        for (name, by) in std::mem::take(&mut self.traffic) {
-            let total: u32 = by.values().sum();
-            let Some((&top, &n)) = by.iter().max_by_key(|&(_, &n)| n) else { continue };
-            if top == f.cfg.node || total < PLACE_MIN || n * 3 < total * 2 {
-                continue;
-            }
-            let again = self.picks.get(&name) == Some(&top);
-            picks.insert(name.clone(), top);
+        let names: Vec<String> = self.objects.keys().cloned().collect();
+        for name in names {
+            let Some(p) = app.procs.get(app.object_proc(&name)) else { continue };
+            let by = traffic.get(&name).cloned().unwrap_or_default();
+            let (obj, core) = (own::obj_id(&name), self.core.as_ref().unwrap());
+            // Where combd's own placement would have it.
+            let builtin = if let Some(pin) = &p.pin {
+                let ok = crate::fleet::pinned(&f.cfg.regions, &f.cfg.areas, &all, &pin.places);
+                if ok.contains(&f.cfg.node) { None } else { core.home(now, obj, &ok) }
+            } else if let Some(scope) = p.spread {
+                core.home(now, obj, &crate::fleet::among(&f.cfg.regions, f.cfg.node, &all, scope))
+            } else if p.nearest {
+                let total: u32 = by.values().sum();
+                by.iter().max_by_key(|&(_, &n)| n).filter(|&(_, &n)| total >= PLACE_MIN && n * 3 >= total * 2).map(|(&n, _)| n)
+            } else {
+                None
+            };
+            let Some(home) = crate::policy::home(&name, f.cfg.node, &by, builtin).filter(|&h| h != f.cfg.node) else { continue };
+            let again = self.picks.get(&name) == Some(&home);
+            picks.insert(name.clone(), home);
             let busy = self.objects.get(&name).is_none_or(|o| !o.pg.is_empty()) || self.ticks.contains_key(&name);
             if !again || busy {
                 continue;
             }
             let id = f.next_id.fetch_add(1, Relaxed);
-            f.wire.send(top, Frame::Forward { id, name: TAKE.into(), req: name.clone() }, self.me);
-            self.asks.insert(id, (name, top));
-        }
-        // Spread objects not on their home, now that it's up (it was down
-        // when they started, say): home, the same way.
-        let all: Vec<own::Node> = f.cfg.peers.keys().copied().chain([f.cfg.node]).collect::<BTreeSet<_>>().into_iter().collect();
-        let now = self.core_now();
-        let spread: Vec<(String, own::Node)> = self
-            .objects
-            .iter()
-            .filter(|(name, o)| o.pg.is_empty() && !self.ticks.contains_key(*name))
-            .filter_map(|(name, _)| {
-                let scope = self.app.procs.get(self.app.object_proc(name))?.spread?;
-                let home = self.core.as_ref()?.home(now, own::obj_id(name), &crate::fleet::among(&f.cfg.regions, f.cfg.node, &all, scope))?;
-                (home != f.cfg.node).then(|| (name.clone(), home))
-            })
-            .collect();
-        for (name, home) in spread {
-            let again = self.picks.get(&name) == Some(&home);
-            picks.insert(name.clone(), home);
-            if again {
-                let id = f.next_id.fetch_add(1, Relaxed);
-                f.wire.send(home, Frame::Forward { id, name: TAKE.into(), req: name.clone() }, self.me);
-                self.asks.insert(id, (name, home));
-            }
+            f.wire.send(home, Frame::Forward { id, name: TAKE.into(), req: name.clone() }, self.me);
+            self.asks.insert(id, (name, home));
         }
         self.picks = picks;
     }

@@ -53,6 +53,8 @@ pub struct FleetCfg {
     /// come in, and moves one whose traffic is elsewhere (`COMBD_PLACE_MS`,
     /// default 30 minutes; 0: never).
     pub place_ms: u64,
+    /// Named sets of regions, for `pin` (`COMBD_AREAS`: `eu=fra1+ams3,us=nyc3`).
+    pub areas: HashMap<String, Vec<String>>,
 }
 
 /// Placement's scope: which nodes a spread object may start on, seen from
@@ -75,6 +77,13 @@ pub fn among(regions: &HashMap<Node, String>, me: Node, all: &[Node], scope: Sco
             Scope::Zone => place(n) == place(me),
         })
         .collect()
+}
+
+/// The nodes a pinned object may live on (`placement = "pin"`): those in
+/// the regions it names, each a region or an area (`COMBD_AREAS`).
+pub fn pinned(regions: &HashMap<Node, String>, areas: &HashMap<String, Vec<String>>, all: &[Node], pin: &[String]) -> Vec<Node> {
+    let ok: Vec<&str> = pin.iter().flat_map(|p| areas.get(p).map_or(vec![p.as_str()], |a| a.iter().map(String::as_str).collect())).collect();
+    all.iter().copied().filter(|n| regions.get(n).is_some_and(|r| ok.contains(&r.split('/').next().unwrap_or("")))).collect()
 }
 
 impl FleetCfg {
@@ -110,7 +119,15 @@ impl FleetCfg {
             })
             .collect();
         let place_ms = std::env::var("COMBD_PLACE_MS").ok().and_then(|p| p.parse().ok()).unwrap_or(30 * 60_000);
-        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure, upload_ms, upload_bytes, read_lease, regions, place_ms })
+        let areas = std::env::var("COMBD_AREAS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|a| {
+                let (name, regions) = a.split_once('=')?;
+                Some((name.trim().to_string(), regions.split('+').map(|r| r.trim().to_string()).collect()))
+            })
+            .collect();
+        Some(FleetCfg { node, lease_ms, replicas, s3, peers, wire_port, wire_certs, insecure, upload_ms, upload_bytes, read_lease, regions, place_ms, areas })
     }
 }
 
@@ -611,6 +628,18 @@ fn fatal(e: std::io::Error) -> ! {
 
 #[cfg(test)]
 mod tests {
+    /// A pin names regions, or areas of them: its nodes are the ones there.
+    #[test]
+    fn a_pin_resolves_regions_and_areas() {
+        let regions: HashMap<Node, String> = [(0, "nyc3/a"), (1, "fra1/a"), (2, "ams3/b")].map(|(n, r)| (n, r.to_string())).into();
+        let areas: HashMap<String, Vec<String>> = [("eu".to_string(), vec!["fra1".to_string(), "ams3".to_string()])].into();
+        let pin = |p: &[&str]| pinned(&regions, &areas, &[0, 1, 2, 3], &p.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(pin(&["eu"]), [1, 2]);
+        assert_eq!(pin(&["nyc3"]), [0]);
+        assert_eq!(pin(&["fra1", "nyc3"]), [0, 1]);
+        assert!(pin(&["sgp1"]).is_empty(), "nowhere: node 3 has no region");
+    }
+
     #[test]
     fn placement_scope_picks_the_nodes_near() {
         let regions: HashMap<Node, String> = [(0, "nyc3/a"), (1, "nyc3/b"), (2, "fra1/a"), (3, "nyc3/a")].map(|(n, p)| (n, p.to_string())).into();

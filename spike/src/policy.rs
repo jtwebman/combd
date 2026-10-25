@@ -6,6 +6,8 @@
 //! in these functions. Each returns `Err(why)` to refuse.
 
 use crate::catalog::{Entry, State};
+use crate::own::Node;
+use std::collections::BTreeMap;
 
 /// A change about to be written to the catalog: a deploy (`entry.app` is
 /// `org/app`, its value the app's state: version, domains), its vars
@@ -23,4 +25,16 @@ pub fn catalog_write(_state: &State, _entry: &Entry) -> Result<(), String> {
 /// with `why` (403 alone; in a fleet, the client is told to retry).
 pub fn new_object(_name: &str) -> Result<(), String> {
     Ok(())
+}
+
+/// Where an object should live (placement), asked once a placement window
+/// (`COMBD_PLACE_MS`) for each object running on node `me`. `builtin` is
+/// what combd's own placement would do: `nearest` (the node most of its
+/// requests came in through), `spread` (its hash home), `pin` (a node in
+/// its regions), or `None` (stay). `traffic`: its requests this window, by
+/// the node they came in through. Return a node to offer it to, or `None`
+/// to keep it here. combd still does the rest: the offer (the node may say
+/// no), the move, two windows running before it moves at all.
+pub fn home(_name: &str, _me: Node, _traffic: &BTreeMap<Node, u32>, builtin: Option<Node>) -> Option<Node> {
+    builtin
 }

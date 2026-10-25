@@ -57,15 +57,16 @@ and the rest of the plan is updated to match.
    land on another node). The 503 helper moved to `@combd/js`. Then
    decide whether idle sessions may live in swap (105,000 held that way,
    in Docker) or the node refuses first (58,000, as now).
-3. **Security review loops** (Fable 5.1, 2026-10-24; "Security review,
-   in rounds"): round 1 fixed, round 2 running. Then the decisions it
-   left (domains per org, per-node credentials, the unit's hardening).
+3. **Security review loops: done** (Fable 5.1, 2026-10-24; three rounds,
+   "Security review, in rounds"): fixed and live, the unit hardened,
+   policy between tenants left to a service's hooks (`policy.rs`).
 4. **Placement: objects move to their home** ("Placement: where an object
    lives"): `nearest`, `spread`, `pin`, one hand-off, the target may say
    no. Built (2026-10-24): the hand-off (`own.rs`, the simulator), and on
    the node `nearest` (the default) and `spread` going home, with the
-   target's yes (`_combd/take`) and its claim at once (`_combd/claim`).
-   Left: `pin` and areas, and seeing moves on the fleet.
+   target's yes (`_combd/take`) and its claim at once (`_combd/claim`);
+   then `pin` with areas and a fallback, and `policy::home`, the hook a
+   fork writes its own placement in. Left: seeing moves on the fleet.
 5. **Getting ready to tell people:** a real `combd` binary (not
    `combd-spike`), releases for Linux and Mac, a 10-minute quickstart,
    and the race against celld, workerd, and Cloudflare (queued below,
@@ -1541,9 +1542,10 @@ written into the hooks in `spike/src/policy.rs` (`catalog_write`: every
 deploy, vars, secret, removal; `new_object`: every object about to start
 on a node), which allow everything as shipped. combd keeps only what
 keeps a node up: two apps can't hold one domain, the disk floor, the
-memory guard. Placement's modes go the same way next: a `policy::home`
-that `place()` asks, the built-ins its default; the hand-off, the
-target's "no", and the two-window guard stay combd's.
+memory guard. Placement went the same way: `policy::home` gets each
+object's built-in home (nearest, spread, pin) and its traffic, and has
+the last word; the hand-off, the target's "no", and the two-window guard
+stay combd's.
 
 **Decisions it left (JT's):**
 - **One compromised node is the whole fleet** today: every node holds the
@@ -1591,7 +1593,7 @@ connections crossed an ocean twice for the next 8 hours.
 |---|---|---|---|
 | `nearest` (default) | the node most of its requests come in through | it stays where it is | |
 | `spread` | its rendezvous hash over the live nodes: even by count, nothing shared between nodes | the next node by hash | it moves back |
-| `pin = ["fra1"]` or `pin = "eu"` | the nearest live node in those regions | `fallback = "nearest"`: it moves out; `"none"`: it waits (data that must not leave) | it moves back |
+| `pin = "fra1,ams3"` or `pin = "eu"` (areas: `COMBD_AREAS=eu=fra1+ams3`) | a live node in those regions (its hash pick) | `fallback = "nearest"`: it runs elsewhere; `"none"`: refused (503) until one is up, and never runs elsewhere | it moves back |
 
 **One loop for all three.** Every window (30 minutes to start), each owner
 works out each object's home. Not this node: it asks the home to take it.

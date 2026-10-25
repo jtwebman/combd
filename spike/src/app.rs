@@ -23,6 +23,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Where a pinned process's objects may live (`placement = "pin"`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pin {
+    /// Regions, or areas of them (`COMBD_AREAS`).
+    pub places: Vec<String>,
+    /// `fallback = "nearest"` (the default): with none of them up, an
+    /// object runs elsewhere, and goes back once one is. `"none"`: it waits
+    /// (data that must not leave them).
+    pub fallback: bool,
+}
+
 #[derive(Clone)]
 pub struct Proc {
     pub name: String,
@@ -62,6 +73,9 @@ pub struct Proc {
     /// the node most of its requests come in through (`COMBD_PLACE_MS`).
     /// `"first"`: it stays where it started.
     pub nearest: bool,
+    /// `placement = "pin"`: an object lives on a node in these regions
+    /// (`pin = "fra1,ams3"`, or an area: `COMBD_AREAS`).
+    pub pin: Option<Pin>,
     /// `memory_kb`, in Wasm pages: the most a cell may grow to.
     pub memory_pages: Option<u32>,
     /// How its module runs (`[modules.<name>] engine`).
@@ -152,7 +166,7 @@ pub struct AppDir<'a> {
 impl<P> App<P> {
     /// One program, the old routes.
     pub fn single(prog: P, max_concurrent: usize) -> App<P> {
-        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, mailbox: usize::MAX, batch: 100, spread: None, nearest: true, memory_pages: None, engine: crate::engine::Kind::Interpreted, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
+        let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, mailbox: usize::MAX, batch: 100, spread: None, nearest: true, pin: None, memory_pages: None, engine: crate::engine::Kind::Interpreted, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
         let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default(), pools: vec![] };
         App { progs: vec![Arc::new(prog)], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
     }
@@ -263,6 +277,10 @@ impl<P> App<P> {
                     },
                     state_max: n("state_kb") as usize * 1024,
                     nearest: matches!(p.settings.get("placement").and_then(serde_json::Value::as_str), None | Some("nearest")),
+                    pin: (p.settings.get("placement").and_then(serde_json::Value::as_str) == Some("pin")).then(|| Pin {
+                        places: p.settings.get("pin").and_then(serde_json::Value::as_str).unwrap_or("").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
+                        fallback: p.settings.get("fallback").and_then(serde_json::Value::as_str) != Some("none"),
+                    }),
                     spread: (p.settings.get("placement").and_then(serde_json::Value::as_str) == Some("spread")).then(|| match p.settings.get("scope").and_then(serde_json::Value::as_str) {
                         Some("zone") => crate::fleet::Scope::Zone,
                         Some("fleet") => crate::fleet::Scope::Fleet,
