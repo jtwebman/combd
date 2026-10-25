@@ -37,11 +37,14 @@ WORKDIR /w
 RUN npm install --no-audit --no-fund workerd@1.20260929.1 && mkdir -p /w/data
 COPY examples/million-workers/worker.mjs examples/million-workers/config.capnp ./
 COPY examples/million/client/index.html ./
-CMD ["npx", "workerd", "serve", "config.capnp"]
+# The binary itself: through npx, a node process (~37 MB) sits above it.
+CMD ["/w/node_modules/workerd/bin/workerd", "serve", "config.capnp"]
 
 # celld bundles with esbuild (for the page's text import); a static binary.
 FROM node:24.21.0-slim AS esbuild
 RUN cd /tmp && npm install --no-audit --no-fund esbuild@0.25.10 && cp node_modules/@esbuild/linux-*/bin/esbuild /esbuild
+# celld dev takes the Worker's variables from .dev.vars: one per design.
+RUN for s in hub object worker; do echo "SESSIONS=$s" > /vars-$s; done
 
 FROM ghcr.io/denoland/celld:v0.6.2 AS celld
 COPY --from=esbuild /esbuild /usr/local/bin/esbuild
@@ -49,4 +52,11 @@ ENV CELLD_ESBUILD=/usr/local/bin/esbuild
 WORKDIR /app
 COPY examples/million-workers/worker.mjs examples/million-workers/wrangler.json ./
 COPY examples/million/client/index.html ./
+COPY --from=esbuild /vars-hub ./.dev.vars
 CMD ["dev", "--host", "0.0.0.0", "--port", "8080", "--no-watch"]
+
+FROM celld AS celld-object
+COPY --from=esbuild /vars-object ./.dev.vars
+
+FROM celld AS celld-worker
+COPY --from=esbuild /vars-worker ./.dev.vars

@@ -1,6 +1,6 @@
 using Workerd = import "/workerd/workerd.capnp";
 
-# million on workerd: `npx workerd serve config.capnp`, with index.html
+# million on workerd: `workerd serve config.capnp`, with index.html
 # (../million/client/index.html) copied beside this file.
 const config :Workerd.Config = (
   services = [
@@ -19,14 +19,17 @@ const million :Workerd.Worker = (
   durableObjectNamespaces = [
     (className = "Chunk", uniqueKey = "chunk", enableSql = true),
     (className = "Boxes", uniqueKey = "boxes", enableSql = true),
+    (className = "Hub", uniqueKey = "hub", enableSql = true),
     (className = "Viewer", uniqueKey = "viewer", enableSql = true),
   ],
   durableObjectStorage = (localDisk = "disk"),
   bindings = [
     (name = "CHUNK", durableObjectNamespace = "Chunk"),
     (name = "BOXES", durableObjectNamespace = "Boxes"),
+    (name = "HUB", durableObjectNamespace = "Hub"),
     (name = "VIEWER", durableObjectNamespace = "Viewer"),
-    # "object" (a Viewer per page socket) unless the environment says "worker".
+    # "hub" (a few Hub objects hold the pages' sockets) unless the
+    # environment says "object" (a Viewer per socket) or "worker".
     (name = "SESSIONS", fromEnvironment = "SESSIONS"),
   ],
 );

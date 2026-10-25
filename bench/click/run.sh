@@ -1,19 +1,26 @@
 #!/bin/bash
-# The click race: million on combd (compiled), and million-workers on
-# workerd and celld, one server at a time, each limited like a $6 droplet
-# (1 CPU, 1 GB, no swap), driven by ws-click from its own containers.
+# The click race: million on combd (compiled), million-workers on workerd
+# and celld, and million-phoenix on the BEAM, one server at a time, each
+# limited like a $6 droplet (1 CPU, 1 GB, no swap), driven by ws-click
+# from its own containers.
 #
 #   bench/click/run.sh                  # build, then every server and test
 #   SERVERS="combd celld" TESTS="idle 1000" bench/click/run.sh
 #
+# Servers: combd, workerd, celld, phoenix. The Workers app holds pages'
+# sockets in a few Hub objects (its best design here), or, to compare, a
+# Viewer object per socket (workerd-object, celld-object) or the Worker
+# (workerd-worker, celld-worker): examples/million-workers/README.md.
+#
 # Tests: `idle` (pages that only watch and renew, added until the server
 # refuses or falls over) and a number of clicking pages (each clicks 1 to 30
 # boxes 1 to 20 s apart, then watches). Pages arrive at RATE a second, STEP
-# to a client container. Raw logs and a summary go to $OUT.
+# to a client container (idle: IDLE_RATE and IDLE_STEP, for finer steps
+# where a server's limit is low). Raw logs and a summary go to $OUT.
 set -u
 cd "$(dirname "$0")/../.."
-SERVERS=${SERVERS:-"combd workerd workerd-worker celld"}
-TESTS=${TESTS:-"idle 1000 5000 10000 20000"}
+SERVERS=${SERVERS:-"combd workerd celld phoenix"}
+TESTS=${TESTS:-"idle 10 100 500 1000 5000 10000 20000"}
 RATE=${RATE:-1000}             # new pages a second
 STEP=${STEP:-2000}             # pages to a client container
 SECS=${SECS:-180}              # clicking, once every page is open
@@ -24,7 +31,7 @@ NET=combd-click
 mkdir -p "$OUT"
 
 if [ "${BUILD:-1}" = 1 ]; then
-    for t in combd workerd celld; do
+    for t in combd workerd celld celld-object celld-worker phoenix; do
         docker build -q -f bench/click/Dockerfile --target $t -t bench-click-$t . >/dev/null || exit 1
     done
 fi
@@ -55,8 +62,8 @@ start() {
     case $1 in
         combd) args="bench-click-combd" ;;
         workerd) args="bench-click-workerd" ;;
-        workerd-worker) args="-e SESSIONS=worker bench-click-workerd" ;;
-        celld) args="bench-click-celld" ;;
+        workerd-object|workerd-worker) args="-e SESSIONS=${1#workerd-} bench-click-workerd" ;;
+        *) args="bench-click-$1" ;;
     esac
     docker run -d --name srv --network $NET --cpus=1 --memory=1g --memory-swap=1g \
         --ulimit nofile=1048576:1048576 $args >/dev/null || exit 1
@@ -95,24 +102,25 @@ died() { docker inspect -f 'server died (OOMKilled={{.State.OOMKilled}} exit={{.
 # have arrived, the server holds two steps fewer than have arrived for
 # 30 s (it refuses, or can't keep up), or it dies. Sampled every second.
 idle() {
-    s=$1 log=$OUT/$1-idle
+    s=$1 log=$OUT/$1-idle step=${IDLE_STEP:-$STEP} rate=${IDLE_RATE:-$RATE}
+    rm -f "$log"[-.]*
     start "$s"
     base=$(mem | cut -d' ' -f1)
     t0=$(date +%s) k=0 sent=0 behind=0 peak=0 peak_mem=$base top=0 h=0 why=
     echo "secs	arrived	held	mem_mib	cpu_pct" > "$log.tsv"
     while :; do
         if [ $sent -lt "$IDLE_MAX" ] && [ $behind -eq 0 ]; then
-            k=$((k + 1)) sent=$((sent + STEP))
-            client $k $STEP 1 1000000
+            k=$((k + 1)) sent=$((sent + step))
+            client $k $step 1 1000000
         fi
-        for _ in $(seq 1 $((STEP / RATE))); do
+        for _ in $(seq 1 $((step / rate))); do
             sleep 1
             h=$(held) m=$(mem)
             echo "$(($(date +%s) - t0))	$sent	$h	${m% *}	${m#* }" >> "$log.tsv"
             up || break
             if [ "$h" -gt "$peak" ]; then peak=$h peak_mem=${m% *}; fi
             top=$(awk -v a="$top" -v b="${m% *}" 'BEGIN { print (b > a ? b : a) }')
-            if [ "$h" -lt $((sent - 2 * STEP)) ]; then behind=$((behind + 1)); else behind=0; fi
+            if [ "$h" -lt $((sent - 2 * step)) ]; then behind=$((behind + 1)); else behind=0; fi
         done
         if ! up; then why=$(died); break; fi
         if [ $behind -ge 30 ]; then why="refusing or behind (held $h of $sent arrived)"; break; fi
@@ -137,6 +145,7 @@ idle() {
 # active <server> <pages>: every page clicking, SECS after all are open.
 active() {
     s=$1 n=$2 log=$OUT/$1-$2
+    rm -f "$log"-*
     start "$s"
     base=$(mem | cut -d' ' -f1)
     k=0
@@ -197,7 +206,7 @@ active() {
 {
     echo "click race: servers [$SERVERS], tests [$TESTS], $RATE new pages a second, $STEP a client, ${SECS}s clicking; logs in $OUT"
     echo "docker $(docker version --format '{{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}'), $(docker info --format '{{.NCPU}} CPUs, {{.MemTotal}} bytes') for docker; $(git rev-parse --short HEAD)"
-    for t in combd workerd celld; do echo "bench-click-$t $(docker image inspect -f '{{.Id}}' bench-click-$t | cut -c1-19)"; done
+    for t in combd workerd celld celld-object celld-worker phoenix; do echo "bench-click-$t $(docker image inspect -f '{{.Id}}' bench-click-$t | cut -c1-19)"; done
 } | tee "$OUT/summary.txt"
 for t in $TESTS; do
     for s in $SERVERS; do
