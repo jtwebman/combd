@@ -1,7 +1,7 @@
 #!/bin/sh
 # The HTTP race: the same app and requests on combd, workerd, celld, Bun, and
 # Node, each limited to CPUS cores (default 1), loaded by wrk from its own
-# container. Build first: the bench images (see Dockerfile) and combd-spike-aot
+# container. Build first: the bench images (see Dockerfile) and combd-aot
 # (spike/Dockerfile with FEATURES=aot).
 set -e
 CPUS=${CPUS:-1}
@@ -32,8 +32,8 @@ run() { # name image command...
 }
 
 echo "cores per server: $CPUS, connections: $CONNS, ${SECS}s per route"
-run combd-rust combd-spike-aot env COMBD_THREADS="$CPUS" ./target/release/combd-spike serve aot rust 8080
-run combd-js combd-spike-aot env COMBD_THREADS="$CPUS" ./target/release/combd-spike serve aot js 8080
+run combd-rust combd-aot env COMBD_THREADS="$CPUS" ./target/release/combd serve aot rust 8080
+run combd-js combd-aot env COMBD_THREADS="$CPUS" ./target/release/combd serve aot js 8080
 run workerd bench-workerd
 run celld bench-celld
 run bun bench-bun

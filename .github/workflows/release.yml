@@ -1,0 +1,62 @@
+# combd's binaries, for Linux and macOS. A tag (v0.1.0) builds all four and
+# makes a draft release with them (publish it by hand once it looks right);
+# run it by hand (Actions, "release", Run workflow) to only build them, as
+# artifacts. The toolchain is rust-toolchain.toml's.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (rust-toolchain.toml's)
+        run: rustup show active-toolchain || rustup toolchain install
+      # What a node runs: the interpreter and compiled modules' builds (no
+      # wasmtime, no fuzzers: those are for combd's own tests).
+      - name: Build
+        working-directory: spike
+        env:
+          COMBD_VERSION: ${{ github.ref_name }}
+        run: cargo build --locked --release --no-default-features --features aot-lite --target ${{ matrix.target }}
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          name=combd-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir -p "$name"
+          cp spike/target/${{ matrix.target }}/release/combd "$name/"
+          cp README.md "$name/" 2>/dev/null || true
+          "$name/combd" help > /dev/null
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}.tar.gz*
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --title "combd $GITHUB_REF_NAME" --notes "combd $GITHUB_REF_NAME for Linux (x86_64, arm64) and macOS (arm64, x86_64). Each .tar.gz has the combd binary; .sha256 beside it."

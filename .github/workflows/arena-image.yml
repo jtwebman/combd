@@ -110,7 +110,7 @@ jobs:
           for try in 1 2 3 4 5 6; do
             for n in 0 1 2; do
               if docker run --rm -v "$PWD/ca.pem:/ca.pem:ro" -e COMBD_TOKEN -e COMBD_ADMIN_CA=/ca.pem -e COMBD_ADMIN_NAME=node$n.combd \
-                "$IMAGE" ./target/release/combd-spike deploy ../examples/arena/app acme "https://n$n.arena.combd.dev:9443"; then
+                "$IMAGE" ./target/release/combd deploy ../examples/arena/app acme "https://n$n.arena.combd.dev:9443"; then
                 exit 0
               fi
             done

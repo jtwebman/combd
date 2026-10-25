@@ -16,7 +16,7 @@ for n in 0 1 2; do
     scp -q -o ConnectTimeout=10 combd-update.sh "root@$node:/usr/local/bin/combd-update"
     ssh -o ConnectTimeout=10 "root@$node" "docker pull -q $IMAGE >/dev/null && docker rm -f caddy combd >/dev/null 2>&1; \
         docker run -d --name combd --restart unless-stopped --network host --env-file /etc/combd/env \
-        -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro $IMAGE ./target/release/combd-spike serve-fleet interp 443 >/dev/null"
+        -v /var/lib/combd:/data -v /etc/combd:/etc/combd:ro $IMAGE ./target/release/combd serve-fleet interp 443 >/dev/null"
     i=0; until curl -sf -m 3 -o /dev/null "https://$node/_combd/ping"; do i=$((i + 1)); [ $i -gt 60 ] && { echo "  no HTTPS answer after 3 minutes: stopping here"; exit 1; }; sleep 3; done
     code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$node/")
     [ "$code" = 301 ] || { echo "  port 80 answered $code, not 301: stopping here"; exit 1; }

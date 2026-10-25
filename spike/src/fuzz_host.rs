@@ -1,6 +1,6 @@
 //! Fuzzing the host API: the wall between a cell and the host. A cell calls
 //! host functions with pointers, lengths, and SQL it picked, and it even
-//! picks their types, so every argument is hostile. `combd-spike fuzz-host N
+//! picks their types, so every argument is hostile. `combd fuzz-host N
 //! [start]` makes random calls (right and wrong arities, edge-value pointers
 //! and lengths, nasty SQL, random bytes) against a real object database and
 //! checks after each one:

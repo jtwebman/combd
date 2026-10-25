@@ -23,6 +23,7 @@ mod click;
 mod catnode;
 mod catsim;
 mod deploy;
+mod dev;
 mod engine;
 mod fleet;
 mod host;
@@ -883,8 +884,53 @@ fn main() {
     main_with(&args.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
+const HELP: &str = "combd: Durable Objects on your own machines.
+
+An app:
+  combd new <name>               a new app in ./<name> (Rust; combd.toml says what runs)
+  combd dev [dir] [port]         build it and serve it here (default ., 8080)
+  combd build [dir]              build it: its crate for wasm32, into modules/
+
+A node, or a fleet (see examples/arena/cloud for a whole one):
+  combd serve-apps <engine> <root> <port>   every app under <root>/<org>/<app>/
+  combd serve-fleet <engine> <port>         a fleet node (COMBD_* settings)
+  combd builder                             make compiled modules' builds for a fleet
+  engine: interp, aot (compiled), or both (each module as its manifest says)
+
+Deploying (to a node's admin port, with COMBD_TOKEN):
+  combd deploy <dir> <org> <url>            combd status <org/app> <url>
+  combd rollback <org/app> <version> <url>  combd remove <org/app> <url>
+  combd vars <org/app> <url> [name=value]   combd secret put|rm <org/app> <name> <url>
+
+Keys and certificates:
+  combd master-key <file>   combd builder-key <file>   combd admin-token <scope>...
+  combd wire-certs <dir> <nodes>
+
+combd also has its own benchmarks, simulators and fuzzers (spike/RESULTS.md).
+";
+
 fn main_with(args: &[&str]) {
+    let done = |r: Result<(), String>| {
+        if let Err(e) = r {
+            eprintln!("combd: {e}");
+            std::process::exit(1);
+        }
+    };
     match args[..] {
+        [] | ["help"] | ["-h"] | ["--help"] => print!("{HELP}"),
+        ["new", name] => done(dev::new(name)),
+        ["build"] => done(dev::build(std::path::Path::new("."))),
+        ["build", dir] => done(dev::build(std::path::Path::new(dir))),
+        ["dev", ref rest @ ..] if rest.len() <= 2 => {
+            let dir = std::path::Path::new(rest.first().copied().unwrap_or("."));
+            let port = rest.get(1).map_or(Ok(8080), |p| p.parse::<u16>()).unwrap_or_else(|_| {
+                eprintln!("combd: a port is a number");
+                std::process::exit(1)
+            });
+            done(dev::build(dir));
+            println!("serving {} on http://127.0.0.1:{port}", dir.display());
+            http::serve_app(&interp::Interp { max_pages: 16384 }, dir, port);
+        }
         ["all"] => {
             for test in ["compute", "startup", "crash", "density", "fairness"] {
                 let engines: &[&str] =
@@ -1325,7 +1371,10 @@ fn main_with(args: &[&str]) {
         [test, "wasmtime"] => run(test, "wasmtime", &wt::Wt::new(WT_FUEL, None)),
         #[cfg(feature = "wasmtime")]
         [test, "wasmtime-pool"] => run(test, "wt-pool", &wt::Wt::new(WT_FUEL, Some(cells() as u32 + 2_000))),
-        _ => eprintln!("usage: combd-spike all | <compute|startup|crash|density|fairness> <interp|wasmtime|wasmtime-pool|native>"),
+        _ => {
+            eprint!("combd: unknown command\n\n{HELP}");
+            std::process::exit(2);
+        }
     }
 }
 

@@ -39,9 +39,9 @@ race() { # name image command...
     echo "   (neighbor: ${n:-?} fib/s)"
 }
 
-race combd-rust combd-spike-aot env COMBD_THREADS=1 ./target/release/combd-spike serve aot rust 8080
-race combd-rust-no-yield combd-spike-aot env COMBD_THREADS=1 COMBD_NO_YIELD=1 ./target/release/combd-spike serve aot rust 8080
-race combd-js combd-spike-aot env COMBD_THREADS=1 ./target/release/combd-spike serve aot js 8080
+race combd-rust combd-aot env COMBD_THREADS=1 ./target/release/combd serve aot rust 8080
+race combd-rust-no-yield combd-aot env COMBD_THREADS=1 COMBD_NO_YIELD=1 ./target/release/combd serve aot rust 8080
+race combd-js combd-aot env COMBD_THREADS=1 ./target/release/combd serve aot js 8080
 race bun bench-bun
 race node bench-node
 race celld bench-celld

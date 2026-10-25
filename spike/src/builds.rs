@@ -1,5 +1,5 @@
 //! Compiled modules' builds, through the bucket. Nodes don't compile:
-//! builders do (`combd-spike builder`), and a node loads what they made.
+//! builders do (`combd builder`), and a node loads what they made.
 //!
 //! ```text
 //! _combd/nodes/<n>                       what node n runs: its pin and its CPU
@@ -340,7 +340,7 @@ fn claim(s3: &S3, k: &str, id: &str) -> bool {
 
 pub fn load_key(file: &Path) -> Result<Ed25519KeyPair, String> {
     let b = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
-    Ed25519KeyPair::from_pkcs8(&b).map_err(|_| format!("{}: not a builder key (combd-spike builder-key)", file.display()))
+    Ed25519KeyPair::from_pkcs8(&b).map_err(|_| format!("{}: not a builder key (combd builder-key)", file.display()))
 }
 
 #[cfg(test)]

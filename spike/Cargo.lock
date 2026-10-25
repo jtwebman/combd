@@ -158,40 +158,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "combd-aot"
-version = "0.0.0"
-dependencies = [
- "cc",
- "combd-mem",
- "corosensei",
- "libc",
-]
-
-[[package]]
-name = "combd-guest"
-version = "0.0.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "combd-load"
-version = "0.0.0"
-dependencies = [
- "combd-aot",
- "libc",
-]
-
-[[package]]
-name = "combd-mem"
-version = "0.0.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "combd-spike"
+name = "combd"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
@@ -226,6 +193,39 @@ dependencies = [
  "wast",
  "wat",
  "webpki-roots",
+]
+
+[[package]]
+name = "combd-aot"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "combd-mem",
+ "corosensei",
+ "libc",
+]
+
+[[package]]
+name = "combd-guest"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "combd-load"
+version = "0.0.0"
+dependencies = [
+ "combd-aot",
+ "libc",
+]
+
+[[package]]
+name = "combd-mem"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

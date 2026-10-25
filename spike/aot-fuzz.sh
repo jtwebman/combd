@@ -9,10 +9,10 @@ cd "$(dirname "$0")"
 N=${1:-200}
 START=${2:-0}
 cargo build --release
-./target/release/combd-spike fuzz-gen "$N" "$START"
-trap './target/release/combd-spike fuzz-gen 0 >/dev/null' EXIT
+./target/release/combd fuzz-gen "$N" "$START"
+trap './target/release/combd fuzz-gen 0 >/dev/null' EXIT
 for f in aot-guard aot; do
     echo "== AOT ($f) vs the interpreter"
     cargo build --release --features "$f"
-    ./target/release/combd-spike fuzz-aot "$N" "$START"
+    ./target/release/combd fuzz-aot "$N" "$START"
 done

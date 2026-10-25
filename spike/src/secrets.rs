@@ -29,7 +29,7 @@ impl Key {
     }
 
     /// The master key: a file of 64 hex characters, that only its owner may
-    /// read (`combd-spike master-key <file>` makes one).
+    /// read (`combd master-key <file>` makes one).
     pub fn load(path: &Path) -> Result<Key, String> {
         let at = path.display();
         #[cfg(unix)]

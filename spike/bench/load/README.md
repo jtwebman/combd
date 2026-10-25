@@ -9,7 +9,7 @@ TF_VAR_do_token=... terraform apply        # 3 droplets in nyc3 (count_of, regio
 # on each: ws-load from the arena's image, at the node's IP on 443:
 docker run -d --name load --network host --ulimit nofile=1048576:1048576 \
   -v /etc/ssl/certs/ca-certificates.crt:/ca.pem:ro ghcr.io/jtwebman/combd-arena:latest \
-  ./target/release/combd-spike ws-load <node ip>:443 million.combd.dev /ws 35000 \
+  ./target/release/combd ws-load <node ip>:443 million.combd.dev /ws 35000 \
   '{"t":"range","from":0,"to":500}' /ca.pem
 TF_VAR_do_token=... terraform destroy
 ```

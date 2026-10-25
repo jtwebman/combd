@@ -1,5 +1,5 @@
 [package]
-name = "combd-spike"
+name = "combd"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -18,7 +18,7 @@ aot-lite = ["dep:combd-aot", "dep:combd-load"]
 aot-guard = ["aot", "combd-aot/guard", "dep:corosensei"]
 # EXPERIMENT ONLY: see combd-aot's `experiment-unchecked`.
 aot-unchecked-experiment = ["aot-lite", "combd-aot/experiment-unchecked"]
-# Differential fuzzing: random valid modules on every engine (`combd-spike fuzz`).
+# Differential fuzzing: random valid modules on every engine (`combd fuzz`).
 fuzz = ["wasmtime", "dep:wasm-smith", "dep:arbitrary", "dep:wat"]
 
 [dependencies]

@@ -164,7 +164,7 @@ nodes trust its public half). Give it its own R2 token for the bucket, in
 ```sh
 docker run -d --name combd-builder --restart unless-stopped --env-file ~/combd-builder/env \
   -v ~/combd-builder/builder.key:/keys/builder.key:ro -v combd-build-work:/work \
-  ghcr.io/jtwebman/combd-builder:latest /combd/spike/target/release/combd-spike builder
+  ghcr.io/jtwebman/combd-builder:latest /combd/spike/target/release/combd builder
 ```
 
 A builder builds for the combd it was made with, so it must move when

@@ -10,12 +10,12 @@
 # node with `docker pause` (it wakes up still thinking it owns things); and
 # SIGKILL a node and delete its disk (it comes back empty, as a new disk would).
 #
-# Build first: combd-spike-aot (spike/Dockerfile with FEATURES=aot-guard).
+# Build first: combd-aot (spike/Dockerfile with FEATURES=aot-guard).
 set -e
 SECS=${SECS:-15}
 THREADS=${THREADS:-32}
 OBJECTS=${OBJECTS:-50}
-IMG=${IMG:-combd-spike-aot}
+IMG=${IMG:-combd-aot}
 # ENGINE=interp with IMG=combd-arena (examples/arena/Dockerfile) skips the AOT image.
 SILO=pgsty/silo:RELEASE.2026-09-16T00-00-00Z
 NET=combd-fleet
@@ -29,7 +29,7 @@ trap cleanup EXIT
 
 # The wire's certificates: a fleet CA and one per node, in a volume.
 docker volume create combd-certs >/dev/null
-docker run --rm -v combd-certs:/certs $IMG ./target/release/combd-spike wire-certs /certs 3 >/dev/null
+docker run --rm -v combd-certs:/certs $IMG ./target/release/combd wire-certs /certs 3 >/dev/null
 
 node() { # n
     docker rm -f node$1 >/dev/null 2>&1 || true
@@ -37,12 +37,12 @@ node() { # n
         -e COMBD_NODE=$1 -e COMBD_PEERS=$PEERS -e COMBD_THREADS=1 -e COMBD_DATA=/data -e COMBD_LEASE_MS=${LEASE_MS:-3000} \
         -e COMBD_REPLICAS=${REPLICAS:-0} -e COMBD_UPLOAD_MS=${UPLOAD_MS:-10000} \
         -e COMBD_S3=http://s3:9000 -e COMBD_S3_KEY=combd -e COMBD_S3_SECRET=combd-secret-key \
-        $IMG ./target/release/combd-spike serve ${ENGINE:-aot} rust 8080 >/dev/null
+        $IMG ./target/release/combd serve ${ENGINE:-aot} rust 8080 >/dev/null
 }
 
 load() { # label
     echo "== $1"
-    docker run --rm --network $NET $IMG ./target/release/combd-spike fleet-load "$SECS" "$THREADS" "$OBJECTS" $NODES
+    docker run --rm --network $NET $IMG ./target/release/combd fleet-load "$SECS" "$THREADS" "$OBJECTS" $NODES
 }
 
 docker run -d --name s3 --network $NET -e MINIO_ROOT_USER=combd -e MINIO_ROOT_PASSWORD=combd-secret-key $SILO server /data >/dev/null

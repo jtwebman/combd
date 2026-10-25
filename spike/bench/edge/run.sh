@@ -31,16 +31,16 @@ case $mode in
 esac
 docker run -d --name edge-srv ${tls:-} --network edge-bench --memory 1g --memory-swap 1g --cpus 1 --ulimit nofile=1048576:1048576 --sysctl net.ipv4.ip_local_port_range="1024 65535" \
   -v combd-linux-target:/target:ro -v $R/examples/million/app:/app:ro -v $B:/bench:ro -v $B/certs:/certs:ro -e MALLOC_MMAP_MAX_=4000000 -e MALLOC_MMAP_THRESHOLD_=131072 \
-  combd-edge-bench sh -c "COMBD_DATA=/tmp/d COMBD_THREADS=1 COMBD_MAX_CONNS=1000000 /target/release/combd-spike serve-app interp /app ${listen:-8080} >/tmp/c.log 2>&1 & $proxy & wait" >/dev/null
+  combd-edge-bench sh -c "COMBD_DATA=/tmp/d COMBD_THREADS=1 COMBD_MAX_CONNS=1000000 /target/release/combd serve-app interp /app ${listen:-8080} >/tmp/c.log 2>&1 & $proxy & wait" >/dev/null
 sleep 3
 base=$(docker exec edge-srv cat /sys/fs/cgroup/memory.current)
 docker run -d --name edge-cli --network edge-bench --ulimit nofile=1048576:1048576 --sysctl net.ipv4.ip_local_port_range="1024 65535" -v combd-linux-target:/target:ro -v $B/certs:/certs:ro \
-  rust:1.99.1-slim-bookworm /target/release/combd-spike ws-load edge-srv:$port million.localhost /ws $n '{"t":"range","from":0,"to":500}' $ca >/dev/null
+  rust:1.99.1-slim-bookworm /target/release/combd ws-load edge-srv:$port million.localhost /ws $n '{"t":"range","from":0,"to":500}' $ca >/dev/null
 for i in $(seq 1 300); do docker logs edge-cli 2>&1 | grep -qE "holding|refused|panicked" && break; sleep 2; done
 sleep 8
 mem=$(docker exec edge-srv cat /sys/fs/cgroup/memory.current)
 sock=$(docker exec edge-srv sh -c "grep -E '^(sock|anon|kernel) ' /sys/fs/cgroup/memory.stat" | tr '\n' ' ')
-rss=$(docker exec edge-srv ps -o rss=,comm= -C combd-spike,caddy,haproxy | awk '{printf "%s %d KB  ", $2, $1}')
+rss=$(docker exec edge-srv ps -o rss=,comm= -C combd,caddy,haproxy | awk '{printf "%s %d KB  ", $2, $1}')
 held=$(docker logs edge-cli 2>&1 | grep -E "holding|refused|panicked" | head -1)
 echo "$mode n=$n: $held | node memory $(( (mem-base)/1024 )) KB = $(( (mem-base)/n )) B/conn | $sock| $rss"
 oom=$(docker exec edge-srv sh -c "grep oom_kill /sys/fs/cgroup/memory.events" 2>/dev/null); echo "  $oom"; docker rm -f edge-srv edge-cli >/dev/null 2>&1

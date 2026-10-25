@@ -1890,7 +1890,7 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
             None
         }
         None => {
-            eprintln!("combd     set COMBD_WIRE_CERTS (see `combd-spike wire-certs`), or COMBD_WIRE_INSECURE=1 for plain TCP");
+            eprintln!("combd     set COMBD_WIRE_CERTS (see `combd wire-certs`), or COMBD_WIRE_INSECURE=1 for plain TCP");
             std::process::exit(1);
         }
     };

@@ -62,7 +62,7 @@ token in `../arena/cloud/.secrets`:
 ```sh
 ./build.sh && cd ../arena/cloud && COMBD_TOKEN=$(cat .secrets/token) \
   COMBD_ADMIN_CA=.secrets/certs/ca.pem COMBD_ADMIN_NAME=node0.combd \
-  ../../../spike/target/release/combd-spike deploy ../../million/app acme https://n0.arena.combd.dev:9443
+  ../../../spike/target/release/combd deploy ../../million/app acme https://n0.arena.combd.dev:9443
 ```
 
 Tests: `million_one_session_per_socket` (one node: sessions asleep between

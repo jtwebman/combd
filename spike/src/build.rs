@@ -5,7 +5,7 @@
 use std::path::Path;
 
 /// What the library is, around the generated code.
-const LIB: &str = r#"//! A compiled module, made by `combd-spike aot-build`. A node reads its pin,
+const LIB: &str = r#"//! A compiled module, made by `combd aot-build`. A node reads its pin,
 //! and only if that's its own, its module.
 #![allow(improper_ctypes_definitions)]
 pub use combd_aot::{rt, Compiled};

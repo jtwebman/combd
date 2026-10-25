@@ -18,7 +18,7 @@ down() { docker rm -f arena-s3 arena0 arena1 arena2 arena-deploy >/dev/null 2>&1
 deploy() {
     docker run --rm --name arena-deploy --network $NET -v arena-certs:/certs:ro -v "$PWD/examples/arena/app:/app:ro" \
         -e COMBD_TOKEN="$(cat examples/arena/.demo-token)" -e COMBD_ADMIN_CA=/certs/ca.pem -e COMBD_ADMIN_NAME=node0.combd \
-        $IMG ./target/release/combd-spike deploy /app acme https://arena0:9090
+        $IMG ./target/release/combd deploy /app acme https://arena0:9090
 }
 if [ "$1" = down ]; then down; docker network rm $NET >/dev/null 2>&1 || true; rm -f examples/arena/.demo-token; echo "stopped"; exit 0; fi
 if [ "$1" = deploy ]; then deploy; exit 0; fi
@@ -28,8 +28,8 @@ docker network create $NET >/dev/null 2>&1 || true
 docker run -d --name arena-s3 --network $NET -e MINIO_ROOT_USER=combd -e MINIO_ROOT_PASSWORD=combd-secret-key $SILO server /data >/dev/null
 # The fleet's certificates, and a deploy token (only its hash goes to the nodes).
 docker volume create arena-certs >/dev/null
-docker run --rm -v arena-certs:/certs $IMG ./target/release/combd-spike wire-certs /certs 3 >/dev/null
-TOKEN_OUT=$(docker run --rm $IMG ./target/release/combd-spike admin-token 'acme/*:*')
+docker run --rm -v arena-certs:/certs $IMG ./target/release/combd wire-certs /certs 3 >/dev/null
+TOKEN_OUT=$(docker run --rm $IMG ./target/release/combd admin-token 'acme/*:*')
 TOKEN=$(echo "$TOKEN_OUT" | sed -n 's/.*: \(combd_[0-9a-f]*\)$/\1/p')
 echo "$TOKEN" > examples/arena/.demo-token
 LINE=$(echo "$TOKEN_OUT" | sed -n 's/^line for the tokens file: *//p')
@@ -43,7 +43,7 @@ node() { # n delay-ms
         -e COMBD_REPLICAS=2 -e COMBD_THREADS=2 -e COMBD_DATA=/data -e COMBD_LEASE_MS=3000 \
         -e COMBD_S3=http://arena-s3:9000 -e COMBD_S3_KEY=combd -e COMBD_S3_SECRET=combd-secret-key \
         -e COMBD_PUBLIC_URLS=$PUBLIC -e COMBD_ADMIN_PORT=9090 -e COMBD_ADMIN_TOKENS=/tokens/tokens \
-        $IMG sh -c "if [ $2 -gt 0 ]; then tc qdisc add dev eth0 root netem delay ${2}ms; fi; exec ./target/release/combd-spike serve-fleet interp 8080" >/dev/null
+        $IMG sh -c "if [ $2 -gt 0 ]; then tc qdisc add dev eth0 root netem delay ${2}ms; fi; exec ./target/release/combd serve-fleet interp 8080" >/dev/null
 }
 sleep 2
 node 0 0

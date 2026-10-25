@@ -3,6 +3,9 @@
 **Self-hosted Durable Objects, built from scratch in Rust.**
 Tiny sealed cells, packed tight. Light, but very strong.
 
+**Try it:** [combd in ten minutes](docs/quickstart.md): `combd new hello`,
+`combd dev`, a page and a counter with its own SQLite, then on a server.
+
 ---
 
 ## The story

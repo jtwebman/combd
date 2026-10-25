@@ -6,9 +6,9 @@ Autobahn TestSuite's client, plain and over TLS:
 ```sh
 (cd echo && cargo build --release --target wasm32-unknown-unknown)
 mkdir -p app/modules && cp echo/target/wasm32-unknown-unknown/release/combd_echo.wasm app/modules/echo.wasm
-../../target/release/combd-spike serve-app interp app 9001 &
+../../target/release/combd serve-app interp app 9001 &
 COMBD_TLS_CERT=../edge/certs/cert.pem COMBD_TLS_KEY=../edge/certs/key.pem \
-  ../../target/release/combd-spike serve-app interp app 9443 &   # certs: ../edge/run.sh makes them
+  ../../target/release/combd serve-app interp app 9443 &   # certs: ../edge/run.sh makes them
 mkdir -p reports/all
 docker run --rm -v "$PWD/config:/config" -v "$PWD/reports:/reports" \
   crossbario/autobahn-testsuite wstest -m fuzzingclient -s /config/all.json

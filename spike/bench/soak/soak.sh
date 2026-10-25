@@ -26,7 +26,7 @@ start)
         n=$(eval echo "\${$(( i % 3 + 1 ))}"); ip=$(dig +short "$n" | head -1); i=$((i + 1))
         ssh-keygen -R "$c" >/dev/null 2>&1 || true
         ssh $O "root@$c" "iptables -t raw -C OUTPUT -p tcp --dport 443 -j NOTRACK 2>/dev/null || { iptables -t raw -A OUTPUT -p tcp --dport 443 -j NOTRACK; iptables -t raw -A PREROUTING -p tcp --sport 443 -j NOTRACK; }
-            docker rm -f load >/dev/null 2>&1; docker run -d --name load --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v /etc/ssl/certs/ca-certificates.crt:/ca.pem:ro $IMG ./target/release/combd-spike ws-click $ip:443 million.combd.dev /ws $PAGES /ca.pem 30 20 >/dev/null
+            docker rm -f load >/dev/null 2>&1; docker run -d --name load --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v /etc/ssl/certs/ca-certificates.crt:/ca.pem:ro $IMG ./target/release/combd ws-click $ip:443 million.combd.dev /ws $PAGES /ca.pem 30 20 >/dev/null
             echo '*/30 * * * * root docker restart load >/dev/null' > /etc/cron.d/soak-churn"
         echo "$c: $PAGES pages on $n ($ip)"
     done

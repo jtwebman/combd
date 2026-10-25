@@ -1,0 +1,13 @@
+[package]
+name = "combd-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Write a combd app in Rust: a request in, a response out, SQLite, alarms, and calls to other processes."
+license = "Apache-2.0"
+repository = "https://github.com/jtwebman/combd"
+
+# Its own workspace: an app pulls it in as a dependency.
+[workspace]
+
+[dependencies]
+serde_json = "1"

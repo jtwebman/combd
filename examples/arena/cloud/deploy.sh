@@ -3,7 +3,7 @@
 # CA). Run it again after a change: a live deploy, every node in a moment.
 set -e
 cd "$(dirname "$0")"
-BIN=../../../spike/target/release/combd-spike
+BIN=../../../spike/target/release/combd
 HOST=$(terraform output -raw host)
 ../build.sh
 COMBD_TOKEN=$(cat .secrets/token) COMBD_ADMIN_CA=.secrets/certs/ca.pem COMBD_ADMIN_NAME=node0.combd \

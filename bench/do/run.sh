@@ -1,7 +1,7 @@
 #!/bin/sh
 # The Durable Object race: the same counter object on combd, workerd, and
 # celld, each limited to CPUS cores (default 1), loaded by wrk from its own
-# container. Build first: combd-spike-aot (spike/Dockerfile, FEATURES=aot-guard)
+# container. Build first: combd-aot (spike/Dockerfile, FEATURES=aot-guard)
 # and the images in bench/do/Dockerfile.
 set -e
 CPUS=${CPUS:-1}
@@ -38,6 +38,6 @@ run() { # name image command...
 }
 
 echo "cores per server: $CPUS, connections: $CONNS, ${SECS}s per test"
-run combd combd-spike-aot env COMBD_THREADS="$CPUS" COMBD_DATA=/tmp/data ./target/release/combd-spike serve aot rust 8080
+run combd combd-aot env COMBD_THREADS="$CPUS" COMBD_DATA=/tmp/data ./target/release/combd serve aot rust 8080
 run workerd bench-do-workerd
 run celld bench-do-celld

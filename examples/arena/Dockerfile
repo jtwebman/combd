@@ -22,12 +22,16 @@ RUN cd guest && cargo build --locked --release --target wasm32-unknown-unknown
 # With the AOT runtime (no modules built in): a node loads compiled
 # modules' builds, and this stage, published as combd-builder, makes them
 # (the same rustc and sources, so their pins match).
-RUN cd spike && cargo build --locked --release --no-default-features --features aot-lite
+RUN cd spike && cargo build --locked --release --no-default-features --features aot-lite \
+    && ln -sf combd target/release/combd-spike
 RUN examples/arena/build.sh
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get -y upgrade && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
-COPY --from=build /combd/spike/target/release/combd-spike /combd/spike/target/release/combd-spike
+COPY --from=build /combd/spike/target/release/combd /combd/spike/target/release/combd
+# The binary was combd-spike until 2026-10-25: nodes and builders that
+# still run it by that name keep working until they're moved over.
+RUN ln -s combd /combd/spike/target/release/combd-spike
 COPY --from=build /combd/guest/target/wasm32-unknown-unknown/release/combd_guest.wasm /combd/guest/target/wasm32-unknown-unknown/release/combd_guest.wasm
 COPY --from=build /combd/examples/arena/app /combd/examples/arena/app
 # A hash of combd's own sources: nodes restart for a new image only when it

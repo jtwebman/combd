@@ -13,7 +13,7 @@
 //! Not a mismatch: running out of stack. The engines have different depth
 //! limits; such a call counts as inconclusive.
 //!
-//! `combd-spike fuzz N [start]` runs seeds `start..start+N`, and writes each
+//! `combd fuzz N [start]` runs seeds `start..start+N`, and writes each
 //! module that disagrees to `fuzz-<seed>.wasm`.
 //!
 //! The AOT tier compiles modules ahead of time, so it's fuzzed in a batch
@@ -408,7 +408,7 @@ pub fn gen_aot(seeds: std::ops::Range<u64>, crate_src: &std::path::Path) -> Stat
     let dir = crate_src.join("fuzz");
     let _ = std::fs::remove_dir_all(&dir);
     let mut st = Stats::default();
-    let mut list = String::from("//! Fuzz modules from `combd-spike fuzz-gen`. Not in git.\n\n");
+    let mut list = String::from("//! Fuzz modules from `combd fuzz-gen`. Not in git.\n\n");
     let mut names = vec![];
     // The hand-written cases first, as `c0`, `c1`, ...
     for (i, bin) in cases().into_iter().enumerate() {

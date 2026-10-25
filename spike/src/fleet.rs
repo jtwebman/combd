@@ -14,7 +14,7 @@
 //! - `COMBD_WIRE_PORT`: where this node listens for peers (default 7100).
 //! - `COMBD_LEASE_MS`: how long a silent node keeps its objects (default 10 s).
 //! - `COMBD_REPLICAS`: peers per object for D3 fast writes (default 0: D2).
-//! - `COMBD_WIRE_CERTS`: the wire's certificates (`combd-spike wire-certs`),
+//! - `COMBD_WIRE_CERTS`: the wire's certificates (`combd wire-certs`),
 //!   or `COMBD_WIRE_INSECURE=1` for plain TCP.
 //! - `COMBD_S3`, `COMBD_S3_KEY`, `COMBD_S3_SECRET`, `COMBD_S3_BUCKET`: the bucket.
 
