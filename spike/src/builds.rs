@@ -25,6 +25,10 @@ use std::time::Duration;
 
 /// A builder that's gone quiet this long loses its claim to another.
 const CLAIM_STALE_MS: u64 = 15 * 60 * 1000;
+/// How long an idle builder waits before it looks for jobs again: at first,
+/// and at most. A job may wait up to `IDLE_MAX` for an idle builder.
+const IDLE_FIRST: Duration = Duration::from_secs(2);
+const IDLE_MAX: Duration = Duration::from_secs(30);
 
 pub fn pin_id(pin: &str) -> String {
     format!("{:016x}", combd_aot::hash(pin.as_bytes()))
@@ -281,9 +285,15 @@ pub fn builder(s3: &S3, id: &str, key: &Ed25519KeyPair, aot: &Path, work: &Path,
     let pin = pin_id(combd_aot::PIN);
     let prefix = format!("_combd/builds/{pin}/");
     eprintln!("builder   {id}: building for {:?} ({pin})", combd_aot::PIN);
+    // A LIST and a PUT are billed writes on R2 and S3: an idle builder looks
+    // less often (2 s, doubling to 30 s), and says it's here once a minute.
+    let (mut wait, mut said) = (IDLE_FIRST, None::<std::time::Instant>);
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         let jobs: Vec<String> = s3.list(&prefix).unwrap_or_default();
-        let _ = s3.put(&format!("_combd/builders/{id}"), serde_json::json!({ "pin": pin, "at": now_ms() }).to_string().as_bytes(), &Cond::Any);
+        if said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+            let _ = s3.put(&format!("_combd/builders/{id}"), serde_json::json!({ "pin": pin, "at": now_ms() }).to_string().as_bytes(), &Cond::Any);
+            said = Some(std::time::Instant::now());
+        }
         let has = |k: &str| jobs.iter().any(|j| j == k);
         let mut did = false;
         for job in jobs.iter().filter(|j| j.ends_with(".wasm")) {
@@ -319,8 +329,15 @@ pub fn builder(s3: &S3, id: &str, key: &Ed25519KeyPair, aot: &Path, work: &Path,
             }
             let _ = s3.delete(&format!("{base}.claim"));
         }
-        if !did {
-            std::thread::sleep(Duration::from_secs(2));
+        if did {
+            wait = IDLE_FIRST;
+        } else {
+            // In steps, so `stop` is still seen within 2 s.
+            let until = std::time::Instant::now() + wait;
+            while std::time::Instant::now() < until && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(IDLE_FIRST.min(until - std::time::Instant::now()));
+            }
+            wait = (wait * 2).min(IDLE_MAX);
         }
     }
 }

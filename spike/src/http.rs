@@ -76,7 +76,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -447,6 +447,9 @@ struct FleetShared {
     start: Instant,
     /// When each node was last heard from (its heartbeats).
     heard: Arc<Mutex<HashMap<own::Node, (u64, Instant)>>>,
+    /// When loop 0 should look in the alarm index next (ms): the soonest
+    /// alarm its last scan saw, or any loop here indexed since, or a retry.
+    next_alarm: AtomicI64,
     /// Where pool messages from other nodes go.
     pools: Arc<std::sync::OnceLock<Arc<crate::pg::Pools>>>,
 }
@@ -479,8 +482,11 @@ fn alarm_key(obj: own::Obj, at: i64) -> String {
     format!("alarm/{obj:032x}/{at:013}")
 }
 
-/// Loop 0 scans the alarm index this often.
-const ALARM_SCAN: Duration = Duration::from_secs(1);
+/// Loop 0 scans the alarm index when its soonest alarm is due (at most once
+/// a second), at once when a peer goes quiet, and at least this often. A
+/// LIST is a billed write on R2 and S3: a scan every second on every node,
+/// with no alarms at all, was most of the fleet's bucket bill (2026-10-26).
+const ALARM_SCAN: Duration = Duration::from_secs(30);
 
 /// A forwarded request with no reply in time gets a 503 (the peer may be
 /// frozen), so the client can retry. "In time" is measured per peer, as TCP
@@ -582,7 +588,8 @@ enum Msg {
     /// Fleet mode: an alarm index move finished.
     Indexed { name: String, new: Option<i64>, ok: bool },
     /// Fleet mode: due alarms from the index: (name, due).
-    AlarmsDue { due: Vec<(String, i64)> },
+    /// And the soonest alarm still to come, if any.
+    AlarmsDue { due: Vec<(String, i64)>, next: Option<i64> },
     /// Fleet mode: another node forwarded us a request.
     WireIn { conn: usize, id: u64, name: String, req: String, from: Option<own::Node> },
     /// Fleet mode: a heartbeat from `node`.
@@ -1632,6 +1639,7 @@ where
                     rtt: HashMap::new(),
                     alarm_fire: HashMap::new(),
                     last_scan: Instant::now(),
+                    quiet: Vec::new(),
                     last_tick: Instant::now(),
                     local_socks: HashMap::new(),
                     sessions: HashMap::new(),
@@ -1730,6 +1738,8 @@ struct Loop<'a, E: Engine> {
     /// Alarms loop 0 fired from the index: name -> (due, tries, not again before).
     alarm_fire: HashMap<String, (i64, u32, i64)>,
     last_scan: Instant,
+    /// Peers not heard from for a lease, at loop 0's last tick.
+    quiet: Vec<own::Node>,
     last_tick: Instant,
     /// WebSocket connections this loop holds: socket id -> connection. They
     /// stay while their object is out of memory, or runs on another node.
@@ -1897,17 +1907,14 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
                 }
                 Job::AlarmScan { back } => {
                     let now = now_ms();
-                    let due = s3
-                        .list("alarm/")
-                        .unwrap_or_default()
+                    let all: Vec<(String, i64)> = s3.list("alarm/").unwrap_or_default().into_iter().filter_map(|k| Some((k.rsplit('/').next()?.parse().ok()?, k)).map(|(at, k)| (k, at))).collect();
+                    let next = all.iter().map(|&(_, at)| at).filter(|&at| at > now).min();
+                    let due = all
                         .into_iter()
-                        .filter_map(|k| {
-                            let at: i64 = k.rsplit('/').next()?.parse().ok()?;
-                            (at <= now).then_some((k, at))
-                        })
+                        .filter(|&(_, at)| at <= now)
                         .filter_map(|(k, at)| Some((String::from_utf8(s3.get(&k).ok()??.0).ok()?, at)))
                         .collect();
-                    (back, Msg::AlarmsDue { due })
+                    (back, Msg::AlarmsDue { due, next })
                 }
             };
             let (tx, waker) = &loops[back];
@@ -2004,6 +2011,7 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
         next_id: AtomicU64::new(1),
         start: Instant::now(),
         heard,
+        next_alarm: AtomicI64::new(i64::MAX),
         pools,
     }
 }
@@ -2097,12 +2105,20 @@ impl<E: Engine> Loop<'_, E> {
                     self.last_tick = Instant::now();
                     if self.me == 0 {
                         self.heartbeat();
+                        let quiet = self.quiet_peers();
+                        let fresh = quiet.iter().any(|n| !self.quiet.contains(n));
+                        self.quiet = quiet;
+                        let next = &self.sh.fleet.as_ref().unwrap().next_alarm;
+                        let due = now_ms() >= next.load(Relaxed) && self.last_scan.elapsed() >= Duration::from_secs(1);
+                        if fresh || due || self.last_scan.elapsed() >= ALARM_SCAN {
+                            self.last_scan = Instant::now();
+                            // Anything indexed from here on lowers it again; anything
+                            // indexed before is in the listing.
+                            next.store(i64::MAX, Relaxed);
+                            self.job(Job::AlarmScan { back: 0 });
+                        }
                     }
                     self.core_on(own::Event::Tick);
-                }
-                if self.me == 0 && self.last_scan.elapsed() >= ALARM_SCAN {
-                    self.last_scan = Instant::now();
-                    self.job(Job::AlarmScan { back: 0 });
                 }
                 if self.last_sweep.elapsed() >= TICK {
                     self.fleet_sweep();
@@ -2289,6 +2305,9 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 Msg::Imaged { obj, act, key } => self.core_on(own::Event::Imaged { obj, act, key }),
                 Msg::Indexed { name, new, ok } => {
+                    if let (true, Some(at), Some(f)) = (ok, new, self.sh.fleet.as_ref()) {
+                        f.next_alarm.fetch_min(at, Relaxed);
+                    }
                     if let Some(o) = self.objects.get_mut(&name) {
                         o.index_busy = false;
                         if ok {
@@ -2297,7 +2316,7 @@ impl<E: Engine> Loop<'_, E> {
                     }
                     self.reconcile(&name);
                 }
-                Msg::AlarmsDue { due } => self.alarms_due(due),
+                Msg::AlarmsDue { due, next } => self.alarms_due(due, next),
                 Msg::WireIn { conn, id, name, req, .. } if name == TAKE => self.take(conn, id, req)?,
                 // Handed to us: claim it now. (The object's loop, by its name.)
                 Msg::WireIn { conn, id, name, req, .. } if name == CLAIM => {
@@ -4586,6 +4605,14 @@ impl<E: Engine> Loop<'_, E> {
     }
 
     /// Hand the core an event, then do what it says.
+    /// Peers not heard from for a lease (or never).
+    fn quiet_peers(&self) -> Vec<own::Node> {
+        let f = self.sh.fleet.as_ref().unwrap();
+        let heard = f.heard.lock().unwrap();
+        let lease = Duration::from_millis(f.cfg.lease_ms);
+        f.cfg.peers.keys().filter(|&&p| p != f.cfg.node && heard.get(&p).is_none_or(|(_, t)| t.elapsed() >= lease)).copied().collect()
+    }
+
     /// "This node is alive", to every peer. From loop 0's tick, so a node
     /// whose loops stop or stall goes quiet, and gets taken over.
     fn heartbeat(&self) {
@@ -5032,15 +5059,19 @@ impl<E: Engine> Loop<'_, E> {
     /// Due alarms from the index: fire each as an ordinary request, routed to
     /// its owner. A fire that keeps failing backs off (0.5 s, doubling, up to
     /// a minute). ponytail: it never gives up, where Cloudflare stops after 6.
-    fn alarms_due(&mut self, due: Vec<(String, i64)>) {
+    fn alarms_due(&mut self, due: Vec<(String, i64)>, next: Option<i64>) {
         let now = now_ms();
+        let next_alarm = &self.sh.fleet.as_ref().unwrap().next_alarm;
+        next_alarm.fetch_min(next.unwrap_or(i64::MAX), Relaxed);
         for (name, at) in due {
             let e = self.alarm_fire.entry(name.clone()).or_insert((at, 0, 0));
             if e.0 == at && now < e.2 {
-                continue; // fired recently; let it run
+                next_alarm.fetch_min(e.2, Relaxed); // fired recently; let it run, look again after
+                continue;
             }
             let tries = if e.0 == at { e.1 + 1 } else { 0 };
             *e = (at, tries, now + (ALARM_BACKOFF_MS << tries.min(7)).min(60_000));
+            next_alarm.fetch_min(e.2, Relaxed); // its retry
             self.sh.stats.alarms_fired.fetch_add(1, Relaxed);
             let req = format!("do ALARM / {}", tries.min(ALARM_TRIES));
             let o = owner(&name, self.sh.cfg.threads);

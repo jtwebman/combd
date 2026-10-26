@@ -34,6 +34,9 @@ The first release: Durable Objects on your own machines, as one binary.
   (`nearest`), spread by hash (`spread`), or pinned to regions (`pin`);
   hooks for your own rules (`policy.rs`).
 - mTLS between nodes; admin tokens; secrets sealed per app.
+- Cheap on a bucket that bills per request: an idle node lists its bucket
+  once every 30 s (alarms are looked for when one is due, or when a peer
+  goes quiet), and an idle builder backs off to 30 s.
 
 **Checked**
 - TLA+ specs for ownership, replication, and the catalog; a deterministic
