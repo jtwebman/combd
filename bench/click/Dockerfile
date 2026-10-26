@@ -80,3 +80,7 @@ COPY --from=phoenix-build /src/_build/prod/rel/million /app
 # Modules load as first used, not all at boot (26 MB less code in memory).
 ENV RELEASE_DISTRIBUTION=none RELEASE_MODE=interactive MILLION_DATA=/tmp/data PORT=8080
 CMD ["/app/bin/million", "start"]
+
+# wrk, for the req<n> tests (plain requests, no sockets).
+FROM debian:bookworm-slim AS wrk
+RUN apt-get update && apt-get install -y --no-install-recommends wrk && rm -rf /var/lib/apt/lists/*

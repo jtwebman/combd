@@ -13,8 +13,11 @@
 # (workerd-worker, celld-worker): examples/million-workers/README.md.
 #
 # Tests: `idle` (pages that only watch and renew, added until the server
-# refuses or falls over) and a number of clicking pages (each clicks 1 to 30
-# boxes 1 to 20 s apart, then watches). Pages arrive at RATE a second, STEP
+# refuses or falls over), a number of clicking pages (each clicks 1 to 30
+# boxes 1 to 20 s apart, then watches), and `req<n>`: plain requests, no
+# sockets, from n connections at once (wrk, REQ_SECS each): `GET /` (the
+# page, from the stateless process) and `GET /api/count` (through it to one
+# object, the total, and back). Pages arrive at RATE a second, STEP
 # to a client container (idle: IDLE_RATE and IDLE_STEP, for finer steps
 # where a server's limit is low). Raw logs and a summary go to $OUT.
 set -u
@@ -24,6 +27,7 @@ TESTS=${TESTS:-"idle 10 100 500 1000 5000 10000 20000"}
 RATE=${RATE:-1000}             # new pages a second
 STEP=${STEP:-2000}             # pages to a client container
 SECS=${SECS:-180}              # clicking, once every page is open
+REQ_SECS=${REQ_SECS:-30}       # each route, in a req<n> test
 IDLE_MAX=${IDLE_MAX:-240000}   # idle pages to try for
 IDLE_SECS=${IDLE_SECS:-900}    # longest an idle ramp may take
 OUT=${OUT:-/tmp/click-race-$(date +%Y%m%d-%H%M%S)}
@@ -31,7 +35,7 @@ NET=combd-click
 mkdir -p "$OUT"
 
 if [ "${BUILD:-1}" = 1 ]; then
-    for t in combd workerd celld celld-object celld-worker phoenix; do
+    for t in combd workerd celld celld-object celld-worker phoenix wrk; do
         docker build -q -f bench/click/Dockerfile --target $t -t bench-click-$t . >/dev/null || exit 1
     done
 fi
@@ -205,6 +209,33 @@ active() {
     stop_all
 }
 
+# req <server> <connections>: wrk at each route for REQ_SECS, after 5 s
+# to warm up.
+req() {
+    s=$1 n=$2 log=$OUT/$1-req$2
+    rm -f "$log"-*
+    start "$s"
+    for path in / /api/count; do
+        w="docker run --rm --network $NET --ulimit nofile=1048576:1048576 bench-click-wrk wrk -t4 -c$n -H Host:million.localhost --latency"
+        $w -d5s "http://srv:8080$path" >/dev/null 2>&1
+        mem >/dev/null
+        $w -d${REQ_SECS}s --timeout 10s "http://srv:8080$path" > "$log-${path//\//_}.txt" 2>&1 &
+        echo "secs	mem_mib	cpu_pct" > "$log-${path//\//_}-mem.tsv"
+        while kill -0 $! 2>/dev/null; do echo "$(mem | tr ' ' '\t')" >> "$log-${path//\//_}-mem.tsv"; sleep 2; done
+        f=$log-${path//\//_}.txt
+        rps=$(awk '/^Requests\/sec/ { printf "%.0f", $2 }' "$f")
+        p50=$(awk '$1 == "50%" { print $2 }' "$f") p99=$(awk '$1 == "99%" { print $2 }' "$f")
+        bad=$(awk '/Non-2xx/ { n += $NF } /Socket errors/ { gsub(/,/, ""); n += $4 + $6 + $8 + $10 } END { print n + 0 }' "$f")
+        peak=$(awk 'NR > 1 && $1 > m { m = $1 } END { printf "%.0f", m }' "$log-${path//\//_}-mem.tsv")
+        cpu=$(awk 'NR > 2 { c += $2; k++ } END { printf "%.0f", k ? c / k : 0 }' "$log-${path//\//_}-mem.tsv")
+        printf "%-15s req %5d conns  GET %-11s %7s req/s  p50 %8s  p99 %8s  errors %6s  memory %4s MiB peak  cpu %3s%% avg %s\n" \
+            "$s" "$n" "$path" "${rps:--}" "${p50:--}" "${p99:--}" "$bad" "$peak" "$cpu" "$(up || died)" | tee -a "$OUT/summary.txt"
+        up || break
+    done
+    docker logs srv > "$log-srv.log" 2>&1
+    stop_all
+}
+
 {
     echo "click race: servers [$SERVERS], tests [$TESTS], $RATE new pages a second, $STEP a client, ${SECS}s clicking; logs in $OUT"
     echo "docker $(docker version --format '{{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}'), $(docker info --format '{{.NCPU}} CPUs, {{.MemTotal}} bytes') for docker; $(git rev-parse --short HEAD)"
@@ -212,7 +243,11 @@ active() {
 } | tee "$OUT/summary.txt"
 for t in $TESTS; do
     for s in $SERVERS; do
-        if [ "$t" = idle ]; then idle "$s"; else active "$s" "$t"; fi
+        case $t in
+            idle) idle "$s" ;;
+            req*) req "$s" "${t#req}" ;;
+            *) active "$s" "$t" ;;
+        esac
     done
 done
 stop_all
