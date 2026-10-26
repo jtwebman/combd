@@ -7,8 +7,9 @@
     "bindings": [
       { "name": "CHUNK", "class_name": "Chunk" },
       { "name": "BOXES", "class_name": "Boxes" },
+      { "name": "HUB", "class_name": "Hub" },
       { "name": "VIEWER", "class_name": "Viewer" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chunk", "Boxes", "Viewer"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chunk", "Boxes", "Hub", "Viewer"] }]
 }

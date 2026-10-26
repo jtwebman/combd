@@ -37,11 +37,14 @@ WORKDIR /w
 RUN npm install --no-audit --no-fund workerd@1.20260929.1 && mkdir -p /w/data
 COPY examples/million-workers/worker.mjs examples/million-workers/config.capnp ./
 COPY examples/million/client/index.html ./
-CMD ["npx", "workerd", "serve", "config.capnp"]
+# The binary itself: through npx, a node process (~37 MB) sits above it.
+CMD ["/w/node_modules/workerd/bin/workerd", "serve", "config.capnp"]
 
 # celld bundles with esbuild (for the page's text import); a static binary.
 FROM node:24.21.0-slim AS esbuild
 RUN cd /tmp && npm install --no-audit --no-fund esbuild@0.25.10 && cp node_modules/@esbuild/linux-*/bin/esbuild /esbuild
+# celld dev takes the Worker's variables from .dev.vars: one per design.
+RUN for s in hub object worker; do echo "SESSIONS=$s" > /vars-$s; done
 
 FROM ghcr.io/denoland/celld:v0.6.2 AS celld
 COPY --from=esbuild /esbuild /usr/local/bin/esbuild
@@ -49,4 +52,31 @@ ENV CELLD_ESBUILD=/usr/local/bin/esbuild
 WORKDIR /app
 COPY examples/million-workers/worker.mjs examples/million-workers/wrangler.json ./
 COPY examples/million/client/index.html ./
+COPY --from=esbuild /vars-hub ./.dev.vars
 CMD ["dev", "--host", "0.0.0.0", "--port", "8080", "--no-watch"]
+
+FROM celld AS celld-object
+COPY --from=esbuild /vars-object ./.dev.vars
+
+FROM celld AS celld-worker
+COPY --from=esbuild /vars-worker ./.dev.vars
+
+# million on the BEAM (examples/million-phoenix): Bandit, Plug and WebSock,
+# a release built and run in the same pinned image.
+FROM elixir:1.20.4-otp-28 AS phoenix-build
+ENV MIX_ENV=prod
+WORKDIR /src
+RUN mix local.hex --force && mix local.rebar --force
+COPY examples/million-phoenix/mix.exs examples/million-phoenix/mix.lock ./
+RUN mix deps.get --only prod && mix deps.compile
+COPY examples/million-phoenix/lib lib
+COPY examples/million-phoenix/rel rel
+COPY examples/million/client/index.html priv/index.html
+RUN mix release
+
+FROM elixir:1.20.4-otp-28 AS phoenix
+COPY --from=phoenix-build /src/_build/prod/rel/million /app
+# No distribution (no epmd): one node, nothing to connect to.
+# Modules load as first used, not all at boot (26 MB less code in memory).
+ENV RELEASE_DISTRIBUTION=none RELEASE_MODE=interactive MILLION_DATA=/tmp/data PORT=8080
+CMD ["/app/bin/million", "start"]

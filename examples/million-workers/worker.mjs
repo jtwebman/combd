@@ -1,15 +1,17 @@
 // One Million Checkboxes as a Cloudflare Workers app with Durable Objects:
 // examples/million (combd) ported, with the same page, protocol, and limits,
-// so the same load client drives both. See README.md for how it maps.
+// so the same load client drives both. See README.md for how it maps, and
+// what each way of holding the sockets measured.
 //
-// A page's socket is held one of two ways (`SESSIONS`):
-// - "object" (the default): a Viewer object per socket, which accepts it
-//   hibernatable, as million's viewer session; chunks push each change to
-//   their watchers' objects over RPC, and each object sends it on.
+// A page's socket is held one of three ways (`SESSIONS`):
+// - "hub" (the default): Hub objects (HUBS) hold every page's socket,
+//   hibernatable; a chunk sends a beat's changes to each Hub with a watcher
+//   (one RPC per Hub, not per page), and the Hub sends them to its pages.
+// - "object": a Viewer object per socket, which accepts it hibernatable, as
+//   million's viewer session; chunks call each watcher's Viewer every beat.
 // - "worker": the Worker invocation holds the page's socket (it can't
 //   hibernate) and opens a socket to each chunk on screen, which the chunk
 //   holds hibernatable; a chunk's changes go up those sockets and straight on.
-//   (celld v0.6.2 drops a Worker's end of such a socket: workerd only.)
 import { DurableObject } from 'cloudflare:workers';
 import INDEX from './index.html';
 
@@ -26,10 +28,20 @@ const BEAT_MS = 150;
 const TOLD_MS = 1000;
 /** A subscription lasts this long unless the viewer renews it (every 20 s). */
 const SUB_MS = 60_000;
-/** How often a chunk drops watchers whose subscriptions ran out. */
+const RENEW_MS = 20_000;
+/** How often a chunk (or a Hub) drops watchers whose subscriptions ran out. */
 const PRUNE_MS = 10_000;
+/** Hubs: pages are spread over this many. One did best on one core (the
+ * race's box; 4 and 16 measured worse); on Cloudflare, where each Hub is a
+ * thread on some machine, you'd raise it with the load. */
+const HUBS = 1;
 
 const HEX = Array.from({ length: 256 }, (_, b) => b.toString(16).padStart(2, '0'));
+const allMsg = (n, bits) => {
+  let hex = '';
+  for (const b of bits) hex += HEX[b];
+  return JSON.stringify({ t: 'all', n, bits: hex });
+};
 
 /** The chunks a page showing boxes [from, to) watches, as million's viewer. */
 function chunksFor(v) {
@@ -55,9 +67,21 @@ function setFor(v, r, send) {
 }
 
 const chunkOf = (env, n) => env.CHUNK.get(env.CHUNK.idFromName(String(n)));
+const parse = (msg) => {
+  try {
+    return JSON.parse(msg);
+  } catch {
+    return {};
+  }
+};
+const closeBack = (ws, code) => {
+  try {
+    ws.close(code === 1005 || code === 1006 ? 1000 : code);
+  } catch {}
+};
 
 /** One per 15,625 boxes (`0` to `63`): the bits, in memory and in its
- * SQLite, and who's watching (Viewer objects, or Worker-held sockets). */
+ * SQLite, and who's watching (Hubs, Viewers, or Worker-held sockets). */
 export class Chunk extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -71,12 +95,17 @@ export class Chunk extends DurableObject {
       this.bits[i >> 3] |= 1 << (i & 7);
       this.checked++;
     }
-    /** Viewer objects watching, by id: until when, and a stub. */
+    /** Hubs and Viewers watching, by id: until when, a stub, and if a Hub.
+     * Who (not until when) is on disk too: an idle chunk is evicted after
+     * 10 s on workerd, and its watchers' next renewal may be 20 s away. */
+    this.sql.exec('CREATE TABLE IF NOT EXISTS subs (id TEXT PRIMARY KEY, hub INTEGER)');
     this.subs = new Map();
+    const until = Date.now() + SUB_MS;
+    for (const { id, hub } of this.sql.exec('SELECT id, hub FROM subs')) this.watch(id, !!hub, until);
     this.pruned = 0;
     /** Every box, as a new watcher gets it: built again only after a change. */
     this.all = null;
-    /** Changes since the last beat, for the watchers at the next one. */
+    /** Changes since the last beat, for the watchers (and the disk) at the next. */
     this.pending = [];
     this.beat = null;
     this.told = 0;
@@ -95,34 +124,36 @@ export class Chunk extends DurableObject {
   }
 
   snapshot() {
-    if (!this.all) {
-      let hex = '';
-      for (const b of this.bits) hex += HEX[b];
-      this.all = JSON.stringify({ t: 'all', n: this.n, bits: hex });
-    }
-    return this.all;
+    return (this.all ??= allMsg(this.n, this.bits));
   }
 
-  /** Watch (or keep watching), over RPC: every box the first time (the
-   * viewer sends it on), then each change. */
-  sub(id, n) {
+  /** Watch (or keep watching), over RPC. A Viewer gets every box the first
+   * time (as `all`, which it sends on); a Hub gets the bits, the first time
+   * or when it asks (it builds `all` for its pages from its own copy). */
+  sub(id, n, hub = false, want = false) {
     this.learn(n);
     const now = Date.now();
     if (now - this.pruned >= PRUNE_MS) {
-      for (const [k, s] of this.subs) if (s.until <= now) this.subs.delete(k);
+      for (const [k, s] of this.subs) if (s.until <= now) this.unsub(k);
       this.pruned = now;
     }
     const s = this.subs.get(id);
-    if (s) {
-      s.until = now + SUB_MS;
-      return null;
+    if (s) s.until = now + SUB_MS;
+    else {
+      this.watch(id, hub, now + SUB_MS);
+      this.sql.exec('INSERT OR REPLACE INTO subs (id, hub) VALUES (?, ?)', id, hub ? 1 : 0);
     }
-    this.subs.set(id, { until: now + SUB_MS, stub: this.env.VIEWER.get(this.env.VIEWER.idFromString(id)) });
-    return this.snapshot();
+    if (s && !want) return null;
+    return hub ? this.bits.slice() : this.snapshot();
+  }
+
+  watch(id, hub, until) {
+    const ns = hub ? this.env.HUB : this.env.VIEWER;
+    this.subs.set(id, { until, stub: ns.get(ns.idFromString(id)), hub });
   }
 
   unsub(id) {
-    this.subs.delete(id);
+    if (this.subs.delete(id)) this.sql.exec('DELETE FROM subs WHERE id = ?', id);
   }
 
   /** Watch over a socket (SESSIONS = "worker"): every box, then each change. */
@@ -136,14 +167,12 @@ export class Chunk extends DurableObject {
   }
 
   webSocketMessage(ws, msg) {
-    const v = JSON.parse(msg);
+    const v = parse(msg);
     if (v.t === 'set') this.set(v.i, v.v);
   }
 
   webSocketClose(ws, code) {
-    try {
-      ws.close(code === 1005 || code === 1006 ? 1000 : code);
-    } catch {}
+    closeBack(ws, code);
   }
 
   /** `on` is what the box should be, not a toggle: two people clicking at
@@ -155,15 +184,8 @@ export class Chunk extends DurableObject {
     if (((this.bits[i >> 3] & bit) !== 0) === on) return;
     this.bits[i >> 3] ^= bit;
     this.all = null;
-    if (on) {
-      this.sql.exec('INSERT INTO on_ (i) VALUES (?)', i);
-      this.checked++;
-    } else {
-      this.sql.exec('DELETE FROM on_ WHERE i = ?', i);
-      this.checked--;
-    }
-    // To the watchers at the next beat (the output gate holds what it
-    // sends until the write is on disk).
+    this.checked += on ? 1 : -1;
+    // To the disk and the watchers at the next beat.
     this.pending.push([i, on]);
     this.dirty = true;
     this.arm();
@@ -178,10 +200,16 @@ export class Chunk extends DurableObject {
     const sets = this.pending;
     this.pending = [];
     if (sets.length) {
+      // A beat's changes in one transaction (million's host commits a batch
+      // of waiting requests in one too). Nobody has seen them yet: what the
+      // beat sends waits for the write (the output gate).
+      this.ctx.storage.transactionSync(() => {
+        for (const [i, on] of sets) this.sql.exec(on ? 'INSERT OR IGNORE INTO on_ (i) VALUES (?)' : 'DELETE FROM on_ WHERE i = ?', i);
+      });
       const msg = JSON.stringify(sets.length === 1 ? { t: 'set', n: this.n, i: sets[0][0], v: sets[0][1] } : { t: 'sets', n: this.n, c: sets });
       // One RPC per watching object: there's no sending to sockets another
       // object holds.
-      for (const s of this.subs.values()) s.stub.push(msg).catch(() => {});
+      for (const s of this.subs.values()) (s.hub ? s.stub.push(msg, this.n, sets) : s.stub.push(msg)).catch(() => {});
       for (const ws of this.ctx.getWebSockets()) {
         try {
           ws.send(msg);
@@ -220,7 +248,156 @@ export class Boxes extends DurableObject {
   }
 }
 
-/** One per page socket (SESSIONS = "object"), as million's viewer: what its
+/** SESSIONS = "hub": one of HUBS, each holding many pages' sockets
+ * (hibernatable), as one combd node holds its viewers' sockets. It watches
+ * a chunk once for all its pages that show it, keeps a copy of its bits for
+ * pages that arrive, and passes each beat's changes to the pages watching.
+ * A page's attachment is what it watches and until when; the rest is
+ * rebuilt from those if the Hub hibernated. */
+export class Hub extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    /** Chunk number to: its bits (null until they come), `all` built from
+     * them, the pages watching, pages waiting for the bits, changes that
+     * came before them, and when the Hub last renewed. */
+    this.chunks = new Map();
+    /** Each page's rate (in memory: a Hub that slept has seen no sets for 10 s). */
+    this.rates = new WeakMap();
+    this.pruned = Date.now();
+    for (const ws of ctx.getWebSockets()) {
+      const a = ws.deserializeAttachment();
+      if (a) for (let n = a.lo; n <= a.hi; n++) this.chunk(n).socks.add(ws);
+    }
+  }
+
+  chunk(n) {
+    let c = this.chunks.get(n);
+    if (!c) this.chunks.set(n, (c = { bits: null, all: null, socks: new Set(), waiting: [], early: [], renewed: 0, asking: false }));
+    return c;
+  }
+
+  fetch() {
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.acceptWebSocket(server);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws, msg) {
+    const v = parse(msg);
+    if (v.t === 'range') this.range(ws, v);
+    else if (v.t === 'set') {
+      let r = this.rates.get(ws);
+      if (!r) this.rates.set(ws, (r = { sec: 0, sets: 0 }));
+      const set = setFor(v, r, (m) => ws.send(m));
+      if (set) await chunkOf(this.env, set[0]).set(set[1], set[2], set[0]);
+    }
+  }
+
+  /** What a page shows (and, every 20 s, that it's still there). */
+  range(ws, v) {
+    const now = Date.now();
+    const [lo, hi] = chunksFor(v);
+    const was = ws.deserializeAttachment() ?? { lo: 1, hi: 0 };
+    ws.serializeAttachment({ lo, hi, until: now + SUB_MS });
+    for (let n = was.lo; n <= was.hi; n++) if (n < lo || n > hi) this.leave(ws, n);
+    for (let n = lo; n <= hi; n++) {
+      const c = this.chunk(n);
+      if (!c.socks.has(ws) && !c.waiting.includes(ws)) {
+        if (c.bits) {
+          ws.send((c.all ??= allMsg(n, c.bits)));
+          c.socks.add(ws);
+        } else c.waiting.push(ws);
+      }
+      // The Hub's own subscription, renewed as its pages renew theirs.
+      if (!c.asking && (!c.bits || now - c.renewed >= RENEW_MS)) this.ask(n, c, !c.bits);
+    }
+    if (now - this.pruned >= PRUNE_MS) this.prune(now);
+  }
+
+  async ask(n, c, want) {
+    c.asking = true;
+    c.renewed = Date.now();
+    try {
+      const bits = await chunkOf(this.env, n).sub(this.ctx.id.toString(), n, true, want);
+      if (bits) {
+        c.bits = bits;
+        for (const sets of c.early) this.apply(n, c, sets);
+        c.all = null;
+      }
+    } catch {
+      c.renewed = 0; // asked again at the next renewal
+    }
+    c.early = [];
+    c.asking = false;
+    if (!c.bits) return;
+    if (c.waiting.length) {
+      c.all ??= allMsg(n, c.bits);
+      for (const ws of c.waiting) {
+        try {
+          ws.send(c.all);
+          c.socks.add(ws);
+        } catch {}
+      }
+      c.waiting = [];
+    }
+  }
+
+  apply(n, c, sets) {
+    for (const [i, on] of sets) {
+      if (on) c.bits[i >> 3] |= 1 << (i & 7);
+      else c.bits[i >> 3] &= ~(1 << (i & 7));
+    }
+    c.all = null;
+  }
+
+  /** A chunk's beat: to every page here that watches it. */
+  push(msg, n, sets) {
+    const c = this.chunks.get(n);
+    if (!c) return;
+    if (c.bits) this.apply(n, c, sets);
+    else c.early.push(sets);
+    for (const ws of c.socks) {
+      try {
+        ws.send(msg);
+      } catch {}
+    }
+  }
+
+  leave(ws, n) {
+    const c = this.chunks.get(n);
+    if (!c) return;
+    c.socks.delete(ws);
+    c.waiting = c.waiting.filter((w) => w !== ws);
+    if (!c.socks.size && !c.waiting.length) {
+      this.chunks.delete(n);
+      chunkOf(this.env, n).unsub(this.ctx.id.toString()).catch(() => {});
+    }
+  }
+
+  /** Pages that stopped renewing are forgotten, as a chunk forgets viewers. */
+  prune(now) {
+    this.pruned = now;
+    for (const ws of this.ctx.getWebSockets()) {
+      const a = ws.deserializeAttachment();
+      if (a && a.until <= now) {
+        for (let n = a.lo; n <= a.hi; n++) this.leave(ws, n);
+        ws.serializeAttachment(null);
+      }
+    }
+  }
+
+  webSocketClose(ws, code) {
+    const a = ws.deserializeAttachment();
+    if (a) for (let n = a.lo; n <= a.hi; n++) this.leave(ws, n);
+    closeBack(ws, code);
+  }
+
+  webSocketError(ws) {
+    this.webSocketClose(ws, 1011);
+  }
+}
+
+/** SESSIONS = "object": one per page socket, as million's viewer: what its
  * page looks at, and its sets. Idle, it hibernates; all it keeps is the
  * socket's attachment (the chunks it watches, and its rate). */
 export class Viewer extends DurableObject {
@@ -236,12 +413,7 @@ export class Viewer extends DurableObject {
   }
 
   async webSocketMessage(ws, msg) {
-    let v;
-    try {
-      v = JSON.parse(msg);
-    } catch {
-      return;
-    }
+    const v = parse(msg);
     const s = this.s;
     const id = this.ctx.id.toString();
     if (v.t === 'range') {
@@ -272,14 +444,14 @@ export class Viewer extends DurableObject {
   // A closed socket's viewer just ends: its chunks forget it when its
   // subscriptions expire (60 s), as million's `on_close = "drop"`.
   webSocketClose(ws, code) {
-    try {
-      ws.close(code === 1005 || code === 1006 ? 1000 : code);
-    } catch {}
+    closeBack(ws, code);
   }
 }
 
-/** SESSIONS = "worker": the page's socket, held by this Worker invocation. */
-function workerSession(env) {
+/** SESSIONS = "worker": the page's socket, held by this Worker invocation
+ * (kept going with waitUntil until the page leaves: celld closes a Worker's
+ * outgoing sockets when its event ends). */
+function workerSession(env, ctx) {
   const [client, server] = Object.values(new WebSocketPair());
   server.accept();
   /** Chunk number to its socket (a promise, while it opens). */
@@ -312,12 +484,7 @@ function workerSession(env) {
     p?.then((ws) => ws.close(1000)).catch(() => {});
   };
   server.addEventListener('message', (e) => {
-    let v;
-    try {
-      v = JSON.parse(e.data);
-    } catch {
-      return;
-    }
+    const v = parse(e.data);
     if (v.t === 'range') {
       // The chunks' sockets stay open, so a renewal with nothing new is free.
       const [lo, hi] = chunksFor(v);
@@ -332,21 +499,27 @@ function workerSession(env) {
       else chunkOf(env, n).set(i, on, n).catch(() => {});
     }
   });
-  server.addEventListener('close', () => {
-    for (const n of [...watching.keys()]) unwatch(n);
-    try {
-      server.close(1000);
-    } catch {}
-  });
+  ctx.waitUntil(
+    new Promise((done) =>
+      server.addEventListener('close', () => {
+        for (const n of [...watching.keys()]) unwatch(n);
+        try {
+          server.close(1000);
+        } catch {}
+        done();
+      }),
+    ),
+  );
   return new Response(null, { status: 101, webSocket: client });
 }
 
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     const path = new URL(req.url).pathname;
     if (path === '/ws' && req.headers.get('upgrade') === 'websocket') {
-      if (env.SESSIONS === 'worker') return workerSession(env);
-      return env.VIEWER.get(env.VIEWER.newUniqueId()).fetch(req);
+      if (env.SESSIONS === 'worker') return workerSession(env, ctx);
+      if (env.SESSIONS === 'object') return env.VIEWER.get(env.VIEWER.newUniqueId()).fetch(req);
+      return env.HUB.get(env.HUB.idFromName(String(Math.floor(Math.random() * HUBS)))).fetch(req);
     }
     if (req.method === 'GET' && path === '/') return new Response(INDEX, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' } });
     if (req.method === 'GET' && path === '/api/count') {

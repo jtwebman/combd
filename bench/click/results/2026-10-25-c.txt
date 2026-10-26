@@ -1,0 +1,40 @@
+click race, 2026-10-25 (second round): servers [combd workerd celld phoenix], tests [idle 10 100 500 1000 5000 10000 20000], 1000 new pages a second, 2000 a client, 180s clicking
+idle: combd and phoenix in steps of 2,000 pages at 1,000 a second; workerd and celld in steps of 500 at 500 a second. phoenix ran after the others.
+bench-click-celld sha256:1e57d30be56a
+bench-click-combd sha256:1d5c43c7af6c
+bench-click-phoenix sha256:f94506ace8e2
+bench-click-workerd sha256:74d8d2f161c6
+docker 29.9.2 linux/arm64, 8 CPUs, 16746086400 bytes for docker; 28565d0
+docker 29.9.2 linux/arm64, 8 CPUs, 16746086400 bytes for docker; 935cedf
+celld           idle   held   39003  memory  915 MiB (base  42, top  948)   22.9 KB a page  refusals      3  end: server died (OOMKilled=true exit=1)
+combd           idle   held  156911  memory  943 MiB (base   6, top  970)    6.1 KB a page  refusals      4  end: refusing or behind (held 156911 of 162000 arrived); a new page got no echo in 15 s
+workerd         idle   held   11559  memory 1019 MiB (base 100, top 1024)   81.5 KB a page  refusals      3  end: server died (OOMKilled=true exit=137)
+phoenix         idle   held   68000  memory 1018 MiB (base  51, top 1018)   14.6 KB a page  refusals      1  end: server died (OOMKilled=true exit=137)
+combd               10 pages  changes/s       1 avg       1 peak  clicks    134  lost     0 (0.00%)  worst p50   153 ms  p99   160 ms  up 10 closed 0  refused 0  memory    9 MiB peak (base   6)  cpu   0% avg 
+workerd             10 pages  changes/s       1 avg       1 peak  clicks    151  lost     0 (0.00%)  worst p50   156 ms  p99   209 ms  up 10 closed 0  refused 0  memory  108 MiB peak (base  99)  cpu   0% avg 
+celld               10 pages  changes/s       1 avg       1 peak  clicks    105  lost     0 (0.00%)  worst p50   162 ms  p99   204 ms  up 10 closed 0  refused 0  memory   53 MiB peak (base  41)  cpu   1% avg 
+phoenix             10 pages  changes/s       1 avg       1 peak  clicks     94  lost     0 (0.00%)  worst p50   159 ms  p99   238 ms  up 10 closed 0  refused 0  memory   66 MiB peak (base  64)  cpu   0% avg 
+combd              100 pages  changes/s      16 avg      23 peak  clicks   1183  lost     0 (0.00%)  worst p50   153 ms  p99   161 ms  up 100 closed 0  refused 0  memory   21 MiB peak (base   5)  cpu   1% avg 
+workerd            100 pages  changes/s      17 avg      24 peak  clicks   1218  lost     0 (0.00%)  worst p50   154 ms  p99   286 ms  up 100 closed 0  refused 0  memory   61 MiB peak (base  10)  cpu   1% avg 
+celld              100 pages  changes/s      16 avg      22 peak  clicks   1220  lost     0 (0.00%)  worst p50   158 ms  p99   258 ms  up 100 closed 0  refused 0  memory   78 MiB peak (base  26)  cpu   3% avg 
+phoenix            100 pages  changes/s      19 avg      26 peak  clicks   1199  lost     0 (0.00%)  worst p50   153 ms  p99   223 ms  up 100 closed 0  refused 0  memory   56 MiB peak (base  51)  cpu   0% avg 
+combd              500 pages  changes/s     326 avg     460 peak  clicks   6259  lost     0 (0.00%)  worst p50   152 ms  p99   161 ms  up 500 closed 0  refused 0  memory   42 MiB peak (base   5)  cpu   2% avg 
+workerd            500 pages  changes/s     313 avg     478 peak  clicks   6069  lost     0 (0.00%)  worst p50   154 ms  p99   313 ms  up 500 closed 0  refused 0  memory  110 MiB peak (base  10)  cpu   3% avg 
+celld              500 pages  changes/s     315 avg     444 peak  clicks   6199  lost     0 (0.00%)  worst p50   158 ms  p99   258 ms  up 500 closed 0  refused 0  memory  126 MiB peak (base  24)  cpu  11% avg 
+phoenix            500 pages  changes/s     336 avg     481 peak  clicks   6120  lost     0 (0.00%)  worst p50   152 ms  p99   328 ms  up 500 closed 0  refused 0  memory   68 MiB peak (base  51)  cpu   2% avg 
+combd             1000 pages  changes/s    1207 avg    1775 peak  clicks  12334  lost     0 (0.00%)  worst p50   152 ms  p99   162 ms  up 1000 closed 0  refused 0  memory   62 MiB peak (base   5)  cpu   4% avg 
+workerd           1000 pages  changes/s    1134 avg    1706 peak  clicks  11824  lost     0 (0.00%)  worst p50   154 ms  p99   191 ms  up 1000 closed 0  refused 0  memory  165 MiB peak (base  10)  cpu   5% avg 
+celld             1000 pages  changes/s    1187 avg    1723 peak  clicks  12145  lost     0 (0.00%)  worst p50   157 ms  p99  1727 ms  up 1000 closed 0  refused 0  memory  181 MiB peak (base  24)  cpu  19% avg 
+phoenix           1000 pages  changes/s    1203 avg    1707 peak  clicks  12290  lost     0 (0.00%)  worst p50   153 ms  p99   199 ms  up 1000 closed 0  refused 0  memory   87 MiB peak (base  57)  cpu   4% avg 
+combd             5000 pages  changes/s   28899 avg   40183 peak  clicks  61727  lost     0 (0.00%)  worst p50   114 ms  p99   983 ms  up 5000 closed 0  refused 0  memory  152 MiB peak (base   5)  cpu  24% avg 
+workerd           5000 pages  changes/s   28546 avg   39899 peak  clicks  61246  lost     0 (0.00%)  worst p50   120 ms  p99   299 ms  up 5000 closed 0  refused 0  memory  519 MiB peak (base  14)  cpu  37% avg 
+celld             5000 pages  changes/s   28719 avg   39581 peak  clicks  61442  lost     0 (0.00%)  worst p50   969 ms  p99  5131 ms  up 5000 closed 0  refused 0  memory  456 MiB peak (base  25)  cpu  79% avg 
+phoenix           5000 pages  changes/s   28712 avg   40525 peak  clicks  61554  lost     0 (0.00%)  worst p50   110 ms  p99   299 ms  up 5000 closed 0  refused 0  memory  168 MiB peak (base  57)  cpu  29% avg 
+combd            10000 pages  changes/s  113522 avg  150670 peak  clicks 123457  lost     0 (0.00%)  worst p50   192 ms  p99  3357 ms  up 10000 closed 0  refused 0  memory  207 MiB peak (base   5)  cpu  54% avg 
+workerd          10000 pages  changes/s  109763 avg  176609 peak  clicks 122477  lost     0 (0.00%)  worst p50   469 ms  p99   841 ms  up 10000 closed 0  refused 0  memory  993 MiB peak (base  10)  cpu  84% avg 
+celld            10000 pages  changes/s  109605 avg  145050 peak  clicks 122153  lost   253 (0.21%)  worst p50  5234 ms  p99  9472 ms  up 9835 closed 165  refused 0  memory  722 MiB peak (base  25)  cpu  96% avg 
+phoenix          10000 pages  changes/s  112723 avg  150960 peak  clicks 122325  lost     0 (0.00%)  worst p50   110 ms  p99   227 ms  up 10000 closed 0  refused 0  memory  248 MiB peak (base  57)  cpu  77% avg 
+combd            20000 pages  changes/s  442741 avg  579315 peak  clicks 246174  lost     0 (0.00%)  worst p50   408 ms  p99  2512 ms  up 20000 closed 0  refused 0  memory  418 MiB peak (base   5)  cpu  77% avg 
+workerd          20000 pages  changes/s   68282 avg   95487 peak  clicks  21217  lost     0 (0.00%)  worst p50   471 ms  p99   697 ms  up 1349 closed 651  refused 6  memory    0 MiB peak (base  10)  cpu   0% avg server died (OOMKilled=true exit=137)
+celld            20000 pages  changes/s  122820 avg  261304 peak  clicks  73372  lost   965 (1.32%)  worst p50  8027 ms  p99  9964 ms  up 6000 closed 0  refused 4  memory    0 MiB peak (base  24)  cpu   0% avg server died (OOMKilled=true exit=1)
+phoenix          20000 pages  changes/s  394307 avg  841956 peak  clicks 246808  lost     2 (0.00%)  worst p50   506 ms  p99  1051 ms  up 20000 closed 0  refused 0  memory  435 MiB peak (base  56)  cpu 100% avg 

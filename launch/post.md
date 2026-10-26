@@ -75,40 +75,50 @@ shared boxes, split into 64 chunk objects. Every open page holds a
 WebSocket and watches a chunk or two. Every click goes to everyone
 watching that chunk. Idle pages cost memory; clicking pages cost fan-out.
 
-We wrote million twice: once for combd, and once as a standard Workers
-app with Durable Objects, for workerd and celld. Same page, same protocol,
-same limits. Then we gave each server what a $6 droplet has (one CPU,
-1 GB, no swap) and pointed the same load client at it: pages that only
-watch, added until the server refuses or falls over, and 1,000 to 20,000
-pages that click.
+We wrote million three times: for combd, as a standard Workers app with
+Durable Objects (for workerd and celld), and in Elixir on Bandit, the
+server Phoenix runs on. Same page, same protocol, same limits. Then we
+gave each server what a $6 droplet has (one CPU, 1 GB, no swap) and
+pointed the same load client at it: pages that only watch, added until
+the server refuses or falls over, and 10 to 20,000 pages that click.
 
 Idle pages, in 1 GB:
 
 | Server | Pages held | Memory a page |
 |---|---|---|
 | combd | about 156,000, then it refused new ones | 6.1 KB |
-| workerd | 2,900 to 6,000, then killed for memory | 133 to 300 KB |
-| celld | about 3,000, then it refused new ones | about 220 KB |
+| Phoenix | about 68,000, then killed for memory | 14.5 KB |
+| celld | 39,000 to 40,500, then killed for memory | 23 KB |
+| workerd | about 11,500, then killed for memory | 82 to 88 KB |
 
-Clicking pages, one CPU:
+Clicking pages, one CPU (p99 echo is the worst 10 seconds of three
+minutes):
 
-| Pages | combd | workerd | celld |
-|---|---|---|---|
-| 1,000 | p50 echo 152 ms, 63 MB, 4% CPU | p50 155 ms, 290 to 610 MB | p50 8 to 9 s, CPU-bound |
-| 5,000 | p50 112 to 153 ms, 146 MB, 25% CPU | p50 0.6 to 5.4 s at 920 to 940 MB, or killed for memory | killed for memory |
-| 10,000 | p50 115 ms to 1.2 s, nothing lost, 220 MB, 55% CPU | killed for memory | half of all clicks lost |
-| 20,000 | 445,000 changes a second, p99 under 0.9 s, nothing lost, 440 MB, 82% CPU | killed for memory | couldn't open the pages |
+| Pages | combd | Phoenix | workerd | celld |
+|---|---|---|---|---|
+| 1,000 | p99 echo 162 ms, 62 MB, 4% CPU | p99 199 to 229 ms, 80 to 87 MB, 4% CPU | p99 184 to 191 ms, 165 MB, 5% CPU | p99 1.7 to 5.1 s, at 18% CPU |
+| 5,000 | p99 0.7 to 1.0 s, 140 to 152 MB, 24% CPU | p99 215 to 299 ms, 165 MB, 29% CPU | p99 220 to 299 ms, 515 MB, 38% CPU | p99 5 to 8 s, 80% CPU |
+| 10,000 | p99 0.7 to 3.4 s, nothing lost, 205 MB, 55% CPU | p99 227 to 251 ms, nothing lost, 245 MB, 76% CPU | p99 0.8 to 2.3 s, at 1 GB of 1 GB, 84% CPU | 0.2 to 0.6% of clicks lost, 97% CPU |
+| 20,000 | 442,000 changes a second, p99 2.1 to 2.5 s, nothing lost, 430 MB, 77% CPU | p99 just over 1 s, 2 clicks lost, 440 MB, 100% CPU | killed for memory | killed for memory |
 
-Where workerd held on, it kept up: at 1,000 pages it delivered the same
-changes as combd, nearly as fast. What ended it was memory. An open page
-costs it 20 to 50 times what it costs combd.
+Below 1,000 pages all four kept every echo under a third of a second.
+Where workerd held on, it kept up: to 5,000 pages its echoes were as short
+as anyone's. What ended it was memory: an open page costs it 13 to 14
+times what it costs combd. celld ran out of time before it ran out of
+CPU: from 1,000 pages its slowest echoes took seconds with its CPU at 18%.
+The BEAM is the one that kept pace. At 5,000 and 10,000 pages Phoenix's
+slowest echoes were shorter than combd's, for about a fifth more memory
+and 40% more CPU, until its one core filled at 20,000. combd held 2.3
+times as many idle pages.
 
 There's a design reason for part of this, and it's worth saying plainly.
 On Workers, a WebSocket belongs to the object that accepted it. A chunk
 can't write to a page's socket; it has to call the object holding it.
 combd lets a chunk send straight to its watchers' sockets, without waking
-the sessions that hold them. We measured two ways to write the Workers
-version, and both are in the repository.
+the sessions that hold them, and Phoenix sends straight to each socket's
+process. We measured three ways to write the Workers version, and all are
+in the repository; the one raced here holds every page's socket in one
+object, so a chunk's beat is one call, not one per page.
 
 We also estimated what the same load would cost on Cloudflare, from its
 published prices (we deployed nothing there). At 10,000 clicking pages
@@ -125,21 +135,27 @@ across many machines. That's what you pay it for.
   ran twice; where runs differed, we show both. The droplet tests we've
   published before (TLS, real network) are the ones to quote for a
   node's capacity.
-- **No TLS anywhere.** celld can't end TLS, so all three ran plain
+- **No TLS anywhere.** celld can't end TLS, so all four ran plain
   WebSockets. On our droplets combd ends TLS itself, which adds about 4 KB
   an idle connection.
-- **The Workers app is ours.** A better port may exist. We'd like to see
-  one, and we'll run it.
-- **Hibernation didn't free memory on workerd here.** Idle objects stayed
-  in memory after three minutes, with no settings changed. On Cloudflare
-  they'd leave memory, so workerd's idle numbers say nothing about what
+- **One core each.** Phoenix ran one scheduler, combd one event loop.
+  With more cores the BEAM, workerd and celld spread out too.
+- **The Workers and Phoenix apps are ours.** We reworked the Workers app
+  until changes stopped helping, and tuned the BEAM the way its users do;
+  what each change measured is in their READMEs. Better ports may exist.
+  We'd like to see them, and we'll run them.
+- **Hibernation frees little on workerd.** It does evict idle objects,
+  but most of an idle page's memory there is the connection itself, and
+  we found no setting that changes it. On Cloudflare a hibernated object
+  leaves memory, so workerd's idle numbers say nothing about what
   Cloudflare holds.
 - **celld ran in its single-node dev mode.** We didn't measure its
   production mode.
 - **combd has a gap too.** When pages arrived as fast as the clients could
   open them, about 14,000 a second, combd was killed for memory in two of
   four tries before its guard caught up. At 1,000 a second it refused
-  cleanly every time. It's on our list.
+  cleanly in four of five tries; the fifth, with other tests sharing the
+  machine, was killed at 114,000. It's on our list.
 
 ## Try it
 
