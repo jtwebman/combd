@@ -18,7 +18,7 @@ defmodule Million.MixProject do
 
   defp deps do
     [
-      {:bandit, "~> 1.13"},
+      {:bandit, "~> 1.14"},
       {:websock_adapter, "~> 0.6"},
       {:exqlite, "~> 0.43"}
     ]

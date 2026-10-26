@@ -63,7 +63,7 @@ COPY --from=esbuild /vars-worker ./.dev.vars
 
 # million on the BEAM (examples/million-phoenix): Bandit, Plug and WebSock,
 # a release built and run in the same pinned image.
-FROM elixir:1.20.4-otp-28 AS phoenix-build
+FROM elixir:1.20.4-otp-28@sha256:d2b22bba38b499b709c113bd040bf4a6dd12b505668b44d9484b5964059fefa9 AS phoenix-build
 ENV MIX_ENV=prod
 WORKDIR /src
 RUN mix local.hex --force && mix local.rebar --force
@@ -74,7 +74,7 @@ COPY examples/million-phoenix/rel rel
 COPY examples/million/client/index.html priv/index.html
 RUN mix release
 
-FROM elixir:1.20.4-otp-28 AS phoenix
+FROM elixir:1.20.4-otp-28@sha256:d2b22bba38b499b709c113bd040bf4a6dd12b505668b44d9484b5964059fefa9 AS phoenix
 COPY --from=phoenix-build /src/_build/prod/rel/million /app
 # No distribution (no epmd): one node, nothing to connect to.
 # Modules load as first used, not all at boot (26 MB less code in memory).
