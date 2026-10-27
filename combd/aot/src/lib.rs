@@ -1,4 +1,4 @@
-//! combd's AOT tier. `combd-spike aot-gen` turns a Wasm module into plain safe
+//! combd's AOT tier. `combd aot-gen` turns a Wasm module into plain safe
 //! Rust (`gen_*.rs`), and rustc + LLVM turn that into machine code for any CPU.
 //! Memory safety comes from rustc: no `unsafe` anywhere, every memory access is
 //! bounds-checked, and every trap is an `Err` passed back up the call chain.

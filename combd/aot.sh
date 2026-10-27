@@ -1,5 +1,5 @@
 #!/bin/sh
-# Compile the Rust cell ahead of time, then build the spike with the AOT tier.
+# Compile the Rust cell ahead of time, then build combd with the AOT tier.
 # Needs guest/ built first. Adds the event cell too if guest-ev is built.
 set -e
 cd "$(dirname "$0")"

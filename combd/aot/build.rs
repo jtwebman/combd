@@ -34,7 +34,7 @@ fn main() {
     if std::path::Path::new("src/gen_ev.rs").exists() {
         println!("cargo:rustc-cfg=has_ev");
     }
-    // Fuzz modules, only while `aot-fuzz.sh` runs (`combd-spike fuzz-gen`).
+    // Fuzz modules, only while `aot-fuzz.sh` runs (`combd fuzz-gen`).
     println!("cargo:rustc-check-cfg=cfg(has_fuzz)");
     println!("cargo:rerun-if-changed=src/gen_fuzz.rs");
     if std::path::Path::new("src/gen_fuzz.rs").exists() {

@@ -14,8 +14,10 @@ ENV CARGO_HTTP_MULTIPLEXING=false CARGO_NET_RETRY=10
 WORKDIR /combd
 COPY guest guest
 COPY combd combd
-# Builders take COMBD_AOT_SRC=/combd/spike/aot (the folder's name until
-# 2026-10-26): kept working until they're moved over to /combd/combd/aot.
+# The folder was spike/ and the binary combd-spike (until 2026-10-26 and
+# 2026-10-25): a builder made before then runs /combd/spike/target/release/
+# combd-spike with COMBD_AOT_SRC=/combd/spike/aot. These links keep it
+# working until it's moved over (README, "Builders"); then they go.
 RUN ln -s combd spike
 COPY examples/arena examples/arena
 # The git commit, built into combd and the game (shown on the page).
@@ -32,15 +34,6 @@ RUN examples/arena/build.sh
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get -y upgrade && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
 COPY --from=build /combd/combd/target/release/combd /combd/combd/target/release/combd
-# The binary was combd-spike until 2026-10-25: nodes and builders that
-# still run it by that name keep working until they're moved over.
-# The folder was spike/ until 2026-10-26: nodes run combd from
-# /opt/combd/current/spike/... (their unit, combd-update) until they're
-# moved over (cloud/combd.service, cloud/combd-update.sh), and builders take
-# COMBD_AOT_SRC=/combd/spike/aot; this link keeps both working. It goes once
-# every node and builder uses combd/.
-RUN ln -s combd /combd/combd/target/release/combd-spike
-RUN ln -s combd /combd/spike
 COPY --from=build /combd/guest/target/wasm32-unknown-unknown/release/combd_guest.wasm /combd/guest/target/wasm32-unknown-unknown/release/combd_guest.wasm
 COPY --from=build /combd/examples/arena/app /combd/examples/arena/app
 # A hash of combd's own sources: nodes restart for a new image only when it

@@ -84,9 +84,11 @@ and the rest of the plan is updated to match.
    **Done (2026-10-25):** the binary is `combd` (package `combd`; the
    folder was `spike/` until 2026-10-26, now `combd/`), with `combd help`, and `combd new`, `build`,
    `dev` for an app. The nodes run it as `combd` (their unit and update
-   script moved over 2026-10-25, one at a time); the images keep a
-   `combd-spike` link only for the Windows builder, pulled by hand: once
-   it runs `combd builder`, the link goes (examples/arena/Dockerfile). `combd-sdk`
+   script moved over 2026-10-25, and to `combd/` paths 2026-10-26, one at
+   a time); only the builder image keeps `spike` and `combd-spike` links,
+   for the Windows builder: once it runs `/combd/combd/target/release/combd
+   builder` with `COMBD_AOT_SRC=/combd/combd/aot`, they go
+   (examples/arena/Dockerfile). `combd-sdk`
    (`sdk/rust/`): a Rust crate for apps (`cell!`, `Request`, `Response`,
    `sql::run`, alarms, `call`, `send`, `env`), with no proc macro.
    `docs/quickstart.md`, each step run as written (new, dev, change it,

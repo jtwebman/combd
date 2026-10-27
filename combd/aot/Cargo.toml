@@ -3,7 +3,7 @@ name = "combd-aot"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "combd's AOT tier: Wasm modules compiled to plain safe Rust by `combd-spike aot-gen`."
+description = "combd's AOT tier: Wasm modules compiled to plain safe Rust by `combd aot-gen`."
 
 [lib]
 path = "src/lib.rs"

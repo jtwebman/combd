@@ -1,6 +1,6 @@
 //! Loading a compiled module's build into a running node. With combd-mem,
 //! this is combd's `unsafe` code outside the AOT tier itself. What it relies on:
-//! - The build is what `combd-spike aot-build` makes: the module's generated
+//! - The build is what `combd aot-build` makes: the module's generated
 //!   Rust (safe Rust, `forbid(unsafe_code)`) with combd-aot, as a library
 //!   that exports `combd_pin` and `combd_module` by the C ABI.
 //! - Its pin is ours (the same rustc, the same combd-aot sources, the same
