@@ -3,3 +3,6 @@ reference/
 .git/
 spike/aot/src/gen_*.rs
 langs/out/
+**/target/
+# Local dev secrets (combd.dev.toml) never go into an image.
+**/combd.dev.toml

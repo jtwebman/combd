@@ -2,7 +2,7 @@
 name = "combd-sdk"
 version = "0.1.0"
 edition = "2021"
-description = "Write a combd app in Rust: a request in, a response out, SQLite, alarms, and calls to other processes."
+description = "Write a combd app in Rust: a request in, a response out, SQLite, Postgres, alarms, and calls to other processes."
 license = "Apache-2.0"
 repository = "https://github.com/jtwebman/combd"
 

@@ -1,0 +1,41 @@
+x race, 2026-10-26: combd's pool, step by step (one run each): b = pooled statements not reset; qnw = + the line, its pullers leaving when it's empty, no loop waker; q = + the loop waker. Then q2: pullers wait on the line (the final design), against b again.
+docker 29.9.2 linux/arm64, 8 CPUs for docker; 75e0e89+changes
+bench-x-combd sha256:df58492e25ad
+bench-x-phoenix sha256:1a98344945f3
+bench-x-workerd sha256:546f77ee03cd
+bench-x-celld sha256:e9891fd88207
+bench-x-pg sha256:ab825405efb9
+combd-b         pool  32     10 conns     5662 req/s  p50   1.36ms  p99   3.01ms  errors      0  server cpu  92% mem   15 MiB peak  postgres cpu 343%  
+combd-b         pool  32    100 conns     6963 req/s  p50  11.04ms  p99  43.95ms  errors      0  server cpu  93% mem   31 MiB peak  postgres cpu 425%  
+combd-b         pool  32   1000 conns     6821 req/s  p50 134.54ms  p99 227.43ms  errors      0  server cpu  93% mem  152 MiB peak  postgres cpu 396%  
+combd-qnw       pool  32     10 conns     2791 req/s  p50   2.54ms  p99   6.47ms  errors      0  server cpu  37% mem   10 MiB peak  postgres cpu 138%  
+combd-qnw       pool  32    100 conns     5887 req/s  p50  12.95ms  p99  66.62ms  errors      0  server cpu  68% mem   27 MiB peak  postgres cpu 324%  
+combd-qnw       pool  32   1000 conns     8003 req/s  p50 112.37ms  p99 208.75ms  errors      0  server cpu  91% mem  152 MiB peak  postgres cpu 457%  
+combd-q         pool  32     10 conns     2747 req/s  p50   2.54ms  p99   6.49ms  errors      0  server cpu  36% mem   22 MiB peak  postgres cpu 132%  
+combd-q         pool  32    100 conns     6054 req/s  p50  12.23ms  p99  67.49ms  errors      0  server cpu  67% mem   27 MiB peak  postgres cpu 332%  
+combd-q         pool  32   1000 conns     8061 req/s  p50 111.07ms  p99 213.79ms  errors      0  server cpu  90% mem  152 MiB peak  postgres cpu 449%  
+combd-b         pool 200     10 conns     5538 req/s  p50   1.36ms  p99   6.31ms  errors      0  server cpu  92% mem    8 MiB peak  postgres cpu 321%  
+combd-b         pool 200    100 conns     6433 req/s  p50  13.75ms  p99  53.66ms  errors      0  server cpu  93% mem   54 MiB peak  postgres cpu 410%  
+combd-b         pool 200   1000 conns     6184 req/s  p50 162.60ms  p99 282.38ms  errors      0  server cpu  95% mem  187 MiB peak  postgres cpu 406%  
+combd-qnw       pool 200     10 conns     2171 req/s  p50   2.92ms  p99  22.07ms  errors      0  server cpu  36% mem    8 MiB peak  postgres cpu 128%  
+combd-qnw       pool 200    100 conns     4977 req/s  p50  17.17ms  p99  87.87ms  errors      0  server cpu  75% mem   43 MiB peak  postgres cpu 343%  
+combd-qnw       pool 200   1000 conns     7532 req/s  p50 120.55ms  p99 251.62ms  errors      0  server cpu  91% mem  191 MiB peak  postgres cpu 456%  
+combd-q         pool 200     10 conns     2767 req/s  p50   2.55ms  p99   6.90ms  errors      0  server cpu  36% mem   22 MiB peak  postgres cpu 133%  
+combd-q         pool 200    100 conns     6022 req/s  p50  13.94ms  p99  68.23ms  errors      0  server cpu  70% mem   44 MiB peak  postgres cpu 336%  
+combd-q         pool 200   1000 conns     7710 req/s  p50 116.94ms  p99 241.93ms  errors      0  server cpu  91% mem  192 MiB peak  postgres cpu 462%  
+bench-x-phoenix sha256:1a98344945f3
+bench-x-workerd sha256:546f77ee03cd
+bench-x-celld sha256:e9891fd88207
+bench-x-pg sha256:ab825405efb9
+combd-b         pool  32     10 conns     5710 req/s  p50   1.34ms  p99   3.02ms  errors      0  server cpu  90% mem   13 MiB peak  postgres cpu 346%  
+combd-b         pool  32    100 conns     6953 req/s  p50  11.17ms  p99  42.59ms  errors      0  server cpu  93% mem   29 MiB peak  postgres cpu 427%  
+combd-b         pool  32   1000 conns     6986 req/s  p50 128.82ms  p99 211.71ms  errors      0  server cpu  94% mem  151 MiB peak  postgres cpu 406%  
+combd-q         pool  32     10 conns     6143 req/s  p50   1.27ms  p99   2.55ms  errors      0  server cpu  87% mem    9 MiB peak  postgres cpu 358%  
+combd-q         pool  32    100 conns     8656 req/s  p50   9.79ms  p99  31.42ms  errors      0  server cpu  93% mem   27 MiB peak  postgres cpu 501%  
+combd-q         pool  32   1000 conns     8132 req/s  p50 113.75ms  p99 203.64ms  errors      0  server cpu  94% mem  151 MiB peak  postgres cpu 470%  
+combd-b         pool 200     10 conns     5464 req/s  p50   1.37ms  p99   7.39ms  errors      0  server cpu  91% mem   10 MiB peak  postgres cpu 324%  
+combd-b         pool 200    100 conns     6403 req/s  p50  13.37ms  p99  53.75ms  errors      0  server cpu  94% mem   57 MiB peak  postgres cpu 408%  
+combd-b         pool 200   1000 conns     6298 req/s  p50 159.16ms  p99 275.53ms  errors      0  server cpu  94% mem  189 MiB peak  postgres cpu 399%  
+combd-q         pool 200     10 conns     6051 req/s  p50   1.28ms  p99   2.96ms  errors      0  server cpu  86% mem    7 MiB peak  postgres cpu 355%  
+combd-q         pool 200    100 conns     7468 req/s  p50  12.29ms  p99  45.81ms  errors      0  server cpu  93% mem   44 MiB peak  postgres cpu 469%  
+combd-q         pool 200   1000 conns     7562 req/s  p50 120.64ms  p99 231.40ms  errors      0  server cpu  95% mem  191 MiB peak  postgres cpu 481%  

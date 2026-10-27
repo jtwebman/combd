@@ -1,0 +1,27 @@
+# An X clone on Postgres: users, posts, follows, likes, and a home
+# timeline. One stateless process; every row is in your Postgres.
+[app]
+name = "x"
+# Locally, browsers (and curl) send x.localhost to 127.0.0.1.
+domains = ["x.localhost"]
+
+[vars]
+POOL_MAX = { type = "int", min = 1, default = 8 }
+
+[secrets]
+PG_URL = { secret = "pg-url", type = "url" }
+
+# Interpreted, so `combd dev` runs it. On a fleet, `engine = "compiled"`
+# (a deploy then waits for its build).
+[modules.x]
+engine = "interpreted"
+
+[http.api]
+module = "x"
+routes = ["/api/*"]
+
+[pool.main]
+module = "combd:postgres"
+url = "$PG_URL"
+max = "$POOL_MAX"
+callers = ["api"]

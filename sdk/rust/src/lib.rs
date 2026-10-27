@@ -26,6 +26,13 @@
 
 pub use serde_json::{json, Value};
 
+/// JSON text, written straight into a buffer: `Value::to_string()` goes
+/// through `Display` (a `fmt` call and an io adapter per piece), several
+/// times slower.
+pub fn to_json(v: &Value) -> String {
+    serde_json::to_string(v).unwrap_or_default()
+}
+
 /// A request, as the host hands it over: `<kind> <METHOD> <path>[ <body>]`.
 /// `kind` is `api` for a stateless process and `do` for a durable object
 /// (then `path` is what's after the object's id in the route). Events come
@@ -60,6 +67,9 @@ impl<'a> Request<'a> {
 
     /// The body as JSON (`Value::Null` if it isn't).
     pub fn json(&self) -> Value {
+        if self.body.is_empty() {
+            return Value::Null; // a GET's: no parse error built to say so
+        }
         serde_json::from_str(self.body).unwrap_or(Value::Null)
     }
 }
@@ -80,7 +90,7 @@ impl Response {
     }
 
     pub fn json(status: u16, v: &Value) -> Response {
-        Response { status, headers: vec![], body: v.to_string() }
+        Response { status, headers: vec![], body: to_json(v) }
     }
 
     pub fn html(body: &str) -> Response {
@@ -150,6 +160,7 @@ mod host {
         pub fn call(ptr: *const u8, len: u32) -> u32;
         pub fn send(ptr: *const u8, len: u32) -> u32;
         pub fn pg_read(ptr: *mut u8, cap: u32) -> u32;
+        pub fn pg_query(handle: u64, ptr: *const u8, len: u32) -> u32;
     }
     #[link(wasm_import_module = "wasi_snapshot_preview1")]
     extern "C" {
@@ -185,12 +196,34 @@ pub mod sql {
 
     /// Run one statement, `?` for each of `params`; the rows it returns.
     pub fn run(q: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String> {
-        let out = raw(&super::json!({ "q": q, "p": params }).to_string());
-        let v: Value = serde_json::from_slice(&out).map_err(|e| e.to_string())?;
+        rows(&raw(&statement(None, q, params)))
+    }
+
+    /// An answer's rows, or its error (with its SQLSTATE first, if it has
+    /// one: Postgres's do, SQLite's don't).
+    pub(crate) fn rows(out: &[u8]) -> Result<Vec<Vec<Value>>, String> {
+        let mut v: Value = serde_json::from_slice(out).map_err(|e| e.to_string())?;
         if let Some(e) = v.get("error") {
-            return Err(e.as_str().unwrap_or("sql error").to_string());
+            let e = e.as_str().unwrap_or("sql error");
+            return Err(v["code"].as_str().map_or(e.to_string(), |c| format!("{c} {e}")));
         }
-        Ok(v["rows"].as_array().map(|r| r.iter().map(|row| row.as_array().cloned().unwrap_or_default()).collect()).unwrap_or_default())
+        // Moved out, not copied.
+        let rows = match v.get_mut("rows").map(Value::take) {
+            Some(Value::Array(rows)) => rows,
+            _ => return Ok(vec![]),
+        };
+        Ok(rows.into_iter().map(|row| if let Value::Array(r) = row { r } else { vec![] }).collect())
+    }
+
+    /// `{"db"?, "q", "p"}`, written out as it goes (no `Value` built first:
+    /// that copies every parameter).
+    pub(crate) fn statement(db: Option<&str>, q: &str, params: &[Value]) -> String {
+        let s = |x: &str| serde_json::to_string(x).unwrap_or_default();
+        let p = serde_json::to_string(params).unwrap_or_default();
+        match db {
+            Some(db) => format!("{{\"db\":{},\"q\":{},\"p\":{p}}}", s(db), s(q)),
+            None => format!("{{\"q\":{},\"p\":{p}}}", s(q)),
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -198,6 +231,38 @@ pub mod sql {
         let n = unsafe { super::host::sql(req.as_ptr(), req.len() as u32) } as usize;
         let mut out = vec![0u8; n];
         unsafe { super::host::sql_read(out.as_mut_ptr()) };
+        out
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn raw(_: &str) -> Vec<u8> {
+        unreachable!("combd-sdk calls the host: build for wasm32-unknown-unknown")
+    }
+}
+
+/// Postgres, through a pool the host runs (`[pool.<name>]` in combd.toml,
+/// with this process among its `callers`). The cell waits, paused, while
+/// the statement runs; it never holds a socket or a password.
+pub mod pg {
+    use super::Value;
+
+    /// One statement on a pooled connection of pool `db`, `$1`, `$2`... for
+    /// `params`; the rows it returns. An error starts with its SQLSTATE
+    /// (`23505 duplicate key value...`). Each statement is its own
+    /// transaction. The connection isn't reset after it, as with most pools:
+    /// what it changes in the session (a `SET`, a session advisory lock, a
+    /// temp table) stays for whichever statement uses that connection next.
+    /// Undo it yourself, or keep it to one request.
+    pub fn query(db: &str, q: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String> {
+        super::sql::rows(&raw(&super::sql::statement(Some(db), q, params)))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn raw(req: &str) -> Vec<u8> {
+        let n = unsafe { super::host::pg_query(0, req.as_ptr(), req.len() as u32) } as usize;
+        let mut out = vec![0u8; n];
+        let got = unsafe { super::host::pg_read(out.as_mut_ptr(), n as u32) } as usize;
+        out.truncate(got);
         out
     }
 
@@ -238,7 +303,7 @@ pub fn now_ms() -> i64 {
 /// one answer.
 #[cfg(target_arch = "wasm32")]
 pub fn call(msg: &Value) -> Value {
-    let m = msg.to_string();
+    let m = to_json(msg);
     let n = unsafe { host::call(m.as_ptr(), m.len() as u32) } as usize;
     let mut out = vec![0u8; n];
     let got = unsafe { host::pg_read(out.as_mut_ptr(), n as u32) } as usize;
@@ -250,7 +315,7 @@ pub fn call(msg: &Value) -> Value {
 /// succeeds. False: too much queued already.
 #[cfg(target_arch = "wasm32")]
 pub fn send(msg: &Value) -> bool {
-    let m = msg.to_string();
+    let m = to_json(msg);
     unsafe { host::send(m.as_ptr(), m.len() as u32) == 1 }
 }
 
@@ -279,5 +344,16 @@ mod tests {
         assert_eq!(Request::parse("api GET /").body, "");
         assert_eq!(Response::json(200, &json!({ "n": 1 })).into_answer(), "200 {\"n\":1}");
         assert_eq!(Response::html("<p>hi</p>").into_answer(), "200\ncontent-type: text/html; charset=utf-8\n\n<p>hi</p>");
+    }
+
+    #[test]
+    fn answers_read_as_rows_or_errors() {
+        assert_eq!(sql::rows(br#"{"rows":[[1,"a"]],"changes":0}"#), Ok(vec![vec![json!(1), json!("a")]]));
+        assert_eq!(sql::rows(br#"{"error":"duplicate key","code":"23505"}"#), Err("23505 duplicate key".into()));
+        assert_eq!(sql::rows(br#"{"error":"no such table: t"}"#), Err("no such table: t".into()));
+        let st = sql::statement(Some("main"), "SELECT \"x\" WHERE a = $1", &[json!(1), json!("a\nb"), json!(null)]);
+        assert_eq!(serde_json::from_str::<Value>(&st).unwrap(), json!({ "db": "main", "q": "SELECT \"x\" WHERE a = $1", "p": [1, "a\nb", null] }));
+        assert_eq!(serde_json::from_str::<Value>(&sql::statement(None, "q", &[])).unwrap(), json!({ "q": "q", "p": [] }));
+        assert_eq!(Request::parse("api GET /").json(), Value::Null);
     }
 }

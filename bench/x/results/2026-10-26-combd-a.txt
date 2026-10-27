@@ -1,0 +1,13 @@
+x race, 2026-10-26, combd final run a: pooled statements in a line per pool (work.rs), not reset, loop waker; same box and settings as 2026-10-26-a/b.txt
+docker 29.9.2 linux/arm64, 8 CPUs for docker; 75e0e89+changes
+bench-x-combd sha256:2ce67cb0138e
+bench-x-phoenix sha256:1a98344945f3
+bench-x-workerd sha256:546f77ee03cd
+bench-x-celld sha256:e9891fd88207
+bench-x-pg sha256:ab825405efb9
+combd           pool  32     10 conns     5828 req/s  p50   1.32ms  p99   4.30ms  errors      0  server cpu  86% mem    7 MiB peak  postgres cpu 361%  
+combd           pool  32    100 conns     8442 req/s  p50  10.16ms  p99  37.46ms  errors      0  server cpu  93% mem   27 MiB peak  postgres cpu 512%  
+combd           pool  32   1000 conns     8473 req/s  p50 109.85ms  p99 197.81ms  errors      0  server cpu  93% mem  150 MiB peak  postgres cpu 479%  
+combd           pool 200     10 conns     6211 req/s  p50   1.26ms  p99   2.52ms  errors      0  server cpu  88% mem    7 MiB peak  postgres cpu 359%  
+combd           pool 200    100 conns     7413 req/s  p50  12.47ms  p99  46.59ms  errors      0  server cpu  94% mem   45 MiB peak  postgres cpu 470%  
+combd           pool 200   1000 conns     7824 req/s  p50 115.55ms  p99 227.32ms  errors      0  server cpu  94% mem  189 MiB peak  postgres cpu 480%  

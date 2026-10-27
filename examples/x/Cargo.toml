@@ -1,0 +1,20 @@
+[package]
+name = "x"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its own workspace: it builds for wasm32 on its own.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+combd-sdk = { path = "../../sdk/rust" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true

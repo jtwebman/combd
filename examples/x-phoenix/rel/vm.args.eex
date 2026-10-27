@@ -1,0 +1,6 @@
+## One CPU (the race's box: 1 CPU, 1 GB), as million-phoenix.
++S 1:1
+## No busy-waiting when idle: spinning schedulers burn the CPU quota.
++sbwt none
++sbwtdcpu none
++sbwtdio none
