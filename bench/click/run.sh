@@ -216,11 +216,12 @@ req() {
     rm -f "$log"-*
     start "$s"
     for path in / /api/count; do
-        w="docker run --rm --network $NET --ulimit nofile=1048576:1048576 bench-click-wrk wrk -t4 -c$n -H Host:million.localhost --latency"
-        $w -d5s "http://srv:8080$path" >/dev/null 2>&1
+        # wrk takes a header only as "Name: value", with the space.
+        w() { docker run --rm --network $NET --ulimit nofile=1048576:1048576 bench-click-wrk wrk -t4 -c$n -H "Host: million.localhost" --latency "$@"; }
+        w -d5s "http://srv:8080$path" >/dev/null 2>&1
         mem >/dev/null
-        $w -d${REQ_SECS}s --timeout 10s "http://srv:8080$path" > "$log-${path//\//_}.txt" 2>&1 &
-        echo "secs	mem_mib	cpu_pct" > "$log-${path//\//_}-mem.tsv"
+        w -d${REQ_SECS}s --timeout 10s "http://srv:8080$path" > "$log-${path//\//_}.txt" 2>&1 &
+        echo "mem_mib	cpu_pct" > "$log-${path//\//_}-mem.tsv"
         while kill -0 $! 2>/dev/null; do echo "$(mem | tr ' ' '\t')" >> "$log-${path//\//_}-mem.tsv"; sleep 2; done
         f=$log-${path//\//_}.txt
         rps=$(awk '/^Requests\/sec/ { printf "%.0f", $2 }' "$f")

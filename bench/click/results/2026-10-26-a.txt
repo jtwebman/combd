@@ -1,0 +1,19 @@
+click race, 2026-10-26 (combd and Phoenix again, after combd's memory-guard fixes; run a): servers [phoenix combd], tests [idle 1000 5000 10000 20000], 1000 new pages a second, 2000 a client, 180s clicking
+this run had the machine busy: both servers' p99 grew to seconds from 5,000 pages (Phoenix's 10,000: 3.8 s, 227 to 251 ms in every other run); run b is the clean one.
+docker 29.9.2 linux/arm64, 8 CPUs, 16746086400 bytes for docker; 0047630
+bench-click-combd sha256:7fee6e7c118b
+bench-click-workerd sha256:1db4266e05a2
+bench-click-celld sha256:2cc0e910be42
+bench-click-celld-object sha256:cb11bfa2f63c
+bench-click-celld-worker sha256:6c9626fb1efd
+bench-click-phoenix sha256:7403e9f45569
+phoenix         idle   held   66626  memory  608 MiB (base  77, top 1018)    8.2 KB a page  refusals      1  end: server died (OOMKilled=true exit=137)
+combd           idle   held  152000  memory  900 MiB (base   6, top  926)    6.0 KB a page  refusals      4  end: refusing or behind (held 152000 of 158000 arrived); a new page got no echo in 15 s
+phoenix           1000 pages  changes/s    1178 avg    1750 peak  clicks  12087  lost     0 (0.00%)  worst p50   152 ms  p99   164 ms  up 1000 closed 0  refused 0  memory  107 MiB peak (base  78)  cpu   4% avg 
+combd             1000 pages  changes/s    1199 avg    1713 peak  clicks  12206  lost     0 (0.00%)  worst p50   151 ms  p99   159 ms  up 1000 closed 0  refused 0  memory   62 MiB peak (base   6)  cpu   4% avg 
+phoenix           5000 pages  changes/s   28739 avg   40132 peak  clicks  61441  lost     0 (0.00%)  worst p50   121 ms  p99   223 ms  up 5000 closed 0  refused 0  memory  160 MiB peak (base  51)  cpu  34% avg 
+combd             5000 pages  changes/s   28509 avg   39152 peak  clicks  61439  lost     0 (0.00%)  worst p50   147 ms  p99  2210 ms  up 5000 closed 0  refused 0  memory  139 MiB peak (base   5)  cpu  27% avg 
+phoenix          10000 pages  changes/s  112841 avg  148718 peak  clicks 122815  lost     0 (0.00%)  worst p50   264 ms  p99  3801 ms  up 10000 closed 0  refused 0  memory  241 MiB peak (base  51)  cpu  82% avg 
+combd            10000 pages  changes/s  113317 avg  159767 peak  clicks 123407  lost     0 (0.00%)  worst p50   481 ms  p99  4131 ms  up 10000 closed 0  refused 0  memory  237 MiB peak (base  10)  cpu  56% avg 
+phoenix          20000 pages  changes/s  425558 avg  543148 peak  clicks 245389  lost     0 (0.00%)  worst p50  1188 ms  p99  4463 ms  up 20000 closed 0  refused 0  memory  446 MiB peak (base  63)  cpu  94% avg 
+combd            20000 pages  changes/s  444593 avg  581835 peak  clicks 245631  lost     0 (0.00%)  worst p50   387 ms  p99  2561 ms  up 20000 closed 0  refused 0  memory  376 MiB peak (base   9)  cpu  79% avg 
