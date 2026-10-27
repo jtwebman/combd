@@ -1847,7 +1847,12 @@ mod tests {
         assert_eq!(from_elsewhere(), Ok(()), "listening while there's room");
         let keep = || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         let held = (keep(), keep());
-        assert!(eventually(3000, || from_elsewhere() == Err(std::io::ErrorKind::ConnectionRefused)), "at max_conns, it stops listening");
+        let last = std::cell::Cell::new(Ok(()));
+        let refused = eventually(3000, || {
+            last.set(from_elsewhere());
+            last.get() == Err(std::io::ErrorKind::ConnectionRefused)
+        });
+        assert!(refused, "at max_conns, it stops listening: got {:?}, conns_open {}, tcp_refusing {}", last.get(), stat(port, "conns_open"), stat(port, "tcp_refusing"));
         drop(held);
         assert!(eventually(3000, || from_elsewhere() == Ok(())), "room again: it listens");
         assert_eq!(stat(port, "tcp_refusing"), 0);
