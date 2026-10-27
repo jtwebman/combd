@@ -81,6 +81,23 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// A loop's waker that writes its eventfd only if the loop isn't already
+/// due to read its inbox. Under load, answers come faster than a loop takes
+/// them, and each write was a system call (and a wakeup) for nothing.
+pub struct LoopWaker {
+    waker: Waker,
+    pending: AtomicBool,
+}
+
+impl LoopWaker {
+    pub fn wake(&self) -> std::io::Result<()> {
+        if self.pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.waker.wake()
+    }
+}
+
 const LISTENER: Token = Token(usize::MAX);
 const WAKER: Token = Token(usize::MAX - 1);
 const REDIRECT: Token = Token(usize::MAX - 2);
@@ -404,7 +421,7 @@ struct Shared {
     /// Postgres pools, one per binding (`pg.rs`).
     pg: Option<Arc<crate::pg::Pools>>,
     cfg: Config,
-    peers: Vec<(Sender<Msg>, Arc<Waker>)>,
+    peers: Vec<(Sender<Msg>, Arc<LoopWaker>)>,
     sync: Mutex<Sender<SyncJob>>,
     index: Mutex<AlarmIndex>,
     stats: Stats,
@@ -1528,7 +1545,7 @@ where
     let mut inboxes = vec![];
     for _ in 0..cfg.threads {
         let poll = Poll::new().expect("poll");
-        let waker = Arc::new(Waker::new(poll.registry(), WAKER).expect("waker"));
+        let waker = Arc::new(LoopWaker { waker: Waker::new(poll.registry(), WAKER).expect("waker"), pending: AtomicBool::new(false) });
         let (tx, rx) = channel();
         polls.push(poll);
         peers.push((tx, waker));
@@ -1543,7 +1560,7 @@ where
     for _ in 0..SYNC_THREADS {
         let (rx, peers, checkpoints) = (sync_rx.clone(), peers.clone(), checkpoints.clone());
         let (slow, max_us) = (slow.clone(), max_us.clone());
-        std::thread::spawn(move || loop {
+        std::thread::Builder::new().name("fsync".into()).spawn(move || loop {
             let Ok(job) = rx.lock().unwrap().recv() else { return };
             // EXPERIMENT ONLY, never ship: COMBD_EXPERIMENT_NO_FSYNC measures
             // what the fsync costs. It breaks the output gate's promise.
@@ -1572,7 +1589,7 @@ where
                 let _ = tx.send(Msg::Checkpointed { obj: job.obj });
                 let _ = waker.wake();
             }
-        });
+        }).expect("fsync thread");
     }
     let fleet = cfg.fleet.take().map(|fc| start_fleet(fc, &peers, cfg.threads, &cfg.data, cfg.catalog.clone()));
     // Always a set of pools (maybe empty): a deploy can add to it. In a
@@ -1606,7 +1623,7 @@ where
             let local = local.try_clone().expect("clone listener");
             let r = redirect.as_ref().map(|r| r.try_clone().expect("clone listener"));
             let app = app.clone();
-            sc.spawn(move || {
+            std::thread::Builder::new().name(format!("loop-{me}")).spawn_scoped(sc, move || {
                 let mut lp = Loop {
                     eng,
                     app: app.clone(),
@@ -1683,7 +1700,7 @@ where
                 if let Err(e) = lp.run(TcpListener::from_std(l), TcpListener::from_std(local), r.map(TcpListener::from_std)) {
                     eprintln!("event loop stopped: {e}");
                 }
-            });
+            }).expect("loop thread");
         }
     });
 }
@@ -1861,7 +1878,7 @@ fn rand_u64() -> u64 {
     u64::from_le_bytes(b)
 }
 
-fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize, data: &std::path::Path, catalog: Option<Arc<crate::catnode::CatNode>>) -> FleetShared {
+fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<LoopWaker>)], threads: usize, data: &std::path::Path, catalog: Option<Arc<crate::catnode::CatNode>>) -> FleetShared {
     // The startup storage test: never serve on a bucket that can't do CAS.
     if let Err(e) = fc.s3.check() {
         eprintln!("combd     the bucket at {} failed the storage test: {e}", fc.s3.host);
@@ -1877,7 +1894,7 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
     let rx = Arc::new(Mutex::new(rx));
     for _ in 0..BUCKET_THREADS {
         let (rx, loops, s3) = (rx.clone(), loops.to_vec(), fc.s3.clone());
-        std::thread::spawn(move || loop {
+        std::thread::Builder::new().name("bucket".into()).spawn(move || loop {
             let Ok(job) = rx.lock().unwrap().recv() else { return };
             let (back, msg) = match job {
                 Job::Call { op, call, back } => (back, Msg::Bucket { op, res: crate::fleet::run_call(&s3, &call) }),
@@ -1920,7 +1937,7 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<Waker>)], threads: usize
             let (tx, waker) = &loops[back];
             let _ = tx.send(msg);
             let _ = waker.wake();
-        });
+        }).expect("bucket thread");
     }
     // The wire: mTLS between nodes, unless plain TCP is asked for.
     let tls = match &fc.wire_certs {
@@ -2067,7 +2084,13 @@ impl<E: Engine> Loop<'_, E> {
                     }
                     LOCAL => self.accept(&mut local, false)?,
                     REDIRECT => self.accept(redirect.as_mut().unwrap(), true)?,
-                    WAKER => self.read_inbox()?,
+                    WAKER => {
+                        // Before the inbox, so a message sent while it's read
+                        // wakes the loop again (and an Acquire: what was sent
+                        // before the waker's flag was set is seen).
+                        self.sh.peers[self.me].1.pending.swap(false, std::sync::atomic::Ordering::AcqRel);
+                        self.read_inbox()?
+                    }
                     Token(id) => {
                         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { continue };
                         if c.linger.is_some() {
@@ -5120,7 +5143,7 @@ impl<E: Engine> Loop<'_, E> {
 /// Where the wire hands what arrives: forwards to the loop that owns the
 /// object, replies to the loop that's waiting.
 struct LoopSink {
-    loops: Vec<(Sender<Msg>, Arc<Waker>)>,
+    loops: Vec<(Sender<Msg>, Arc<LoopWaker>)>,
     threads: usize,
     peer_store: Sender<(own::PeerCall, PeerBack)>,
     catalog: Option<Arc<crate::catnode::CatNode>>,
@@ -5579,6 +5602,27 @@ fn redirect_to_https(rbuf: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loop waker writes once until the loop reads its inbox, and again
+    /// after.
+    #[test]
+    fn a_loop_waker_wakes_once_until_read() {
+        let mut poll = Poll::new().unwrap();
+        let w = LoopWaker { waker: Waker::new(poll.registry(), WAKER).unwrap(), pending: AtomicBool::new(false) };
+        let mut ev = Events::with_capacity(4);
+        let mut events = |poll: &mut Poll, ms| {
+            poll.poll(&mut ev, Some(Duration::from_millis(ms))).unwrap();
+            ev.iter().count()
+        };
+        w.wake().unwrap();
+        w.wake().unwrap();
+        assert_eq!(events(&mut poll, 200), 1);
+        w.wake().unwrap();
+        assert_eq!(events(&mut poll, 50), 0, "woken again before the inbox was read");
+        w.pending.swap(false, std::sync::atomic::Ordering::AcqRel);
+        w.wake().unwrap();
+        assert_eq!(events(&mut poll, 200), 1, "not woken after the inbox was read");
+    }
 
     /// Feed `buf` to the parser as the event loop does: requests until it
     /// needs more bytes or refuses. Err(()) if it panicked.

@@ -39,6 +39,7 @@ mod manifest;
 mod pg;
 mod policy;
 mod pool;
+mod work;
 #[cfg(test)]
 mod spectest;
 #[cfg(feature = "fuzz")]
@@ -3462,9 +3463,13 @@ mod tests {
         assert_eq!(rows(&r), serde_json::json!([[1, "one", 5_000_000_000i64, 1.5, true, {"a": [1, 2]}]]), "{r}");
         let r = q("/api/pg/q", "SELEKT 1", serde_json::json!([]));
         assert_eq!(r["code"], "42601", "{r}");
-        // 2. Pooled connections are reset: a `SET` never reaches the next user.
+        // 2. A session's end resets its connection: its `SET` never reaches
+        //    the statements after it. (A pooled statement's own `SET` stays on
+        //    its connection, as in PgBouncer's transaction mode: pg.rs.)
         for _ in 0..8 {
-            q("/api/pg/q", "SET search_path TO nowhere", serde_json::json!([]));
+            assert_eq!(http(port, "POST", "/do/reset/pg/open", "").0, 200);
+            q("/do/reset/pg/s", "SET search_path TO nowhere", serde_json::json!([]));
+            assert_eq!(http(port, "POST", "/do/reset/pg/close", "").0, 200);
         }
         for _ in 0..8 {
             assert!(q("/api/pg/q", &format!("SELECT count(*) FROM {t}"), serde_json::json!([]))["error"].is_null());
@@ -3520,9 +3525,8 @@ mod tests {
         assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 42), false);
         assert_eq!(lock("/do/acct/pg/s", "pg_advisory_unlock", 42), true);
         assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 42), true);
-        // A pooled statement's session is reset with the next statement on
-        // its connection, or alone within a moment: a lock it took is gone by then.
-        assert!(eventually(100, || lock("/do/other/pg/q", "pg_try_advisory_lock", 42) == serde_json::json!(true)), "a pooled lock must not outlive its statement by more than a moment");
+        // (A lock a pooled statement takes stays with its connection, which
+        // isn't reset after it: pg.rs. That one holds 42 now.)
         // Cached statements that went stale are prepared again: a table
         // altered under one, and the user deallocating everything.
         let star = format!("SELECT * FROM {t} WHERE k = 1");
@@ -3535,10 +3539,11 @@ mod tests {
         assert_eq!((after.len(), after.last().cloned()), (before.len() + 1, Some(serde_json::json!(7))), "{raw:?}");
         q("/api/pg/q", "DEALLOCATE ALL", serde_json::json!([]));
         assert_eq!(row(rows(&q("/api/pg/q", &star, serde_json::json!([])))), after);
-        // 6. A crash releases the object's session and its locks.
+        // 6. A crash releases the object's session and its locks (its reset
+        //    goes out within a moment, `DEFER`).
         lock("/do/acct/pg/s", "pg_advisory_lock", 43);
         assert_eq!(http(port, "POST", "/do/acct/pg/crash", "").0, 500);
-        assert_eq!(lock("/do/other/pg/q", "pg_try_advisory_lock", 43), true);
+        assert!(eventually(1000, || lock("/do/other/pg/q", "pg_try_advisory_lock", 43) == serde_json::json!(true)), "a crashed session's lock outlived it");
         assert_eq!(http(port, "POST", "/do/acct/pg/s", "{\"q\":\"SELECT 1\"}").0, 409, "a fresh cell has no session");
         // 7. A blocking lock wait parks the cell; the loop goes on.
         assert_eq!(http(port, "POST", "/do/acct/pg/open", "").0, 200);
@@ -3596,6 +3601,48 @@ mod tests {
         // Its member is free again: two more fit.
         assert_eq!(http(port, "POST", "/do/c/pg/open", "").0, 200);
         assert_eq!(http(port, "POST", "/do/d/pg/open", "").0, 200);
+    }
+
+    /// Pooled statements keep every member pulling from the line; a session
+    /// asking meanwhile still gets one (a puller lets go), well within its
+    /// wait, and no pooled statement fails for it.
+    #[test]
+    fn a_session_gets_a_connection_under_pooled_load() {
+        let Ok(url) = std::env::var("COMBD_PG_TEST") else {
+            eprintln!("skipping: set COMBD_PG_TEST to a Postgres URL");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        let pg = pg::PgCfg { pools: vec![pg::PoolCfg { max: 2, wait_ms: 2000, ..pg::PoolCfg::new("main", &url) }] };
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { pg: Some(pg), ..cfg(&dir.0, 2) });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let load: Vec<_> = (0..12)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut n = 0;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let (code, body) = http(port, "POST", "/api/pg/q", "{\"q\":\"SELECT pg_sleep(0.02)\"}");
+                        assert!(code == 200 && !body.contains("error"), "a pooled statement failed: {code} {body}");
+                        n += 1;
+                    }
+                    n
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(300));
+        for i in 0..3 {
+            let st = Instant::now();
+            assert_eq!(http(port, "POST", &format!("/do/s{i}/pg/open"), "").0, 200, "session {i}: no connection");
+            assert!(st.elapsed() < Duration::from_millis(1500), "session {i} waited {:?}", st.elapsed());
+            let (_, body) = http(port, "POST", &format!("/do/s{i}/pg/s"), "{\"q\":\"SELECT 1\"}");
+            assert!(body.contains("[[1]]"), "{body}");
+            assert_eq!(http(port, "POST", &format!("/do/s{i}/pg/close"), "").1, "{\"closed\":true}");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let done: usize = load.into_iter().map(|h| h.join().unwrap()).sum();
+        // Two members, 20 ms each: ~100 a second, for ~0.4 s.
+        assert!(done > 20, "only {done} pooled statements ran");
     }
 
     const GUEST_EV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../guest-ev/target/wasm32-unknown-unknown/release/combd_guest_ev.wasm");
@@ -5101,7 +5148,7 @@ callers = ["api"]
         postgres_end_to_end(interp::Interp { max_pages: 16384 }, "interp");
     }
 
-    #[cfg(feature = "aot-guard")]
+    #[cfg(feature = "aot-lite")]
     #[test]
     fn postgres_on_aot() {
         postgres_end_to_end(aot::Aot, "aot");

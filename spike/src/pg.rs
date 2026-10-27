@@ -20,21 +20,40 @@
 //!   At max, an ask waits in line, and fails after `wait_ms`.
 //! - A lease is the member's alone: everything session-scoped works on it
 //!   (transactions over many calls, row locks, advisory locks, `SET`).
-//! - On release the member resets (`RESET`: a rollback, then what `DISCARD
-//!   ALL` does, in one round trip), which rolls back and releases every
-//!   lock, and tells the pool it's free.
+//! - When a session's lease ends (released, or past `lease_ms`), the
+//!   member resets (`RESET`: a rollback, then what `DISCARD ALL` does, sent
+//!   with its next statement), which rolls back and releases every lock,
+//!   and tells the pool it's free.
 //! - A lease past `lease_ms` is taken back by the member itself: it resets,
 //!   and the holder's next call gets an error. It doesn't need the pool for
 //!   that.
 //! - A member free for `idle_ms` stops, and its connection closes.
 //! - "Too many clients" from the database: the ask waits instead of failing.
-//! - A pooled statement is a lease for one statement.
+//! - A pooled statement goes in its pool's line on the node (`work.rs`),
+//!   and whichever member is taking from it runs it: no lease, and no word
+//!   to the agent. The agent asks for members to take from the line (asks
+//!   like a session's, so `max`, the manager and other nodes' members work
+//!   as for any lease) when it has work and nobody on it, and while it's
+//!   longer than the members on it. A member with nothing to take waits on
+//!   the line for `KEEP`, then is free as usual; it stops after its
+//!   statement when it's called back, a new manager takes over, or a
+//!   session is waiting (`set_yield`). Through one agent thread, every
+//!   statement was two of its messages and its books: its ceiling, however
+//!   many cores (2026-10-26, RESULTS.md, "The X race on Postgres").
+//! - A pooled statement's member is not reset after it, as in PgBouncer's
+//!   transaction mode and the pools apps keep themselves (Postgrex, Rails,
+//!   Prisma): what a statement changes in the session (a `SET`, a session
+//!   advisory lock, a temp table) stays for the statements after it on that
+//!   connection, until something undoes it. Undo it in the app, or use a
+//!   session (`pg_open`). The reset was 9 statements after every statement:
+//!   a quarter of a node's throughput on the X clone.
 //!
 //! Every connection has a statement timeout (a lock wait counts). The answer
 //! to a statement is the same JSON as the object's own SQLite:
 //! `{"rows": [[...]], "changes": n}` or `{"error": "...", "code": "SQLSTATE"}`.
 
 use crate::pool;
+use crate::work::Work;
 use postgres::error::SqlState;
 use postgres::types::{ToSql, Type};
 use tokio_postgres::{Config, NoTls};
@@ -58,6 +77,9 @@ const RESET: &str = "ROLLBACK; CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RES
 const MAX_ANSWER: usize = crate::store::MAX_RESULT;
 
 pub type Reply = Box<dyn FnOnce(Vec<u8>) + Send>;
+/// A pooled statement in its pool's line (`work.rs`): it, and where its
+/// answer goes.
+type Item = (Vec<u8>, Reply);
 /// A lease, or why there isn't one.
 pub type LeaseReply = Box<dyn FnOnce(Result<Lease, String>) + Send>;
 
@@ -185,6 +207,9 @@ impl Lease {
 
 enum Job {
     Lease(u64),
+    /// Take from the pool's line, on lease `u64`, until it's empty or the
+    /// member is let go.
+    Pull(u64),
     Query { lease: u64, req: Vec<u8>, reply: Reply, release: bool },
     Release(u64),
     Stop,
@@ -196,6 +221,8 @@ type Key = (u32, u64);
 /// What a pool's agent hears.
 enum Msg {
     Ask(LeaseReply),
+    /// The line has work and nobody to take it.
+    Kick,
     /// From its own members.
     Started(Key, Result<(), bool>),
     Free(Key),
@@ -263,7 +290,7 @@ pub struct PoolFleet {
 
 /// Every pool on this node, by name. A deploy can add pools (`ensure`).
 pub struct Pools {
-    pools: Mutex<HashMap<String, (PoolCfg, Sender<Msg>)>>,
+    pools: Mutex<HashMap<String, (PoolCfg, Sender<Msg>, Arc<Work<Item>>)>>,
     fleet: Option<Arc<PoolFleet>>,
     stop: Arc<AtomicBool>,
     /// Round trips (ms) from here to other nodes, for picking the nearest.
@@ -285,7 +312,7 @@ impl Pools {
     pub fn ensure(&self, cfgs: &[PoolCfg]) {
         let mut pools = self.pools.lock().unwrap();
         for p in cfgs {
-            if pools.get(&p.name).is_some_and(|(c, _)| c == p) {
+            if pools.get(&p.name).is_some_and(|(c, ..)| c == p) {
                 continue;
             }
             let mut pg: Config = match p.url.parse() {
@@ -306,9 +333,11 @@ impl Pools {
                 pg.application_name("combd");
             }
             let (tx, rx) = channel();
-            let agent = Agent::new(p.clone(), pg, self.fleet.clone(), tx.clone(), self.stop.clone(), self.rtt.clone());
-            std::thread::spawn(move || agent.run(rx));
-            if let Some((_, old)) = pools.insert(p.name.clone(), (p.clone(), tx)) {
+            let work: Arc<Work<Item>> = Arc::default();
+            let agent = Agent::new(p.clone(), pg, self.fleet.clone(), tx.clone(), self.stop.clone(), self.rtt.clone(), work.clone());
+            std::thread::Builder::new().name("pg-agent".into()).spawn(move || agent.run(rx)).expect("pg agent thread");
+            // The old one's members finish its line (nothing new joins it).
+            if let Some((_, old, _)) = pools.insert(p.name.clone(), (p.clone(), tx, work)) {
                 let _ = old.send(Msg::Retire);
             }
         }
@@ -318,20 +347,24 @@ impl Pools {
         self.pools.lock().unwrap().contains_key(binding)
     }
 
-    /// One statement on a member leased just for it.
+    /// One statement, in the pool's line: whichever of this node's members
+    /// is free takes it, with no word to the agent (but when nobody's
+    /// pulling: then it finds someone).
     pub fn query(&self, binding: &str, req: Vec<u8>, reply: Reply) {
-        self.lease(
-            binding,
-            Box::new(move |l| match l {
-                Ok(l) => l.run(req, reply, true),
-                Err(e) => reply(json!({ "error": e }).to_string().into_bytes()),
-            }),
-        );
+        let p = self.pools.lock().unwrap().get(binding).map(|(c, tx, w)| (c.wait_ms, tx.clone(), w.clone()));
+        match p {
+            Some((wait_ms, tx, work)) => {
+                if work.push((req, reply), Instant::now() + Duration::from_millis(wait_ms)) {
+                    let _ = tx.send(Msg::Kick);
+                }
+            }
+            None => reply(json!({ "error": format!("no database binding {binding:?}") }).to_string().into_bytes()),
+        }
     }
 
     /// Lease a member: now, once one's started, or once one's free.
     pub fn lease(&self, binding: &str, reply: LeaseReply) {
-        let tx = self.pools.lock().unwrap().get(binding).map(|(_, tx)| tx.clone());
+        let tx = self.pools.lock().unwrap().get(binding).map(|(_, tx, _)| tx.clone());
         match tx {
             Some(p) => {
                 let _ = p.send(Msg::Ask(reply));
@@ -343,7 +376,7 @@ impl Pools {
     /// A pool message from another node.
     pub fn deliver(&self, body: &[u8]) {
         let Ok(env) = serde_json::from_slice::<Env>(body) else { return };
-        if let Some((_, tx)) = self.pools.lock().unwrap().get(&env.pool) {
+        if let Some((_, tx, _)) = self.pools.lock().unwrap().get(&env.pool) {
             let _ = tx.send(Msg::Net(env));
         }
     }
@@ -469,6 +502,9 @@ struct Mine {
     free_since: Instant,
     /// The manager wants it back.
     recalled: bool,
+    /// Stop taking from the line after this statement (called back, or a
+    /// new manager): read by the member between statements.
+    let_go: Arc<AtomicBool>,
 }
 
 /// How long a node keeps a member no ask of its own has used, before it
@@ -480,6 +516,12 @@ const LOCAL_LEASE: u64 = 1 << 62;
 /// A pool's agent on one node: it runs this node's members, sends asks and
 /// member news to the manager, serves other nodes' calls on its members,
 /// and, if this node is the manager, runs the books too.
+/// The most of a node's asks waiting at the manager at once: enough for it
+/// to grow the pool and call members back from other nodes, few enough that
+/// its queue stays short (it looks at every ask there on every change, and
+/// a node's own members serve the rest as they come free).
+const AT_MANAGER: usize = 16;
+
 struct Agent {
     cfg: PoolCfg,
     pg: Config,
@@ -498,6 +540,8 @@ struct Agent {
     retiring: bool,
     /// This node's asks, oldest first: (reply, deadline, sent to the manager).
     asks: std::collections::BTreeMap<u64, (LeaseReply, Instant, bool)>,
+    /// How many of `asks` aren't sent yet (so `top_up` needn't look at all).
+    unsent: usize,
     next_ask: u64,
     next_lease: u64,
     members: HashMap<Key, Mine>,
@@ -509,10 +553,14 @@ struct Agent {
     last_tick: Instant,
     last_report: Instant,
     local: std::collections::VecDeque<Env>,
+    /// Pooled statements in line, and the asks this node made for members to
+    /// take from it (they're served like any other ask).
+    work: Arc<Work<Item>>,
+    pull_asks: std::collections::HashSet<u64>,
 }
 
 impl Agent {
-    fn new(cfg: PoolCfg, pg: Config, fleet: Option<Arc<PoolFleet>>, tx: Sender<Msg>, stop: Arc<AtomicBool>, rtt: Arc<Mutex<HashMap<u32, u64>>>) -> Agent {
+    fn new(cfg: PoolCfg, pg: Config, fleet: Option<Arc<PoolFleet>>, tx: Sender<Msg>, stop: Arc<AtomicBool>, rtt: Arc<Mutex<HashMap<u32, u64>>>, work: Arc<Work<Item>>) -> Agent {
         let me = fleet.as_ref().map_or(0, |f| f.me);
         let mut a = Agent {
             cfg,
@@ -529,6 +577,7 @@ impl Agent {
             claiming: false,
             retiring: false,
             asks: Default::default(),
+            unsent: 0,
             next_ask: 0,
             next_lease: LOCAL_LEASE,
             members: HashMap::new(),
@@ -538,6 +587,8 @@ impl Agent {
             last_tick: Instant::now(),
             last_report: Instant::now(),
             local: Default::default(),
+            work,
+            pull_asks: Default::default(),
         };
         // On its own, this node manages its pools.
         if a.fleet.is_none() {
@@ -553,7 +604,9 @@ impl Agent {
 
     fn run(mut self, rx: Receiver<Msg>) {
         loop {
-            if self.stop.load(Relaxed) || (self.retiring && self.members.is_empty()) {
+            // Retired: done once its members are, and its line (what's left
+            // with nobody to take it fails at its deadline, in `tick`).
+            if self.stop.load(Relaxed) || (self.retiring && self.members.is_empty() && self.work.look().0 == 0) {
                 for m in self.members.values() {
                     let _ = m.tx.send(Job::Stop);
                 }
@@ -609,12 +662,14 @@ impl Agent {
                 self.next_ask += 1;
                 let ask = self.next_ask;
                 self.asks.insert(ask, (reply, Instant::now() + Duration::from_millis(self.cfg.wait_ms + 1000), false));
+                self.unsent += 1;
                 self.top_up();
             }
+            Msg::Kick => self.top_up(),
             Msg::Started(key, r) => {
                 let (ask, lease) = self.starting.remove(&key).unwrap_or_default();
                 match r {
-                    Ok(()) => match (self.asks.remove(&ask), self.members.get(&key)) {
+                    Ok(()) => match (self.take_ask(&ask), self.members.get(&key)) {
                         (Some((reply, ..)), Some(m)) => reply(Ok(Lease { id: lease, to: To::Here(m.tx.clone()), session_idle: self.session_idle() })),
                         // Its asker gave up: it goes back to the pool.
                         (None, Some(m)) => {
@@ -626,7 +681,7 @@ impl Agent {
                         self.members.remove(&key);
                         // Full: the ask waits in line again.
                         if !full {
-                            if let Some((reply, ..)) = self.asks.remove(&ask) {
+                            if let Some((reply, ..)) = self.take_ask(&ask) {
                                 reply(Err("the database is unreachable".into()));
                             }
                         }
@@ -700,14 +755,19 @@ impl Agent {
                 }
                 let key = (epoch, member);
                 let (tx, jobs) = channel();
-                self.members.insert(key, Mine { tx, busy: true, resetting: false, kept: true, free_since: Instant::now(), recalled: false });
+                let let_go: Arc<AtomicBool> = Arc::default();
+                self.members.insert(key, Mine { tx, busy: true, resetting: false, kept: true, free_since: Instant::now(), recalled: false, let_go: let_go.clone() });
                 self.starting.insert(key, (ask, lease));
-                let (pg, me, lease_ms, retries) = (self.pg.clone(), self.tx.clone(), self.cfg.lease_ms, self.cfg.retries);
-                std::thread::spawn(move || run_member(key, pg, retries, lease, lease_ms, jobs, me));
+                let (pg, me, lease_ms, retries, work) = (self.pg.clone(), self.tx.clone(), self.cfg.lease_ms, self.cfg.retries, self.work.clone());
+                std::thread::Builder::new()
+                    .name("pg-conn".into())
+                    .spawn(move || run_member(key, pg, retries, lease, lease_ms, jobs, me, work, let_go))
+                    .expect("pg connection thread");
             }
             Net::Grant { ask, asker, member, lease } => match self.members.get_mut(&(epoch, member)) {
                 Some(m) => {
                     m.busy = true;
+                    m.let_go.store(false, Relaxed);
                     // Granted to an ask of this node's own: it keeps it after.
                     m.kept = asker == self.me;
                     let _ = m.tx.send(Job::Lease(lease));
@@ -716,7 +776,7 @@ impl Agent {
                 None => self.send(from, epoch, Net::Gone { member }),
             },
             Net::Fail { ask } => {
-                if let Some((reply, ..)) = self.asks.remove(&ask) {
+                if let Some((reply, ..)) = self.take_ask(&ask) {
                     reply(Err("no database connection free in time".into()));
                 }
             }
@@ -728,6 +788,9 @@ impl Agent {
             Net::Recall { member } => {
                 let Some(m) = self.members.get_mut(&(epoch, member)) else { return };
                 m.recalled = true;
+                // Taking from the line: it stops after this statement.
+                m.let_go.store(true, Relaxed);
+                self.work.wake();
                 // Free here now: back it goes. Busy: when its lease is done.
                 if m.kept && !m.busy && !m.resetting {
                     m.kept = false;
@@ -736,7 +799,7 @@ impl Agent {
             }
             Net::Granted { ask, member, lease } => {
                 let key = (epoch, member);
-                let Some((reply, ..)) = self.asks.remove(&ask) else {
+                let Some((reply, ..)) = self.take_ask(&ask) else {
                     // Its asker gave up (or got another): hand it back.
                     return self.send(from, epoch, Net::Release { member, lease });
                 };
@@ -779,6 +842,7 @@ impl Agent {
     /// serve (a reset beats a connect).
     fn top_up(&mut self) {
         let Some((_, epoch)) = self.mgr else { return };
+        self.want_pullers();
         let ready = |m: &Mine| m.kept && !m.recalled && !m.busy && !m.resetting;
         while !self.asks.is_empty() {
             // The one freed last: its reset goes out with this statement, and
@@ -786,27 +850,86 @@ impl Agent {
             let Some(key) = self.members.iter().filter(|(k, m)| k.0 == epoch && ready(m)).max_by_key(|(_, m)| m.free_since).map(|(k, _)| *k) else { break };
             self.lend(key);
         }
+        // Sessions still waiting for a whole connection: let that many
+        // pullers go after their statement (they'd never stop otherwise).
+        self.work.set_yield(self.asks.len() - self.pull_asks.len());
         let soon = self.members.iter().filter(|(k, m)| k.0 == epoch && m.kept && !m.recalled && m.resetting).count();
-        let unsent: Vec<u64> = self.asks.iter().filter(|(_, a)| !a.2).map(|(&k, _)| k).skip(soon).collect();
-        if unsent.is_empty() {
+        let room = AT_MANAGER.saturating_sub(self.asks.len() - self.unsent);
+        if self.unsent <= soon || room == 0 {
             return;
         }
+        let unsent: Vec<u64> = self.asks.iter().filter(|(_, a)| !a.2).map(|(&k, _)| k).skip(soon).take(room).collect();
         let near = self.near();
         for ask in unsent {
             self.asks.get_mut(&ask).unwrap().2 = true;
+            self.unsent -= 1;
             self.to_mgr(epoch, Net::Ask { ask, near: near.clone() });
         }
     }
 
+    /// Members to take from the line: one per statement waiting, up to the
+    /// pool's max, counting those pulling or asked for already. Each is an
+    /// ask like a session's (local, from the manager, or another node's).
+    fn want_pullers(&mut self) {
+        if self.retiring {
+            return;
+        }
+        let (waiting, pulling, asked) = self.work.look();
+        let n = waiting.min(self.cfg.max).saturating_sub(pulling + asked);
+        self.work.asked(n);
+        for _ in 0..n {
+            self.next_ask += 1;
+            let ask = self.next_ask;
+            let work = self.work.clone();
+            let reply: LeaseReply = Box::new(move |l| match l {
+                Ok(l) => match &l.to {
+                    // A member here takes from the line until it's empty.
+                    To::Here(m) => {
+                        work.add_puller();
+                        work.asked_done();
+                        if m.send(Job::Pull(l.id)).is_err() {
+                            work.stop_pulling();
+                        }
+                    }
+                    // One on another node runs one statement, over the wire.
+                    To::There { .. } => {
+                        work.asked_done();
+                        match work.take() {
+                            Some((req, reply)) => l.run(req, reply, true),
+                            None => l.release(),
+                        }
+                    }
+                },
+                // Its statements wait for their own deadline (or the next).
+                Err(_) => work.asked_done(),
+            });
+            self.asks.insert(ask, (reply, Instant::now() + Duration::from_millis(self.cfg.wait_ms + 1000), false));
+            self.pull_asks.insert(ask);
+            self.unsent += 1;
+        }
+    }
+
+    /// An ask leaves `asks` (answered, failed, or lent to): only through here.
+    fn take_ask(&mut self, ask: &u64) -> Option<(LeaseReply, Instant, bool)> {
+        self.pull_asks.remove(ask);
+        let a = self.asks.remove(ask)?;
+        if !a.2 {
+            self.unsent -= 1;
+        }
+        Some(a)
+    }
+
     /// Lend kept member `key` to this node's oldest ask, with no word to the
     /// manager (but to drop that ask, if it had it).
+    /// A session's ask before the line's: the line has other members.
     fn lend(&mut self, key: Key) {
-        let Some(ask) = self.asks.keys().next().copied() else { return };
-        let (reply, _, sent) = self.asks.remove(&ask).unwrap();
+        let Some(ask) = self.asks.keys().find(|a| !self.pull_asks.contains(a)).or_else(|| self.asks.keys().next()).copied() else { return };
+        let (reply, _, sent) = self.take_ask(&ask).unwrap();
         self.next_lease += 1;
         let lease = self.next_lease;
         let m = self.members.get_mut(&key).unwrap();
         m.busy = true;
+        m.let_go.store(false, Relaxed);
         let tx = m.tx.clone();
         let _ = tx.send(Job::Lease(lease));
         if sent {
@@ -829,15 +952,20 @@ impl Agent {
 
     fn tick(&mut self) {
         let t = Instant::now();
-        let late: Vec<u64> = self.asks.iter().filter(|(_, (_, d, _))| t >= *d).map(|(&a, _)| a).collect();
+        // The second past `wait_ms` is for the manager's word on a sent ask;
+        // one still here (`AT_MANAGER`) fails at `wait_ms`, as it would there.
+        let late: Vec<u64> = self.asks.iter().filter(|(_, (_, d, sent))| t + if *sent { Duration::ZERO } else { Duration::from_secs(1) } >= *d).map(|(&a, _)| a).collect();
         for a in late {
-            let (reply, _, sent) = self.asks.remove(&a).unwrap();
+            let (reply, _, sent) = self.take_ask(&a).unwrap();
             if sent {
                 if let Some(e) = self.mgr.map(|g| g.1) {
                     self.to_mgr(e, Net::Cancel { ask: a });
                 }
             }
             reply(Err("no database connection free in time".into()));
+        }
+        for (_, reply) in self.work.expired(t) {
+            reply(json!({ "error": "no database connection free in time" }).to_string().into_bytes());
         }
         let late: Vec<u64> = self.queries.iter().filter(|(_, (_, d))| t >= *d).map(|(&q, _)| q).collect();
         for q in late {
@@ -886,13 +1014,19 @@ impl Agent {
             // stop now), and every ask goes to the new one.
             let stop_now = self.cfg.on_manager_loss_stop;
             for (k, m) in &self.members {
-                if self.retiring || cur.is_some_and(|g| k.0 < g.1) && (stop_now || !m.busy) {
+                let older = cur.is_some_and(|g| k.0 < g.1);
+                if older {
+                    m.let_go.store(true, Relaxed);
+                    self.work.wake();
+                }
+                if self.retiring || older && (stop_now || !m.busy) {
                     let _ = m.tx.send(Job::Stop);
                 }
             }
             for a in self.asks.values_mut() {
                 a.2 = false;
             }
+            self.unsent = self.asks.len();
             self.top_up();
         }
         match cur {
@@ -911,7 +1045,7 @@ impl Agent {
             Some((n, e)) if n == self.me => !self.claimed.contains(&e),
             Some((n, _)) => quiet(n) >= Duration::from_millis(f.lease_ms),
         };
-        let busy = !self.asks.is_empty() || !self.members.is_empty();
+        let busy = !self.asks.is_empty() || !self.members.is_empty() || self.work.look().0 > 0;
         if dead && busy && !self.claiming && !self.retiring {
             self.claiming = true;
             let e = cur.map_or(1, |g| g.1 + 1);
@@ -953,7 +1087,8 @@ fn connect(rt: &tokio::runtime::Runtime, pg: &Config) -> Result<tokio_postgres::
 
 /// One member: a connection on its own thread, leased to one holder at a
 /// time, from its first lease (the ask it started for).
-fn run_member(id: Key, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs: Receiver<Job>, pool: Sender<Msg>) {
+#[allow(clippy::too_many_arguments)]
+fn run_member(id: Key, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs: Receiver<Job>, pool: Sender<Msg>, work: Arc<Work<Item>>, let_go: Arc<AtomicBool>) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(_) => return drop(pool.send(Msg::Started(id, Err(false)))),
@@ -989,14 +1124,42 @@ fn run_member(id: Key, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs
     let mut dirty: Option<Instant> = None;
     // A lease is over: the member is free at once, and its reset waits a
     // moment for the next holder's first statement.
-    let end_lease = |lease: &mut Option<(u64, Instant)>, dirty: &mut Option<Instant>, broken: bool| -> bool {
+    // A session's end resets the connection; a pooled statement's doesn't
+    // (`reset`: see the top of this file).
+    let end_lease = |lease: &mut Option<(u64, Instant)>, dirty: &mut Option<Instant>, broken: bool, reset: bool| -> bool {
         *lease = None;
         if broken {
             return false;
         }
-        *dirty = Some(Instant::now() + DEFER);
+        if reset {
+            *dirty = Some(Instant::now() + DEFER);
+        }
         let _ = pool.send(Msg::Free(id));
         true
+    };
+    // One statement: its answer, as the caller gets it.
+    let exec = |req: &[u8], stmts: &mut Stmts, dirty: &mut Option<Instant>, broken: &mut bool| -> Vec<u8> {
+        let answer = if *broken {
+            json!({ "error": "the database session was lost" })
+        } else if dirty.take().is_some() {
+            // The reset, then the statement, sent back to back: the
+            // server runs them in order, so it starts clean.
+            let (r, a) = rt.block_on(in_order(client.batch_execute(RESET), run(&client, stmts, req)));
+            if r.is_err() {
+                *broken = true;
+                json!({ "error": "the database session was lost" })
+            } else {
+                a
+            }
+        } else {
+            rt.block_on(run(&client, stmts, req))
+        };
+        *broken |= client.is_closed();
+        let bytes = serde_json::to_vec(&answer).unwrap_or_default();
+        if bytes.len() > MAX_ANSWER {
+            return br#"{"error":"result too large"}"#.to_vec();
+        }
+        bytes
     };
     loop {
         let wake = [lease.map(|l| l.1), dirty].into_iter().flatten().min();
@@ -1019,7 +1182,7 @@ fn run_member(id: Key, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs
             dirty = None;
         }
         // Past its time: take it back.
-        if lease.is_some_and(|(_, until)| Instant::now() >= until) && !end_lease(&mut lease, &mut dirty, broken) {
+        if lease.is_some_and(|(_, until)| Instant::now() >= until) && !end_lease(&mut lease, &mut dirty, broken, true) {
             break;
         }
         match job {
@@ -1030,33 +1193,41 @@ fn run_member(id: Key, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs
                     reply(json!({ "error": "the database lease ran out or was released" }).to_string().into_bytes());
                     continue;
                 }
-                let answer = if broken {
-                    json!({ "error": "the database session was lost" })
-                } else if dirty.take().is_some() {
-                    // The reset, then the statement, sent back to back: the
-                    // server runs them in order, so it starts clean.
-                    let (r, a) = rt.block_on(in_order(client.batch_execute(RESET), run(&client, &mut stmts, &req)));
-                    if r.is_err() {
-                        broken = true;
-                        json!({ "error": "the database session was lost" })
-                    } else {
-                        a
-                    }
-                } else {
-                    rt.block_on(run(&client, &mut stmts, &req))
-                };
-                broken |= client.is_closed();
-                let mut bytes = serde_json::to_vec(&answer).unwrap_or_default();
-                if bytes.len() > MAX_ANSWER {
-                    bytes = br#"{"error":"result too large"}"#.to_vec();
+                reply(exec(&req, &mut stmts, &mut dirty, &mut broken));
+                if release && !end_lease(&mut lease, &mut dirty, broken, false) {
+                    break;
                 }
-                reply(bytes);
-                if release && !end_lease(&mut lease, &mut dirty, broken) {
+            }
+            // Pooled statements from the line, one after another, with no
+            // word to anyone between them (and no reset: see the top).
+            Some(Job::Pull(l)) => {
+                // Not this lease (it ran out): no pulling, and the lease it
+                // has now isn't this one's to end.
+                if lease.map(|x| x.0) != Some(l) {
+                    work.stop_pulling();
+                    continue;
+                }
+                // A session's reset first: waiting on the line, nothing would
+                // send it (its locks would be held as long as it waits).
+                if dirty.take().is_some() && rt.block_on(client.batch_execute(RESET)).is_err() {
+                    broken = true;
+                }
+                // An empty line: it waits for the next (a push wakes it), as
+                // long as a free member is kept here otherwise.
+                loop {
+                    if broken {
+                        work.stop_pulling();
+                        break;
+                    }
+                    let Some((req, reply)) = work.pull_wait(KEEP, &let_go) else { break };
+                    reply(exec(&req, &mut stmts, &mut dirty, &mut broken));
+                }
+                if !end_lease(&mut lease, &mut dirty, broken, false) {
                     break;
                 }
             }
             Some(Job::Release(l)) => {
-                if lease.map(|x| x.0) == Some(l) && !end_lease(&mut lease, &mut dirty, broken) {
+                if lease.map(|x| x.0) == Some(l) && !end_lease(&mut lease, &mut dirty, broken, true) {
                     break;
                 }
             }

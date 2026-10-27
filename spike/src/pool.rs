@@ -188,6 +188,27 @@ impl Core {
         let mut i = 0;
         // Members about to be free: resetting, or recalled from a node.
         let mut soon = self.members.values().filter(|m| m.st == St::Resetting || (m.recalled && m.st == St::Busy)).count();
+        // Counted once, not per ask: with nothing free at max, every ask in
+        // a long queue gets the same answer, and scanning every member for
+        // each of them was most of a node's CPU (1,000 asks, 200 members).
+        let mut n_free = self.members.values().filter(|m| m.st == St::Free).count();
+        // Busy members a node could be asked to hand back, by node (a few
+        // nodes: a Vec, not a hash per ask).
+        let (mut n_back, mut back_on) = (0, Vec::<(Node, usize)>::new());
+        let on = |v: &mut Vec<(Node, usize)>, n: Node| -> usize {
+            match v.iter().position(|x| x.0 == n) {
+                Some(i) => i,
+                None => {
+                    v.push((n, 0));
+                    v.len() - 1
+                }
+            }
+        };
+        for m in self.members.values().filter(|m| m.st == St::Busy && !m.recalled) {
+            n_back += 1;
+            let k = on(&mut back_on, m.node);
+            back_on[k].1 += 1;
+        }
         while i < self.queue.len() {
             let a = &self.queue[i];
             if now >= a.deadline {
@@ -195,15 +216,25 @@ impl Core {
                 self.queue.remove(i);
                 continue;
             }
+            let cap = if now < self.full_until { 0 } else { self.cfg.max };
+            // Nothing free, no room, nobody elsewhere to call back: it waits.
+            if n_free == 0 && self.members.len() >= cap && (soon > 0 || n_back == back_on.iter().find(|x| x.0 == a.node).map_or(0, |x| x.1)) {
+                soon = soon.saturating_sub(1);
+                i += 1;
+                continue;
+            }
             let dist = |n: Node| if n == a.node { Some(0) } else { a.near.iter().find(|x| x.0 == n).map(|x| x.1 + 1) };
             let free = self.members.iter().filter(|(_, m)| m.st == St::Free).min_by_key(|(&id, m)| (dist(m.node).unwrap_or(u64::MAX), id)).map(|(&id, _)| id);
-            let cap = if now < self.full_until { 0 } else { self.cfg.max };
             // Below max, a member on the asker's node beats a far free one.
             let near_free = free.filter(|id| dist(self.members[id].node) == Some(0));
             if let Some(m) = near_free.or(if self.members.len() >= cap { free } else { None }) {
                 let m_ = self.members.get_mut(&m).unwrap();
                 m_.st = St::Busy;
                 m_.since = now;
+                n_free -= 1;
+                n_back += 1;
+                let k = on(&mut back_on, m_.node);
+                back_on[k].1 += 1;
                 out.push(Out::Grant { ask: a.id, member: m });
                 self.queue.remove(i);
             } else if soon > 0 {
@@ -220,7 +251,11 @@ impl Core {
                 // it back (the asker's own node serves it from its own).
                 let back = self.members.iter().filter(|(_, m)| m.st == St::Busy && !m.recalled && m.node != a.node).min_by_key(|(&id, m)| (dist(m.node).unwrap_or(u64::MAX), id)).map(|(&id, _)| id);
                 if let Some(id) = back {
-                    self.members.get_mut(&id).unwrap().recalled = true;
+                    let m = self.members.get_mut(&id).unwrap();
+                    m.recalled = true;
+                    n_back -= 1;
+                    let k = on(&mut back_on, m.node);
+                    back_on[k].1 -= 1;
                     out.push(Out::Recall { member: id });
                 }
                 i += 1;
