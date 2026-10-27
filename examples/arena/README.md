@@ -33,7 +33,7 @@ lives in memory only. If its node dies mid-match, that match is lost.
 
 ```sh
 ./build.sh                                     # the game module
-cd ../../spike && cargo run --release -- serve-app interp ../examples/arena/app 8080
+cd ../../combd && cargo run --release -- serve-app interp ../examples/arena/app 8080
 ```
 
 Then open http://localhost:8080 in two browser windows.
@@ -112,7 +112,7 @@ has its own name, `n0.arena.<domain>` and so on. HTTPS throughout (a
 the name and `*.name` through a DNS challenge, and combd serves it itself
 on each node (single mode: it ends TLS on 443, and 80 redirects there).
 Until 2026-10-20 Caddy did, in front: a node held about 9,500 connections
-then, about 70,000 now (`spike/RESULTS.md`, "What a node holds").
+then, about 70,000 now (`combd/RESULTS.md`, "What a node holds").
 
 1. GitHub builds combd (`.github/workflows/arena-image.yml`) on each push
    and puts it on the repo's `arena` release, where nodes fetch it. Nodes
@@ -145,7 +145,7 @@ then, about 70,000 now (`spike/RESULTS.md`, "What a node holds").
    than one app on the nodes, each names its domains in its manifest.
 8. **A new combd reads bundles an older one deployed** (it meets them in the
    bucket through every update). `deploy.rs`'s test of frozen bundles
-   (`spike/src/testdata`) fails if a change can't; on 2026-10-19 one
+   (`combd/src/testdata`) fails if a change can't; on 2026-10-19 one
    couldn't, and every app had to be deployed again. The other way round, a
    bundle the old combd can't read is refused by the nodes still on it: a
    new format ships in two steps, a combd that reads it, then one that writes it.
@@ -159,12 +159,12 @@ nodes trust its public half). Give it its own R2 token for the bucket, in
 `~/combd-builder/env` (chmod 600): `COMBD_S3`, `COMBD_S3_BUCKET`,
 `COMBD_S3_KEY`, `COMBD_S3_SECRET`, `COMBD_S3_REGION=auto`,
 `COMBD_BUILDER_ID`, `COMBD_BUILDER_KEY=/keys/builder.key`,
-`COMBD_AOT_SRC=/combd/spike/aot`, `COMBD_BUILD_WORK=/work`. Then:
+`COMBD_AOT_SRC=/combd/combd/aot`, `COMBD_BUILD_WORK=/work`. Then:
 
 ```sh
 docker run -d --name combd-builder --restart unless-stopped --env-file ~/combd-builder/env \
   -v ~/combd-builder/builder.key:/keys/builder.key:ro -v combd-build-work:/work \
-  ghcr.io/jtwebman/combd-builder:latest /combd/spike/target/release/combd builder
+  ghcr.io/jtwebman/combd-builder:latest /combd/combd/target/release/combd builder
 ```
 
 A builder builds for the combd it was made with, so it must move when

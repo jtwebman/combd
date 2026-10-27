@@ -1,6 +1,6 @@
 # combd 0.1: Durable Objects on a $6 server
 
-*Draft, 2026-10-25. Numbers are from `spike/RESULTS.md`.*
+*Draft, 2026-10-25. Numbers are from `combd/RESULTS.md`.*
 
 combd runs Cloudflare-style Durable Objects on machines you own. Every
 chat room, game, or document is its own small server with its own SQLite

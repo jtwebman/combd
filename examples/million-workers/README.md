@@ -71,7 +71,7 @@ Hubs; the race then settled on one (below).
 | celld, `object` | 1,981 (shed load) | 275 KB | 3.6 s / 4.8 s, 682 MB, 84% | 43% lost |
 | celld, `worker` | 16,503 (killed) | 58 KB | 1.7 s / 7.4 s, 333 MB, 86% | 78% lost |
 
-So the race runs `hub` on both, with one Hub. There (`spike/RESULTS.md`,
+So the race runs `hub` on both, with one Hub. There (`combd/RESULTS.md`,
 two runs of 180 s a level): workerd held 11,500 idle pages (82 to 88 KB
 a page) and kept p99 echo under 300 ms to 5,000 clicking pages, then hit
 1 GB at 10,000; celld held 39,000 to 40,500 (23 KB) and was fine to 500,

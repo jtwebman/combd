@@ -25,7 +25,7 @@ SUM=$(echo "$INFO" | sed -n 's/^sha256=\([0-9a-f]*\)$/\1/p')
 if [ "$(readlink /opt/combd/current)" = "/opt/combd/$SRC" ]; then rm -f $SEEN; exit 0; fi
 # Fetched (and checked) first, so its builds can be asked for while this
 # node waits its turn.
-if [ ! -x "/opt/combd/$SRC/spike/target/release/combd" ]; then
+if [ ! -x "/opt/combd/$SRC/combd/target/release/combd" ]; then
     T=$(mktemp)
     curl -fsSL -m 300 -o "$T" "$URL/combd-arena-linux-amd64.tar.gz" || exit 0
     # Mid-upload, or not what the note says: next minute.
@@ -35,7 +35,7 @@ fi
 # Not before the new combd's builds of the fleet's compiled modules are in
 # the bucket: moving sooner would take those apps down on this node until
 # they were (2026-10-21). It asks for them; a builder makes them.
-READY=$(set -a; . /etc/combd/env; set +a; "/opt/combd/$SRC/spike/target/release/combd" builds-ready 2>&1)
+READY=$(set -a; . /etc/combd/env; set +a; "/opt/combd/$SRC/combd/target/release/combd" builds-ready 2>&1)
 case $? in
     0) ;;
     1) [ "$(cat $SEEN.builds 2>/dev/null)" = "$SRC" ] || { logger -t combd-update "$SRC: waiting for builds: $READY"; echo "$SRC" > $SEEN.builds; }; exit 0;;

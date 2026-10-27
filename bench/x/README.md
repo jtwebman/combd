@@ -42,4 +42,4 @@ Workers or celld. On Cloudflare that connection is to Hyperdrive, a pooler
 beside the database; PgBouncer stands in for it here. celld has no
 Hyperdrive, and workerd's local binding connects straight to the database.
 
-Results: `results/`, and spike/RESULTS.md, "The X race on Postgres".
+Results: `results/`, and combd/RESULTS.md, "The X race on Postgres".

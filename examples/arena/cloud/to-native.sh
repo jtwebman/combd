@@ -28,7 +28,7 @@ for n in ${NODES:-0 1 2}; do
         chown combd:combd /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node$n.key /etc/combd/tls/key.pem
         chmod 600 /etc/combd/tokens /etc/combd/master.key /etc/combd/certs/node$n.key /etc/combd/tls/key.pem
         /usr/local/bin/combd-update now
-        if [ ! -x /opt/combd/current/spike/target/release/combd ]; then chown -R root:root /var/lib/combd /etc/combd; docker start combd; echo '  no release fetched: back on Docker'; exit 1; fi
+        if [ ! -x /opt/combd/current/combd/target/release/combd ]; then chown -R root:root /var/lib/combd /etc/combd; docker start combd; echo '  no release fetched: back on Docker'; exit 1; fi
         systemctl is-active -q combd || systemctl start combd"
     i=0; until curl -sf -m 3 -o /dev/null "https://$node/_combd/ping"; do i=$((i + 1)); [ $i -gt 60 ] && { echo "  no answer after 3 minutes: stopping here"; ssh $O "root@$node" 'journalctl -u combd -n 20 --no-pager'; exit 1; }; sleep 3; done
     u=$(ssh $O "root@$node" 'ps -o user= -C combd | head -1')

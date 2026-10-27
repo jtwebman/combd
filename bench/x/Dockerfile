@@ -10,18 +10,18 @@ RUN rustup target add wasm32-unknown-unknown
 ENV CARGO_HTTP_MULTIPLEXING=false CARGO_NET_RETRY=10
 WORKDIR /combd
 COPY guest guest
-COPY spike spike
+COPY combd combd
 COPY sdk sdk
 COPY examples/x examples/x
 RUN cd guest && cargo build --locked --release --target wasm32-unknown-unknown
-RUN cd spike && cargo build --locked --release --no-default-features --features aot-lite
+RUN cd combd && cargo build --locked --release --no-default-features --features aot-lite
 RUN cd examples/x && cargo build --locked --release --target wasm32-unknown-unknown \
     && mkdir -p /app/modules /aot && cp target/wasm32-unknown-unknown/release/x.wasm /app/modules/ \
     && sed 's/^engine = "interpreted"/engine = "compiled"/' combd.toml > /app/combd.toml \
-    && w=/app/modules/x.wasm && /combd/spike/target/release/combd aot-build $w /aot/$(sha256sum $w | cut -c1-32).so
+    && w=/app/modules/x.wasm && /combd/combd/target/release/combd aot-build $w /aot/$(sha256sum $w | cut -c1-32).so
 
 FROM debian:bookworm-slim AS combd
-COPY --from=combd-build /combd/spike/target/release/combd /usr/local/bin/combd
+COPY --from=combd-build /combd/combd/target/release/combd /usr/local/bin/combd
 COPY --from=combd-build /app /app
 COPY --from=combd-build /aot /aot
 ENV MALLOC_MMAP_THRESHOLD_=131072 MALLOC_MMAP_MAX_=4000000

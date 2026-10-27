@@ -2,7 +2,7 @@ reference/
 .DS_Store
 target/
 langs/out/
-spike/aot/src/gen_*.rs
+combd/aot/src/gen_*.rs
 # Terraform: plans hold variable values (tokens) in plain text; state, a
 # provider cache, and secrets.
 *.plan

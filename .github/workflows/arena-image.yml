@@ -8,7 +8,7 @@ name: arena image
 on:
   push:
     branches: [main]
-    paths: [spike/**, guest/**, guest-ev/**, examples/arena/**, "!examples/arena/cloud/**", "!**/*.md", .github/workflows/arena-image.yml]
+    paths: [combd/**, guest/**, guest-ev/**, examples/arena/**, "!examples/arena/cloud/**", "!**/*.md", .github/workflows/arena-image.yml]
   workflow_dispatch:
 permissions:
   contents: write
@@ -21,7 +21,7 @@ jobs:
       - name: Hash combd's own sources
         id: src
         # Docs don't count: a change to them alone restarts nothing.
-        run: echo "hash=$(git ls-tree -r HEAD spike guest | grep -v '\.md$' | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "hash=$(git ls-tree -r HEAD combd guest | grep -v '\.md$' | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io

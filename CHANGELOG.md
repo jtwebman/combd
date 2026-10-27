@@ -63,4 +63,3 @@ The first release: Durable Objects on your own machines, as one binary.
   ABI level, without the SDK).
 - One compromised node can act for the fleet: every node holds the
   bucket's credentials.
-- The source still lives in `spike/`.

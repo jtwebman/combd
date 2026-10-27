@@ -1,6 +1,6 @@
 //! The official WebAssembly spec testsuite, run against our interpreter.
 //!
-//! `spike/spectest.sh` fetches the suite at a pinned commit; the test
+//! `combd/spectest.sh` fetches the suite at a pinned commit; the test
 //! `wasm_spec_testsuite` runs every `.wast` script in it. Each check is:
 //! - **pass**,
 //! - **fail**: a wrong answer, a missing trap, an invalid module we accept,

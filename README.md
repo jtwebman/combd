@@ -71,7 +71,7 @@ simple API can later open the door to Python, Go, JavaScript, and more.
 
 **Further along than we planned.** We started by reading celld closely and
 writing down how we think combd should work. **[Read the plan.](plan.md)**
-Then we built, and kept score. **[See the results.](spike/RESULTS.md)**
+Then we built, and kept score. **[See the results.](combd/RESULTS.md)**
 
 **The engine.** We wrote our own WebAssembly interpreter and raced it against
 Wasmtime with 10,000 cells, some stuck in endless loops. The stuck cells cost

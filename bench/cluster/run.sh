@@ -10,7 +10,7 @@
 # node with `docker pause` (it wakes up still thinking it owns things); and
 # SIGKILL a node and delete its disk (it comes back empty, as a new disk would).
 #
-# Build first: combd-aot (spike/Dockerfile with FEATURES=aot-guard).
+# Build first: combd-aot (combd/Dockerfile with FEATURES=aot-guard).
 set -e
 SECS=${SECS:-15}
 THREADS=${THREADS:-32}

@@ -15,4 +15,4 @@ repo root:
 
 Then run them on both engines:
 
-    cd spike && cargo run --release -- langs
+    cd combd && cargo run --release -- langs

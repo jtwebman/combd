@@ -2,7 +2,7 @@
 # The HTTP race: the same app and requests on combd, workerd, celld, Bun, and
 # Node, each limited to CPUS cores (default 1), loaded by wrk from its own
 # container. Build first: the bench images (see Dockerfile) and combd-aot
-# (spike/Dockerfile with FEATURES=aot).
+# (combd/Dockerfile with FEATURES=aot).
 set -e
 CPUS=${CPUS:-1}
 CONNS=${CONNS:-32}

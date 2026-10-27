@@ -27,7 +27,7 @@ jobs:
       # What a node runs: the interpreter and compiled modules' builds (no
       # wasmtime, no fuzzers: those are for combd's own tests).
       - name: Build
-        working-directory: spike
+        working-directory: combd
         env:
           COMBD_VERSION: ${{ github.ref_name }}
         run: cargo build --locked --release --no-default-features --features aot-lite --target ${{ matrix.target }}
@@ -37,7 +37,7 @@ jobs:
         run: |
           name=combd-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir -p "$name"
-          cp spike/target/${{ matrix.target }}/release/combd "$name/"
+          cp combd/target/${{ matrix.target }}/release/combd "$name/"
           cp README.md "$name/" 2>/dev/null || true
           "$name/combd" help > /dev/null
           tar czf "$name.tar.gz" "$name"

@@ -10,8 +10,8 @@ User=combd
 Group=combd
 EnvironmentFile=/etc/combd/env
 Environment=MALLOC_MMAP_THRESHOLD_=131072 MALLOC_MMAP_MAX_=4000000
-WorkingDirectory=/opt/combd/current/spike
-ExecStart=/opt/combd/current/spike/target/release/combd serve-fleet both 443
+WorkingDirectory=/opt/combd/current/combd
+ExecStart=/opt/combd/current/combd/target/release/combd serve-fleet both 443
 Restart=always
 RestartSec=1
 LimitNOFILE=1048576

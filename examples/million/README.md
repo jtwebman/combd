@@ -49,7 +49,7 @@ the chunks, and `boxes` share the other one (`cell/`).
 
 ```sh
 ./build.sh
-cd ../../spike && cargo run --release -- serve-app interp ../examples/million/app 8080
+cd ../../combd && cargo run --release -- serve-app interp ../examples/million/app 8080
 ```
 
 Then open http://million.localhost:8080 (browsers send `*.localhost` to
@@ -62,7 +62,7 @@ token in `../arena/cloud/.secrets`:
 ```sh
 ./build.sh && cd ../arena/cloud && COMBD_TOKEN=$(cat .secrets/token) \
   COMBD_ADMIN_CA=.secrets/certs/ca.pem COMBD_ADMIN_NAME=node0.combd \
-  ../../../spike/target/release/combd deploy ../../million/app acme https://n0.arena.combd.dev:9443
+  ../../../combd/target/release/combd deploy ../../million/app acme https://n0.arena.combd.dev:9443
 ```
 
 Tests: `million_one_session_per_socket` (one node: sessions asleep between

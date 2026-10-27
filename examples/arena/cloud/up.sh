@@ -5,8 +5,8 @@
 set -e
 cd "$(dirname "$0")"
 [ -f terraform.tfvars ] || { echo "copy terraform.tfvars.example to terraform.tfvars and fill it in"; exit 1; }
-BIN=../../../spike/target/release/combd
-[ -x $BIN ] || (cd ../../../spike && cargo build --release)
+BIN=../../../combd/target/release/combd
+[ -x $BIN ] || (cd ../../../combd && cargo build --release)
 # The fleet's secrets, made here and kept here (gitignored): the wire's CA and
 # a certificate per node, a deploy token (the nodes get only its hash), and
 # the master key for secrets. Delete .secrets to start over.

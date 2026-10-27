@@ -18,13 +18,13 @@ and the rest of the plan is updated to match.
    in the tests keep old deploys loading. Builders are documented
    (examples/arena/README.md, "Builders"); the Windows builder is still
    pulled by hand: tell JT when combd's runtime changes (the pin: rustc,
-   `spike/aot`, `spike/mem`), or he sets up Watchtower.
+   `combd/aot`, `combd/mem`), or he sets up Watchtower.
 2. **Overload turns people away instead of collapsing.** The whole
    machine's memory is watched; at most `COMBD_MAX_AWAKE` cells at work a
    loop (sleeping sessions wait their turn); a full node refuses new
    connections (a TLS one is closed), never this machine itself. Measured:
    ~30,000 active users held on a 1 GB node, the rest refused, the node
-   answering; ~58,000 idle (spike/RESULTS.md, "Overload, without Docker").
+   answering; ~58,000 idle (combd/RESULTS.md, "Overload, without Docker").
 3. **Security.** A review (Fable 5.1, high effort) and its fixes: signed
    releases (ed25519, `examples/arena/cloud/release.pub`; the private key
    is the `ARENA_RELEASE_KEY` secret and `cloud/.secrets/release.key`),
@@ -38,7 +38,7 @@ and the rest of the plan is updated to match.
 
 **Next, in order:**
 1. **The soak test: passed** (2026-10-23 04:45 to 10-24 07:30 PDT,
-   26.7 h, 3,000 pages; spike/bench/soak/README.md). No swap, no growth
+   26.7 h, 3,000 pages; combd/bench/soak/README.md). No swap, no growth
    between chaos events (flat for the 8 h after the last), the only
    restart the chaos kill, nothing refused. The n0 reboot: combd up in
    27 s, its 1,000 connections back within 10 minutes. The outside probe:
@@ -82,7 +82,7 @@ and the rest of the plan is updated to match.
    and the race against celld, workerd, and Cloudflare (queued below,
    under "Compile on deploy") as the launch post.
    **Done (2026-10-25):** the binary is `combd` (package `combd`; the
-   folder is still `spike/`), with `combd help`, and `combd new`, `build`,
+   folder was `spike/` until 2026-10-26, now `combd/`), with `combd help`, and `combd new`, `build`,
    `dev` for an app. The nodes run it as `combd` (their unit and update
    script moved over 2026-10-25, one at a time); the images keep a
    `combd-spike` link only for the Windows builder, pulled by hand: once
@@ -97,7 +97,7 @@ and the rest of the plan is updated to match.
    held ~156,000 idle pages to workerd's and celld's 3,000 to 6,000, and
    20,000 clicking pages with none lost, where they were killed for memory
    by 5,000 to 10,000. The post: `launch/post.md`, a draft for JT. Left: a
-   first tag (JT), `combd-sdk` on crates.io, the `spike/` folder's name,
+   first tag (JT), `combd-sdk` on crates.io, the `spike/` folder's name (done 2026-10-26: `combd/`),
    and what the race found in combd: pages arriving ~14,000 a second
    outran the memory guard (killed for memory, 2 of 4 tries): fixed
    (2026-10-25: measured on accept, sessions freeze at once under
@@ -165,7 +165,7 @@ and restarts clean. State lives in SQLite and a bucket you own.
 ## What building taught us
 
 Each of these started as a line in this plan, met real code or a real test,
-and changed. Numbers and details are in [spike/RESULTS.md](spike/RESULTS.md).
+and changed. Numbers and details are in [combd/RESULTS.md](combd/RESULTS.md).
 
 **Our own engine was the right bet, with one gap.** We planned our own Wasm
 interpreter and kept it: against Wasmtime it won load time (about 85x),
@@ -679,7 +679,7 @@ did it.
 **Status (2026-10-13): step 1 works.** jsc compiles `app.js`, matches Node
 byte for byte, beats Node over HTTP on every route, and trails Bun by 9% to
 32%. Under a heavy neighbor it keeps 35x to 56x Bun's throughput. Numbers in
-`spike/RESULTS.md`. Next for speed: per-request memory regions instead of
+`combd/RESULTS.md`. Next for speed: per-request memory regions instead of
 refcounts, shapes, and cheaper AOT checks.
 
 **What we support, in steps:**
@@ -1185,7 +1185,7 @@ The spike measures every row against a real celld node on the same machine.
 
 **Decision (after the phase 0 race):** our own interpreter is the default
 engine. Wasmtime stays behind the engine interface as a fast-compute option.
-See [spike/RESULTS.md](spike/RESULTS.md). If we ever need raw speed, add a JIT tier for
+See [combd/RESULTS.md](combd/RESULTS.md). If we ever need raw speed, add a JIT tier for
 hot cells later, the way BEAM did.
 
 ## AOT tier: compile once per CPU, cache it, run it everywhere
@@ -1248,13 +1248,13 @@ turns a Wasm module into plain safe Rust, and rustc + LLVM produce the machine
 code for any CPU. No Wasmtime. rustc guarantees the generated code can't
 escape its sandbox, so a generator bug can't become a security bug. It beat
 Wasmtime on fib, sieve, and every JS API route, and cold starts a JS cell from
-a snapshot in 53 us. See [spike/RESULTS.md](spike/RESULTS.md).
+a snapshot in 53 us. See [combd/RESULTS.md](combd/RESULTS.md).
 
 **Racing Bun (2026-10-13):** a sandboxed, preemptible Rust cell on this
 tier ties or beats Bun on two of three API routes and beats Node on all three.
 Native QuickJS loses to Node and Bun, so JS throughput needs a JS compiler,
 not a faster QuickJS (see "Our own JS engine"). Details in
-[spike/RESULTS.md](spike/RESULTS.md).
+[combd/RESULTS.md](combd/RESULTS.md).
 
 Done: 1-byte traps (results in registers), memory as its own argument, a stack
 budget in a register, fuel in a register, one bounds check per access, lazy
@@ -1454,7 +1454,7 @@ It stays in, off by default; the arena's nodes don't run it (not worth
 dropping Docker's seccomp for).
 
 **Both removed (2026-10-22).** kTLS turned out to move memory into the
-kernel rather than save it (`spike/RESULTS.md`), and io_uring saved no CPU:
+kernel rather than save it (`combd/RESULTS.md`), and io_uring saved no CPU:
 Linux-only unsafe code for nothing, so out. Git has both (`combd-ktls`,
 `combd-ring`) if NIC offload or bigger sends make them worth measuring again.
 
@@ -1598,7 +1598,7 @@ objects pays for that).
 fork.** No built-in policy between tenants: which org may claim which
 domain (any org with a deploy token can claim any domain not taken), and
 quotas per tenant (objects, bytes, awake cells), are a service's rules,
-written into the hooks in `spike/src/policy.rs` (`catalog_write`: every
+written into the hooks in `combd/src/policy.rs` (`catalog_write`: every
 deploy, vars, secret, removal; `new_object`: every object about to start
 on a node), which allow everything as shipped. combd keeps only what
 keeps a node up: two apps can't hold one domain, the disk floor, the
@@ -1943,7 +1943,7 @@ Linux VM, with and without load on the other cores; aim for p99.99 under
 ## Build order (when we do build)
 
 0. **DONE 2026-10-13. Spike: the engine race.** Results in
-   [spike/RESULTS.md](spike/RESULTS.md). Our interpreter beat Wasmtime on load
+   [combd/RESULTS.md](combd/RESULTS.md). Our interpreter beat Wasmtime on load
    (~85x), spawn (~25x), crash restart (~3x), memory per cell, latency, binary
    size (~5.5x smaller), and can snapshot mid-call. It lost on raw compute
    (15x to 39x slower). Preemption works: a stuck neighbor costs ~40 us, versus
@@ -1953,26 +1953,26 @@ Linux VM, with and without load on the other cores; aim for p99.99 under
 0a. **DONE 2026-10-13. Languages right away.** A small, safe WASI preview 1
    shim, plus the test cell in AssemblyScript, TinyGo, C, and Zig
    (`langs/`). All five languages, including Rust, pass all checks on both
-   engines. See [spike/RESULTS.md](spike/RESULTS.md).
+   engines. See [combd/RESULTS.md](combd/RESULTS.md).
 0b. **DONE 2026-10-13. JS spike.** QuickJS in Wasm, a Hono-style app, on our
    engine, Wasmtime, Node, and Bun. Interpreted JS can't beat Bun, even native
    QuickJS. **Decision: compile JS instead, and drop QuickJS.** See
-   [spike/RESULTS.md](spike/RESULTS.md).
+   [combd/RESULTS.md](combd/RESULTS.md).
 0c. **DONE 2026-10-13. HTTP race against workerd, celld, Bun, and Node.** Per
    core, a Rust cell on combd beat Bun on every route (1.3x to 1.6x), celld by
    2.7x to 5.3x, and workerd by 3.9x to 6.8x, with sub-millisecond p99. See
-   [spike/RESULTS.md](spike/RESULTS.md). Still to race: Durable Objects with
+   [combd/RESULTS.md](combd/RESULTS.md). Still to race: Durable Objects with
    state, cold start over HTTP, and memory per object at scale.
 1. **Spec + decision core + simulator** for ownership and the output gate. No
    network yet. **Done 2026-10-14:** TLC checks 4.9 million states, and four
    known-bad versions fail; the core runs 100,000 simulator seeds (10.4M
    acknowledged writes, 167k crashes, 167k freezes) with every invariant
-   holding. See [spike/RESULTS.md](spike/RESULTS.md) and [spec/](spec/).
+   holding. See [combd/RESULTS.md](combd/RESULTS.md) and [spec/](spec/).
 2. **Single node (D1).** HTTP in, route to cell, SQLite, alarms, supervisor,
    hibernation, egress broker, mTLS admin port.
    **Started 2026-10-14:** objects, host SQLite with an authorizer, the output
    gate, crash rollback, and the race against workerd and celld are done (see
-   [spike/RESULTS.md](spike/RESULTS.md)). Then alarms (with retries, and
+   [combd/RESULTS.md](combd/RESULTS.md)). Then alarms (with retries, and
    found again after a restart), eviction of idle objects, one owner per
    object across event loops, and `/_combd/stats`. Then a group commit (one
    fsync for many writes, answers held until covered): hot writes 8.3x
@@ -1992,13 +1992,13 @@ Linux VM, with and without load on the other cores; aim for p99.99 under
    availability fixes came out of it.
    Next: handle a peer that lost its disk (spec first), then quiet Linux
    machines for honest numbers. See
-   [spike/RESULTS.md](spike/RESULTS.md).
+   [combd/RESULTS.md](combd/RESULTS.md).
 4. **WebSockets** with hibernation. **Done 2026-10-14** on one node: the
    host holds the sockets, idle objects leave memory, a message wakes them.
    Then binary messages and fleet mode: connections stay on the node they
    reached, events go to the owner, and the socket list lives in the
    object's storage, so it survives a takeover. Next: numbers. See
-   [spike/RESULTS.md](spike/RESULTS.md).
+   [combd/RESULTS.md](combd/RESULTS.md).
 5. **Bring your own database.** Host-owned pools, Postgres first.
    **Started 2026-10-15:** pooled statements, and pinned handles: a Worker's
    lasts its request, a Durable Object's lasts across messages, with
@@ -2009,7 +2009,7 @@ Linux VM, with and without load on the other cores; aim for p99.99 under
    (typed vars and secrets, process and pool settings, strict checks).
    Next: the process model, then the fleet pool (nearest member,
    cross-node calls, takeover), then TLS, LISTEN/NOTIFY. See
-   [spike/RESULTS.md](spike/RESULTS.md).
+   [combd/RESULTS.md](combd/RESULTS.md).
 6. **Fast fleet writes (D3).** Done early, as part of step 3 (see "What
    building taught us").
 7. **JavaScript** (our JS-to-Rust compiler, Workers APIs next), then **more

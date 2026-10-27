@@ -1,4 +1,4 @@
 #!/bin/sh
 # Before a push: the whole check, quick (CI builds and deploys, but doesn't
 # test). Turn it on once: git config core.hooksPath .githooks
-exec "$(git rev-parse --show-toplevel)/spike/check.sh" quick
+exec "$(git rev-parse --show-toplevel)/combd/check.sh" quick

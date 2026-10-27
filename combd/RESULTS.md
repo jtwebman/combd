@@ -15,8 +15,8 @@ Same Rust cell (`guest/`), compiled once to `wasm32-unknown-unknown`, run on:
 
 Run it:
 - macOS: `cd guest && cargo build --release --target wasm32-unknown-unknown`,
-  then `cd spike && cargo run --release -- all`.
-- Linux: `docker build -f spike/Dockerfile -t combd-spike .` from the repo
+  then `cd combd && cargo run --release -- all`.
+- Linux: `docker build -f combd/Dockerfile -t combd-spike .` from the repo
   root, then `docker run --rm combd-spike`. All tests run during the build.
 
 Numbers are from the latest run. Earlier runs gave the same picture.
@@ -159,7 +159,7 @@ on both engines with five checks each:
 - **Loading is 20x to 85x faster than Wasmtime.** Go is the extreme: 2 ms vs
   175 ms, because Wasmtime compiles the whole module to machine code first.
 - **Compute is 7x to 15x behind Wasmtime** on these builds.
-- **The WASI shim is small and safe** (`spike/src/host.rs`, shared by both
+- **The WASI shim is small and safe** (`combd/src/host.rs`, shared by both
   engines):
   - stdout and stderr go to a 64 KB capped buffer,
   - the clock is rounded to 1 ms (timing attacks),
@@ -329,7 +329,7 @@ jump needs machine code: an AOT tier (see the plan).
 
 ## Our own AOT compiler: Wasm to safe Rust (macOS)
 
-`aot-gen` (`spike/src/aot_gen.rs`, about 600 lines) compiles a Wasm module into
+`aot-gen` (`combd/src/aot_gen.rs`, about 600 lines) compiles a Wasm module into
 plain safe Rust, and rustc + LLVM turn it into machine code. No Wasmtime, and
 no compiler of our own for each CPU.
 - Every Wasm local and stack slot becomes a `let mut` variable.
@@ -340,7 +340,7 @@ no compiler of our own for each CPU.
   overflowing the host's stack.
 
 The output has no `unsafe`, so rustc, not our generator, guarantees a cell
-can't touch memory outside its own. Build it with `spike/aot.sh`.
+can't touch memory outside its own. Build it with `combd/aot.sh`.
 
 The Rust cell became 13,500 lines of Rust. QuickJS became 432,000 lines. rustc
 took 3 min 40 s and 3 GB for both: fine at deploy time, never at request time.
@@ -518,7 +518,7 @@ generated code have no bounds checks. A Wasm address is a u32 plus a static
 offset under 64 KiB, so it always lands inside the reservation; past live
 memory it hits a guard page.
 
-A small C shim (`spike/aot/src/trap.c`, sigsetjmp/siglongjmp) turns that fault
+A small C shim (`combd/aot/src/trap.c`, sigsetjmp/siglongjmp) turns that fault
 into a trap, but only when the faulting address is inside the reservation of
 the cell running on that thread. Any other fault goes to the previous handler,
 so real host crashes still crash. `guard.rs` and `trap.c` hold the only
@@ -808,13 +808,13 @@ version fails on a different invariant:
 | no manifest: rebuild from every segment | history rewrite |
 | a same-node wake keeps its epoch | two writers in one epoch |
 
-**2. A pure decision core** (`spike/src/own.rs`): `Core::on(now, event) ->
+**2. A pure decision core** (`combd/src/own.rs`): `Core::on(now, event) ->
 effects`, with no I/O, clock, or randomness. Leases are heartbeats judged by
 the observer's own clock, for liveness only. Manifests and segments are
 write-once, a second fence the spec doesn't need: even a process that reused
 an epoch couldn't overwrite its predecessor's data.
 
-**3. A deterministic simulator** (`spike/src/sim.rs`, `combd-spike sim N`).
+**3. A deterministic simulator** (`combd/src/sim.rs`, `combd-spike sim N`).
 The real core runs in 3 nodes against a fake bucket with real conditional
 writes. Bucket calls take 1 to 50 ms (sometimes 500), 3% of requests and
 replies get lost, clocks run up to 10% fast or slow, and processes crash or
@@ -840,7 +840,7 @@ simulator) and a real executor on many nodes, with MinIO as the bucket.
 The decision core now runs in real nodes (fleet mode, when `COMBD_S3` is set),
 with the bucket as the only coordinator.
 
-**The bucket.** A small S3 client (`spike/src/s3.rs`: SigV4, get, conditional
+**The bucket.** A small S3 client (`combd/src/s3.rs`: SigV4, get, conditional
 put, list). Before serving, every node runs a storage test that races 16
 writers on one `If-Match` and one `If-None-Match`; exactly one may win each.
 
@@ -862,7 +862,7 @@ bucket: an answer leaves only after its segment is uploaded and a fresh read
 of the ownership record shows we still own the object.
 
 **The wire.** Nodes keep long-lived TCP connections to each other with
-length-prefixed binary frames (`spike/src/fleet.rs`). A request for an object
+length-prefixed binary frames (`combd/src/fleet.rs`). A request for an object
 another node owns is forwarded there, one hop at most, and the answer comes
 back the same way. A broken connection fails its waiting requests with a 503
 at once; a forward with no reply in 2 s does too.
@@ -1138,7 +1138,7 @@ that served always has one.
 The fleet was checked four ways; the sandbox only had our own tests. Now it
 has two outside judges.
 
-**The official WebAssembly testsuite** (`spike/spectest.sh`, pinned commit,
+**The official WebAssembly testsuite** (`combd/spectest.sh`, pinned commit,
 every `.wast` file) against the interpreter: **30,497 checks pass, 0 fail**,
 34,346 skipped. A skip is a module we refuse at load because it uses
 something we don't support, counted by reason: SIMD (most of them), imported
@@ -1240,7 +1240,7 @@ cut-offs) and 200 damaged peer logs: no panics, and whatever decodes, the
 peer store takes. The decoder was bounds-checked from the start, and it held.
 
 **Stores at a trap, in the guard-page AOT tier.** Hand-written cases
-(`spike/aot-cases/precise_traps.wat`) store, trap, and store again. One
+(`combd/aot-cases/precise_traps.wat`) store, trap, and store again. One
 fails on the guard-page build: LLVM drops a store that a later one
 overwrites, not knowing the load between them can fault, so memory at the
 trap isn't what Wasm says. That's invisible in combd: a trapped cell is
@@ -1273,7 +1273,7 @@ other status to refuse it as plain HTTP), `do WSMSG /<id> <text>`, and
   queued per request, 64 messages waiting per socket before we stop
   reading, and a client that reads too slowly (8 MB unsent) or sends too
   fast (4 MiB unread) is closed.
-- The protocol code (`spike/src/ws.rs`) checks every RFC 6455 rule a server
+- The protocol code (`combd/src/ws.rs`) checks every RFC 6455 rule a server
   must: masking, reserved bits, opcodes, control frame sizes, fragments,
   UTF-8. Its own SHA-1 and base64 (a few dozen lines each) for the handshake.
 
@@ -1317,8 +1317,8 @@ numbers (idle sockets per GB, wake-up time, cross-node message time).
 ## Bring your own database: Postgres
 
 The host runs one pool per `[pools.<name>]` in the app's manifest:
-a manager (`spike/src/pool.rs`, pure decisions, tested on its own) and
-members, each one connection on its own thread (`spike/src/pg.rs`). The
+a manager (`combd/src/pool.rs`, pure decisions, tested on its own) and
+members, each one connection on its own thread (`combd/src/pg.rs`). The
 first ask starts a member; an ask while all are busy starts another, up to
 `max`; then asks wait in line and fail after `wait_ms`.
 A lease is checked on every call, so a holder whose lease ran out can't
@@ -1395,7 +1395,7 @@ numbers.
 ## The manifest: typed settings, vars, and secrets
 
 An app ships one of `combd.toml`, `combd.yaml`, or `combd.json`
-(`spike/src/manifest.rs`). All three read into the same tree and get the
+(`combd/src/manifest.rs`). All three read into the same tree and get the
 same checks, and every mistake is reported at once. Any mistake and nothing
 starts. No more env vars for app settings: node settings (threads, data
 dir, fleet) stay with whoever runs the machine.
@@ -1445,7 +1445,7 @@ TTL, their own storage), and secrets encrypted there.
 ## An app of processes
 
 `combd-spike serve-app <engine> <dir> <port>` serves an app from its
-manifest (`spike/src/app.rs`): one program per kind (`modules/<kind>.wasm`,
+manifest (`combd/src/app.rs`): one program per kind (`modules/<kind>.wasm`,
 loaded once), and each process with its own warm cells, event-cell
 instances, and settings (`max_concurrent`). Requests are routed by host
 (case and port ignored) and path (query string ignored), most specific
@@ -1547,9 +1547,9 @@ with nothing in the bucket telling anyone it died.
 
 ## The catalog in the nodes: deploys and vars
 
-Every fleet node runs the catalog (`spike/src/catnode.rs`): a thread around
+Every fleet node runs the catalog (`combd/src/catnode.rs`): a thread around
 the tested core that does its bucket calls through a small storage trait
-(`spike/src/kv.rs`: get, put always / if absent / if the etag matches,
+(`combd/src/kv.rs`: get, put always / if absent / if the etag matches,
 delete, list; the bucket is the first backend), pushes each new entry to
 the other nodes over the wire (a new one-way frame, `Catalog`), keeps its
 copy on local disk for a fast restart, and snapshots and trims the log
@@ -1581,7 +1581,7 @@ two nodes (the later one wins whole).
 
 A pool in the manifest (`max = 100`) is now one for the fleet, not one per
 node: 1,000 nodes never open more than `max` connections. Every node runs
-an agent per pool (`spike/src/pg.rs`); one of them is also the manager,
+an agent per pool (`combd/src/pg.rs`); one of them is also the manager,
 running the tested pool core (`pool.rs`) as before.
 - **Members start on the asker's node.** At max, the nearest free member
   is leased instead, and that holder's queries go over the wire (a new
@@ -1838,7 +1838,7 @@ busy object, and each peer the same.
 
 ## Secrets, sealed in the catalog
 
-Secrets live in the catalog, sealed (`spike/src/secrets.rs`). Each app
+Secrets live in the catalog, sealed (`combd/src/secrets.rs`). Each app
 gets its own data key with its first secret, sealed by the fleet's master
 key (a file of 64 hex characters, `COMBD_MASTER_KEY_FILE`, refused if
 anyone but its owner can read it; `combd-spike master-key <file>` makes
@@ -1877,8 +1877,8 @@ environments bind it in when they land.
 
 ## The catalog: core and simulator
 
-`spike/src/catalog.rs` is the catalog's decision core (no I/O), and
-`spike/src/catsim.rs` runs it on three nodes against a fake bucket where a
+`combd/src/catalog.rs` is the catalog's decision core (no I/O), and
+`combd/src/catsim.rs` runs it on three nodes against a fake bucket where a
 deleted key is simply gone: calls of 1 to 50 ms (sometimes 500), lost
 requests and replies, lost, repeated, and reordered pushes, crashes that
 keep or lose a node's copy, and random snapshots that trim the log. An
@@ -1908,7 +1908,7 @@ combd knows nothing about people: only tokens and what each may do. Users,
 orgs, invites, logins, and roles live outside it (your CI and identity
 system, or a hosted dashboard that holds the tokens and calls the same API).
 
-- **The bucket** (`spike/src/deploy.rs`): `apps/<org>/<app>/versions/<hash>`
+- **The bucket** (`combd/src/deploy.rs`): `apps/<org>/<app>/versions/<hash>`
   holds a bundle (the manifest and `modules/*.wasm`, nothing else, so the
   dev env file can't ride along), named by its SHA-256; `current` says
   which is live and moves only by compare-and-swap; `vars` holds the vars.
@@ -1923,7 +1923,7 @@ system, or a hosted dashboard that holds the tokens and calls the same API).
   processes are added and the old ones retired, so in-flight work finishes
   on the old code, new requests get the new, and an object's next request
   runs the new code on its old storage.
-- **The admin API** (`spike/src/admin.rs`), on its own port: deploy,
+- **The admin API** (`combd/src/admin.rs`), on its own port: deploy,
   status, rollback (an earlier version, checked again), take down, set
   vars (checked against their declared types; the CLI's `"8"` is an int
   only if the var is). Tokens are stored as SHA-256 hashes and compared in

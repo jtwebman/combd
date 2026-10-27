@@ -1,7 +1,7 @@
 #!/bin/sh
 # The Durable Object race: the same counter object on combd, workerd, and
 # celld, each limited to CPUS cores (default 1), loaded by wrk from its own
-# container. Build first: combd-aot (spike/Dockerfile, FEATURES=aot-guard)
+# container. Build first: combd-aot (combd/Dockerfile, FEATURES=aot-guard)
 # and the images in bench/do/Dockerfile.
 set -e
 CPUS=${CPUS:-1}
