@@ -14,11 +14,6 @@ ENV CARGO_HTTP_MULTIPLEXING=false CARGO_NET_RETRY=10
 WORKDIR /combd
 COPY guest guest
 COPY combd combd
-# The folder was spike/ and the binary combd-spike (until 2026-10-26 and
-# 2026-10-25): a builder made before then runs /combd/spike/target/release/
-# combd-spike with COMBD_AOT_SRC=/combd/spike/aot. These links keep it
-# working until it's moved over (README, "Builders"); then they go.
-RUN ln -s combd spike
 COPY examples/arena examples/arena
 # The git commit, built into combd and the game (shown on the page).
 ARG ARENA_VERSION=dev
@@ -27,8 +22,7 @@ RUN cd guest && cargo build --locked --release --target wasm32-unknown-unknown
 # With the AOT runtime (no modules built in): a node loads compiled
 # modules' builds, and this stage, published as combd-builder, makes them
 # (the same rustc and sources, so their pins match).
-RUN cd combd && cargo build --locked --release --no-default-features --features aot-lite \
-    && ln -sf combd target/release/combd-spike
+RUN cd combd && cargo build --locked --release --no-default-features --features aot-lite
 RUN examples/arena/build.sh
 
 FROM debian:bookworm-slim

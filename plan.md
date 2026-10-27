@@ -85,10 +85,8 @@ and the rest of the plan is updated to match.
    folder was `spike/` until 2026-10-26, now `combd/`), with `combd help`, and `combd new`, `build`,
    `dev` for an app. The nodes run it as `combd` (their unit and update
    script moved over 2026-10-25, and to `combd/` paths 2026-10-26, one at
-   a time); only the builder image keeps `spike` and `combd-spike` links,
-   for the Windows builder: once it runs `/combd/combd/target/release/combd
-   builder` with `COMBD_AOT_SRC=/combd/combd/aot`, they go
-   (examples/arena/Dockerfile). `combd-sdk`
+   a time), and so does the Windows builder (2026-10-27): no `spike` or
+   `combd-spike` links are left in the images. `combd-sdk`
    (`sdk/rust/`): a Rust crate for apps (`cell!`, `Request`, `Response`,
    `sql::run`, alarms, `call`, `send`, `env`), with no proc macro.
    `docs/quickstart.md`, each step run as written (new, dev, change it,
