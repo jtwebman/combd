@@ -2660,7 +2660,9 @@ cells.
 
 Million on four servers, on the same box, one at a time (`bench/click/run.sh`,
 one command; summaries in `bench/click/results/`, this round's in
-`2026-10-25-c.txt` and `-d.txt`).
+`2026-10-25-c.txt` and `-d.txt`). combd and Phoenix after combd's burst
+fixes: "The click race again", below (combd's tails at 10,000 and 20,000
+pages are much shorter now).
 - **The apps:**
   - combd runs `examples/million` with its chunks and viewers compiled
     (the nodes' build, `aot-lite`; the builds made by `aot-build`, the
@@ -2996,3 +2998,174 @@ where it gets proven.
 **The flaky test.** `fuzz_host`'s cost checks timed host calls by the wall
 clock and failed when the machine was busy; they use the thread's CPU time
 now (passed 3 of 3 under 20 busy loops).
+
+## The click race again: combd and Phoenix, after the fixes (2026-10-26)
+
+combd's tails in the race (p99 0.7 to 3.4 s at 10,000 pages, 2.1 to 2.5 s
+at 20,000) were from before the burst fixes above; two runs of combd alone
+on the new code gave 414 to 430 ms and 685 to 736 ms. To tell the fixes
+from a quieter machine, combd and Phoenix (now Bandit 1.14.0) ran again,
+interleaved, twice (`bench/click/results/2026-10-26-a.txt` and `-b.txt`;
+0047630, same box and settings as the race).
+
+Run a had the machine busy: both servers' tails grew to seconds from 5,000
+pages (Phoenix's 10,000: p99 3.8 s, where every other run gave 227 to
+251 ms; combd's 4.1 s). Run b was clean, Phoenix back at its race numbers:
+
+| Pages | combd (run b; and alone, 2 runs) | Phoenix (run b) |
+|---|---|---|
+| idle | 152,000 (154,000 to 155,000 alone), 6.0 KB a page, then refused at TCP | 68,000, 14.7 KB a page, then killed for memory (66,626 in run a) |
+| 1,000 | p99 166 ms (159 in run a), 60 MiB, 8% CPU | p99 168 ms (164), 82 MiB, 7% |
+| 5,000 | p99 312 ms, 141 MiB, 26% | p99 206 ms, 161 MiB, 32% |
+| 10,000 | p99 395 ms (414 to 430 alone), 0 lost, 201 MiB, 60% | p99 238 ms, 0 lost, 239 MiB, 84% |
+| 20,000 | 446,000 changes a second, p99 758 ms (685 to 736 alone), 0 lost, 373 MiB, 80% | 267,000 changes a second, p99 912 ms, 2 lost, 2,463 of 20,000 pages closed, 394 MiB, 99% |
+
+- **It's the fixes.** In a run where Phoenix matched the race, combd's
+  10,000 was 395 ms, not 0.7 to 3.4 s; three clean runs of the new code
+  agree (395 to 430 ms). The burst fixes freeze idle sessions at once
+  under pressure and measure memory on accept; what they bought at
+  10,000 and 20,000 clicking pages wasn't measured alone.
+- **Phoenix still has the shorter tails at 5,000 and 10,000** (206 and
+  238 ms to 312 and 395), for ~20% more memory and 40 to 50% more CPU. At
+  20,000 its one core filled, and this time it closed 2,463 pages (the
+  race: none closed, p99 1.02 to 1.05 s).
+- **Idle, combd holds ~3% fewer than the race** (152,000 to 155,000, not
+  156,000 to 157,000): the guard's lines moved down (reclaim at 80%,
+  refuse at 90%). Every idle run ended refusing, none killed.
+- The machine wasn't idle in either run: other containers (a Postgres at
+  ~17% of a core) and a Python process at ~27% of one ran throughout, as
+  they did for the race.
+
+## Plain requests: the four servers, and million's page compiled (2026-10-26)
+
+`bench/click/run.sh`'s `req<n>`: no sockets, wrk from n connections for
+30 s after 5 s of warm-up, at million's `GET /` (the page, from the
+stateless process) and `GET /api/count` (through it to one object, the
+total, and back); the same box and limits as the click race. Summaries:
+`bench/click/results/2026-10-26-req-*.txt`.
+
+The first run of it measured nothing for combd: wrk takes a header only as
+`Name: value`, and `Host:million.localhost` left wrk's own `Host: srv:8080`,
+so combd (which routes by host) answered 404 to every request, and the
+other three (which don't) answered. Fixed in run.sh.
+
+**million's page, compiled.** It ran interpreted only because a compiled
+cell couldn't wait on `call` (the page asks the total that way); the lite
+build pauses such a call on a fiber now (plan item 6). The page's module is
+the chunks' module, so its build was already there. combd alone, two runs
+each way:
+
+| combd | Page interpreted | Page compiled |
+|---|---|---|
+| `/`, 10 / 100 / 1,000 conns | 76,000 to 79,000 / 74,000 to 77,000 / 62,000 to 67,000 | 94,000 to 97,000 / 93,000 to 97,000 / 70,000 to 73,000 |
+| `/api/count`, 10 / 100 / 1,000 | 30,000 to 31,000 / 37,000 to 40,000 / 35,000 to 37,000 | 67,000 / 101,000 / 72,000 to 76,000 |
+| memory at 1,000 conns | 50 to 52 MiB | 90 to 106 MiB (a waiting call holds its fiber's stack) |
+
+The fibers cost nothing measurable where they're on the hot path: million's
+chunks import `call` too, so with the change every chunk request runs on
+one, and the click race's 10,000 and 20,000 clicking pages measured as
+before (p99 391 to 438 ms and 735 to 798 ms, nothing lost, 56 to 57% and
+79 to 81% CPU, two runs).
+
+**All four** (combd with its page compiled; requests a second, p50 / p99;
+memory peak; every server at 100% of its CPU):
+
+| | combd | Phoenix | workerd | celld |
+|---|---|---|---|---|
+| `/`, 10 | 94,300 to 96,500, 0.08 / 0.15 ms | 40,800 to 43,600, 0.18 / 0.31 to 0.43 ms | 26,400 to 26,600, 0.22 / 97 to 103 ms | 24,400 to 25,100, 0.3 / 12 ms |
+| `/`, 100 | 92,800 to 96,900, 1.0 / 1.7 to 1.9 ms | 40,600 to 40,700, 2.4 / 3.2 to 3.7 ms | 25,400 to 26,700, 2.4 to 3.1 ms / 2.6 to 3.4 s, 1 to 28 failed | 20,700 to 23,800, 3.7 to 4.0 / 17 to 19 ms |
+| `/`, 1,000 | 70,100 to 73,000, 14 / 17 to 18 ms | 36,900, 27 / 33 ms | 20,800, 29 / 156 ms | 22,700, 21 / 183 ms |
+| `/api/count`, 10 | 66,600 to 67,400, 0.11 / 0.21 ms | 50,000 to 50,400, 0.15 / 0.25 to 0.28 ms | 17,000 to 17,500, 0.33 / 221 to 270 ms | 12,200 to 12,500, 0.41 / 37 ms |
+| `/api/count`, 100 | 100,500 to 101,300, 1.0 / 1.5 ms | 59,000 to 59,600, 1.7 / 2.2 to 2.5 ms | 14,600 to 16,000, 3.3 to 3.7 ms / 5.6 to 7.7 s, 9 to 96 failed | 13,100 to 13,300, 5.3 / 43 ms |
+| `/api/count`, 1,000 | 71,800 to 76,400, 13 to 14 / 16 to 18 ms | 46,300, 22 / 26 ms | 13,700, 47 / 227 ms | 10,500, 98 / 175 ms |
+| memory | 5 to 106 MiB | 53 to 108 MiB | 615 to 789 MiB | 60 to 203 MiB |
+
+- The other three's 1,000-connection numbers are from run a: in run b, a
+  docker pull and build ran beside that level (their CPU under 100%, half
+  the rate). Run b is in the file, marked.
+- workerd's tails: its p50 is fine, but a few requests wait seconds from
+  100 connections, and some fail (wrk's 10 s timeout, or reset).
+
+## The X race on Postgres (2026-10-26)
+
+`examples/x`, an X clone (users, posts, follows, likes, a home timeline)
+on Postgres, on combd, Phoenix (Bandit, Plug, Postgrex), workerd and celld
+(one Worker, postgres.js over `cloudflare:sockets`, PgBouncer in its
+container in Hyperdrive's place), and those two with no pooler at all.
+How it's kept apples to apples, and how to run it: `bench/x/README.md`.
+Each server in 1 CPU and 1 GB with its pool inside that, one Postgres 16
+with 6 CPUs, the same seeded data (a fresh copy per test), the same SQL,
+the same connections to Postgres (`POOLS`). Summaries:
+`bench/x/results/2026-10-26-*.txt`.
+
+**Requests a second, p99** (two runs each; combd's are its final code,
+`-combd-a`/`-b`; the others' from the race, `-a`/`-b`):
+
+| Pool 32 | 10 connections | 100 | 1,000 |
+|---|---|---|---|
+| **combd** | **5,828 to 6,009**, 2.7 to 4.3 ms | **8,442 to 8,834**, 29 to 37 ms | **8,201 to 8,473**, 198 to 207 ms |
+| Phoenix | 4,990 to 5,009, 2.9 ms | 6,483 to 6,555, 23 ms | 6,044 to 6,107, 249 to 255 ms, 116 to 5,426 failed |
+| workerd + PgBouncer | 1,466 to 1,532, 30 ms | 1,515 to 1,569, 100 to 105 ms | 1,296 to 1,331, 1.1 s |
+| celld + PgBouncer | 1,379 to 1,389, 34 ms | 1,171 to 1,196, 126 to 147 ms | 814 to 821, 1.8 s |
+| workerd, direct | 633 to 639, 26 ms | 788 to 812, 210 ms | 1,657 to 1,718, 1.6 to 1.7 s, 43,000 to 44,000 failed |
+| celld, direct | 223 to 226, 48 to 50 ms | 216 to 222, 555 to 567 ms | 523 to 547, 4.3 to 5.5 s, 11,500 to 12,500 failed |
+
+| Pool 200 | 10 | 100 | 1,000 |
+|---|---|---|---|
+| **combd** | **6,211 to 6,271**, 2.5 ms | **7,362 to 7,413**, 45 to 47 ms | **7,701 to 7,824**, 227 to 233 ms |
+| Phoenix | 4,756 to 4,794, 2.9 to 3.0 ms | 6,448 to 6,587, 22 to 24 ms | 6,328 to 6,568, 218 to 230 ms |
+| workerd + PgBouncer | 1,412 to 1,496 | 1,472 to 1,606 | 1,210 to 1,250 |
+| celld + PgBouncer | 1,356 to 1,377 | 1,165 to 1,195 | 733 to 751 |
+
+Memory at peak: combd 7 to 192 MiB, Phoenix 71 to 312, celld 56 to 275,
+workerd 187 to 670. Every server's CPU was at 85 to 99%; Postgres at up to
+~520% of its 600 with combd (the box's limit is near).
+
+- **combd leads at every level**, 12% to 40% over Phoenix in requests;
+  Phoenix keeps the shorter p99 at 100 connections (23 ms to 29 to 37 at
+  pool 32), combd at 1,000. Phoenix's errors at pool 32 and 1,000
+  connections are Postgrex's queue timeouts (a checkout waiting too long);
+  at pool 200 it had none.
+- **The Workers are held by the connection per request.** With PgBouncer
+  in their box, ~1,200 to 1,600; straight to Postgres, a backend started
+  and authenticated per request: 220 to 800, and at 1,000 connections tens
+  of thousands failed. On Cloudflare, Hyperdrive takes that cost off the
+  Worker's machine; here, as for the others, the pooler counts in the box.
+
+**What the race found in combd, and fixed** (`-pool-steps.txt`, and the
+sweeps in the session's notes; each measured at pool 32 unless said):
+
+1. **The pool got slower as it grew.** The manager (`pool.rs`) scanned
+   every member for every waiting ask on every change: at 1,000
+   connections, 4,070 req/s at pool 8 fell to 1,172 at pool 200. Now the
+   counts it needs are taken once a change: 4,680 at 200.
+2. **Every ask went to the manager, then was cancelled** when a member of
+   the node's own came free (two scans of its line per statement). At most
+   16 of a node's asks wait there now (`AT_MANAGER`).
+3. **The SDK turned JSON into text through `Display`**, parsed a GET's
+   empty body (building an error to say so), and copied every result and
+   parameter. Fixed in `combd-sdk`, for every app. 1 to 3: 5,406 to 5,771
+   (100 connections), 4,942 to 5,766 (1,000).
+4. **The reset after every pooled statement** (9 statements: rollback,
+   `RESET ALL`, `DISCARD`s, a deallocate) was a quarter of combd's
+   throughput and ~22% of Postgres's time. Postgrex, Rails, and PgBouncer's
+   transaction mode don't reset between statements either; now combd
+   doesn't (a session, `pg_open`, still is): 5,817 to 7,172 (100), 5,371
+   to 7,047 (1,000), measured with the reset switched off.
+5. **One agent thread passed every statement along** (two of its messages
+   and its books each, ~6 us of its one thread: a ceiling of ~150,000 to
+   180,000 statements a second per node, however many cores). Now a pool
+   has a line per node (`work.rs`), and its members take from it: under
+   load the agent hears nothing (0.0% of a CPU, 10 switches a second,
+   against 10.6% and 6,722). The first try let a member go as soon as the
+   line was empty, and under light load every statement brought the agent
+   back (2,747 req/s at 10 connections, half); waiting on the line, as a
+   worker pool does, fixed it: 6,953 to 8,656 (100 connections), 6,986 to
+   8,132 (1,000), 5,710 to 6,143 (10).
+6. **A loop is woken once per wake-up, not per message** (`LoopWaker`): a
+   flag, so a burst of answers is one write to its eventfd. Measured with
+   the line: +1 to 3% at 1 CPU, near run-to-run noise.
+
+Measuring first changed the order: the plan was to remove thread hops; the
+measurement (per-thread CPU, `pg_stat_statements`) put the reset first and
+the hops last.

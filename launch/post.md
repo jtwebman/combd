@@ -9,7 +9,7 @@ database. State lives on local disk and in a bucket you already pay for
 consensus cluster: one 13 MB binary, open source under Apache-2.0.
 
 The point of this release is how little it needs. On one CPU and 1 GB, the
-size of a $6-a-month droplet, combd holds about 156,000 idle WebSocket
+size of a $6-a-month droplet, combd holds about 152,000 idle WebSocket
 pages, or 20,000 pages clicking with nothing lost. We raced it against the
 two other ways to run Durable Objects yourself, Cloudflare's workerd and
 Deno's celld, on the same box. The numbers are below.
@@ -86,8 +86,8 @@ Idle pages, in 1 GB:
 
 | Server | Pages held | Memory a page |
 |---|---|---|
-| combd | about 156,000, then it refused new ones | 6.1 KB |
-| Phoenix | about 68,000, then killed for memory | 14.5 KB |
+| combd | 152,000 to 155,000, then it refused new ones | 6.0 KB |
+| Phoenix | 66,600 to 68,000, then killed for memory | 14.7 KB |
 | celld | 39,000 to 40,500, then killed for memory | 23 KB |
 | workerd | about 11,500, then killed for memory | 82 to 88 KB |
 
@@ -96,10 +96,10 @@ minutes):
 
 | Pages | combd | Phoenix | workerd | celld |
 |---|---|---|---|---|
-| 1,000 | p99 echo 162 ms, 62 MB, 4% CPU | p99 199 to 229 ms, 80 to 87 MB, 4% CPU | p99 184 to 191 ms, 165 MB, 5% CPU | p99 1.7 to 5.1 s, at 18% CPU |
-| 5,000 | p99 0.7 to 1.0 s, 140 to 152 MB, 24% CPU | p99 215 to 299 ms, 165 MB, 29% CPU | p99 220 to 299 ms, 515 MB, 38% CPU | p99 5 to 8 s, 80% CPU |
-| 10,000 | p99 0.7 to 3.4 s, nothing lost, 205 MB, 55% CPU | p99 227 to 251 ms, nothing lost, 245 MB, 76% CPU | p99 0.8 to 2.3 s, at 1 GB of 1 GB, 84% CPU | 0.2 to 0.6% of clicks lost, 97% CPU |
-| 20,000 | 442,000 changes a second, p99 2.1 to 2.5 s, nothing lost, 430 MB, 77% CPU | p99 just over 1 s, 2 clicks lost, 440 MB, 100% CPU | killed for memory | killed for memory |
+| 1,000 | p99 echo 159 to 166 ms, 60 to 62 MB, 4 to 8% CPU | p99 164 to 168 ms, 82 to 107 MB, 4 to 7% CPU | p99 184 to 191 ms, 165 MB, 5% CPU | p99 1.7 to 5.1 s, at 18% CPU |
+| 5,000 | p99 312 ms, 141 MB, 26% CPU | p99 206 ms, 161 MB, 32% CPU | p99 220 to 299 ms, 515 MB, 38% CPU | p99 5 to 8 s, 80% CPU |
+| 10,000 | p99 395 to 430 ms, nothing lost, 202 MB, 56 to 60% CPU | p99 238 ms, nothing lost, 239 MB, 84% CPU | p99 0.8 to 2.3 s, at 1 GB of 1 GB, 84% CPU | 0.2 to 0.6% of clicks lost, 97% CPU |
+| 20,000 | 446,000 changes a second, p99 685 to 758 ms, nothing lost, 373 to 392 MB, 79 to 82% CPU | p99 912 ms, 2,463 pages closed, 2 clicks lost, 394 MB, 99% CPU | killed for memory | killed for memory |
 
 Below 1,000 pages all four kept every echo under a third of a second.
 Where workerd held on, it kept up: to 5,000 pages its echoes were as short
@@ -107,9 +107,11 @@ as anyone's. What ended it was memory: an open page costs it 13 to 14
 times what it costs combd. celld ran out of time before it ran out of
 CPU: from 1,000 pages its slowest echoes took seconds with its CPU at 18%.
 The BEAM is the one that kept pace. At 5,000 and 10,000 pages Phoenix's
-slowest echoes were shorter than combd's, for about a fifth more memory
-and 40% more CPU, until its one core filled at 20,000. combd held 2.3
-times as many idle pages.
+slowest echoes were shorter than combd's (206 and 238 ms, to combd's 312
+and 395 to 430), for about a fifth more memory and 40 to 50% more CPU.
+At 20,000 its one core filled and it closed 2,463 of the pages, where
+combd kept all 20,000 at 80% of its CPU. combd held 2.2 times as many idle
+pages.
 
 There's a design reason for part of this, and it's worth saying plainly.
 On Workers, a WebSocket belongs to the object that accepted it. A chunk
@@ -124,17 +126,38 @@ We also estimated what the same load would cost on Cloudflare, from its
 published prices (we deployed nothing there). At 10,000 clicking pages
 it's about $2.80 an hour with the cheaper design and about $34 an hour
 with an object per socket, where each push is a billed call. combd ran
-that load in a box the size of a $6-a-month droplet, with over 40% of its
+that load in a box the size of a $6-a-month droplet, with about 40% of its
 CPU free. Cloudflare wouldn't fall over at this load: it spreads objects
 across many machines. That's what you pay it for.
+
+Plain requests, no sockets, from 10 to 1,000 connections at once (wrk,
+30 seconds each): `GET /` is million's page from a stateless process, and
+`GET /api/count` goes through that process to one object, the total, and
+back. Requests a second, and p99:
+
+| Route, connections | combd | Phoenix | workerd | celld |
+|---|---|---|---|---|
+| `/`, 10 | 94,000 to 97,000, 0.15 ms | 41,000 to 44,000, 0.3 to 0.4 ms | 26,000 to 27,000, 97 to 103 ms | 24,000 to 25,000, 12 ms |
+| `/`, 100 | 93,000 to 97,000, 1.7 to 1.9 ms | 41,000, 3.2 to 3.7 ms | 25,000 to 27,000, 2.6 to 3.4 s, 1 to 28 failed | 21,000 to 24,000, 17 to 19 ms |
+| `/`, 1,000 | 70,000 to 73,000, 17 to 18 ms | 37,000, 33 ms | 21,000, 156 ms | 23,000, 183 ms |
+| `/api/count`, 10 | 67,000, 0.2 ms | 50,000, 0.25 to 0.28 ms | 17,000 to 18,000, 221 to 270 ms | 12,000 to 13,000, 37 ms |
+| `/api/count`, 100 | 101,000, 1.5 ms | 59,000 to 60,000, 2.2 to 2.5 ms | 15,000 to 16,000, 5.6 to 7.7 s, 9 to 96 failed | 13,000, 43 ms |
+| `/api/count`, 1,000 | 72,000 to 76,000, 16 to 18 ms | 46,000, 26 ms | 14,000, 227 ms | 11,000, 175 ms |
+
+Every server used its whole CPU. combd answered the most, and on the
+route through an object, 1.7 times Phoenix's at 100 connections, in 5 to
+106 MB; workerd held 615 to 790 MB, and its slowest requests took seconds.
 
 ## What these numbers don't say
 
 - **It's a Mac, not a droplet.** We ran this on an Apple M4 Max, in
   Docker's Linux VM, with the load clients on the same machine. Each test
-  ran twice; where runs differed, we show both. The droplet tests we've
-  published before (TLS, real network) are the ones to quote for a
-  node's capacity.
+  ran twice; where runs differed, we show both. combd and Phoenix ran
+  again after combd's last fixes: one of those two runs had the machine
+  busy (both servers' slowest echoes grew to seconds), so for them we show
+  the other, and combd's two runs alone on the same code. The droplet
+  tests we've published before (TLS, real network) are the ones to quote
+  for a node's capacity.
 - **No TLS anywhere.** celld can't end TLS, so all four ran plain
   WebSockets. On our droplets combd ends TLS itself, which adds about 4 KB
   an idle connection.
@@ -151,11 +174,14 @@ across many machines. That's what you pay it for.
   Cloudflare holds.
 - **celld ran in its single-node dev mode.** We didn't measure its
   production mode.
-- **combd has a gap too.** When pages arrived as fast as the clients could
+- **combd had a gap too.** When pages arrived as fast as the clients could
   open them, about 14,000 a second, combd was killed for memory in two of
-  four tries before its guard caught up. At 1,000 a second it refused
-  cleanly in four of five tries; the fifth, with other tests sharing the
-  machine, was killed at 114,000. It's on our list.
+  four tries before its guard caught up. We fixed it: it now measures its
+  memory as connections arrive, freezes idle sessions at once under
+  pressure, and leaves more room for the kernel's socket buffers. Since
+  then, six bursts and four idle runs ended with combd refusing new pages,
+  never killed. The price is the idle number: about 152,000 pages, where
+  it held 156,000 before.
 
 ## Try it
 

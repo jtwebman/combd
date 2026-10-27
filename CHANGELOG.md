@@ -9,17 +9,31 @@ The first release: Durable Objects on your own machines, as one binary.
   in a few commands (`docs/quickstart.md`).
 - `combd-sdk`, a Rust crate for apps: a request in, a response out
   (`cell!`), each durable object's own SQLite (`sql::run`, one
-  transaction a request), alarms, calls between processes, and its panics
-  in the node's log.
+  transaction a request), Postgres through the node's pool (`pg::query`),
+  alarms, calls between processes, and its panics in the node's log.
+- `examples/x`: an X clone on Postgres (users, posts, follows, likes, a
+  home timeline), with a check of every route.
 - `combd.toml`: stateless processes, durable objects (one per id), a
   process per WebSocket, event cells, Postgres pools, vars, and secrets.
+- Postgres pools as most pools work (PgBouncer's transaction mode,
+  Postgrex, Rails): a pooled statement's connection isn't reset after it,
+  so what it changes in the session (a `SET`) stays for the statements
+  after it on that connection; undo it in the app. A session (`pg_open`)
+  is reset when it ends.
+- A pooled statement waits in a line per pool on each node, and whichever
+  connection is free takes the next: no thread between them, so a big
+  machine isn't held to what one bookkeeping thread can pass along.
+  A session waiting for a whole connection goes first. The line
+  (`work.rs`) knows nothing of Postgres: another database's pool can use
+  it as it is.
 
 **The runtime**
 - WebAssembly cells on combd's own engine: an interpreter, or compiled
   ahead of time to machine code through safe Rust, built by builders and
   signed. No JavaScript engine.
 - Preemptive, fair scheduling: a cell stuck in a loop costs its neighbors
-  microseconds. A cell that crashes restarts clean; its request rolls
+  microseconds. A compiled cell waiting on Postgres or another process is
+  paused, not blocking its loop. A cell that crashes restarts clean; its request rolls
   back.
 - Sessions that sleep: an idle WebSocket costs about 2 KB in combd.
 - An overload guard: past 80% of its memory a node reclaims, past 90% it

@@ -2,13 +2,13 @@
 
 Status: hardening before we tell people about it. A working runtime,
 live on a three-node fleet of $6 droplets (the arena and million).
-Updated: 2026-10-24
+Updated: 2026-10-26
 
 This plan was written before we built anything. Most of it held up. Where
 building taught us something, the section below says what changed and why,
 and the rest of the plan is updated to match.
 
-## Where we are, and what's next (2026-10-24)
+## Where we are, and what's next (2026-10-26)
 
 **Done in the hardening round** (the order we agreed: 1, 2, 4, then 3):
 1. **Updates that never take an app down.** A node moves to a new combd
@@ -104,7 +104,34 @@ and the rest of the plan is updated to match.
    pressure, reclaim at 80% and refuse at 90%; 0 kills in 6 bursts, the
    cgroup's peak never at its limit; RESULTS.md, "The memory guard under a
    burst").
-6. **The X clone on Postgres**, v0.1's last item.
+6. **The X clone on Postgres**, v0.1's last item. Scope (JT, 2026-10-26):
+   posts and a home timeline, follows, likes; no live updates, no auth.
+   **Done (2026-10-26):**
+   - Compiled cells in release builds (aot-lite) wait on Postgres and
+     `call`: a call of a module that imports them runs on a fiber
+     (`combd-load`'s `fiber`); million's page is compiled now too
+     (`/api/count` 37,000 to 101,000 req/s). `combd_sdk::pg::query`.
+   - `examples/x` (+ `check.sh`), `examples/x-phoenix`,
+     `examples/x-workers`; the race, `bench/x/` (README: how it's kept
+     apples to apples). combd leads Phoenix by 12% to 40% at every level
+     (RESULTS.md, "The X race on Postgres"); the Workers are held by a
+     connection per request, even with PgBouncer in Hyperdrive's place.
+   - What it found in combd, fixed: the pool slowed as it grew; every ask
+     went to the manager and was cancelled; the SDK's JSON went through
+     `Display`; pooled statements were reset after each (now not, as
+     Postgrex, Rails, PgBouncer: JT's call, documented in pg.rs, the SDK,
+     the CHANGELOG); one agent thread passed every statement along (now a
+     line per pool, `work.rs`, database-agnostic, that members take from;
+     a waiting session goes first). Loop wakers write once per wake-up.
+     Threads are named by role (`loop-N`, `pg-agent`, `pg-conn`).
+   Left:
+   - Whether the X race goes in the launch post (JT).
+   - Phoenix keeps the shorter p99 at 100 connections (23 ms to 29 to 37).
+   - Show the agent's ceiling gone on a big machine (here Postgres runs out
+     first): a many-core box, combd and Postgres apart.
+   - `processes_call_and_send_on_aot` and `an_app_of_processes_on_aot` fail
+     on aot-guard (their apps' modules are interpreted on an AOT-only
+     engine); nothing runs them.
 7. **JavaScript: `@combd/js`**, a Workers-compatible library over
    combd's host (`fetch` handler, Request/Response, `DurableObject`,
    `storage.sql`, WebSockets; it answers to `cloudflare:workers`), on a
