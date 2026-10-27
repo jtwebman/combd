@@ -1,0 +1,32 @@
+req race, 2026-10-26, run a: four servers, million's page interpreted on combd (its manifest then)
+docker 29.9.2 linux/arm64, 8 CPUs, 16746086400 bytes for docker; 75e0e89
+bench-click-combd sha256:5e76607a267c
+bench-click-workerd sha256:f0e63baa07c8
+bench-click-celld sha256:c907c7895529
+bench-click-celld-object sha256:9328b4ccb542
+bench-click-celld-worker sha256:8b7b47131c61
+bench-click-phoenix sha256:0f0d03f05211
+combd           req    10 conns  GET /             76185 req/s  p50 100.00us  p99 180.00us  errors      0  memory    7 MiB peak  cpu  99% avg 
+combd           req    10 conns  GET /api/count    30362 req/s  p50 250.00us  p99 409.00us  errors      0  memory    6 MiB peak  cpu  99% avg 
+phoenix         req    10 conns  GET /             40781 req/s  p50 185.00us  p99 426.00us  errors      0  memory   68 MiB peak  cpu  99% avg 
+phoenix         req    10 conns  GET /api/count    50375 req/s  p50 152.00us  p99 282.00us  errors      0  memory   67 MiB peak  cpu 100% avg 
+workerd         req    10 conns  GET /             26437 req/s  p50 218.00us  p99 102.69ms  errors      0  memory  765 MiB peak  cpu 100% avg 
+workerd         req    10 conns  GET /api/count    16981 req/s  p50 348.00us  p99 269.72ms  errors      0  memory  734 MiB peak  cpu 100% avg 
+celld           req    10 conns  GET /             24446 req/s  p50 298.00us  p99  12.48ms  errors      0  memory  127 MiB peak  cpu 100% avg 
+celld           req    10 conns  GET /api/count    12201 req/s  p50 420.00us  p99  36.96ms  errors      0  memory  153 MiB peak  cpu  99% avg 
+combd           req   100 conns  GET /             76559 req/s  p50   1.26ms  p99   5.70ms  errors      0  memory   11 MiB peak  cpu  99% avg 
+combd           req   100 conns  GET /api/count    40333 req/s  p50   2.43ms  p99   3.48ms  errors      0  memory   10 MiB peak  cpu 100% avg 
+phoenix         req   100 conns  GET /             40703 req/s  p50   2.42ms  p99   3.15ms  errors      0  memory   56 MiB peak  cpu 100% avg 
+phoenix         req   100 conns  GET /api/count    59031 req/s  p50   1.68ms  p99   2.15ms  errors      0  memory   56 MiB peak  cpu 100% avg 
+workerd         req   100 conns  GET /             26716 req/s  p50   2.43ms  p99    2.60s  errors     28  memory  644 MiB peak  cpu 100% avg 
+workerd         req   100 conns  GET /api/count    15952 req/s  p50   3.28ms  p99    7.65s  errors      9  memory  622 MiB peak  cpu 100% avg 
+celld           req   100 conns  GET /             23795 req/s  p50   3.67ms  p99  17.45ms  errors      0  memory   67 MiB peak  cpu 100% avg 
+celld           req   100 conns  GET /api/count    13316 req/s  p50   5.26ms  p99  43.19ms  errors      0  memory   73 MiB peak  cpu 100% avg 
+combd           req  1000 conns  GET /             67355 req/s  p50  14.67ms  p99  17.53ms  errors      0  memory   52 MiB peak  cpu 100% avg 
+combd           req  1000 conns  GET /api/count    37113 req/s  p50  26.89ms  p99  30.57ms  errors      0  memory   51 MiB peak  cpu 100% avg 
+phoenix         req  1000 conns  GET /             36882 req/s  p50  26.79ms  p99  33.04ms  errors      0  memory   98 MiB peak  cpu 100% avg 
+phoenix         req  1000 conns  GET /api/count    46301 req/s  p50  21.56ms  p99  25.83ms  errors      0  memory   96 MiB peak  cpu 100% avg 
+workerd         req  1000 conns  GET /             20782 req/s  p50  28.66ms  p99 156.40ms  errors      0  memory  712 MiB peak  cpu 100% avg 
+workerd         req  1000 conns  GET /api/count    13746 req/s  p50  46.51ms  p99 227.05ms  errors      0  memory  708 MiB peak  cpu 100% avg 
+celld           req  1000 conns  GET /             22692 req/s  p50  21.15ms  p99 182.75ms  errors      0  memory   92 MiB peak  cpu 100% avg 
+celld           req  1000 conns  GET /api/count    10524 req/s  p50  97.61ms  p99 175.15ms  errors      0  memory  150 MiB peak  cpu 100% avg 

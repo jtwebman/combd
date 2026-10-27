@@ -1,0 +1,14 @@
+req race, 2026-10-26: combd alone, million's page compiled (engine = "compiled" for web, now that compiled cells wait on call; uncommitted tree on 75e0e89), run a
+docker 29.9.2 linux/arm64, 8 CPUs, 16746086400 bytes for docker; 75e0e89
+bench-click-combd sha256:215b22d72b85
+bench-click-workerd sha256:cca11de3beec
+bench-click-celld sha256:932a6398e3ac
+bench-click-celld-object sha256:a4a0f2875dfe
+bench-click-celld-worker sha256:a31630bc24af
+bench-click-phoenix sha256:a080a14dde51
+combd           req    10 conns  GET /             94336 req/s  p50  78.00us  p99 149.00us  errors      0  memory   15 MiB peak  cpu 100% avg 
+combd           req    10 conns  GET /api/count    66570 req/s  p50 115.00us  p99 213.00us  errors      0  memory   14 MiB peak  cpu 100% avg 
+combd           req   100 conns  GET /             92758 req/s  p50   1.03ms  p99   1.89ms  errors      0  memory   24 MiB peak  cpu  99% avg 
+combd           req   100 conns  GET /api/count   100538 req/s  p50   0.96ms  p99   1.49ms  errors      0  memory   24 MiB peak  cpu 100% avg 
+combd           req  1000 conns  GET /             72982 req/s  p50  13.54ms  p99  16.82ms  errors      0  memory  106 MiB peak  cpu 100% avg 
+combd           req  1000 conns  GET /api/count    71842 req/s  p50  13.84ms  p99  17.51ms  errors      0  memory  105 MiB peak  cpu 100% avg 

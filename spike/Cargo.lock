@@ -218,6 +218,7 @@ name = "combd-load"
 version = "0.0.0"
 dependencies = [
  "combd-aot",
+ "corosensei",
  "libc",
 ]
 

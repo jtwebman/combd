@@ -3,8 +3,9 @@ name = "combd-load"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Loading a compiled module's build into a running node: combd's unsafe code for the AOT tier's builds."
+description = "Loading a compiled module's build into a running node, and pausing its calls that wait on the host: combd's unsafe code for the AOT tier's builds."
 
 [dependencies]
 libc = "0.2"
+corosensei = "0.3.4"
 combd-aot = { path = "../aot", default-features = false }

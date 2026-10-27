@@ -13,6 +13,10 @@
 //!
 //! A loaded build stays loaded (and its `Compiled` lives) for as long as
 //! the process does.
+//!
+//! `fiber`: the lite build's way to pause a call that waits on the host.
+
+pub mod fiber;
 
 use combd_aot::Compiled;
 use std::ffi::{CStr, CString};

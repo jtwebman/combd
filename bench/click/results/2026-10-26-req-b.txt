@@ -1,0 +1,33 @@
+req race, 2026-10-26, run b: four servers, million's page interpreted on combd (its manifest then)
+the 1000-connection level of this run had the machine busy (a docker pull and build beside it): Phoenix's /api/count, workerd and celld below 100% CPU and at half run a's rate; run a's are the ones to use.
+docker 29.9.2 linux/arm64, 8 CPUs, 16746086400 bytes for docker; 75e0e89
+bench-click-combd sha256:5e76607a267c
+bench-click-workerd sha256:f0e63baa07c8
+bench-click-celld sha256:c907c7895529
+bench-click-celld-object sha256:9328b4ccb542
+bench-click-celld-worker sha256:8b7b47131c61
+bench-click-phoenix sha256:0f0d03f05211
+combd           req    10 conns  GET /             78554 req/s  p50  98.00us  p99 156.00us  errors      0  memory    7 MiB peak  cpu 100% avg 
+combd           req    10 conns  GET /api/count    31436 req/s  p50 243.00us  p99 378.00us  errors      0  memory    6 MiB peak  cpu 100% avg 
+phoenix         req    10 conns  GET /             43587 req/s  p50 177.00us  p99 313.00us  errors      0  memory   53 MiB peak  cpu 100% avg 
+phoenix         req    10 conns  GET /api/count    50031 req/s  p50 153.00us  p99 254.00us  errors      0  memory   53 MiB peak  cpu 100% avg 
+workerd         req    10 conns  GET /             26592 req/s  p50 219.00us  p99  96.86ms  errors      0  memory  641 MiB peak  cpu 100% avg 
+workerd         req    10 conns  GET /api/count    17539 req/s  p50 325.00us  p99 220.96ms  errors      0  memory  615 MiB peak  cpu 100% avg 
+celld           req    10 conns  GET /             25090 req/s  p50 294.00us  p99  11.92ms  errors      0  memory   60 MiB peak  cpu 100% avg 
+celld           req    10 conns  GET /api/count    12548 req/s  p50 408.00us  p99  37.16ms  errors      0  memory   85 MiB peak  cpu  99% avg 
+combd           req   100 conns  GET /             74115 req/s  p50   1.32ms  p99   1.98ms  errors      0  memory   11 MiB peak  cpu 100% avg 
+combd           req   100 conns  GET /api/count    37138 req/s  p50   2.56ms  p99   4.61ms  errors      0  memory   11 MiB peak  cpu 100% avg 
+phoenix         req   100 conns  GET /             40578 req/s  p50   2.40ms  p99   3.71ms  errors      0  memory   57 MiB peak  cpu 100% avg 
+phoenix         req   100 conns  GET /api/count    59634 req/s  p50   1.64ms  p99   2.53ms  errors      0  memory   56 MiB peak  cpu 100% avg 
+workerd         req   100 conns  GET /             25425 req/s  p50   3.11ms  p99    3.35s  errors      1  memory  643 MiB peak  cpu 100% avg 
+workerd         req   100 conns  GET /api/count    14618 req/s  p50   3.73ms  p99    5.64s  errors     96  memory  636 MiB peak  cpu 100% avg 
+celld           req   100 conns  GET /             20725 req/s  p50   4.03ms  p99  19.21ms  errors      0  memory   66 MiB peak  cpu 100% avg 
+celld           req   100 conns  GET /api/count    13079 req/s  p50   5.36ms  p99  43.11ms  errors      0  memory  105 MiB peak  cpu 100% avg 
+combd           req  1000 conns  GET /             62215 req/s  p50  15.91ms  p99  19.25ms  errors      0  memory   52 MiB peak  cpu 100% avg 
+combd           req  1000 conns  GET /api/count    34946 req/s  p50  27.52ms  p99  48.27ms  errors      0  memory   50 MiB peak  cpu 100% avg 
+phoenix         req  1000 conns  GET /             33672 req/s  p50  28.11ms  p99  53.95ms  errors      0  memory  105 MiB peak  cpu 100% avg 
+phoenix         req  1000 conns  GET /api/count    26300 req/s  p50  34.95ms  p99  77.93ms  errors      0  memory  108 MiB peak  cpu  97% avg 
+workerd         req  1000 conns  GET /              6905 req/s  p50  52.08ms  p99 776.63ms  errors      0  memory  789 MiB peak  cpu  94% avg 
+workerd         req  1000 conns  GET /api/count     9656 req/s  p50  44.80ms  p99    3.74s  errors    640  memory  786 MiB peak  cpu  94% avg 
+celld           req  1000 conns  GET /             10521 req/s  p50 109.48ms  p99 287.30ms  errors      0  memory  169 MiB peak  cpu  97% avg 
+celld           req  1000 conns  GET /api/count     6899 req/s  p50 121.28ms  p99 384.20ms  errors      0  memory  203 MiB peak  cpu  94% avg 

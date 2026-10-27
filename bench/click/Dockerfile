@@ -5,8 +5,8 @@
 # bench-click-combd is also the load client (ws-click).
 
 # combd as the nodes run it (aot-lite, as examples/arena/Dockerfile), with
-# million's chunks and viewers compiled here (aot-build, the builder's
-# command) and its page interpreted, as its manifest says.
+# million's modules compiled here (aot-build, the builder's command), as its
+# manifest says (the page's copy is the same module: one build).
 FROM rust:1.99.1-slim-bookworm AS combd-build
 RUN rustup target add wasm32-unknown-unknown
 ENV CARGO_HTTP_MULTIPLEXING=false CARGO_NET_RETRY=10
