@@ -51,6 +51,11 @@ The first release: Durable Objects on your own machines, as one binary.
 - Builders hold no bucket credentials: one asks any node's admin API for
   work and sends back what it built (`COMBD_FLEET`), each request signed
   with its builder key, which the nodes must list.
+- Or pushed to: `combd builder serve` builds each job while its request
+  waits, so it can scale to zero and build many at once (Cloud Run). The
+  node that claims a job sends it (`COMBD_BUILDER_PUSH`), signed with the
+  nodes' push key, which the builder must list; a push that fails is sent
+  again on the next ask.
 - `combd deploy` (and status, rollback, vars, secrets) to a node with a
   public certificate needs only `COMBD_TOKEN`: the fleet's CA is for a
   fleet with its own.

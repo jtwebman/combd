@@ -274,12 +274,12 @@ fn handle(s: &mut (impl Read + Write), raw: &std::net::TcpStream, cfg: &AdminCfg
     }
 }
 
-type Refused = (u16, Json);
+pub type Refused = (u16, Json);
 
 /// One request: method, path, its `authorization`, body (at most a bundle's
 /// size). `check` sees the method, path, and `authorization` first; if it
 /// refuses, no body is read.
-fn read_request(s: &mut impl Read, check: impl Fn(&str, &str, Option<&str>) -> Result<(), Refused>) -> Result<Result<(String, String, Option<String>, Vec<u8>), Refused>, String> {
+pub fn read_request(s: &mut impl Read, check: impl Fn(&str, &str, Option<&str>) -> Result<(), Refused>) -> Result<Result<(String, String, Option<String>, Vec<u8>), Refused>, String> {
     let mut buf = vec![];
     let mut chunk = [0u8; 16 * 1024];
     loop {
@@ -425,9 +425,20 @@ pub fn request(url: &str, tls: Option<(&Arc<rustls::ClientConfig>, &str)>, token
 
 /// The same, with `auth` as the whole `authorization` header (a builder's).
 pub fn request_as(url: &str, tls: Option<(&Arc<rustls::ClientConfig>, &str)>, auth: &str, method: &str, path: &str, body: &[u8]) -> Result<(u16, Json), String> {
+    request_for(std::time::Duration::from_secs(120), url, tls, auth, method, path, body)
+}
+
+/// The same, waiting up to `wait` for the answer (a build takes minutes).
+pub fn request_for(wait: std::time::Duration, url: &str, tls: Option<(&Arc<rustls::ClientConfig>, &str)>, auth: &str, method: &str, path: &str, body: &[u8]) -> Result<(u16, Json), String> {
     let hostport = url.split_once("://").map_or(url, |(_, r)| r).trim_end_matches('/');
-    let s = std::net::TcpStream::connect(hostport).map_err(|e| format!("{hostport}: {e}"))?;
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(120)));
+    // No port: the scheme's (a Cloud Run URL has none).
+    let port = match (hostport.contains(':'), url.starts_with("https://")) {
+        (true, _) => "",
+        (false, true) => ":443",
+        (false, false) => ":80",
+    };
+    let s = std::net::TcpStream::connect(format!("{hostport}{port}")).map_err(|e| format!("{hostport}: {e}"))?;
+    let _ = s.set_read_timeout(Some(wait));
     let head = format!("{method} {path} HTTP/1.1\r\nhost: {hostport}\r\nauthorization: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
     let mut out = vec![];
     let go = |s: &mut dyn ReadWrite, out: &mut Vec<u8>| -> std::io::Result<()> {

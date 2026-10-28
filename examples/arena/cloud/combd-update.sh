@@ -7,6 +7,9 @@ URL=$(sed -n 's/^COMBD_RELEASE=//p' /etc/combd/update)
 URL=${URL:-https://github.com/jtwebman/combd/releases/download/arena}
 N=$(sed -n 's/^COMBD_NODE=//p' /etc/combd/env)
 SEEN=/var/lib/combd-update.seen
+# One run at a time: builds-ready waits for builds it pushed, past the next
+# minute's run.
+exec 9>/run/combd-update.lock && flock -n 9 || exit 0
 # The note, signed by CI's release key (cloud/release.pub, here as
 # /etc/combd/release.pub): nothing unsigned is fetched, let alone run.
 NOTE=$(mktemp) && SIG=$(mktemp) && trap 'rm -f "$NOTE" "$SIG" "$T"' EXIT

@@ -11,9 +11,20 @@
 //! _combd/builders/<id>                   a builder: its pin, CPUs, and when it last looked
 //! ```
 //!
-//! Builders don't touch the bucket: they ask a node's admin API for work and
-//! send back what they built (`POST /v1/builds/next`, `/v1/builds/done`),
-//! each request signed with their key, which the nodes must list.
+//! Builders don't touch the bucket. Two ways to get them work:
+//! - Pull (`combd builder`): a builder asks a node's admin API for work and
+//!   sends back what it built (`POST /v1/builds/next`, `/v1/builds/done`),
+//!   each request signed with its key, which the nodes must list.
+//! - Push (`combd builder serve`): the node that claims a job sends it to
+//!   the builder (`COMBD_BUILDER_PUSH`, `POST /build`) and writes what comes
+//!   back. One build per request, so a host like Cloud Run (one request an
+//!   instance) builds many at once and scales to zero.
+//!   Each push is signed with the nodes' push key (`COMBD_PUSH_KEY`), which
+//!   the builder must list (`COMBD_PUSH_KEYS`): no shared secret, and the
+//!   key that signs builds stays on the builder.
+//! A build is loaded only with a listed builder's signature either way. A builder builds for its own pin only: move it before the
+//! nodes. A push of another pin's job is turned away (409) and sent again
+//! later, not failed.
 //!
 //! `<pin>` is a short hash of what the build has to match (rustc, combd-aot,
 //! the target: see combd-aot's `PIN`), `<m>` the module's hash. A build is
@@ -195,10 +206,139 @@ impl Builds {
     }
 }
 
-/// Ask for a build of `wasm` for `pin` and `cpu` (once: the job is the module).
+/// Ask for a build of `wasm` for `pin` and `cpu` (once: the job is the module),
+/// and push it to the builder if there's one to push to.
 pub fn want(s3: &S3, pin: &str, cpu: &str, wasm: &[u8]) -> Result<(), String> {
     s3.put(&key(pin, cpu, &module_id(wasm), "wasm"), wasm, &Cond::IfAbsent).map_err(|e| e.to_string())?.ok();
+    if let Ok(url) = std::env::var("COMBD_BUILDER_PUSH") {
+        push(s3, &url, &std::env::var("COMBD_PUSH_KEY").unwrap_or_default(), pin, cpu, wasm);
+    }
     Ok(())
+}
+
+/// Pushes from this process: (the job's claim, when it was sent, its thread).
+type Pushes = Vec<(String, std::time::Instant, std::thread::JoinHandle<()>)>;
+static PUSHING: std::sync::Mutex<Pushes> = std::sync::Mutex::new(Vec::new());
+/// At most this many builds at once from one process.
+const PUSHES: usize = 4;
+/// A job isn't pushed again sooner than this after it was (it's asked for
+/// every few seconds while a deploy waits).
+const PUSH_AGAIN: Duration = Duration::from_secs(30);
+/// How long a pushed build may take, a cold start included: under
+/// `CLAIM_STALE_MS`, so no one takes the job from a push still waiting.
+const PUSH_WAIT: Duration = Duration::from_secs(14 * 60);
+
+/// Push a job to the builder at `url`, off the caller's thread, if this
+/// process can claim it: the claim makes the push the job's only one, and
+/// if this node dies its claim goes stale and another sends it. On a
+/// timeout, a refusal, or a builder of another pin, the claim is let go and
+/// the next ask sends it again; a module that can't be built is the job's
+/// answer (`.err`), as from a pull.
+fn push(s3: &S3, url: &str, key_file: &str, pin: &str, cpu: &str, wasm: &[u8]) {
+    let m = module_id(wasm);
+    let k = key(pin, cpu, &m, "claim");
+    let mut p = PUSHING.lock().unwrap();
+    p.retain(|(_, at, h)| !h.is_finished() || at.elapsed() < PUSH_AGAIN);
+    if p.iter().filter(|(_, _, h)| !h.is_finished()).count() >= PUSHES || p.iter().any(|(j, ..)| *j == k) {
+        return;
+    }
+    let (s3, url, key_file, pin, cpu, wasm, k2) = (s3.clone(), url.to_string(), key_file.to_string(), pin.to_string(), cpu.to_string(), wasm.to_vec(), k.clone());
+    let h = std::thread::spawn(move || {
+        let k = k2;
+        let signer = match load_key(Path::new(&key_file)) {
+            Ok(key) => key,
+            Err(e) => return eprintln!("builds    can't push to {url}: COMBD_PUSH_KEY: {e}"),
+        };
+        if !claim(&s3, &k, "push") {
+            return;
+        }
+        let body = serde_json::json!({ "pin": pin, "cpu": cpu, "module": m, "wasm": hex(&wasm) }).to_string().into_bytes();
+        let tls = crate::s3::tls_config();
+        let host = url.split_once("://").map_or(url.as_str(), |(_, r)| r).split([':', '/']).next().unwrap_or("").to_string();
+        let tls = url.starts_with("https://").then_some((&tls, host.as_str()));
+        let saved = match crate::admin::request_for(PUSH_WAIT, &url, tls, &sign_request(&signer, "POST", "/build", &body), "POST", "/build", &body) {
+            Ok((200, v)) => match (v["error"].as_str(), unhex(v["so"].as_str().unwrap_or(""))) {
+                (Some(e), _) => done(&s3, &pin, &cpu, &m, Err(e)),
+                (None, Some(so)) if !so.is_empty() => done(&s3, &pin, &cpu, &m, Ok((&so, v["sig"].as_str().unwrap_or("")))),
+                _ => Err("its answer has no build".into()),
+            },
+            Ok((status, v)) => Err(format!("{status}: {}", v["error"].as_str().unwrap_or("?"))),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = saved {
+            eprintln!("builds    {m} for {cpu}: the builder at {url}: {e} (sent again on the next ask)");
+            let _ = s3.delete(&k);
+        }
+    });
+    p.push((k, std::time::Instant::now(), h));
+}
+
+/// Wait for this process's pushes (before it exits: `builds-ready`).
+pub fn pushed() {
+    let hs: Vec<_> = PUSHING.lock().unwrap().drain(..).map(|(.., h)| h).collect();
+    for h in hs {
+        let _ = h.join();
+    }
+}
+
+/// Build one job: the answer a builder sends back, pushed or pulled
+/// (`pin`, `cpu`, `module`, and the build and its signature, or why not).
+fn build_job(key: &Ed25519KeyPair, aot: &Path, work: &Path, pin: &str, cpu: &str, m: &str, wasm: &str) -> serde_json::Value {
+    let r = unhex(wasm).ok_or_else(|| "the job's Wasm isn't hex".to_string()).and_then(|wasm| {
+        let out = work.join(format!("{m}-{cpu}.so"));
+        let level = (cpu != "generic").then_some(cpu);
+        crate::build::build(&wasm, aot, work, &out, None, level)?;
+        std::fs::read(&out).map_err(|e| e.to_string())
+    });
+    match &r {
+        Ok(so) => serde_json::json!({ "pin": pin, "cpu": cpu, "module": m, "so": hex(so), "sig": hex(key.sign(&signed(pin, cpu, m, so)).as_ref()) }),
+        Err(e) => serde_json::json!({ "pin": pin, "cpu": cpu, "module": m, "error": e }),
+    }
+}
+
+/// A push builder (`combd builder serve`): `POST /build`, signed by a push
+/// key in `keys`, `{pin, cpu, module, wasm}`, built while the request waits, one at
+/// a time; a job for another pin is turned away (409), for the node to
+/// send again (once this builder's moved, or to another).
+pub fn serve(l: std::net::TcpListener, keys: &[Vec<u8>], key: &Ed25519KeyPair, aot: &Path, work: &Path) {
+    let pin = pin_id(combd_aot::PIN);
+    eprintln!("builder   building for {:?} ({pin}), for what's pushed to {}", combd_aot::PIN, l.local_addr().map(|a| a.to_string()).unwrap_or_default());
+    for s in l.incoming().flatten() {
+        let mut s = s;
+        let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+        // The key and the time on the headers, before the body is read; the
+        // signature over the body after.
+        let check = |method: &str, path: &str, auth: Option<&str>| match (method, path) {
+            ("POST", "/build") if check_request(keys, auth.unwrap_or(""), method, path, None) => Ok(()),
+            ("POST", "/build") => Err((401, serde_json::json!({ "error": "want Authorization: Builder <key> <ms> <signature>, from a push key this builder lists" }))),
+            _ => Err((404, serde_json::json!({ "error": "POST /build" }))),
+        };
+        let (status, answer) = match crate::admin::read_request(&mut s, check) {
+            Ok(Ok((_, _, auth, body))) if !check_request(keys, auth.as_deref().unwrap_or(""), "POST", "/build", Some(&body)) => (401, serde_json::json!({ "error": "not signed by a push key this builder lists" })),
+            Ok(Ok((.., body))) => match serde_json::from_slice::<serde_json::Value>(&body) {
+                Ok(j) if j["pin"].as_str() != Some(pin.as_str()) => (409, serde_json::json!({ "error": format!("this builder builds for {pin}") })),
+                Ok(j) => {
+                    let (cpu, m) = (j["cpu"].as_str().unwrap_or(""), j["module"].as_str().unwrap_or(""));
+                    match (part(cpu), part(m)) {
+                        (Ok(cpu), Ok(m)) => {
+                            let a = build_job(key, aot, work, &pin, cpu, m, j["wasm"].as_str().unwrap_or(""));
+                            match a["error"].as_str() {
+                                Some(e) => eprintln!("builder   {m} for {cpu} failed: {e}"),
+                                None => eprintln!("builder   built {m} for {cpu} ({} KB)", a["so"].as_str().map_or(0, |h| h.len() / 2048)),
+                            }
+                            (200, a)
+                        }
+                        (Err(e), _) | (_, Err(e)) => (400, serde_json::json!({ "error": e })),
+                    }
+                }
+                Err(_) => (400, serde_json::json!({ "error": "want {\"pin\", \"cpu\", \"module\", \"wasm\"}" })),
+            },
+            Ok(Err((status, e))) => (status, e),
+            Err(e) => (400, serde_json::json!({ "error": e })),
+        };
+        let body = answer.to_string();
+        let _ = std::io::Write::write_all(&mut s, format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes());
+    }
 }
 
 /// Every (pin, CPU) the fleet's nodes run, from their records.
@@ -405,19 +545,11 @@ pub fn builder(fleet: &str, id: &str, key: &Ed25519KeyPair, aot: &Path, work: &P
         let job = job.ok().filter(|v| v["job"].is_object());
         if let Some(j) = &job {
             let (cpu, m) = (j["job"]["cpu"].as_str().unwrap_or(""), j["job"]["module"].as_str().unwrap_or(""));
-            let r = unhex(j["job"]["wasm"].as_str().unwrap_or("")).ok_or_else(|| "the job's Wasm isn't hex".to_string()).and_then(|wasm| {
-                let out = work.join(format!("{m}-{cpu}.so"));
-                let level = (cpu != "generic").then_some(cpu);
-                crate::build::build(&wasm, aot, work, &out, None, level)?;
-                std::fs::read(&out).map_err(|e| e.to_string())
-            });
-            let answer = match &r {
-                Ok(so) => serde_json::json!({ "pin": pin, "cpu": cpu, "module": m, "so": hex(so), "sig": hex(key.sign(&signed(&pin, cpu, m, so)).as_ref()) }),
-                Err(e) => serde_json::json!({ "pin": pin, "cpu": cpu, "module": m, "error": e }),
-            };
-            match (call("/v1/builds/done", answer), &r) {
-                (Ok(_), Ok(so)) => eprintln!("builder   {id}: built {m} for {cpu} ({} KB)", so.len() / 1024),
-                (Ok(_), Err(e)) => eprintln!("builder   {id}: {m} for {cpu} failed: {e}"),
+            let answer = build_job(key, aot, work, &pin, cpu, m, j["job"]["wasm"].as_str().unwrap_or(""));
+            let (kb, failed) = (answer["so"].as_str().map_or(0, |h| h.len() / 2048), answer["error"].as_str().map(String::from));
+            match (call("/v1/builds/done", answer), failed) {
+                (Ok(_), None) => eprintln!("builder   {id}: built {m} for {cpu} ({kb} KB)"),
+                (Ok(_), Some(e)) => eprintln!("builder   {id}: {m} for {cpu} failed: {e}"),
                 // Its claim goes stale, and it (or another) builds it again.
                 (Err(e), _) => eprintln!("builder   {id}: built {m} for {cpu}, but couldn't send it: {e}"),
             }
@@ -494,6 +626,70 @@ mod tests {
         assert!(!check_request(&keys, &old, "POST", "/v1/builds/next", Some(b"body")), "signed too long ago");
         assert!(!check_request(&keys, "Bearer combd_x", "POST", "/v1/builds/next", None));
         assert!(part("../x").is_err() && part("").is_err() && part("x86-64-v3").is_ok());
+    }
+
+    /// A push builder builds only what a node it lists signed, over this
+    /// very body, for its own pin: anything else is turned away before a
+    /// build starts.
+    #[test]
+    fn a_push_builder_takes_only_its_nodes_signed_jobs_for_its_pin() {
+        let dir = crate::store::tempdir::Dir::new();
+        let nodes = vec![unhex(&new_key(&dir.0.join("node")).unwrap()).unwrap()];
+        new_key(&dir.0.join("builder")).unwrap();
+        new_key(&dir.0.join("stranger")).unwrap();
+        let (node, stranger, builder) = (load_key(&dir.0.join("node")).unwrap(), load_key(&dir.0.join("stranger")).unwrap(), load_key(&dir.0.join("builder")).unwrap());
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let work = dir.0.clone();
+        std::thread::spawn(move || serve(l, &nodes, &builder, &work, &work));
+        let job = |pin: &str| serde_json::json!({ "pin": pin, "cpu": "x86-64-v3", "module": "m", "wasm": "00" }).to_string().into_bytes();
+        let ours = job(&pin_id(combd_aot::PIN));
+        let send = |auth: &str, body: &[u8]| crate::admin::request_as(&url, None, auth, "POST", "/build", body).unwrap().0;
+        assert_eq!(send("", &ours), 401, "unsigned");
+        assert_eq!(send(&sign_request(&stranger, "POST", "/build", &ours), &ours), 401, "a key it doesn't list");
+        assert_eq!(send(&sign_request(&node, "POST", "/build", &job("other")), &ours), 401, "signed over another body");
+        assert_eq!(send(&sign_request(&node, "POST", "/build", &job("other")), &job("other")), 409, "another pin: sent again later, not failed");
+    }
+
+    /// A pushed job's answer is written as a pull's would be (the build and
+    /// its signature, its claim let go); a builder of another pin leaves
+    /// the job unanswered and unclaimed, for the next ask.
+    #[test]
+    fn a_pushed_build_is_written_or_its_job_let_go() {
+        let Some(base) = S3::from_env() else {
+            return eprintln!("skipping: set COMBD_S3 to test pushes against a real bucket");
+        };
+        let s3 = S3 { bucket: format!("combd-test-push-{}-{}", std::process::id(), now_ms()), ..base };
+        s3.make_bucket().unwrap();
+        let dir = crate::store::tempdir::Dir::new();
+        new_key(&dir.0.join("node")).unwrap();
+        let keyf = dir.0.join("node").to_string_lossy().to_string();
+        // A builder that gives one answer, whatever it's sent.
+        let builder = |answer: String| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", l.local_addr().unwrap());
+            std::thread::spawn(move || {
+                let (mut s, _) = l.accept().unwrap();
+                let _ = crate::admin::read_request(&mut s, |_, _, _| Ok(()));
+                let _ = std::io::Write::write_all(&mut s, answer.as_bytes());
+            });
+            url
+        };
+        let reply = |status: u16, body: serde_json::Value| format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.to_string().len());
+        let got = |m: &str, ext: &str| s3.get(&key("p1", "x86-64-v3", m, ext)).unwrap().map(|(b, _)| b);
+
+        push(&s3, &builder(reply(200, serde_json::json!({ "so": hex(b"native"), "sig": "abcd" }))), &keyf, "p1", "x86-64-v3", b"one");
+        pushed();
+        let m = module_id(b"one");
+        assert_eq!(got(&m, "so").as_deref(), Some(&b"native"[..]));
+        assert_eq!(got(&m, "sig").as_deref(), Some(&b"abcd"[..]));
+        assert!(got(&m, "claim").is_none(), "its claim is let go");
+
+        push(&s3, &builder(reply(409, serde_json::json!({ "error": "this builder builds for another pin" }))), &keyf, "p1", "x86-64-v3", b"two");
+        pushed();
+        let m = module_id(b"two");
+        assert!(got(&m, "so").is_none() && got(&m, "err").is_none(), "another pin's builder doesn't answer the job");
+        assert!(got(&m, "claim").is_none(), "and the next ask may send it again");
     }
 
     /// A build already on the node is loaded only with a trusted builder's

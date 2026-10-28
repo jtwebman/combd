@@ -179,3 +179,31 @@ docker run -d --name watchtower --restart unless-stopped -v /var/run/docker.sock
 
 Until it has, nodes keep the combd they run (they wait for the new one's
 builds), so a late builder delays an update; it doesn't take an app down.
+
+**Push instead of pull**: `combd builder serve` waits for work instead of
+asking for it, and builds each job while its request waits, so it can scale
+to zero and build many at once (Cloud Run, one request an instance). The
+node that claims a job sends it (`COMBD_BUILDER_PUSH=https://<its URL>`),
+signed with the nodes' push key (`COMBD_PUSH_KEY`, made by `combd
+builder-key push.key`; the builder lists its public half in
+`COMBD_PUSH_KEYS`). Nothing is shared: the nodes hold the push key, the
+builder its builder key. A push that times out or fails is sent again on
+the next ask; a node that dies mid-push leaves a claim that goes stale in
+15 minutes. Both ways can run at once (they claim jobs the same way).
+
+A builder builds for its own combd only: move it before the nodes (it
+turns away another combd's jobs, and they're sent again once it matches).
+
+```sh
+gcloud run deploy combd-builder --image <combd-builder, in Artifact Registry> \
+  --command /combd/combd/target/release/combd --args builder,serve \
+  --concurrency 1 --timeout 15m --min-instances 0 --max-instances 4 --cpu 4 --memory 8Gi \
+  --allow-unauthenticated \
+  --set-env-vars COMBD_BUILDER_KEY=/keys/builder/key,COMBD_PUSH_KEYS=/keys/push/keys,COMBD_BUILD_WORK=/tmp/work \
+  --set-secrets /keys/builder/key=combd-builder-key:latest,/keys/push/keys=combd-push-keys:latest
+```
+
+`--allow-unauthenticated` lets the nodes reach it; the push signature is
+what lets them in. Each cold instance compiles combd's runtime once before
+its first build, so the first builds after a scale-up are
+slow.

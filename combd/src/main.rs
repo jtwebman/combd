@@ -903,7 +903,7 @@ An app:
 A node, or a fleet (see examples/arena/cloud for a whole one):
   combd serve-apps <engine> <root> <port>   every app under <root>/<org>/<app>/
   combd serve-fleet <engine> <port>         a fleet node (COMBD_* settings)
-  combd builder                             make compiled modules' builds for a fleet
+  combd builder [serve]                     make compiled modules' builds for a fleet (serve: pushed to it)
   engine: interp, aot (compiled), or both (each module as its manifest says)
 
 Deploying (to a node's admin port, with COMBD_TOKEN):
@@ -1256,18 +1256,37 @@ fn main_with(args: &[&str]) {
         // admin API, https://<name>:9443), for this binary's pin, signing
         // with COMBD_BUILDER_KEY, until killed. No bucket: the nodes have it.
         #[cfg(feature = "aot-lite")]
-        ["builder"] => {
-            let fleet = std::env::var("COMBD_FLEET").unwrap_or_else(|_| {
-                eprintln!("combd     builder: needs the fleet's admin API in COMBD_FLEET (https://<a node or the fleet's name>:9443)");
-                std::process::exit(1);
-            });
+        ["builder"] | ["builder", "serve"] => {
             let key = builds::load_key(std::path::Path::new(&std::env::var("COMBD_BUILDER_KEY").unwrap_or_else(|_| "builder.key".into()))).unwrap_or_else(|e| {
                 eprintln!("combd     builder: {e}");
                 std::process::exit(1);
             });
-            let id = std::env::var("COMBD_BUILDER_ID").unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_else(|_| "builder".into()));
             let aot = std::env::var_os("COMBD_AOT_SRC").map_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot"), Into::into);
             let work = std::env::var_os("COMBD_BUILD_WORK").map_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds"), Into::into);
+            if args.len() == 2 {
+                // Push: build what's sent to $PORT (as Cloud Run sets it), and
+                // answer; only what's signed by a node's push key it lists.
+                let keys = std::env::var("COMBD_PUSH_KEYS").map_err(|_| "needs the nodes' push keys: COMBD_PUSH_KEYS, a file of their public keys".to_string())
+                    .and_then(|f| std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}")))
+                    .map(|t| builds::parse_keys(&t))
+                    .and_then(|k| if k.is_empty() { Err("COMBD_PUSH_KEYS lists no keys".into()) } else { Ok(k) })
+                    .unwrap_or_else(|e| {
+                        eprintln!("combd     builder serve: {e}");
+                        std::process::exit(1);
+                    });
+                let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
+                let l = std::net::TcpListener::bind(format!("0.0.0.0:{port}")).unwrap_or_else(|e| {
+                    eprintln!("combd     builder serve: port {port}: {e}");
+                    std::process::exit(1);
+                });
+                builds::serve(l, &keys, &key, &aot, &work);
+                return;
+            }
+            let fleet = std::env::var("COMBD_FLEET").unwrap_or_else(|_| {
+                eprintln!("combd     builder: needs the fleet's admin API in COMBD_FLEET (https://<a node or the fleet's name>:9443)");
+                std::process::exit(1);
+            });
+            let id = std::env::var("COMBD_BUILDER_ID").unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_else(|_| "builder".into()));
             builds::builder(&fleet, &id, &key, &aot, &work, &std::sync::atomic::AtomicBool::new(false));
         }
         // Before an update: exit 0 if every compiled module the fleet runs is
@@ -1276,6 +1295,7 @@ fn main_with(args: &[&str]) {
         #[cfg(feature = "aot-lite")]
         ["builds-ready"] => {
             let r = s3::S3::from_env().ok_or_else(|| "no bucket (COMBD_S3)".to_string()).and_then(|s3| http::builds_ready(&s3, &http::Config::from_env().data));
+            builds::pushed();
             match r {
                 Ok(true) => println!("combd     builds-ready: every compiled module is built for {}", builds::pin_id(combd_aot::PIN)),
                 Ok(false) => {
@@ -3209,6 +3229,17 @@ mod tests {
         for k in bucket.list("_combd/builds/").unwrap() {
             bucket.delete(&k).unwrap();
         }
+        // This time the builder is pushed to (`combd builder serve`): the
+        // node that claims a job sends it, signed with the nodes' push key.
+        let push_public = builds::new_key(&dir.0.join("push.key")).unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::env::set_var("COMBD_BUILDER_PUSH", format!("http://{}", l.local_addr().unwrap()));
+        std::env::set_var("COMBD_PUSH_KEY", dir.0.join("push.key"));
+        let key = builds::load_key(&dir.0.join("builder.key")).unwrap();
+        std::thread::spawn(move || {
+            let (aot, work) = (std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot"), std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds"));
+            builds::serve(l, &builds::parse_keys(&push_public), &key, &aot, &work)
+        });
         // What combd-update asks a new binary before a node moves to it: not
         // yet (and the build is asked for), from node 0's copy of the catalog.
         assert_eq!(http::builds_ready(&bucket, &dir.0.join("d0")), Ok(false), "no builds: not ready");
@@ -3217,11 +3248,9 @@ mod tests {
         start(2, ports[2], "builds2");
         assert!(eventually(60_000, || std::net::TcpStream::connect(("127.0.0.1", ports[2])).is_ok()), "node 2 is up");
         assert_eq!(http_to(ports[2], "fast.test", "POST", "/room/r/incr", "").0, 404, "not live on it while it builds");
-        let stop = Arc::new(AtomicBool::new(false));
-        builder(&stop);
-        assert!(eventually(300_000, || http_to(ports[2], "fast.test", "POST", "/room/r/incr", "").0 == 200), "live on it once built");
+        assert!(eventually(300_000, || http_to(ports[2], "fast.test", "POST", "/room/r/incr", "").0 == 200), "live on it once built (pushed)");
         assert_eq!(http::builds_ready(&bucket, &dir.0.join("d0")), Ok(true), "built: ready");
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::env::remove_var("COMBD_BUILDER_PUSH");
     }
 
     /// A tiny WebSocket client, for tests.
