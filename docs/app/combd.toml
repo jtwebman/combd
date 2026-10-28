@@ -2,4 +2,4 @@
 # arena (static/ is made by ../build.sh from the book in ../src).
 [app]
 name = "docs"
-domains = ["docs.combd.dev", "localhost"]
+domains = ["docs.combd.dev"]
