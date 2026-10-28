@@ -5453,8 +5453,15 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router, lim: &
         return Ok(Some(r));
     }
     if !router.legacy && path != "/_combd/stats" {
-        let r = match router.route(host, path.split('?').next().unwrap_or("")) {
+        let (bare, query) = path.split_once('?').map_or((path, None), |(p, q)| (p, Some(q)));
+        let r = match router.route(host, bare) {
             Some(Hit::Object(name, sub)) => {
+                // Routed on the path alone; the object gets its query too, as
+                // a worker does (and as `/do/<name>/...` always has).
+                let sub = match query {
+                    Some(q) => format!("{sub}?{q}"),
+                    None => sub,
+                };
                 if name.len() > MAX_NAME {
                     return Err(400);
                 }
@@ -5827,6 +5834,18 @@ mod tests {
         assert_eq!(hit("shop.test", "/room/r1"), "cell 2", "a host beats any host");
         assert_eq!(hit("x", "/room//x"), "cell 0", "an empty id isn't one");
         assert_eq!(hit("x", "/"), "cell 0");
+        // An object reached by a route gets the query, as a worker does.
+        let line = |req: &str| {
+            let mut rbuf = req.as_bytes().to_vec();
+            match parse_buf(&mut rbuf, &mut false, &r, &Limits::default()) {
+                Ok(Some(Req::Object(n, l))) => format!("{n}: {l}"),
+                Ok(Some(Req::Cell(p, l))) => format!("cell {p}: {l}"),
+                _ => "other".into(),
+            }
+        };
+        assert_eq!(line("GET /room/r1/count?since=5&x=y HTTP/1.1\r\nhost: x\r\n\r\n"), "room/r1: do GET /count?since=5&x=y");
+        assert_eq!(line("GET /room/r1?q HTTP/1.1\r\nhost: x\r\n\r\n"), "room/r1: do GET /?q");
+        assert_eq!(line("GET /x?q=1 HTTP/1.1\r\nhost: x\r\n\r\n"), "cell 0: api GET /x?q=1");
     }
 
     /// Valid requests, damaged at random: the parser must never panic.
