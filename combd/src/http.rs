@@ -920,6 +920,9 @@ enum Req {
     Stats,
     /// A manifest's routes don't match.
     NotFound,
+    /// No route, but the app has static files: them, the path (no query),
+    /// HEAD or not, `if-none-match`, `accept-encoding`.
+    Static(Arc<crate::statics::Static>, String, bool, Option<String>, String),
     /// The fleet's nodes and their public addresses (for clients choosing
     /// the nearest), and a ping to time a round trip.
     Nodes,
@@ -3966,6 +3969,38 @@ impl<E: Engine> Loop<'_, E> {
         }
     }
 
+    /// A static file (`statics.rs`): the file, a 304 if the browser's copy
+    /// is still good, a redirect to a folder's `/`, or the app's 404 page.
+    fn queue_static(&mut self, who: Who, st: &crate::statics::Static, path: &str, head: bool, etags: Option<&str>, accept: &str) {
+        use crate::statics::Found;
+        let (status, f) = match st.find(path) {
+            Found::File(f) => (200, f),
+            Found::Redirect(to) => return self.queue_reply(who, (301, format!("\0location: {to}\0"))),
+            Found::Missing(Some(f)) => (404, f),
+            Found::Missing(None) => return self.queue_reply(who, (404, "{\"error\":\"no route\"}".into())),
+        };
+        let Some(c) = self.conn(who) else { return };
+        let (body, enc, etag) = f.pick(accept);
+        let fresh = status == 200 && etags.is_some_and(|v| v.split(',').any(|t| t.trim().trim_start_matches("W/") == etag || t.trim() == "*"));
+        let _ = write!(c.wbuf, "HTTP/1.1 {} OK\r\ncontent-type: {}\r\netag: {etag}\r\ncache-control: no-cache\r\nx-content-type-options: nosniff\r\n", if fresh { 304 } else { status }, f.ctype);
+        if f.varies() {
+            let _ = write!(c.wbuf, "vary: accept-encoding\r\n");
+        }
+        if let Some(e) = enc {
+            let _ = write!(c.wbuf, "content-encoding: {e}\r\n");
+        }
+        if fresh {
+            let _ = write!(c.wbuf, "\r\n");
+        } else {
+            let _ = write!(c.wbuf, "content-length: {}\r\n\r\n", body.len());
+            if !head {
+                c.wbuf.extend_from_slice(body);
+            }
+        }
+        c.busy = false;
+        c.at = Instant::now();
+    }
+
     /// Connections past their time (`Limits`): a request still arriving
     /// past the read timeout gets 408; a new one that sent nothing, a kept
     /// one idle past keep-alive, or a TLS handshake that drags, just closes.
@@ -4188,6 +4223,7 @@ impl<E: Engine> Loop<'_, E> {
             }
             Req::NewId => self.queue_reply(who, (200, format!("{{\"id\":\"{}\"}}", uuid_v7()))),
             Req::NotFound => self.queue_reply(who, (404, "{\"error\":\"no route\"}".into())),
+            Req::Static(st, path, head, etags, accept) => self.queue_static(who, &st, &path, head, etags.as_deref(), &accept),
             Req::Ping => self.queue_reply(who, (200, "\0access-control-allow-origin: *\ncache-control: no-store\0{}".into())),
             Req::Nodes => {
                 let me = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node);
@@ -5351,10 +5387,14 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router, lim: &
     let mut clen: Option<usize> = None;
     let mut close = false;
     let (mut upgrade, mut ws_key, mut ws_ok) = (false, None, false);
-    let mut host = "";
+    let (mut host, mut etags, mut accept) = ("", None, "");
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("host") {
             host = std::str::from_utf8(h.value).map_err(|_| 400u16)?;
+        } else if h.name.eq_ignore_ascii_case("if-none-match") {
+            etags = std::str::from_utf8(h.value).ok();
+        } else if h.name.eq_ignore_ascii_case("accept-encoding") {
+            accept = std::str::from_utf8(h.value).unwrap_or("");
         }
         if h.name.eq_ignore_ascii_case("upgrade") && h.value.eq_ignore_ascii_case(b"websocket") {
             upgrade = true;
@@ -5436,7 +5476,10 @@ fn parse_buf(rbuf: &mut Vec<u8>, close_after: &mut bool, router: &Router, lim: &
                 _ => return Err(400),
             },
             Some(Hit::Cell(p)) => Req::Cell(p, line("api", path)),
-            None => Req::NotFound,
+            None => match router.statics(host) {
+                Some(st) if method == "GET" || method == "HEAD" => Req::Static(st.clone(), path.split('?').next().unwrap_or("").to_string(), method == "HEAD", etags.map(String::from), accept.to_string()),
+                _ => Req::NotFound,
+            },
         };
         rbuf.drain(..hlen + clen);
         return Ok(Some(r));

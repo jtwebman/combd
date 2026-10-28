@@ -29,6 +29,7 @@ mod fleet;
 mod host;
 mod own;
 mod s3;
+mod statics;
 mod secrets;
 mod sim;
 mod store;
@@ -2022,6 +2023,71 @@ mod tests {
         let dir = store::tempdir::Dir::new();
         let (port, _, _) = server_app(eng, cfg(&dir.0, 1), move |_| a);
         assert_eq!(http_to(port, "env.localhost", "GET", "/env/V", ""), (200, "{\"value\":\"one\"}".into()));
+    }
+
+    /// An app's `static/` folder is served where its routes aren't: the
+    /// file (its ETag answered 304, a `.br` beside it to a browser that
+    /// takes br), a folder's index, its `404.html`; HEAD without the body.
+    /// It rides in the bundle, and comes out of it the same.
+    #[test]
+    fn an_apps_static_files_are_served_where_its_routes_arent() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir_all(app.0.join("modules")).unwrap();
+        std::fs::create_dir_all(app.0.join("static/guide")).unwrap();
+        std::fs::create_dir_all(app.0.join("static/room/r")).unwrap();
+        std::fs::write(app.0.join("combd.toml"), "[app]\nname = \"site\"\n[durable.room]\nmodule = \"classic\"\nroutes = [\"/room/:id/*\"]\n").unwrap();
+        std::fs::copy(GUEST, app.0.join("modules/classic.wasm")).unwrap();
+        for (n, b) in [("index.html", "<h1>home</h1>"), ("guide/index.html", "guide"), ("app.js", "plain js"), ("app.js.br", "BROTLI"), ("404.html", "lost"), ("room/r/count", "never: a route wins")] {
+            std::fs::write(app.0.join("static").join(n), b).unwrap();
+        }
+        std::fs::write(app.0.join("static/.DS_Store"), "junk").unwrap();
+        // Through a bundle and back, as a deploy carries it (hidden files left behind).
+        let unpacked = store::tempdir::Dir::new();
+        deploy::unpack(&deploy::bundle(&app.0).unwrap(), &unpacked.0).unwrap();
+        assert_eq!(std::fs::read_to_string(unpacked.0.join("static/guide/index.html")).unwrap(), "guide");
+        assert!(deploy::decode(&deploy::bundle(&app.0).unwrap()).unwrap().iter().any(|(n, _)| n == "static/app.js.br"));
+        assert!(!unpacked.0.join("static/.DS_Store").exists());
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, _) = http::load_app(&eng, &unpacked.0).unwrap_or_else(|e| panic!("{e}"));
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = server_app(eng, cfg(&dir.0, 1), move |_| a);
+        let raw = |req: String| {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            write!(s, "{req}connection: close\r\n\r\n").unwrap();
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out);
+            out
+        };
+        let get = |path: &str, extra: &str| raw(format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n{extra}"));
+        let home = get("/", "");
+        assert!(home.starts_with("HTTP/1.1 200") && home.contains("content-type: text/html; charset=utf-8") && home.ends_with("<h1>home</h1>"), "{home}");
+        let etag = home.lines().find_map(|l| l.strip_prefix("etag: ")).unwrap().to_string();
+        assert!(get("/", &format!("if-none-match: {etag}\r\n")).starts_with("HTTP/1.1 304"), "the browser's copy is still good");
+        assert!(get("/guide", "").contains("location: /guide/"));
+        assert!(get("/guide/", "").ends_with("guide"));
+        let br = get("/app.js", "accept-encoding: gzip, br\r\n");
+        assert!(br.contains("content-encoding: br") && br.contains("vary: accept-encoding") && br.ends_with("BROTLI"), "{br}");
+        assert!(get("/app.js", "").ends_with("plain js"));
+        let lost = get("/nope", "");
+        assert!(lost.starts_with("HTTP/1.1 404") && lost.ends_with("lost"), "{lost}");
+        let head = raw("HEAD /app.js HTTP/1.1\r\nhost: localhost\r\n".into());
+        assert!(head.contains("content-length: 8") && head.ends_with("\r\n\r\n"), "HEAD: the length, not the body: {head}");
+        assert_eq!(http(port, "POST", "/app.js", "").0, 404, "only GET and HEAD");
+        assert_eq!(http(port, "GET", "/room/r/count", ""), (200, "{\"count\":0}".into()), "a route wins over a file");
+        // An app of static files only: no modules, no processes.
+        let docs = store::tempdir::Dir::new();
+        std::fs::create_dir_all(docs.0.join("static")).unwrap();
+        std::fs::write(docs.0.join("combd.toml"), "[app]\nname = \"docs\"\n").unwrap();
+        std::fs::write(docs.0.join("static/index.html"), "docs").unwrap();
+        let unpacked = store::tempdir::Dir::new();
+        deploy::unpack(&deploy::bundle(&docs.0).unwrap(), &unpacked.0).unwrap();
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, _) = http::load_app(&eng, &unpacked.0).unwrap_or_else(|e| panic!("{e}"));
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = server_app(eng, cfg(&dir.0, 1), move |_| a);
+        assert_eq!(http(port, "GET", "/", ""), (200, "docs".into()));
     }
 
     /// A busy object's mailbox fills: what comes past `mailbox` is refused

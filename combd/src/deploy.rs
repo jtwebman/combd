@@ -16,11 +16,11 @@ use std::path::{Path, PathBuf};
 
 /// A bundle's limits: the whole of it, and how many files.
 pub const MAX_BUNDLE: usize = 64 << 20;
-const MAX_FILES: usize = 256;
+const MAX_FILES: usize = 4096;
 
 /// The files of an app's folder that make a version: its manifest (one of
-/// three names) and `modules/*.wasm`. Nothing else, so nothing private (the
-/// dev environment's file) can ride along.
+/// three names), `modules/*.wasm`, and `static/` (`statics.rs`). Nothing
+/// else, so nothing private (the dev environment's file) can ride along.
 pub fn bundle(dir: &Path) -> Result<Vec<u8>, String> {
     let mut files: Vec<(String, Vec<u8>)> = vec![];
     for n in ["combd.toml", "combd.yaml", "combd.json"] {
@@ -36,6 +36,19 @@ pub fn bundle(dir: &Path) -> Result<Vec<u8>, String> {
     for p in mods {
         let name = format!("modules/{}", p.file_name().unwrap().to_string_lossy());
         files.push((name, std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?));
+    }
+    if dir.join("static").is_dir() {
+        for (rel, b) in crate::statics::walk(&dir.join("static"))? {
+            // Hidden files (.DS_Store, .nojekyll) stay behind.
+            if rel.split('/').any(|s| s.starts_with('.')) {
+                continue;
+            }
+            let name = format!("static/{rel}");
+            if !crate::statics::name_ok(&name) {
+                return Err(format!("{name}: a static file's path is plain names (letters, digits, . - _), none starting with ."));
+            }
+            files.push((name, b));
+        }
     }
     encode(&files)
 }
@@ -56,7 +69,8 @@ fn encode(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
 }
 
 /// A bundle's files. It comes from a client, so every name is checked: a
-/// manifest, or `modules/<name>.wasm` with a plain name. No paths.
+/// manifest, `modules/<name>.wasm` with a plain name, or a static file under
+/// `static/` (no `..`, nothing hidden).
 pub fn decode(b: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     let bad = || "not a combd bundle".to_string();
     if b.len() > MAX_BUNDLE {
@@ -82,8 +96,8 @@ pub fn decode(b: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         let dl = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
         let data = take(dl)?.to_vec();
         let module_ok = name.strip_prefix("modules/").and_then(|m| m.strip_suffix(".wasm")).is_some_and(|m| !m.is_empty() && m.len() <= 63 && m.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'));
-        if !module_ok && !["combd.toml", "combd.yaml", "combd.json"].contains(&name.as_str()) {
-            return Err(format!("{name:?}: a bundle holds a manifest and modules/<name>.wasm only"));
+        if !module_ok && !crate::statics::name_ok(&name) && !["combd.toml", "combd.yaml", "combd.json"].contains(&name.as_str()) {
+            return Err(format!("{name:?}: a bundle holds a manifest, modules/<name>.wasm, and static/ only"));
         }
         if files.iter().any(|(n, _): &(String, Vec<u8>)| *n == name) {
             return Err(format!("{name} twice"));
@@ -108,6 +122,9 @@ pub fn unpack(bundle: &[u8], dir: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir.join("modules")).map_err(|e| e.to_string())?;
     for (n, data) in files {
+        if let Some(parent) = dir.join(&n).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{n}: {e}"))?;
+        }
         std::fs::write(dir.join(&n), data).map_err(|e| format!("{n}: {e}"))?;
     }
     Ok(())

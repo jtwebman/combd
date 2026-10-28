@@ -107,6 +107,8 @@ pub struct Tenant {
     pub environ: Arc<Vec<Vec<u8>>>,
     /// Its Postgres pools (named `<org>/<app>/<pool>`).
     pub pools: Vec<crate::pg::PoolCfg>,
+    /// Its `static/` files, if it has any.
+    pub statics: Option<Arc<crate::statics::Static>>,
 }
 
 impl Tenant {
@@ -136,6 +138,8 @@ pub struct Router {
     domains: Vec<Vec<String>>,
     /// No manifest: the old fixed routes, all to process 0.
     pub legacy: bool,
+    /// Each app's static files, by app (`App::tenants`).
+    statics: Vec<Option<Arc<crate::statics::Static>>>,
 }
 
 struct Target {
@@ -167,7 +171,7 @@ impl<P> App<P> {
     /// One program, the old routes.
     pub fn single(prog: P, max_concurrent: usize) -> App<P> {
         let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, mailbox: usize::MAX, batch: 100, spread: None, nearest: true, pin: None, memory_pages: None, engine: crate::engine::Kind::Interpreted, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
-        let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default(), pools: vec![] };
+        let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default(), pools: vec![], statics: None };
         App { progs: vec![Arc::new(prog)], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
     }
 
@@ -211,7 +215,8 @@ impl<P> App<P> {
         for a in apps {
             let environ = Arc::new(a.resolved.environ.iter().map(|(k, v)| format!("{k}={v}").into_bytes()).collect());
             let pools = crate::pg::PgCfg::from_manifest(a.resolved, &format!("{}/{}", a.org, a.app)).map(|c| c.pools).unwrap_or_default();
-            let tenant = Tenant { org: a.org.into(), app: a.app.into(), domains: a.domains.to_vec(), environ, pools };
+            let statics = crate::statics::Static::load(a.dir).map_err(|e| format!("{}/{}: {e}", a.org, a.app))?.map(Arc::new);
+            let tenant = Tenant { org: a.org.into(), app: a.app.into(), domains: a.domains.to_vec(), environ, pools, statics };
             match find(&tenants, a.org, a.app) {
                 Some(t) => {
                     tenants[t] = tenant;
@@ -316,7 +321,9 @@ impl<P> App<P> {
         // ...and those of apps this deploy didn't touch.
         targets.extend(self.router.routes.iter().filter(|x| !procs[x.proc].retired && !gone.contains(&x.tenant)).map(|x| Target { route: x.route.clone(), proc: x.proc, tenant: x.tenant, name: x.name.clone(), durable: x.durable }));
         let domains = tenants.iter().enumerate().map(|(t, x)| if gone.contains(&t) { vec![] } else { x.domains.clone() }).collect();
-        Ok(App { progs, procs, tenants, router: Router::new(targets, domains), by_hash, gone })
+        let mut router = Router::new(targets, domains);
+        router.statics = tenants.iter().enumerate().map(|(t, x)| if gone.contains(&t) { None } else { x.statics.clone() }).collect();
+        Ok(App { progs, procs, tenants, router, by_hash, gone })
     }
 
     /// Every live app's pools.
@@ -373,11 +380,11 @@ impl Router {
             (r.host.is_some(), segs)
         };
         routes.sort_by(|a, b| key(&b.route).cmp(&key(&a.route)));
-        Router { routes, domains, legacy: false }
+        Router { routes, domains, legacy: false, statics: vec![] }
     }
 
     pub fn legacy() -> Router {
-        Router { routes: vec![], domains: vec![], legacy: true }
+        Router { routes: vec![], domains: vec![], legacy: true, statics: vec![] }
     }
 
     /// Routes straight from text, for tests: (route, process name, durable),
@@ -386,6 +393,17 @@ impl Router {
     pub fn from(routes: &[(&str, &str, bool)]) -> Router {
         let routes = routes.iter().enumerate().map(|(i, (r, n, d))| Target { route: crate::manifest::parse_route(r).unwrap(), proc: i, tenant: 0, name: n.to_string(), durable: *d }).collect();
         Router::new(routes, vec![vec![]])
+    }
+
+    /// The static files of the app at `host` (its domains, or any host for
+    /// an app that names none), if it has some.
+    pub fn statics(&self, host: &str) -> Option<&Arc<crate::statics::Static>> {
+        let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+        let has = |t: usize| self.statics.get(t).and_then(Option::as_ref);
+        match self.domains.iter().position(|d| d.contains(&host)) {
+            Some(t) => has(t),
+            None => (0..self.domains.len()).filter(|&t| self.domains[t].is_empty()).find_map(has),
+        }
     }
 
     /// The route for `host` and `path` (no query string), if any. A route

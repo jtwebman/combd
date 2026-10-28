@@ -15,6 +15,10 @@ The first release: Durable Objects on your own machines, as one binary.
   home timeline), with a check of every route.
 - `combd.toml`: stateless processes, durable objects (one per id), a
   process per WebSocket, event cells, Postgres pools, vars, and secrets.
+- Static files: an app's `static/` folder rides in its bundle and is
+  served where its routes aren't (a folder's `index.html`, a `404.html`),
+  from memory, with ETags and any `.br` or `.gz` beside a file. An app can
+  be static files alone.
 - Postgres pools as most pools work (PgBouncer's transaction mode,
   Postgrex, Rails): a pooled statement's connection isn't reset after it,
   so what it changes in the session (a `SET`) stays for the statements
