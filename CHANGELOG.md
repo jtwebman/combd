@@ -51,6 +51,9 @@ The first release: Durable Objects on your own machines, as one binary.
 - Builders hold no bucket credentials: one asks any node's admin API for
   work and sends back what it built (`COMBD_FLEET`), each request signed
   with its builder key, which the nodes must list.
+- `combd deploy` (and status, rollback, vars, secrets) to a node with a
+  public certificate needs only `COMBD_TOKEN`: the fleet's CA is for a
+  fleet with its own.
 - Cheap on a bucket that bills per request: an idle node lists its bucket
   once every 30 s (alarms are looked for when one is due, or when a peer
   goes quiet), and an idle builder backs off to 30 s.

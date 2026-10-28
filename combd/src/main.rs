@@ -375,10 +375,17 @@ impl<V: CellVm> host::Mem for VmMem<'_, V> {
 /// non-zero if it failed.
 fn cli(url: &str, f: impl FnOnce(&dyn Fn(&str, &str, &[u8]) -> Result<serde_json::Value, String>) -> Result<serde_json::Value, String>) {
     let token = std::env::var("COMBD_TOKEN").unwrap_or_default();
-    let tls = std::env::var("COMBD_ADMIN_CA").ok().map(|ca| wire::admin_client(std::path::Path::new(&ca)));
-    let name = std::env::var("COMBD_ADMIN_NAME").unwrap_or_else(|_| "node0.combd".into());
+    // The fleet's own CA if given (COMBD_ADMIN_CA, COMBD_ADMIN_NAME), else
+    // the public roots and the URL's host (a node with a public cert).
+    let ca = std::env::var("COMBD_ADMIN_CA").ok();
+    let host = url.split_once("://").map_or(url, |(_, r)| r).split([':', '/']).next().unwrap_or("").to_string();
+    let name = std::env::var("COMBD_ADMIN_NAME").unwrap_or_else(|_| if ca.is_some() { "node0.combd".into() } else { host });
     let r = (|| {
-        let tls = tls.transpose()?;
+        let tls = match &ca {
+            Some(ca) => Some(wire::admin_client(std::path::Path::new(ca))?),
+            None if url.starts_with("https://") => Some(s3::tls_config()),
+            None => None,
+        };
         let call = |method: &str, path: &str, body: &[u8]| -> Result<serde_json::Value, String> {
             let (status, v) = admin::request(url, tls.as_ref().map(|c| (c, name.as_str())), &token, method, path, body)?;
             if status == 200 { Ok(v) } else { Err(format!("{status}: {}", v["error"].as_str().unwrap_or("?"))) }
@@ -1287,8 +1294,8 @@ fn main_with(args: &[&str]) {
             println!("token (give it to your CI; it's shown once): {token}");
             println!("line for the tokens file:                   {line}");
         }
-        // The admin API, from the command line: COMBD_TOKEN, and for https
-        // COMBD_ADMIN_CA (the fleet's ca.pem) and COMBD_ADMIN_NAME (node0.combd).
+        // The admin API, from the command line: COMBD_TOKEN, and for a fleet
+        // with its own CA, COMBD_ADMIN_CA (its ca.pem) and COMBD_ADMIN_NAME.
         ["deploy", dir, org, url] => cli(url, |call| {
             let dir = std::path::Path::new(dir);
             let m = manifest::load(dir)?.ok_or("no manifest in that folder")?;
