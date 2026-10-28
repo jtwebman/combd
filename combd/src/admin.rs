@@ -17,6 +17,8 @@
 //! PUT    /v1/apps/<org>/<app>/secrets/<name>   the value (the body): set it
 //! DELETE /v1/apps/<org>/<app>/secrets/<name>   delete it
 //! GET    /v1/nodes                      every node's stats (a `*/*:read` token)
+//! POST   /v1/builds/next                {"id", "pin"}: a builder's next job (signed by a builder key)
+//! POST   /v1/builds/done                {"pin", "cpu", "module", "so", "sig"} or {..., "error"}: what it built
 //! GET    /                              the panel: those, as a page
 //! ```
 //!
@@ -34,6 +36,9 @@ pub struct AdminCfg {
     pub tls: Option<Arc<rustls::ServerConfig>>,
     /// (SHA-256 of a token, its scopes).
     pub tokens: Vec<([u8; 32], Vec<String>)>,
+    /// The builders' public keys (`COMBD_BUILDER_KEYS`): a request to
+    /// `/v1/builds/...` must be signed by one of them.
+    pub builders: Vec<Vec<u8>>,
 }
 
 impl AdminCfg {
@@ -50,7 +55,14 @@ impl AdminCfg {
         let (cert, key) = (std::env::var("COMBD_TLS_CERT").ok(), std::env::var("COMBD_TLS_KEY").ok());
         let public = cert.as_deref().zip(key.as_deref()).map(|(c, k)| (std::path::Path::new(c), std::path::Path::new(k)));
         let tls = certs.map(|d| crate::wire::admin_tls_with(d, node, public)).transpose()?;
-        Ok(Some(AdminCfg { port, public: tls.is_some(), tls, tokens }))
+        #[cfg(feature = "aot-lite")]
+        let builders = match std::env::var("COMBD_BUILDER_KEYS") {
+            Ok(f) => crate::builds::parse_keys(&std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?),
+            Err(_) => vec![],
+        };
+        #[cfg(not(feature = "aot-lite"))]
+        let builders = vec![];
+        Ok(Some(AdminCfg { port, public: tls.is_some(), tls, tokens, builders }))
     }
 }
 
@@ -126,6 +138,15 @@ pub trait Api: Sync {
     }
     /// Deploys waiting for builds, and their builds.
     fn deploys(&self) -> Result<Json, String> {
+        Err("not in a fleet".into())
+    }
+    /// A builder's next job for its pin: `{"job": {"cpu", "module", "wasm"}}`
+    /// (the Wasm in hex), or `{"job": null}`.
+    fn build_next(&self, _id: &str, _pin: &str) -> Result<Json, String> {
+        Err("not in a fleet".into())
+    }
+    /// What a builder built, or why it couldn't.
+    fn build_done(&self, _done: &Json) -> Result<Json, String> {
         Err("not in a fleet".into())
     }
     /// Every couple of seconds: what's waiting gets another go.
@@ -220,13 +241,14 @@ const PANEL: &str = include_str!("admin.html");
 fn handle(s: &mut (impl Read + Write), raw: &std::net::TcpStream, cfg: &AdminCfg, api: &dyn Api) {
     // The token is checked on the headers, before any of a body is read.
     let (status, body, early) = match read_request(s, |m, p, t| authorize(cfg, m, p, t)) {
-        Ok(Ok((method, path, _))) if method == "GET" && path == "/" => {
+        Ok(Ok((method, path, ..))) if method == "GET" && path == "/" => {
             let _ = write!(s, "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncache-control: no-store\r\nx-frame-options: DENY\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{PANEL}", PANEL.len());
             let _ = s.flush();
             return;
         }
-        Ok(Ok((method, path, body))) => {
-            let (st, b) = run(api, &method, &path, &body);
+        Ok(Ok((method, path, auth, body))) => {
+            let signed = !path.starts_with("/v1/builds/") || builder_signed(&cfg.builders, auth.as_deref().unwrap_or(""), &method, &path, Some(&body));
+            let (st, b) = if signed { run(api, &method, &path, &body) } else { (401, json!({ "error": "not signed by a builder this node trusts" })) };
             (st, b, false)
         }
         Ok(Err((st, b))) => (st, b, true),
@@ -254,9 +276,10 @@ fn handle(s: &mut (impl Read + Write), raw: &std::net::TcpStream, cfg: &AdminCfg
 
 type Refused = (u16, Json);
 
-/// One request: method, path, body (at most a bundle's size). `check` sees
-/// the method, path, and token first; if it refuses, no body is read.
-fn read_request(s: &mut impl Read, check: impl Fn(&str, &str, Option<&str>) -> Result<(), Refused>) -> Result<Result<(String, String, Vec<u8>), Refused>, String> {
+/// One request: method, path, its `authorization`, body (at most a bundle's
+/// size). `check` sees the method, path, and `authorization` first; if it
+/// refuses, no body is read.
+fn read_request(s: &mut impl Read, check: impl Fn(&str, &str, Option<&str>) -> Result<(), Refused>) -> Result<Result<(String, String, Option<String>, Vec<u8>), Refused>, String> {
     let mut buf = vec![];
     let mut chunk = [0u8; 16 * 1024];
     loop {
@@ -273,13 +296,13 @@ fn read_request(s: &mut impl Read, check: impl Fn(&str, &str, Option<&str>) -> R
             Err(_) => return Err("bad request".into()),
             Ok(httparse::Status::Complete(hlen)) => {
                 let h = |name: &str| req.headers.iter().find(|x| x.name.eq_ignore_ascii_case(name)).and_then(|x| std::str::from_utf8(x.value).ok());
-                let token = h("authorization").and_then(|v| v.strip_prefix("Bearer ")).map(|t| t.trim().to_string());
+                let auth = h("authorization").map(|v| v.trim().to_string());
                 let clen: usize = h("content-length").map_or(Ok(0), |v| v.trim().parse().map_err(|_| "bad content-length".to_string()))?;
                 if clen > crate::deploy::MAX_BUNDLE {
                     return Err("too big".into());
                 }
                 let (method, path) = (req.method.unwrap_or("").to_string(), req.path.unwrap_or("").to_string());
-                if let Err(refused) = check(&method, &path, token.as_deref()) {
+                if let Err(refused) = check(&method, &path, auth.as_deref()) {
                     return Ok(Err(refused));
                 }
                 let mut body = buf[hlen..].to_vec();
@@ -291,7 +314,7 @@ fn read_request(s: &mut impl Read, check: impl Fn(&str, &str, Option<&str>) -> R
                     body.extend_from_slice(&chunk[..n]);
                 }
                 body.truncate(clen);
-                return Ok(Ok((method, path, body)));
+                return Ok(Ok((method, path, auth, body)));
             }
         }
     }
@@ -305,6 +328,8 @@ fn endpoint<'a>(method: &str, path: &'a str) -> Option<(&'a str, &'a str, Vec<&'
         // The cluster's own: a token for every app (`*/*`).
         ["v1", "nodes"] if method == "GET" => return Some(("*", "*", vec!["nodes"], "read")),
         ["v1", "deploys"] if method == "GET" => return Some(("*", "*", vec!["deploys"], "read")),
+        // A builder's: signed by its key, no token.
+        ["v1", "builds", what @ ("next" | "done")] if method == "POST" => return Some(("*", "*", vec![*what], "build")),
         _ => return None,
     };
     let action = match (method, rest.as_slice()) {
@@ -317,13 +342,21 @@ fn endpoint<'a>(method: &str, path: &'a str) -> Option<(&'a str, &'a str, Vec<&'
     Some((org, app, rest, action))
 }
 
-fn authorize(cfg: &AdminCfg, method: &str, path: &str, token: Option<&str>) -> Result<(), Refused> {
+fn authorize(cfg: &AdminCfg, method: &str, path: &str, auth: Option<&str>) -> Result<(), Refused> {
     // The page itself holds nothing: it asks with the token you give it.
     if (method, path) == ("GET", "/") {
         return Ok(());
     }
     let Some((org, app, _, action)) = endpoint(method, path) else { return Err((404, json!({ "error": "no such endpoint" }))) };
-    let Some(token) = token else { return Err((401, json!({ "error": "want Authorization: Bearer <token>" }))) };
+    // A builder: a key the node lists, signed lately (the signature over
+    // the whole request is checked once the body's in).
+    if action == "build" {
+        return match auth.is_some_and(|a| builder_signed(&cfg.builders, a, method, path, None)) {
+            true => Ok(()),
+            false => Err((401, json!({ "error": "want Authorization: Builder <key> <ms> <signature>, from a builder this node trusts" }))),
+        };
+    }
+    let Some(token) = auth.and_then(|v| v.strip_prefix("Bearer ")).map(str::trim) else { return Err((401, json!({ "error": "want Authorization: Bearer <token>" }))) };
     if !allowed(&cfg.tokens, token, org, app, action) {
         // The same answer for a bad token and a weak one: no hints.
         return Err((403, json!({ "error": format!("this token may not {action} {org}/{app}") })));
@@ -331,10 +364,34 @@ fn authorize(cfg: &AdminCfg, method: &str, path: &str, token: Option<&str>) -> R
     Ok(())
 }
 
+/// Signed by a builder in `keys` (`builds::check_request`). Without the
+/// compiled tier there are no builders: never.
+#[cfg(feature = "aot-lite")]
+fn builder_signed(keys: &[Vec<u8>], auth: &str, method: &str, path: &str, body: Option<&[u8]>) -> bool {
+    crate::builds::check_request(keys, auth, method, path, body)
+}
+
+#[cfg(not(feature = "aot-lite"))]
+fn builder_signed(_: &[Vec<u8>], _: &str, _: &str, _: &str, _: Option<&[u8]>) -> bool {
+    false
+}
+
 fn run(api: &dyn Api, method: &str, path: &str, body: &[u8]) -> (u16, Json) {
     let Some((org, app, rest, _)) = endpoint(method, path) else { return (404, json!({ "error": "no such endpoint" })) };
     if (org, app) == ("*", "*") {
-        return match if rest == ["deploys"] { api.deploys() } else { api.nodes() } {
+        let r = match rest.as_slice() {
+            ["deploys"] => api.deploys(),
+            ["next"] => match serde_json::from_slice::<Json>(body) {
+                Ok(v) => api.build_next(v["id"].as_str().unwrap_or(""), v["pin"].as_str().unwrap_or("")),
+                Err(_) => Err("want {\"id\", \"pin\"}".into()),
+            },
+            ["done"] => match serde_json::from_slice::<Json>(body) {
+                Ok(v) => api.build_done(&v),
+                Err(_) => Err("want {\"pin\", \"cpu\", \"module\", ...}".into()),
+            },
+            _ => api.nodes(),
+        };
+        return match r {
             Ok(v) => (200, v),
             Err(e) => (400, json!({ "error": e })),
         };
@@ -363,10 +420,15 @@ fn run(api: &dyn Api, method: &str, path: &str, body: &[u8]) -> (u16, Json) {
 /// A client call, for the CLI and tests: `url` is `http://host:port` (for
 /// localhost) or `https://host:port` (then `tls` and the server's name).
 pub fn request(url: &str, tls: Option<(&Arc<rustls::ClientConfig>, &str)>, token: &str, method: &str, path: &str, body: &[u8]) -> Result<(u16, Json), String> {
+    request_as(url, tls, &format!("Bearer {token}"), method, path, body)
+}
+
+/// The same, with `auth` as the whole `authorization` header (a builder's).
+pub fn request_as(url: &str, tls: Option<(&Arc<rustls::ClientConfig>, &str)>, auth: &str, method: &str, path: &str, body: &[u8]) -> Result<(u16, Json), String> {
     let hostport = url.split_once("://").map_or(url, |(_, r)| r).trim_end_matches('/');
     let s = std::net::TcpStream::connect(hostport).map_err(|e| format!("{hostport}: {e}"))?;
     let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(120)));
-    let head = format!("{method} {path} HTTP/1.1\r\nhost: {hostport}\r\nauthorization: Bearer {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+    let head = format!("{method} {path} HTTP/1.1\r\nhost: {hostport}\r\nauthorization: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
     let mut out = vec![];
     let go = |s: &mut dyn ReadWrite, out: &mut Vec<u8>| -> std::io::Result<()> {
         // A server may refuse before the body is all sent: still read why.
@@ -411,7 +473,7 @@ mod tests {
             let b = crate::sim::mangle(&mut rng, good);
             let refuse = i % 2 == 0;
             let r = std::panic::catch_unwind(|| read_request(&mut &b[..], |_, _, _| if refuse { Err((403, json!({}))) } else { Ok(()) })).expect("the request reader panicked");
-            if let Ok(Ok((_, _, body))) = r {
+            if let Ok(Ok((_, _, _, body))) = r {
                 assert!(body.len() <= crate::deploy::MAX_BUNDLE);
             }
         }

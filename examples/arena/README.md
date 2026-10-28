@@ -153,13 +153,14 @@ then, about 70,000 now (`combd/RESULTS.md`, "What a node holds").
 ### Builders
 
 Compiled modules are built by a builder: any Linux machine with Docker (a
-Windows box's WSL works) that pulls jobs from the bucket and signs what it
-builds with `builder.key` (made by `cloud/up.sh`, in `cloud/.secrets`; the
-nodes trust its public half). Give it its own R2 token for the bucket, in
-`~/combd-builder/env` (chmod 600): `COMBD_S3`, `COMBD_S3_BUCKET`,
-`COMBD_S3_KEY`, `COMBD_S3_SECRET`, `COMBD_S3_REGION=auto`,
-`COMBD_BUILDER_ID`, `COMBD_BUILDER_KEY=/keys/builder.key`,
-`COMBD_AOT_SRC=/combd/combd/aot`, `COMBD_BUILD_WORK=/work`. Then:
+Windows box's WSL works) that asks the fleet's admin API for work and sends
+back what it built. It holds one secret, `builder.key` (made by
+`cloud/up.sh`, in `cloud/.secrets`): it signs every request and every build
+with it, and the nodes answer only keys they list (`COMBD_BUILDER_KEYS`).
+It never sees the bucket. In `~/combd-builder/env`:
+`COMBD_FLEET=https://arena.combd.dev:9443` (the fleet's name: any node
+that answers), `COMBD_BUILDER_ID` (its name in `/v1/deploys`),
+`COMBD_BUILDER_KEY=/keys/builder.key`, `COMBD_BUILD_WORK=/work`. Then:
 
 ```sh
 docker run -d --name combd-builder --restart unless-stopped --env-file ~/combd-builder/env \

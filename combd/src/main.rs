@@ -1245,12 +1245,13 @@ fn main_with(args: &[&str]) {
                 std::process::exit(1);
             }
         },
-        // Build compiled modules for the fleet in COMBD_S3 (for this binary's
-        // pin), signing with COMBD_BUILDER_KEY, until killed.
+        // Build compiled modules for the fleet at COMBD_FLEET (any node's
+        // admin API, https://<name>:9443), for this binary's pin, signing
+        // with COMBD_BUILDER_KEY, until killed. No bucket: the nodes have it.
         #[cfg(feature = "aot-lite")]
         ["builder"] => {
-            let s3 = s3::S3::from_env().unwrap_or_else(|| {
-                eprintln!("combd     builder: needs the fleet's bucket (COMBD_S3, ...)");
+            let fleet = std::env::var("COMBD_FLEET").unwrap_or_else(|_| {
+                eprintln!("combd     builder: needs the fleet's admin API in COMBD_FLEET (https://<a node or the fleet's name>:9443)");
                 std::process::exit(1);
             });
             let key = builds::load_key(std::path::Path::new(&std::env::var("COMBD_BUILDER_KEY").unwrap_or_else(|_| "builder.key".into()))).unwrap_or_else(|e| {
@@ -1260,7 +1261,7 @@ fn main_with(args: &[&str]) {
             let id = std::env::var("COMBD_BUILDER_ID").unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_else(|_| "builder".into()));
             let aot = std::env::var_os("COMBD_AOT_SRC").map_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot"), Into::into);
             let work = std::env::var_os("COMBD_BUILD_WORK").map_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds"), Into::into);
-            builds::builder(&s3, &id, &key, &aot, &work, &std::sync::atomic::AtomicBool::new(false));
+            builds::builder(&fleet, &id, &key, &aot, &work, &std::sync::atomic::AtomicBool::new(false));
         }
         // Before an update: exit 0 if every compiled module the fleet runs is
         // built for this binary (asking for those that aren't), 1 if not yet,
@@ -3142,7 +3143,7 @@ mod tests {
             let b = builds::Builds::new(bucket.clone(), dir.0.join(builds), keys.clone(), n).unwrap();
             let eng = both::Both { builds: Some(Arc::new(b)), ..both() };
             let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), ..cfg(&dir.0.join(format!("d{n}")), 1) };
-            let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: false, tls: None, tokens: admin::parse_tokens(&line).unwrap() });
+            let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: false, tls: None, tokens: admin::parse_tokens(&line).unwrap(), builders: keys.clone() });
             let stop = c.stop.clone();
             (stop, std::thread::spawn(move || http::serve_fleet_apps(&eng, port, c, admin).unwrap()))
         };
@@ -3160,13 +3161,27 @@ mod tests {
         assert_eq!(http_to(ports[0], "fast.test", "POST", "/room/r/incr", "").0, 404, "not live while it builds");
         let (_, d) = api("GET", "/v1/deploys", b"");
         assert_eq!(d["pending"][0]["app"], "acme/fast", "{d}");
-        // A builder comes along.
+        // A stranger can't ask for work, or send a build: only a builder
+        // the node lists, signing each request.
+        let stranger = builds::load_key(&{
+            builds::new_key(&dir.0.join("stranger.key")).unwrap();
+            dir.0.join("stranger.key")
+        })
+        .unwrap();
+        let ask = |k: &ring::signature::Ed25519KeyPair, path: &str, body: &[u8]| admin::request_as(&url, None, &builds::sign_request(k, "POST", path, body), "POST", path, body).unwrap().0;
+        assert_eq!(ask(&stranger, "/v1/builds/next", br#"{"id":"x","pin":"p"}"#), 401);
+        assert_eq!(api("POST", "/v1/builds/next", br#"{"id":"x","pin":"p"}"#).0, 401, "an admin token isn't a builder's key");
+        let mine = builds::load_key(&dir.0.join("builder.key")).unwrap();
+        let signed = builds::sign_request(&mine, "POST", "/v1/builds/next", br#"{"id":"x","pin":"p"}"#);
+        assert_eq!(admin::request_as(&url, None, &signed, "POST", "/v1/builds/next", br#"{"id":"x","pin":"q"}"#).unwrap().0, 401, "signed for another body");
+        assert_eq!(ask(&mine, "/v1/builds/done", br#"{"pin":"../x","cpu":"c","module":"m","error":"e"}"#), 400, "a key's parts are checked");
+        // A builder comes along: it knows the fleet's URL and its key, not the bucket.
         let stop = Arc::new(AtomicBool::new(false));
         let builder = |stop: &Arc<AtomicBool>| {
-            let (b, key, s) = (bucket.clone(), builds::load_key(&dir.0.join("builder.key")).unwrap(), stop.clone());
+            let (url, key, s) = (url.clone(), builds::load_key(&dir.0.join("builder.key")).unwrap(), stop.clone());
             let aot_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("aot");
             let work = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/aot-builds");
-            std::thread::spawn(move || builds::builder(&b, "test-builder", &key, &aot_src, &work, &s))
+            std::thread::spawn(move || builds::builder(&url, "test-builder", &key, &aot_src, &work, &s))
         };
         let first_builder = builder(&stop);
         assert!(eventually(300_000, || api("GET", "/v1/apps/acme/fast", b"").1["version"] == v["version"]), "live once built: {}", api("GET", "/v1/deploys", b"").1);
@@ -4253,7 +4268,7 @@ callers = ["api"]
                 let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new(), place_ms: 0, areas: HashMap::new() };
                 let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), public: public.clone(), ..cfg(&dir.0.join(format!("d{n}")), 2) };
                 // Nodes 0 and 1 take deploys (to race them against each other).
-                let admin = (n < 2).then(|| admin::AdminCfg { port: admin_ports[n as usize], public: true, tls: Some(wire::admin_tls(&certs, n).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}\n{ops_line}")).unwrap() });
+                let admin = (n < 2).then(|| admin::AdminCfg { port: admin_ports[n as usize], public: true, tls: Some(wire::admin_tls(&certs, n).unwrap()), tokens: admin::parse_tokens(&format!("{line}\n{weak_line}\n{ops_line}")).unwrap(), builders: vec![] });
                 let port = ports[n as usize];
                 std::thread::spawn(move || http::serve_fleet_apps(&interp::Interp { max_pages: 16384 }, port, c, admin).unwrap());
                 port
@@ -4884,7 +4899,7 @@ callers = ["api"]
             .map(|n| {
                 let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 2, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new(), place_ms: 0, areas: HashMap::new() };
                 let c = http::Config { fleet: Some(fc), stop: stops[n as usize].clone(), ..cfg(&dir.0.join(format!("d{n}")), 2) };
-                let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: false, tls: None, tokens: admin::parse_tokens(&line).unwrap() });
+                let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: false, tls: None, tokens: admin::parse_tokens(&line).unwrap(), builders: vec![] });
                 let port = free_ports(1)[0];
                 std::thread::spawn(move || http::serve_fleet_apps(&interp::Interp { max_pages: 16384 }, port, c, admin).unwrap());
                 port

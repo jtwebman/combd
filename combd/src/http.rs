@@ -1167,6 +1167,23 @@ where
         }
     }
 
+    #[cfg(feature = "aot-lite")]
+    fn build_next(&self, id: &str, pin: &str) -> Result<serde_json::Value, String> {
+        let job = crate::builds::next(self.s3, id, pin)?;
+        Ok(serde_json::json!({ "job": job.map(|(cpu, m, wasm)| serde_json::json!({ "cpu": cpu, "module": m, "wasm": wasm.iter().map(|b| format!("{b:02x}")).collect::<String>() })) }))
+    }
+
+    #[cfg(feature = "aot-lite")]
+    fn build_done(&self, d: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let s = |k: &str| d[k].as_str().unwrap_or("");
+        let so = (d["error"].is_null()).then(|| crate::builds::unhex(s("so")).filter(|so| !so.is_empty()).ok_or("want \"so\" (hex) and \"sig\", or \"error\"")).transpose()?;
+        let r = match &so {
+            Some(so) => Ok((so.as_slice(), s("sig"))),
+            None => Err(s("error")),
+        };
+        crate::builds::done(self.s3, s("pin"), s("cpu"), s("module"), r).map(|()| serde_json::json!({ "ok": true }))
+    }
+
     fn deploys(&self) -> Result<serde_json::Value, String> {
         let p = self.pending.lock().unwrap();
         let list: Vec<serde_json::Value> = p

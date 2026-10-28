@@ -11,6 +11,10 @@
 //! _combd/builders/<id>                   a builder: its pin, CPUs, and when it last looked
 //! ```
 //!
+//! Builders don't touch the bucket: they ask a node's admin API for work and
+//! send back what they built (`POST /v1/builds/next`, `/v1/builds/done`),
+//! each request signed with their key, which the nodes must list.
+//!
 //! `<pin>` is a short hash of what the build has to match (rustc, combd-aot,
 //! the target: see combd-aot's `PIN`), `<m>` the module's hash. A build is
 //! native code a node will run, so it's only loaded with a signature from a
@@ -85,7 +89,7 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
+pub fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect()
 }
 
@@ -278,58 +282,145 @@ pub fn builders(s3: &S3) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A builder: takes jobs for its own pin (it can make no other), one at a
-/// time, until `stop`. `aot` is the combd-aot sources it builds against,
-/// `work` its cargo directory (kept: the runtime compiles once).
-pub fn builder(s3: &S3, id: &str, key: &Ed25519KeyPair, aot: &Path, work: &Path, stop: &std::sync::atomic::AtomicBool) {
-    let pin = pin_id(combd_aot::PIN);
-    let prefix = format!("_combd/builds/{pin}/");
-    eprintln!("builder   {id}: building for {:?} ({pin})", combd_aot::PIN);
-    // A LIST and a PUT are billed writes on R2 and S3: an idle builder looks
-    // less often (2 s, doubling to 30 s), and says it's here once a minute.
-    let (mut wait, mut said) = (IDLE_FIRST, None::<std::time::Instant>);
-    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-        let jobs: Vec<String> = s3.list(&prefix).unwrap_or_default();
-        if said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
-            let _ = s3.put(&format!("_combd/builders/{id}"), serde_json::json!({ "pin": pin, "at": now_ms() }).to_string().as_bytes(), &Cond::Any);
-            said = Some(std::time::Instant::now());
+/// How far a builder's clock may be from a node's: a request signed longer
+/// ago (or ahead) than this is refused.
+const REQUEST_SKEW_MS: u64 = 5 * 60 * 1000;
+
+/// What a builder signs for a request: all of it.
+fn request_msg(method: &str, path: &str, at: u64, body: &[u8]) -> Vec<u8> {
+    let mut msg = format!("combd builder request\0{method}\0{path}\0{at}\0").into_bytes();
+    msg.extend_from_slice(&Sha256::digest(body));
+    msg
+}
+
+/// A builder's request, signed with its key: the `authorization` header.
+pub fn sign_request(key: &Ed25519KeyPair, method: &str, path: &str, body: &[u8]) -> String {
+    let at = now_ms();
+    format!("Builder {} {at} {}", hex(key.public_key().as_ref()), hex(key.sign(&request_msg(method, path, at, body)).as_ref()))
+}
+
+/// Is `auth` from a builder in `keys`, signed lately? Without the body,
+/// only that much (so a stranger's body is never read); with it, the
+/// signature over the whole request too.
+pub fn check_request(keys: &[Vec<u8>], auth: &str, method: &str, path: &str, body: Option<&[u8]>) -> bool {
+    let mut w = auth.strip_prefix("Builder ").unwrap_or("").split(' ');
+    let (Some(k), Some(at), Some(sig)) = (w.next().and_then(unhex), w.next().and_then(|t| t.parse::<u64>().ok()), w.next().and_then(unhex)) else { return false };
+    keys.contains(&k) && now_ms().abs_diff(at) <= REQUEST_SKEW_MS && body.is_none_or(|b| UnparsedPublicKey::new(&ED25519, &k).verify(&request_msg(method, path, at, b), &sig).is_ok())
+}
+
+/// A pin, CPU, or module as a builder names it: one part of a bucket key.
+fn part(s: &str) -> Result<&str, String> {
+    let ok = !s.is_empty() && s.len() <= 64 && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-');
+    if ok { Ok(s) } else { Err(format!("{s:?}: not a pin, CPU, or module")) }
+}
+
+/// A node's side of `POST /v1/builds/next`: a job for the builder's pin that
+/// nobody has built or claimed, claimed for it now, as (CPU, module, its
+/// Wasm); or none. Notes the builder was here (`_combd/builders/<id>`), once
+/// a minute at most from each node: a PUT is a billed write.
+pub fn next(s3: &S3, id: &str, pin: &str) -> Result<Option<(String, String, Vec<u8>)>, String> {
+    static SAID: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+    let (id, pin, now) = (part(id)?, part(pin)?, now_ms());
+    let say = {
+        let mut said = SAID.lock().unwrap();
+        said.retain(|(_, t)| now.saturating_sub(*t) < 60_000);
+        let due = !said.iter().any(|(i, _)| i == id);
+        if due {
+            said.push((id.to_string(), now));
         }
-        let has = |k: &str| jobs.iter().any(|j| j == k);
-        let mut did = false;
-        for job in jobs.iter().filter(|j| j.ends_with(".wasm")) {
-            let base = job.trim_end_matches(".wasm");
-            if has(&format!("{base}.sig")) || has(&format!("{base}.err")) {
-                continue;
+        due
+    };
+    if say {
+        let _ = s3.put(&format!("_combd/builders/{id}"), serde_json::json!({ "pin": pin, "at": now }).to_string().as_bytes(), &Cond::Any);
+    }
+    let prefix = format!("_combd/builds/{pin}/");
+    let jobs = s3.list(&prefix).map_err(|e| e.to_string())?;
+    let has = |k: &str| jobs.iter().any(|j| j == k);
+    for job in jobs.iter().filter(|j| j.ends_with(".wasm")) {
+        let base = job.trim_end_matches(".wasm");
+        if has(&format!("{base}.sig")) || has(&format!("{base}.err")) {
+            continue;
+        }
+        let Some((cpu, m)) = base.strip_prefix(&prefix).and_then(|r| r.split_once('/')) else { continue };
+        if !claim(s3, &format!("{base}.claim"), id) {
+            continue;
+        }
+        match s3.get(job).map_err(|e| e.to_string())? {
+            Some((wasm, _)) => return Ok(Some((cpu.to_string(), m.to_string(), wasm))),
+            None => drop(s3.delete(&format!("{base}.claim"))),
+        }
+    }
+    Ok(None)
+}
+
+/// A node's side of `POST /v1/builds/done`: the build and its signature
+/// (checked when a node loads it, not here), or why it couldn't be built.
+/// The claim goes.
+pub fn done(s3: &S3, pin: &str, cpu: &str, m: &str, r: Result<(&[u8], &str), &str>) -> Result<(), String> {
+    let (pin, cpu, m) = (part(pin)?, part(cpu)?, part(m)?);
+    let put = |ext: &str, b: &[u8]| s3.put(&key(pin, cpu, m, ext), b, &Cond::Any).map_err(|e| e.to_string())?.map_err(|()| format!("can't write the {ext}"));
+    match r {
+        // The build first, its signature last: a node sees a build as
+        // there only once it's signed.
+        Ok((so, sig)) => put("so", so).and_then(|_| put("sig", sig.as_bytes()))?,
+        Err(e) => put("err", e.as_bytes())?,
+    };
+    let _ = s3.delete(&key(pin, cpu, m, "claim"));
+    Ok(())
+}
+
+/// A builder: asks the fleet (`fleet`, any node's admin API, or a name for
+/// all of them) for jobs for its own pin (it can make no other), builds
+/// them one at a time, and sends each back, until `stop`. It signs every
+/// request with its key; it never sees the bucket. `aot` is the combd-aot
+/// sources it builds against, `work` its cargo directory (kept: the runtime
+/// compiles once).
+pub fn builder(fleet: &str, id: &str, key: &Ed25519KeyPair, aot: &Path, work: &Path, stop: &std::sync::atomic::AtomicBool) {
+    let pin = pin_id(combd_aot::PIN);
+    eprintln!("builder   {id}: building for {:?} ({pin}), from {fleet}", combd_aot::PIN);
+    let host = fleet.split_once("://").map_or(fleet, |(_, r)| r).split([':', '/']).next().unwrap_or("").to_string();
+    let tls = crate::s3::tls_config();
+    let call = |path: &str, body: serde_json::Value| -> Result<serde_json::Value, String> {
+        let body = body.to_string().into_bytes();
+        let auth = sign_request(key, "POST", path, &body);
+        let tls = fleet.starts_with("https://").then_some((&tls, host.as_str()));
+        match crate::admin::request_as(fleet, tls, &auth, "POST", path, &body)? {
+            (200, v) => Ok(v),
+            (status, v) => Err(format!("{status}: {}", v["error"].as_str().unwrap_or("?"))),
+        }
+    };
+    // An idle builder asks less often (2 s, doubling to 30 s): each ask is
+    // a LIST, a billed write.
+    let (mut wait, mut failing) = (IDLE_FIRST, false);
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let job = call("/v1/builds/next", serde_json::json!({ "id": id, "pin": pin }));
+        // Said once when it stops working, and once when it works again.
+        if job.is_err() != failing {
+            failing = job.is_err();
+            match &job {
+                Err(e) => eprintln!("builder   {id}: can't ask {fleet} for work: {e}"),
+                Ok(_) => eprintln!("builder   {id}: asking {fleet} for work again"),
             }
-            let Some((cpu, m)) = base.strip_prefix(&prefix).and_then(|r| r.split_once('/')) else { continue };
-            if !claim(s3, &format!("{base}.claim"), id) {
-                continue;
-            }
-            did = true;
-            let r = s3.get(job).map_err(|e| e.to_string()).and_then(|w| w.ok_or_else(|| "the job is gone".to_string())).and_then(|(wasm, _)| {
+        }
+        let job = job.ok().filter(|v| v["job"].is_object());
+        if let Some(j) = &job {
+            let (cpu, m) = (j["job"]["cpu"].as_str().unwrap_or(""), j["job"]["module"].as_str().unwrap_or(""));
+            let r = unhex(j["job"]["wasm"].as_str().unwrap_or("")).ok_or_else(|| "the job's Wasm isn't hex".to_string()).and_then(|wasm| {
                 let out = work.join(format!("{m}-{cpu}.so"));
                 let level = (cpu != "generic").then_some(cpu);
                 crate::build::build(&wasm, aot, work, &out, None, level)?;
                 std::fs::read(&out).map_err(|e| e.to_string())
             });
-            match r {
-                Ok(so) => {
-                    let sig = key.sign(&signed(&pin, cpu, m, &so));
-                    let put = |ext: &str, b: &[u8]| s3.put(&format!("{base}.{ext}"), b, &Cond::Any);
-                    // The build first, its signature last: a node sees a
-                    // build as there only once it's signed.
-                    if put("so", &so).is_ok() && put("sig", hex(sig.as_ref()).as_bytes()).is_ok() {
-                        eprintln!("builder   {id}: built {m} for {cpu} ({} KB)", so.len() / 1024);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("builder   {id}: {m} for {cpu} failed: {e}");
-                    let _ = s3.put(&format!("{base}.err"), e.as_bytes(), &Cond::Any);
-                }
+            let answer = match &r {
+                Ok(so) => serde_json::json!({ "pin": pin, "cpu": cpu, "module": m, "so": hex(so), "sig": hex(key.sign(&signed(&pin, cpu, m, so)).as_ref()) }),
+                Err(e) => serde_json::json!({ "pin": pin, "cpu": cpu, "module": m, "error": e }),
+            };
+            match (call("/v1/builds/done", answer), &r) {
+                (Ok(_), Ok(so)) => eprintln!("builder   {id}: built {m} for {cpu} ({} KB)", so.len() / 1024),
+                (Ok(_), Err(e)) => eprintln!("builder   {id}: {m} for {cpu} failed: {e}"),
+                // Its claim goes stale, and it (or another) builds it again.
+                (Err(e), _) => eprintln!("builder   {id}: built {m} for {cpu}, but couldn't send it: {e}"),
             }
-            let _ = s3.delete(&format!("{base}.claim"));
-        }
-        if did {
             wait = IDLE_FIRST;
         } else {
             // In steps, so `stop` is still seen within 2 s.
@@ -379,6 +470,30 @@ mod tests {
         assert!(!ok("p", "x86-64-v3", "n", b"so"), "another module");
         assert!(!ok("p", "x86-64-v3", "m", b"os"), "another build");
         assert_eq!(parse_keys(&format!("# builders\n{}\nnot hex\n", hex(&public))), [public]);
+    }
+
+    /// A builder's request is taken only from a key the node lists, signed
+    /// lately, over exactly what was sent.
+    #[test]
+    fn a_request_is_a_listed_builders_signed_lately_over_all_of_it() {
+        let dir = crate::store::tempdir::Dir::new();
+        let keys = vec![unhex(&new_key(&dir.0.join("k")).unwrap()).unwrap()];
+        let (k, stranger) = (load_key(&dir.0.join("k")).unwrap(), load_key(&{
+            new_key(&dir.0.join("s")).unwrap();
+            dir.0.join("s")
+        })
+        .unwrap());
+        let auth = sign_request(&k, "POST", "/v1/builds/next", b"body");
+        assert!(check_request(&keys, &auth, "POST", "/v1/builds/next", None));
+        assert!(check_request(&keys, &auth, "POST", "/v1/builds/next", Some(b"body")));
+        assert!(!check_request(&keys, &auth, "POST", "/v1/builds/next", Some(b"bodY")), "another body");
+        assert!(!check_request(&keys, &auth, "POST", "/v1/builds/done", Some(b"body")), "another path");
+        assert!(!check_request(&keys, &sign_request(&stranger, "POST", "/v1/builds/next", b"body"), "POST", "/v1/builds/next", None), "a key it doesn't list");
+        let at = now_ms() - REQUEST_SKEW_MS - 1000;
+        let old = format!("Builder {} {at} {}", hex(k.public_key().as_ref()), hex(k.sign(&request_msg("POST", "/v1/builds/next", at, b"body")).as_ref()));
+        assert!(!check_request(&keys, &old, "POST", "/v1/builds/next", Some(b"body")), "signed too long ago");
+        assert!(!check_request(&keys, "Bearer combd_x", "POST", "/v1/builds/next", None));
+        assert!(part("../x").is_err() && part("").is_err() && part("x86-64-v3").is_ok());
     }
 
     /// A build already on the node is loaded only with a trusted builder's
