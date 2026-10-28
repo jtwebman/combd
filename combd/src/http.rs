@@ -530,6 +530,12 @@ const HOP_SHIFT: u32 = 56;
 const MAX_NOT_RUN: u8 = 3;
 /// While connections pour in, memory is measured every this many.
 const ACCEPT_MEASURE: u32 = 64;
+/// The longest a loop takes connections in one go before it does the rest
+/// of its work (and comes back for more at once). Without it, connections
+/// arriving faster than it turned them away kept it in `accept`: it served
+/// nobody, and never got to stop listening when full (seen as a slow
+/// close() stretched one refusal to a second).
+const ACCEPT_SLICE: Duration = Duration::from_millis(5);
 /// How long an idle object stays while memory is short (`idle_limit`).
 const SQUEEZED_IDLE: Duration = Duration::from_secs(10);
 /// The most an event-cell instance may have in flight (open tickets).
@@ -2068,11 +2074,13 @@ impl<E: Engine> Loop<'_, E> {
             }
         }
         let mut touched: Vec<usize> = vec![];
+        // Listeners whose last accept stopped at its slice: more may be waiting.
+        let mut more: Vec<Token> = vec![];
         while !self.sh.cfg.stop.load(Relaxed) {
             self.flush_unsent()?;
             self.pick_up_app()?;
             // Never block while requests are waiting to run.
-            let timeout = if self.tasks.is_empty() {
+            let timeout = if self.tasks.is_empty() && more.is_empty() {
                 let next = self.alarms.peek().map(|Reverse((at, _))| Duration::from_millis((at - now_ms()).max(0) as u64));
                 let timer = self.ev_timers.peek().map(|Reverse((at, ..))| *at).into_iter().chain(self.ticks.values().map(|t| t.1)).min().map(|at| at.saturating_duration_since(Instant::now()));
                 let next = match (next, timer) {
@@ -2090,17 +2098,26 @@ impl<E: Engine> Loop<'_, E> {
                 r => r?,
             }
             touched.clear();
-            for ev in events.iter() {
-                match ev.token() {
-                    LISTENER => {
-                        if let Some(mut l) = self.public.take() {
+            let again = std::mem::take(&mut more);
+            for (token, ev) in again.into_iter().map(|t| (t, None)).chain(events.iter().map(|ev| (ev.token(), Some(ev)))) {
+                let stopped = match token {
+                    LISTENER => match self.public.take() {
+                        Some(mut l) => {
                             let r = self.accept(&mut l, false);
                             self.public = Some(l);
                             r?
                         }
-                    }
+                        None => false,
+                    },
                     LOCAL => self.accept(&mut local, false)?,
                     REDIRECT => self.accept(redirect.as_mut().unwrap(), true)?,
+                    _ => false,
+                };
+                if stopped && !more.contains(&token) {
+                    more.push(token);
+                }
+                match token {
+                    LISTENER | LOCAL | REDIRECT => {}
                     WAKER => {
                         // Before the inbox, so a message sent while it's read
                         // wakes the loop again (and an Acquire: what was sent
@@ -2112,7 +2129,7 @@ impl<E: Engine> Loop<'_, E> {
                         let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else { continue };
                         if c.linger.is_some() {
                             c.peer_done |= drop_reads(&mut c.s);
-                        } else if ev.is_readable() && read_all(c, &self.sh.cfg.limits) {
+                        } else if ev.is_some_and(|e| e.is_readable()) && read_all(c, &self.sh.cfg.limits) {
                             // The peer is done sending (or past a limit): answer
                             // what's buffered, then close.
                             c.close_after = true;
@@ -2252,9 +2269,14 @@ impl<E: Engine> Loop<'_, E> {
         Ok(())
     }
 
-    fn accept(&mut self, listener: &mut TcpListener, redirect: bool) -> std::io::Result<()> {
-        let mut taken = 0u32;
+    /// Take what's waiting on `listener`, for `ACCEPT_SLICE` at most:
+    /// `true` if it stopped there, with more maybe waiting.
+    fn accept(&mut self, listener: &mut TcpListener, redirect: bool) -> std::io::Result<bool> {
+        let (mut taken, started) = (0u32, Instant::now());
         loop {
+            if started.elapsed() >= ACCEPT_SLICE {
+                return Ok(true);
+            }
             match listener.accept() {
                 Ok((mut s, from)) => {
                     // A burst: measure as it comes, not only on the sweep
@@ -2294,7 +2316,7 @@ impl<E: Engine> Loop<'_, E> {
                     (c.tls, c.redirect) = (tls, redirect);
                     self.sh.stats.conns_open.fetch_add(1, Relaxed);
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
                 // Out of files (EMFILE, ENFILE): it shouldn't be, under max_conns.
                 Err(e) if matches!(e.raw_os_error(), Some(23 | 24)) => {
                     self.sh.stats.accept_failed.fetch_add(1, Relaxed);
@@ -2302,9 +2324,9 @@ impl<E: Engine> Loop<'_, E> {
                         self.last_accept_warning = Instant::now();
                         eprintln!("combd     can't take a connection: {e}");
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
-                Err(_) => return Ok(()), // another loop took it, or a transient error
+                Err(_) => return Ok(false), // another loop took it, or a transient error
             }
         }
     }

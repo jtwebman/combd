@@ -1853,7 +1853,8 @@ mod tests {
             last.set(from_elsewhere());
             last.get() == Err(std::io::ErrorKind::ConnectionRefused)
         });
-        assert!(refused, "at max_conns, it stops listening: got {:?}, conns_open {}, tcp_refusing {}", last.get(), stat(port, "conns_open"), stat(port, "tcp_refusing"));
+        // (Its stats can't be asked for here: full, it turns this machine away too.)
+        assert!(refused, "at max_conns, it stops listening: a connection from elsewhere got {:?}", last.get());
         drop(held);
         assert!(eventually(3000, || from_elsewhere() == Ok(())), "room again: it listens");
         assert_eq!(stat(port, "tcp_refusing"), 0);
