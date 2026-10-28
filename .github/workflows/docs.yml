@@ -1,0 +1,37 @@
+# docs.combd.dev: the book in docs/src, built (mdbook) into the docs app's
+# static/ folder and deployed to the fleet as the app combd/docs, through
+# any node's admin API with a token for that app alone (DOCS_DEPLOY_TOKEN).
+# combd itself comes from the arena release (the nodes' own).
+name: docs
+on:
+  push:
+    branches: [main]
+    paths: [docs/**, .github/workflows/docs.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency: docs-deploy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools (mdbook, brotli, combd)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sSfL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | sudo tar xz -C /usr/local/bin mdbook
+          sudo apt-get install -y -qq brotli >/dev/null
+          gh release download arena --repo "$GITHUB_REPOSITORY" -p combd-arena-linux-amd64.tar.gz -O combd.tgz
+          tar xzf combd.tgz ./combd/target/release/combd && sudo mv combd/target/release/combd /usr/local/bin/combd
+      - name: Build
+        run: docs/build.sh
+      - name: Deploy (any node that answers; again while the fleet is moving to a combd that serves static files)
+        env:
+          COMBD_TOKEN: ${{ secrets.DOCS_DEPLOY_TOKEN }}
+        run: |
+          for try in $(seq 1 30); do
+            combd deploy docs/app combd https://arena.combd.dev:9443 && exit 0
+            sleep 60
+          done
+          exit 1

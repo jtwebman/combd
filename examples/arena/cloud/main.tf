@@ -178,10 +178,11 @@ resource "digitalocean_droplet" "node" {
       "COMBD_TLS_CERT=/etc/combd/tls/cert.pem",
       "COMBD_TLS_KEY=/etc/combd/tls/key.pem",
       "COMBD_REDIRECT_PORT=80",
-      # What combd may use of the droplet's 1 GB, by its own count. Past 85%
-      # it reclaims, past 95% it refuses new work; it watches the whole
-      # machine's free memory the same way, since the kernel's part of its
-      # connections isn't in its count.
+      # What combd may use of the droplet's 1 GB, by its own count. Past 80%
+      # it reclaims, past 90% it refuses new connections (until back under
+      # 85%). It watches the whole machine's memory too (reclaim at 85%,
+      # refuse at 95%), since the kernel's part of its connections isn't in
+      # its own count.
       "COMBD_MEMORY_BUDGET=550M",
       # Compiled modules: builds signed by these builders only.
       "COMBD_BUILDER_KEYS=/etc/combd/builder-keys",

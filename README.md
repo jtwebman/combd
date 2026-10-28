@@ -3,8 +3,10 @@
 **Self-hosted Durable Objects, built from scratch in Rust.**
 Tiny sealed cells, packed tight. Light, but very strong.
 
-**Try it:** [combd in ten minutes](docs/quickstart.md): `combd new hello`,
-`combd dev`, a page and a counter with its own SQLite, then on a server.
+**Docs: [docs.combd.dev](https://docs.combd.dev)**, served by combd itself.
+**Try it:** [combd in ten minutes](https://docs.combd.dev/quickstart.html):
+`combd new hello`, `combd dev`, a page and a counter with its own SQLite,
+then on a server.
 
 ---
 
@@ -54,8 +56,7 @@ abilities we hand it. Around that sit more walls: locked-down processes,
 encrypted and authenticated traffic between machines, and outbound requests
 that are denied unless allowed. Security is not a later phase.
 
-**Our own engine.** We plan to write our own WebAssembly interpreter in safe
-Rust. Because a running cell is just plain data to it, combd can pause a cell
+**Our own engine.** We wrote our own WebAssembly interpreter in safe Rust. Because a running cell is just plain data to it, combd can pause a cell
 at any instruction, save it in the middle of a request, and even move it to
 another machine while it runs. No JIT also means a whole class of sandbox
 escape bugs can't happen. The engine sits behind a small interface, so a faster
@@ -96,79 +97,52 @@ retired; its results below stand).
 - **With a CPU-heavy neighbor on the same core**, it kept 35x to 56x Bun's
   throughput, because combd keeps yielding and Bun can't.
 
-**Durable Objects on one node.** Each object is a warm cell with its own
-SQLite file, and each answer waits until its writes are safely on disk. On
-one core, combd beat workerd's Durable Objects by 1.8x on writes, 8.3x on
-reads, and 5.7x on writes spread over 1,000 objects.
+**What it runs.** The details are in [the docs](https://docs.combd.dev);
+the short version:
+- **Durable Objects:** each object a warm cell with its own SQLite, every
+  answer waiting until its writes are on disk. On one core, combd beat
+  workerd's Durable Objects by 1.8x on writes and 8.3x on reads.
+  ([Processes](https://docs.combd.dev/processes.html),
+  [storage](https://docs.combd.dev/storage.html))
+- **WebSockets that sleep:** a quiet room leaves memory with its sockets
+  still open, and the next message wakes it with its state intact.
+- **Your own Postgres,** through one pool for the whole fleet with a max you
+  set: a thousand nodes against a database that takes 100 connections, and
+  it never sees more than 100. Transactions across many messages, and a
+  crash rolls them back. ([Postgres pools](https://docs.combd.dev/postgres.html))
+- **Static files** beside the code, served from memory: a page and its
+  assets, or a whole site (these docs).
+  ([Static files](https://docs.combd.dev/static-files.html))
+- **A fleet over your bucket:** several nodes share one S3 or R2 bucket,
+  which decides who owns each object. Writes are confirmed by peer nodes,
+  and a node that dies, freezes, or is cut off is taken over with every
+  acknowledged write intact. Each part is checked four ways: a TLA+ spec, a
+  deterministic simulator, kill tests on a real cluster, and known-bad
+  versions that must fail. ([Running a fleet](https://docs.combd.dev/fleet.html))
+- **Compiled on deploy:** a module runs interpreted, or compiled to machine
+  code by builders you run, which ask the fleet for work or have it pushed
+  to them (Cloud Run, scaled to zero), and sign what they build.
+  ([Builders](https://docs.combd.dev/builders.html))
+- **Deploys from anywhere:** `combd deploy` with a token scoped to one app.
+  ([Deploying](https://docs.combd.dev/deploying.html))
+- **TLS in combd itself,** no proxy in front: an idle connection costs about
+  10 KB, against about 106 KB behind Caddy.
+- **Overload says no instead of falling over:** a full node turns new
+  connections away at TCP and keeps serving the ones it has.
+  ([Overload](https://docs.combd.dev/overload.html))
 
-**WebSockets that sleep.** An object can hold many WebSockets, like a chat
-room. When it goes quiet it leaves memory, and its sockets stay open; the
-next message wakes it with its state intact. Pings never wake it at all.
-Text and binary both work, across a fleet too: a client can reach any node,
-and the room's sockets survive its owner going down.
-
-**Your own Postgres.** Cells reach a database through the host, which keeps
-the connections and the password, in one pool per database with a max you
-set: run 1000 nodes against a Postgres that takes 100 connections, and it
-never sees more than 100. The pool grows when asked, makes asks wait in line
-at max, takes back connections held too long, and closes idle ones. (One
-node today; one manager for a whole fleet is next.) A Worker can run a transaction in one
-request. A Durable Object can hold one across many messages, with row locks
-and advisory locks, and a crash rolls it back and lets the locks go. A cell
-waiting on the database is paused and costs no CPU.
-
-**Many requests per instance.** A Worker can opt in to being an event
-cell, like a Node process: one instance takes up to 32 requests at once
-(`COMBD_EV_MAX`) and runs them while they wait on timers or Postgres. Thirty
-requests that each wait 400 ms finish in about 400 ms on one instance. It can
-answer and keep working (waitUntil). The price: a crash fails every
-unanswered request on that instance, and work after an answer is best
-effort. Set `COMBD_EV_MAX=1` for strict one-request let-it-crash.
-
-**Durable Objects across a fleet.** Several combd nodes share one S3 bucket,
-which decides who owns each object. Writes are confirmed by two peer nodes,
-so they don't wait on the bucket, and the bucket gets them in batches. Kill
-a node, freeze it, or cut it off from the network, and another takes over
-with every acknowledged write intact. Each part is checked four ways: a
-TLA+ spec, a deterministic simulator with crashes, lost messages, and
-network splits, a real cluster with kill tests, and known-bad versions that
-must fail every one of them.
-
-**Compiled on deploy.** Each module says how it runs: `interpreted`, or
-`compiled` to machine code. A compiled module is built by builders, machines
-you run that pick up jobs from the bucket and sign what they build. Nodes
-load only signed builds, and a deploy waits until its builds are ready. The
-admin panel shows the nodes, the deploys, and where each process's CPU goes.
-
-**TLS in combd itself.** A node can end TLS on its own, without Caddy or
-HAProxy in front. An idle connection costs about 10 KB there, against about
-106 KB behind Caddy. It passes the Autobahn WebSocket suite and testssl.sh.
-
-**Live, on $6 machines.** Two apps run on a three-node fleet (New York,
+**Live, on $6 machines.** Three apps run on a three-node fleet (New York,
 Frankfurt, Singapore), one 1 vCPU, 1 GB droplet each, over an R2 bucket:
-[a real-time 1 vs 1 game](examples/arena/) and
-[One Million Checkboxes](https://million.combd.dev) ([source](examples/million/)).
-Each node runs combd under systemd as its own user, no Docker, and moves
-to a new release by itself, only one signed with the release key. What
-one node that size does (measured 2026-10-22):
-- **About 58,000 idle WebSockets**, each with million's 3.9 KB snapshot
-  (~10 KB a connection, all told). Then it turns new ones away and stays
-  fast: pings 4 to 20 ms, no swapping.
+[a real-time 1 vs 1 game](examples/arena/),
+[One Million Checkboxes](https://million.combd.dev) ([source](examples/million/)),
+and [these docs](https://docs.combd.dev). Each node moves to a new release by
+itself, only one signed with the release key. What one node that size does:
+- **About 58,000 idle WebSockets**, then it turns new ones away and stays
+  fast.
 - **10,000 people clicking at once** on million, every click sent to
-  everyone watching it: nothing lost, p50 echo under 420 ms, 62% CPU.
-  20,000: 0.04% of clicks lost.
-- **Past about 30,000 active users it turns the rest away and keeps
-  serving the ones it has**: 40,000 arriving, ~30,000 held, 0.5% of their
-  clicks lost, the node answering throughout.
-
-When a node gets more than it can do, it says so instead of falling over:
-- it watches the whole machine's memory, not just its own count, and
-  refuses new connections before it would swap;
-- at most `COMBD_MAX_AWAKE` cells at work at once (1,000): past it,
-  sleeping sessions wait their turn, still asleep;
-- a full mailbox refuses at once (503 `overloaded`) instead of queueing
-  forever, and requests that pile up for an object run together as one
-  batch, in one transaction.
+  everyone watching it: nothing lost, p50 echo under 420 ms.
+- **Past about 30,000 active users it turns the rest away** and keeps
+  serving the ones it has.
 
 ## What surprised us
 
@@ -207,7 +181,8 @@ the full story; the short version:
 
 ## Next
 
-- **A bigger real app:** an X clone on combd and Postgres.
+- **Environments:** an app deployed as staging and production, each with its
+  own vars and secrets.
 - **JavaScript, without a JS engine:** a Workers-compatible library over
   combd's host, compiled to Wasm.
 - **A billion checkboxes** on the same three $6 servers, and what it needs

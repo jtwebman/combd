@@ -185,7 +185,7 @@ route through an object, 1.7 times Phoenix's at 100 connections, in 5 to
 
 ## Try it
 
-Start with the quickstart: [combd in ten minutes](../docs/quickstart.md).
+Start with the quickstart: [combd in ten minutes](../docs/src/quickstart.md).
 
 Everything here is in the repository: the plan with what building taught
 us, every measurement with how it was made, the specs, and the race

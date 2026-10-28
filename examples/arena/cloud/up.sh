@@ -6,10 +6,12 @@ set -e
 cd "$(dirname "$0")"
 [ -f terraform.tfvars ] || { echo "copy terraform.tfvars.example to terraform.tfvars and fill it in"; exit 1; }
 BIN=../../../combd/target/release/combd
-[ -x $BIN ] || (cd ../../../combd && cargo build --release)
+# With compiled modules' support (aot-lite), as the nodes run it: it has builder-key.
+(cd ../../../combd && cargo build --release -q --features aot-lite)
 # The fleet's secrets, made here and kept here (gitignored): the wire's CA and
-# a certificate per node, a deploy token (the nodes get only its hash), and
-# the master key for secrets. Delete .secrets to start over.
+# a certificate per node, a deploy token (the nodes get only its hash), the
+# master key for secrets, and a builder's key (the nodes get its public half).
+# Delete .secrets to start over.
 S=.secrets
 if [ ! -d $S ]; then
     mkdir -p $S && chmod 700 $S && umask 077
@@ -18,6 +20,7 @@ if [ ! -d $S ]; then
     echo "$OUT" | sed -n 's/.*: \(combd_[0-9a-f]*\)$/\1/p' > $S/token
     echo "$OUT" | sed -n 's/^line for the tokens file: *//p' > $S/tokens
     $BIN master-key $S/master.key >/dev/null
+    $BIN builder-key $S/builder.key | sed -n 's/.*COMBD_BUILDER_KEYS: *//p' > $S/builder-keys
 fi
 terraform init -input=false >/dev/null
 terraform apply

@@ -89,7 +89,7 @@ and the rest of the plan is updated to match.
    `combd-spike` links are left in the images. `combd-sdk`
    (`sdk/rust/`): a Rust crate for apps (`cell!`, `Request`, `Response`,
    `sql::run`, alarms, `call`, `send`, `env`), with no proc macro.
-   `docs/quickstart.md`, each step run as written (new, dev, change it,
+   `docs/src/quickstart.md`, each step run as written (new, dev, change it,
    serve-apps). `.github/workflows/release.yml`: Linux x86_64 and arm64,
    macOS arm64 and x86_64; a `v*` tag makes a draft release (all four
    built and ran on GitHub's runners). The race (`bench/click/`, one
@@ -1005,9 +1005,9 @@ passed its spec and simulator.
 
 | Step | Ack a write when... | Speed | What can be lost |
 |---|---|---|---|
-| **D1: single node** | local fsync done. Bucket backup runs async. | very fast (~1 ms) | last few seconds, only if the disk dies |
+| **D1: single node** | local fsync done. No bucket, no backup (a fleet of one has the bucket: D2). | very fast (~1 ms) | everything on it, if the disk dies |
 | **D2: fleet, bucket proof** | the bucket has it and ownership is re-checked | slow (~hundreds of ms, many writes share one upload) | nothing acknowledged |
-| **D3: fleet, peer proof** | every peer of the object (2 by default) has it on disk; if one is down, the D2 proof instead | fast (~14 ms p50 on our Docker cluster, vs ~28 ms for D2) | nothing acknowledged, as long as a peer's disk survives |
+| **D3: fleet, peer proof** | every peer of the object (`COMBD_REPLICAS`: 0 by default, which is D2; the arena runs 2) has it on disk; if one is down, the D2 proof instead | fast (~14 ms p50 on our Docker cluster, vs ~28 ms for D2) | nothing acknowledged, as long as a peer's disk survives |
 
 All three are built. D1 is honest and simple, and good for many apps. D3 is
 where celld's hardest code lives (node logs, sealing, takeover recovery). We

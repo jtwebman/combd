@@ -1,0 +1,5 @@
+# docs.combd.dev: the docs, as static files on the fleet that runs the
+# arena (static/ is made by ../build.sh from the book in ../src).
+[app]
+name = "docs"
+domains = ["docs.combd.dev", "localhost"]

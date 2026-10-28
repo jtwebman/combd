@@ -1,0 +1,17 @@
+[book]
+title = "combd"
+description = "Durable Objects on your own machines: Wasm cells, one node or a fleet over a bucket."
+language = "en"
+src = "src"
+
+[output.html]
+site-url = "/"
+no-section-label = false
+
+[output.html.search]
+enable = true
+
+[output.html.playground]
+runnable = false
+copyable = true
+editable = false

@@ -6,7 +6,7 @@ The first release: Durable Objects on your own machines, as one binary.
 
 **Run an app**
 - `combd new`, `combd dev`, `combd build`: an app from nothing to running
-  in a few commands (`docs/quickstart.md`).
+  in a few commands (`docs/src/quickstart.md`).
 - `combd-sdk`, a Rust crate for apps: a request in, a response out
   (`cell!`), each durable object's own SQLite (`sql::run`, one
   transaction a request), Postgres through the node's pool (`pg::query`),
