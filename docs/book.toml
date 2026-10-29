@@ -1,11 +1,12 @@
 [book]
 title = "combd"
-description = "Durable Objects on your own machines: Wasm cells, one node or a fleet over a bucket."
+description = "Durable Objects on your own machines. Wasm cells on one node, or a fleet over a bucket."
 language = "en"
 src = "src"
 
 [output.html]
 site-url = "/"
+git-repository-url = "https://github.com/jtwebman/combd"
 no-section-label = false
 
 [output.html.search]

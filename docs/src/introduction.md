@@ -45,6 +45,7 @@ machine, then on a server.
 How combd is built and tested, and the numbers behind it, are in the
 repo: [`plan.md`](https://github.com/jtwebman/combd/blob/main/plan.md) and
 [`combd/RESULTS.md`](https://github.com/jtwebman/combd/blob/main/combd/RESULTS.md).
-combd is open source, under Apache-2.0.
+combd is open source, under Apache-2.0. The code is on GitHub at
+[github.com/jtwebman/combd](https://github.com/jtwebman/combd).
 
 Every page is also plain markdown, at its name with `.md`. [`llms.txt`](/llms.txt) lists them, and [`llms-full.txt`](/llms-full.txt) has them all in one file, for tools that read docs.
