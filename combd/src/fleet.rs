@@ -270,10 +270,17 @@ pub fn encode_call(c: &PeerCall, b: &mut Vec<u8>) {
             b.extend_from_slice(&obj.to_le_bytes());
             b.extend_from_slice(&epoch.to_le_bytes());
         }
-        PeerCall::Learn { obj, epoch } => {
+        // 3: born is the epoch; or (new in 0.1) 4, with born.
+        PeerCall::Learn { obj, epoch, born } if born == epoch => {
             b.push(3);
             b.extend_from_slice(&obj.to_le_bytes());
             b.extend_from_slice(&epoch.to_le_bytes());
+        }
+        PeerCall::Learn { obj, epoch, born } => {
+            b.push(4);
+            b.extend_from_slice(&obj.to_le_bytes());
+            b.extend_from_slice(&epoch.to_le_bytes());
+            b.extend_from_slice(&born.to_le_bytes());
         }
     }
 }
@@ -282,7 +289,11 @@ fn decode_call(r: &mut Rd) -> Option<PeerCall> {
     Some(match r.u8()? {
         1 => PeerCall::Append { obj: r.u128()?, epoch: r.u32()?, from: r.u64()?, trunc: r.u64()?, ents: r.ents()? },
         2 => PeerCall::Fence { obj: r.u128()?, epoch: r.u32()? },
-        3 => PeerCall::Learn { obj: r.u128()?, epoch: r.u32()? },
+        3 => {
+            let (obj, epoch) = (r.u128()?, r.u32()?);
+            PeerCall::Learn { obj, epoch, born: epoch }
+        }
+        4 => PeerCall::Learn { obj: r.u128()?, epoch: r.u32()?, born: r.u32()? },
         _ => return None,
     })
 }
@@ -300,6 +311,12 @@ fn encode_res(res: &PeerRes, b: &mut Vec<u8>) {
         }
         PeerRes::Kept(n) => {
             b.push(5);
+            b.extend_from_slice(&n.to_le_bytes());
+        }
+        // New in 0.1: an older node reads it as a lost reply (the peer
+        // looks slow; its owner falls back to the bucket), never as more.
+        PeerRes::Reborn(n) => {
+            b.push(6);
             b.extend_from_slice(&n.to_le_bytes());
         }
         PeerRes::Tails { born, tails: ts } => {
@@ -321,6 +338,7 @@ fn decode_res(r: &mut Rd) -> Option<PeerRes> {
         2 => PeerRes::Refused,
         4 => PeerRes::Wait(r.u64()?),
         5 => PeerRes::Kept(r.u64()?),
+        6 => PeerRes::Reborn(r.u64()?),
         3 => {
             let born = r.u32()?;
             let n = r.u32()?;
@@ -529,12 +547,13 @@ impl DiskPeers {
     }
 
     /// Apply a call; it's durable after the next `sync`. A wiped store first
-    /// relearns the object (`learn`: the epoch in its ownership record);
-    /// `None` if it can't, and then it doesn't answer.
-    pub fn handle(&mut self, c: PeerCall, learn: &mut impl FnMut(crate::own::Obj) -> Option<u32>) -> std::io::Result<Option<PeerRes>> {
+    /// relearns the object (`learn`: the epoch in its ownership record, and
+    /// the newest that began before this store came back); `None` if it
+    /// can't, and then it doesn't answer.
+    pub fn handle(&mut self, c: PeerCall, learn: &mut impl FnMut(crate::own::Obj) -> Option<(u32, u32)>) -> std::io::Result<Option<PeerRes>> {
         if let Some(obj) = self.store.must_learn(&c) {
-            let Some(epoch) = learn(obj) else { return Ok(None) };
-            self.apply(PeerCall::Learn { obj, epoch })?;
+            let Some((epoch, born)) = learn(obj) else { return Ok(None) };
+            self.apply(PeerCall::Learn { obj, epoch, born })?;
         }
         self.apply(c).map(Some)
     }
@@ -597,7 +616,7 @@ impl DiskPeers {
 pub fn serve_peers<B: Send + 'static>(
     mut disk: DiskPeers,
     rx: std::sync::mpsc::Receiver<(PeerCall, B)>,
-    mut learn: impl FnMut(crate::own::Obj) -> Option<u32> + Send + 'static,
+    mut learn: impl FnMut(crate::own::Obj) -> Option<(u32, u32)> + Send + 'static,
     answer: impl Fn(B, Option<PeerRes>) + Send + 'static,
 ) {
     std::thread::spawn(move || {
@@ -746,7 +765,7 @@ mod tests {
         assert!(d.store.wiped);
         let call = PeerCall::Append { obj: 7, epoch: 2, from: 1, ents: vec![vec![1]], trunc: 0 };
         assert_eq!(d.handle(call.clone(), &mut |_| None).unwrap(), None, "no answer without the bucket");
-        assert_eq!(d.handle(call, &mut |_| Some(3)).unwrap(), Some(PeerRes::Refused), "epoch 2 is fenced by the record");
+        assert_eq!(d.handle(call, &mut |_| Some((3, 3))).unwrap(), Some(PeerRes::Refused), "epoch 2 is fenced by the record");
         d.sync().unwrap();
         drop(d);
         let mut d = DiskPeers::open(&dir, true).unwrap();
@@ -794,6 +813,7 @@ mod tests {
             Frame::Pool { body: b"{}".to_vec() },
             Frame::PeerReply { id: 9, res: PeerRes::Wait(1500) },
             Frame::PeerReply { id: 10, res: PeerRes::Kept(7) },
+            Frame::PeerReply { id: 11, res: PeerRes::Reborn(9) },
             Frame::PeerReply { id: 5, res: PeerRes::Tails { born: 4, tails: vec![Tail { epoch: 2, from: 7, ents: vec![vec![3; 5]] }] } },
         ] {
             let b = f.encode();

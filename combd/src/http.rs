@@ -359,6 +359,7 @@ struct Stats {
     gc_deleted: AtomicU64,
     /// Objects handed to another node (placement).
     moves: AtomicU64,
+    reseats: AtomicU64,
     /// WebSockets open, and messages in from them.
     sockets_open: AtomicU64,
     ws_messages: AtomicU64,
@@ -2020,13 +2021,27 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<LoopWaker>)], threads: u
     // their own: if the event loops stop or stall, so do the heartbeats, and
     // the other nodes take over. (A thread of its own kept a stopped node
     // "alive" forever.)
+    // A store that lost its disk came back now, by the bucket's clock (the
+    // lease just written): a record written later than that began an epoch
+    // it saw whole. Two seconds to spare, for a bucket whose servers' clocks
+    // differ a little; closer than that, it can't speak for the epoch (its
+    // owner reseats).
+    let back = if disk.store.wiped { fc.s3.get_modified(&own::lease_key(fc.node)).ok().flatten().and_then(|(_, m)| m) } else { None };
     let (w, ls, s3) = (wire.clone(), loops.to_vec(), fc.s3.clone());
     let learn = move |obj| match s3.get(&own::own_key(obj)) {
         Ok(Some((b, _))) => match own::Val::decode(&own::own_key(obj), &b) {
-            Some(own::Val::Rec(r)) => Some(r.epoch),
+            Some(own::Val::Rec(r)) => match back {
+                Some(back) => own::born_of(obj, r.epoch, |k| match s3.get_modified(k) {
+                    Ok(Some((_, m))) => Ok(Some(m.is_some_and(|m| m > back + 2))),
+                    Ok(None) => Ok(None),
+                    Err(_) => Err(()),
+                })
+                .map(|born| (r.epoch, born)),
+                None => Some((r.epoch, r.epoch)),
+            },
             _ => None,
         },
-        Ok(None) => Some(0),
+        Ok(None) => Some((0, 0)),
         Err(_) => None,
     };
     crate::fleet::serve_peers(disk, prx, learn, move |back, res| match back {
@@ -4167,7 +4182,7 @@ impl<E: Engine> Loop<'_, E> {
             Req::Stats => {
                 let s = &self.sh.stats;
                 let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"moves\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"disk_low\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"moves\":{},\"reseats\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"disk_low\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
                     s.objects_live.load(Relaxed),
                     s.objects_opened.load(Relaxed),
                     s.evictions.load(Relaxed),
@@ -4188,6 +4203,7 @@ impl<E: Engine> Loop<'_, E> {
                     s.fence_waits.load(Relaxed),
                     s.gc_deleted.load(Relaxed),
                     s.moves.load(Relaxed),
+                    s.reseats.load(Relaxed),
                     s.sockets_open.load(Relaxed),
                     s.ws_messages.load(Relaxed),
                     s.ws_handoffs.load(Relaxed),
@@ -4735,6 +4751,7 @@ impl<E: Engine> Loop<'_, E> {
         st.fence_waits.fetch_add(now.fence_waits - was.fence_waits, Relaxed);
         st.gc_deleted.fetch_add(now.gc_deleted - was.gc_deleted, Relaxed);
         st.moves.fetch_add(now.moves - was.moves, Relaxed);
+        st.reseats.fetch_add(now.reseats - was.reseats, Relaxed);
         for e in effects {
             self.effect(e);
         }

@@ -141,8 +141,43 @@ The peers are interchangeable, and so are the writes, so TLC checks one of
 each set of mirror-image states (`SYMMETRY`); that's sound for invariants,
 which is all we check.
 
+**Peer sets, and a node replaced** (2026-10-28). A drill on real nodes
+found an object that no node would serve: one node replaced with an empty
+disk, then its owner lost. The owner had picked itself as one of its own
+two peers, so the object had two copies where the fleet counted three, and
+the model couldn't show it: it kept owners and peers apart, with one peer
+set for every epoch. Now each epoch has its own set (`pset`), two of a pool
+of three peer machines, never its owner's. A claim after no epoch or a
+sealed one picks any set. A claim after an unsealed one keeps that epoch's,
+so its fence covers it. A peer that lost its disk relearns lazily, on first
+touch (`Learn`), as the code does, and speaks for every epoch whose
+manifest was written after it came back. The code reads that from the
+bucket's times, and may know less, so `Learn` may pick any `born` up to the
+record's epoch. Loading from a sealed epoch needs only the fence: the
+bucket has all of it, and the peers fenced may be another set that holds
+none of it. One more known-bad version must fail:
+
+| Bug | Caught by |
+|---|---|
+| load with no peer's tail, sealed or not | NoLostAckedWrite |
+
+The model checks safety. Liveness is the simulator's
+(`a_lost_disk_and_a_lost_node_strand_nothing`: a replaced node, then a node
+lost for good, in 3,000 runs), and the drill's
+(`combd/bench/drill/replace-node.sh`).
+
+With peer sets, the model with no wipes checks clean in 213,050,094
+distinct states (an hour on 14 cores). The wipe model no longer finishes on
+a laptop: TLC stopped at 1.1 billion distinct states, every behavior up to
+28 steps, with 389 million left and the disk full. No error in any of it.
+So `check.sh` walks it at random instead, for 30 minutes (`WIPE_SECS`).
+Random runs find both known wipe bugs, in about 8 minutes and 2. An hour
+of them, 3.67 billion states, found nothing on the fix (2026-10-29).
+That's evidence, not proof. The whole space needs a bigger machine.
+
 Run `./check.sh` (needs Java; it fetches TLC 1.7.4 and checks its hash). The
-whole run takes about 25 minutes, most of it the wipe model.
+whole run takes about two hours: an hour for the model with no wipes, half
+an hour for the wipe model.
 
 Not modeled yet: reads (they pass the same gate as writes), leases and
 clocks (liveness only), many objects, and checkpoints of old epochs.

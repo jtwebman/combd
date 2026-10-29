@@ -48,6 +48,10 @@ The first release: Durable Objects on your own machines, as one binary.
 - Objects in your own bucket (S3, R2), owned by conditional write; writes
   confirmed by peers and uploaded in batches; a deploy reaches every node
   through the catalog.
+- A dead node can be replaced by a new machine with its number and an
+  empty disk: it knows its disk is new, and the owners it's a peer of start
+  a new epoch it sees whole (`reseats` in stats). An owner is never its own
+  peer, so with 2 peers a write is on three machines.
 - Placement: objects move to the node their requests come in through
   (`nearest`), spread by hash (`spread`), or pinned to regions (`pin`);
   hooks for your own rules (`policy.rs`).

@@ -2030,9 +2030,11 @@ containers. Most can be built later as cells on top of the core.
 - **Multi-tenant from day one, or single-tenant first?** Recommend: design
   every boundary for hostile tenants, but ship single-tenant first. Later, run
   a separate process per tenant with seccomp/landlock as a second wall.
-- **A peer that loses its disk.** Today it must rejoin as a new node. Better:
-  a store that knows it's new, so the next owner uses another peer's tail.
-  Spec first.
+- **A peer that loses its disk.** Answered (2026-10-28, `spec/README.md`,
+  "Peer sets, and a node replaced"): it rejoins under its own number, knows
+  its disk is new, speaks for every epoch that began after it came back, and
+  its owners reseat (a new epoch it sees whole). An owner is never its own
+  peer. The drill: `combd/bench/drill/replace-node.sh`.
 - **Lease and hint tuning under splits.** A node cut off from everything but
   its clients still costs about 3 s, mostly one lease plus routing hints.
 - **Message format between cells.** Plain bytes (simple) or WIT types (safer,
@@ -2107,3 +2109,85 @@ crates.io as `combd`.
 - celld guarantees, testing, security docs: `reference/celld/docs/`
 - WASI 0.3: https://wasi.dev/releases/wasi-p3
 - Fermyon joins Akamai: https://www.fermyon.com/blog/fermyon-joins-akamai
+
+## To look at: Lust (github.com/t3dotgg/lust-lang)
+
+JT (2026-10-28): look at [Lust](https://github.com/t3dotgg/lust-lang) and see whether we
+can compile our apps with it; if not, see whether we can help its author
+make it so. It might speed the project up a great deal. First steps: what
+it compiles to (Wasm we can load, or native), what it needs from a host,
+and how far its output is from what combd runs (`modules/*.wasm`, the host
+ABI in `docs/src/languages.md`).
+
+## To do: telemetry in the bucket, with our own Parquet writer
+
+JT (2026-10-28), after Ryan Dahl's post on celld's version: one setting
+turns on a whole observability stack. celld does it with `CELLD_OTEL=1`
+(`reference/celld/docs/telemetry.md`, `crates/celld/telemetry.rs`). Each
+node buffers a span per request and a record per log line, then writes a
+Parquet file to `telemetry/` in the fleet bucket every 5 minutes or 5 MB.
+DuckDB queries the bucket directly, and old files are deleted after 30 days.
+`CELLD_OTEL=http://...` sends the same data to an OTLP collector instead.
+
+Ours: `COMBD_TELEMETRY=1`, with the same layout
+(`telemetry/<traces|logs>/<node>/<yyyy>/<mm>/<dd>/<hh>/<id>.parquet`), so
+the same DuckDB queries work. celld uses the `parquet` crate (59, no arrow).
+We write our own instead. Our rows are flat, so the subset we need is small:
+
+- The file is `PAR1`, one row group of column chunks, the footer, the
+  footer's length, and `PAR1` again.
+- Each column chunk is one data page, v1, PLAIN encoded. Strings that repeat
+  (app, process, node, route) also get a dictionary page, with RLE indexes.
+  Nullable columns get RLE definition levels.
+- The page headers and the footer (FileMetaData: schema, row groups, column
+  chunk offsets, min and max stats) are Thrift compact protocol. That's
+  varints, zigzag, and field headers, about 150 lines for the encoder.
+- Types: INT64 (times in µs, durations, sizes), INT32 (status), BYTE_ARRAY
+  with the STRING logical type, BOOLEAN.
+- No compression at first (codec UNCOMPRESSED). Dictionaries already shrink
+  the repeated strings. Add zstd or gzip later if files get too big.
+
+All of that is maybe 500 lines with its tests. Check it by writing files and
+reading them back with DuckDB and pyarrow in a test (skipped if neither is
+installed), plus a fixed file checked byte for byte.
+
+What to record: per request, the time, node, org/app/process, object, route,
+method, status, duration, queue wait, bytes in and out, forwarded or not,
+and the trace and span ids (W3C `traceparent` in, and passed on to outbound
+fetches and forwards). Also a cell's log lines, with their span. Telemetry
+sheds before requests do, and the node's stats count what it drops.
+
+Later: an OTLP/HTTP sink behind the same setting, for Grafana or Honeycomb,
+and alerts as scheduled DuckDB queries.
+
+## For the marketing site: how celld's author pitches it
+
+JT (2026-10-28): Ryan Dahl's post (@rough__sea, 2026-10-01) is a good
+model for how to pitch combd. His words:
+
+> i feel like people do not grok how important celld is.
+>
+> it's scalable applications of arbitrary complexity. the only dependency is s3.
+>
+> once you see it, you'll realize there's no point to traditional javascript runtimes in serving applications - only for build processes (eg bundling) and scripting.
+>
+> the networking and scaleability are deeply rooted not only in the distributed runtime (celld), but in the programming model itself (largely kenton's design)
+>
+> I wasn't quite sure when I started celld how well this could be made to work, but we've been running it in bigger capacities and getting user reports over the last months. Actually handles load surprisingly well. (any experience in the comments to share?)
+>
+> because the programming model does not expose the underlying linux system, you can actually think of celld as a distributed operating system - running in user space of linux. it only runs one program / doesn't support multi-tenant, but it has system services like an operating system. it's all about networking - i like to think of it as the practical modern version of plan9 or even erlang beam.
+
+What we can say the same way, since it's true of combd too:
+
+- The only dependency is a bucket. One binary, any S3-compatible store
+  that passes `bucket-check`.
+- A distributed system in user space. Apps see objects, requests, SQL,
+  and sockets, never the machine.
+
+Where combd differs, to lead with:
+
+- Many tenants. celld "only runs one program". combd runs many orgs and
+  apps on one fleet, each with its own tokens, domains, and limits.
+- Any language that compiles to Wasm, not only JavaScript.
+- Every acked write on three machines with D3, and how it's checked (the
+  spec, the simulator, the drills), shown with the numbers.

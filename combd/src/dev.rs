@@ -1,5 +1,5 @@
 //! `combd new`, `combd build`, `combd dev`: an app from nothing to running
-//! here, the way the quickstart (`docs/quickstart.md`) goes.
+//! here, the way the quickstart (`docs/src/quickstart.md`) goes.
 
 use std::path::Path;
 

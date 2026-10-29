@@ -85,9 +85,15 @@ bucket.
 ### D3: a fleet, proven by peers
 
 With `COMBD_REPLICAS` set, each object has that many peer nodes, picked by
-hash. A write is acknowledged once every peer has it on disk, and the
-bucket gets it in batches, in the background. If a peer is down, a write
+hash. A peer is never the object's owner, so with 2 peers a write is on
+three machines. A write is acknowledged once every peer has it on disk, and
+the bucket gets it in batches, in the background. If a peer is down, a write
 is acknowledged the D2 way.
+
+A peer that lost its disk tells the owner when it gets the next write. The
+owner then uploads everything, closes its epoch, and starts a new one, so
+the peer holds a whole copy again. The node's stats count these as
+`reseats`.
 
 While every peer is up, uploads wait up to `COMBD_UPLOAD_MS` (10 s), or
 until `COMBD_UPLOAD_BYTES` (1 MB, at most 16 MB) build up. So an object's

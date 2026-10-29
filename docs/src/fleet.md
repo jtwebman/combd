@@ -231,6 +231,28 @@ it serves, and swaps in whatever the catalog says changed.
 A node refuses a wire with no certificates, unless
 `COMBD_WIRE_INSECURE=1` asks for plain TCP, with a warning in the log.
 
+## Replacing a node
+
+A node that dies for good can be replaced by a new machine with the same
+number and an empty disk. Give it the same `/etc/combd` files and start it.
+
+- It finds its lease in the bucket and its peer log gone, so it knows its
+  disk is new. Its log says `the peer store was lost`.
+- It refuses to speak for any epoch it may have lost part of, and it can
+  speak for every epoch that began after it came back.
+- Each owner it's a peer of starts a new epoch when it next writes there.
+  Watch `reseats` in `/_combd/stats` go up.
+
+Until those owners have done that, the fleet counts one copy fewer for
+those objects. Losing another node in that window can leave an object
+unable to answer until that node is back. combd never answers with fewer
+writes than it acknowledged. Replace one node at a time. Before the next
+one, let the objects it holds get a write, or go idle and leave memory.
+
+To practice this on one machine, run `combd/bench/drill/replace-node.sh`.
+It starts three nodes, kills one with `kill -9`, wipes its disk, starts it
+again, and checks that every acknowledged write is still there.
+
 ## TLS in combd
 
 A node can end TLS itself, with no proxy in front. `COMBD_TLS_CERT` is

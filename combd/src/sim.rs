@@ -148,6 +148,8 @@ pub struct Stats {
     pub probe_ms: u64,
     pub splits: u64,
     pub wipes: u64,
+    /// Nodes lost for good (`loss`).
+    pub lost: u64,
     /// The longest time any object went without an acknowledged write, in ms
     /// (while traffic was running).
     pub max_gap: u64,
@@ -181,15 +183,20 @@ enum Msg {
 type End = Option<Node>;
 
 /// A peer store answers a call; a wiped one first relearns the object from
-/// the bucket, as a real one does.
-fn store_call(stores: &mut HashMap<Node, PeerStore>, bucket: &BTreeMap<String, (Val, u64)>, node: Node, call: PeerCall, now: u64) -> PeerRes {
+/// the bucket, as a real one does. `back`: the bucket's version when it came
+/// back (a record written since began an epoch it saw whole).
+fn store_call(stores: &mut HashMap<Node, PeerStore>, bucket: &BTreeMap<String, (Val, u64)>, back: Option<u64>, node: Node, call: PeerCall, now: u64) -> PeerRes {
     let st = stores.get_mut(&node).expect("every node's store is made at its spawn");
     if let Some(obj) = st.must_learn(&call) {
         let epoch = match bucket.get(&own_key(obj)) {
             Some((Val::Rec(r), _)) => r.epoch,
             _ => 0,
         };
-        st.handle(PeerCall::Learn { obj, epoch });
+        let born = match back {
+            Some(b) => born_of(obj, epoch, |k| Ok(bucket.get(k).map(|(_, ver)| *ver > b))).unwrap_or(epoch),
+            None => epoch,
+        };
+        st.handle(PeerCall::Learn { obj, epoch, born });
     }
     st.handle_at(call, now)
 }
@@ -260,6 +267,12 @@ pub struct Sim {
     proven: HashMap<(Obj, u32), Vec<W>>,
     /// The node lost for good, if one was.
     gone: Option<Node>,
+    /// The node whose disk was lost (with `loss` too, the loss comes once
+    /// it speaks again for every object it's a peer of).
+    wiped: Option<Node>,
+    /// A wiped store's node: the bucket's version when it last started
+    /// (as a real node's lease write, by the bucket's clock).
+    backs: HashMap<Node, u64>,
     /// After the faults: has each object taken a write yet?
     probes: BTreeMap<Obj, bool>,
     /// Beats in flight (no client, no proof).
@@ -314,6 +327,8 @@ impl Sim {
             answered_by: HashMap::new(),
             proven: HashMap::new(),
             gone: None,
+            wiped: None,
+            backs: HashMap::new(),
             probes: BTreeMap::new(),
             beats: Default::default(),
         };
@@ -342,6 +357,9 @@ impl Sim {
     }
 
     fn spawn(&mut self, node: Node) {
+        if self.stores.get(&node).is_some_and(|st| st.wiped) {
+            self.backs.insert(node, self.version);
+        }
         let rate = 0.9 + self.rng.below(200) as f64 / 1000.0;
         let off = self.rng.below(1_000_000);
         self.procs.push(Proc {
@@ -479,9 +497,27 @@ impl Sim {
                     }
                 }
                 // One node lost for good, partway through.
-                if self.s.loss && self.gone.is_none() && self.faulty() && self.now > self.s.duration / 3 && self.rng.chance(0.02) {
+                // With wipes too: a replaced machine first, then, once it
+                // speaks again for every object it's a peer of, a node lost
+                // for good. What counts is the epoch a takeover would load
+                // from (the last with a manifest), unless it was sealed.
+                // Sooner is two lost disks for an epoch whose two peers they
+                // were, which rightly stops rather than guess.
+                let replaced = !self.s.wipes
+                    || self.wiped.is_some_and(|w| {
+                        (0..self.s.objects as Obj).all(|o| match self.bucket.get(&own_key(o)) {
+                            Some((Val::Rec(r), _)) => {
+                                let q = (1..=r.epoch).rev().find(|&e| self.bucket.contains_key(&manifest_key(o, e))).unwrap_or(0);
+                                let sealed_q = r.sealed && r.epoch == q || r.sealed_from >= q;
+                                q == 0 || sealed_q || !r.peers.contains(&w) || self.stores.get(&w).is_some_and(|st| st.speaks_for(o, q))
+                            }
+                            _ => true,
+                        })
+                    });
+                if self.s.loss && replaced && self.gone.is_none() && self.faulty() && self.now > self.s.duration / 3 && self.rng.chance(0.02) {
                     let n = self.procs[p].node;
                     self.gone = Some(n);
+                    self.stats.lost += 1;
                     for q in self.procs.iter_mut().filter(|q| q.node == n) {
                         q.alive = false;
                     }
@@ -522,11 +558,11 @@ impl Sim {
                     self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
                 } else if self.cut(Some(node), Some(from)) {
                     let now = self.clock(self.current[&node]);
-                    store_call(&mut self.stores, &self.bucket, node, call, now);
+                    store_call(&mut self.stores, &self.bucket, self.backs.get(&node).copied(), node, call, now);
                     self.at(TIMEOUT, Msg::Proc(p, Event::Reply { op, res: Res::Lost }));
                 } else if !lose_reply {
                     let now = self.clock(self.current[&node]);
-                    let res = Res::Peer(store_call(&mut self.stores, &self.bucket, node, call, now));
+                    let res = Res::Peer(store_call(&mut self.stores, &self.bucket, self.backs.get(&node).copied(), node, call, now));
                     let d = self.peer_latency();
                     self.at(d, Msg::Proc(p, Event::Reply { op, res }));
                 }
@@ -614,10 +650,10 @@ impl Sim {
             self.stats.crashes += 1;
             self.procs[p].alive = false;
             // Now and then the disk goes with it (once per run: two lost
-            // disks at once really can lose writes, and a node lost for good
-            // is one: with both, an object whose two peers were those two
-            // rightly stops rather than lose acknowledged writes).
-            if self.s.wipes && !self.s.loss && self.stats.wipes == 0 && self.rng.chance(0.3) {
+            // disks at once really can lose writes). With `loss` too, before
+            // the node lost for good: see there.
+            if self.s.wipes && self.stats.wipes == 0 && self.gone.is_none() && self.rng.chance(0.3) {
+                self.wiped = Some(node);
                 self.stats.wipes += 1;
                 let mut st = PeerStore::wiped();
                 st.forgets_fence = self.s.bugs.wipe_forgets_fence;
@@ -1005,6 +1041,7 @@ pub fn run_with(seeds: std::ops::Range<u64>, settings: &dyn Fn() -> Settings) ->
         total.freezes += s.freezes;
         total.splits += s.splits;
         total.wipes += s.wipes;
+        total.lost += s.lost;
         total.max_gap = total.max_gap.max(s.max_gap);
         total.probe_ms = total.probe_ms.max(s.probe_ms);
         if let Err(e) = r {
@@ -1090,6 +1127,22 @@ mod tests {
         assert!(bad.is_some_and(|(_, why)| why.contains("ms to get in")), "wait_when_down wasn't caught");
     }
 
+    /// A node's disk is lost and it comes back (a replaced machine); once
+    /// the fleet counts on it again (every object it's a peer of reseated
+    /// past what it lost), a node is lost for good: every object still takes
+    /// a write once the faults stop. Most runs get that far. The way it was
+    /// (an owner its own peer, no reseat) almost never does: an object whose
+    /// other copy was on the wiped disk stays one failure from stranded.
+    #[test]
+    fn a_lost_disk_and_a_lost_node_strand_nothing() {
+        let (s, bad) = run_with(0..3000, &|| Settings { replicas: 2, wipes: true, loss: true, ..Settings::default() });
+        assert!(bad.is_none(), "{bad:?}");
+        assert!(s.wipes > 1000 && s.lost * 10 >= s.wipes * 7, "the fleet should count on a replaced node again: {s:?}");
+        let old = Bugs { self_peer: true, ..Bugs::default() };
+        let (o, bad) = run_with(0..3000, &|| Settings { replicas: 2, wipes: true, loss: true, bugs: old, ..Settings::default() });
+        assert!(bad.is_some() || o.lost * 10 < o.wipes * 6, "self_peer wasn't caught: {o:?}");
+    }
+
     /// Read leases: reads answered with no round are still never stale,
     /// through splits and lost disks, and the lease is really used. The two
     /// ways to get it wrong (peers that break their promise, an owner that
@@ -1104,7 +1157,9 @@ mod tests {
             ("lease_overtrust", Bugs { lease_overtrust: true, ..Bugs::default() }),
             ("lease_trusts_kept", Bugs { lease_trusts_kept: true, ..Bugs::default() }),
         ] {
-            let (_, bad) = run_with(0..2000, &|| Settings { replicas: 2, splits: true, bugs, ..Settings::default() });
+            // Rarer since an owner is never its own peer: lease_trusts_kept
+            // shows first at seed 2484.
+            let (_, bad) = run_with(0..4000, &|| Settings { replicas: 2, splits: true, bugs, ..Settings::default() });
             assert!(bad.as_ref().is_some_and(|(_, why)| why.contains("missed write")), "{name} wasn't caught: {bad:?}");
         }
     }
@@ -1173,7 +1228,9 @@ mod tests {
         let (_, bad) = run_with(0..3000, &|| Settings { replicas: 2, splits: true, bugs: Bugs { gc_unproven: true, ..Bugs::default() }, ..Settings::default() });
         assert!(bad.as_ref().is_some_and(|(_, why)| why.contains("lost write")), "gc_unproven wasn't caught: {bad:?}");
         // Deletes that lean on a newer, unproven image than their round proved.
-        let (_, bad) = run_with(0..8000, &|| Settings { replicas: 2, splits: true, bugs: Bugs { gc_newest_image: true, ..Bugs::default() }, ..Settings::default() });
+        // Rare: first at seed 39839 since an owner is never its own peer
+        // (and reseats seal more epochs).
+        let (_, bad) = run_with(0..40000, &|| Settings { replicas: 2, splits: true, bugs: Bugs { gc_newest_image: true, ..Bugs::default() }, ..Settings::default() });
         assert!(bad.is_some(), "gc_newest_image wasn't caught");
         for (name, replicas, bugs) in cases {
             let (_, bad) = run_many(0..6000, replicas, bugs);

@@ -66,6 +66,8 @@ pub enum Cond {
 pub struct Resp {
     pub status: u16,
     pub etag: Option<String>,
+    /// `Last-Modified`, in Unix seconds: the bucket's own clock.
+    pub modified: Option<u64>,
     pub body: Vec<u8>,
 }
 
@@ -235,7 +237,7 @@ impl S3 {
         }
         let yes = |e: std::io::Error| (e, true);
         let status = line.split(' ').nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| yes(std::io::Error::other(format!("bad status line {line:?}"))))?;
-        let (mut etag, mut len, mut chunked, mut keep) = (None, None, false, true);
+        let (mut etag, mut len, mut chunked, mut keep, mut modified) = (None, None, false, true, None);
         loop {
             line.clear();
             r.read_line(&mut line).map_err(yes)?;
@@ -246,6 +248,7 @@ impl S3 {
             let Some((k, v)) = l.split_once(':') else { continue };
             match k.trim().to_ascii_lowercase().as_str() {
                 "etag" => etag = Some(v.trim().to_string()),
+                "last-modified" => modified = http_date(v.trim()),
                 "content-length" => len = v.trim().parse().ok(),
                 "transfer-encoding" => chunked = v.to_ascii_lowercase().contains("chunked"),
                 "connection" => keep = !v.to_ascii_lowercase().contains("close"),
@@ -294,7 +297,7 @@ impl S3 {
                 pool.push(Conn { s: r.into_inner(), idle: std::time::Instant::now() });
             }
         }
-        Ok(Resp { status, etag, body })
+        Ok(Resp { status, etag, modified, body })
     }
 
     fn fail(what: &str, r: &Resp) -> std::io::Error {
@@ -319,6 +322,17 @@ impl S3 {
         let r = self.send("GET", key, &[], &[], b"")?;
         match r.status {
             200 => Ok(Some((r.body, r.etag.unwrap_or_default()))),
+            404 => Ok(None),
+            _ => Err(Self::fail("get", &r)),
+        }
+    }
+
+    /// As `get`, with when the bucket last wrote it (`Last-Modified`, Unix
+    /// seconds; `None` if it didn't say).
+    pub fn get_modified(&self, key: &str) -> Io<Option<(Vec<u8>, Option<u64>)>> {
+        let r = self.send("GET", key, &[], &[], b"")?;
+        match r.status {
+            200 => Ok(Some((r.body, r.modified))),
             404 => Ok(None),
             _ => Err(Self::fail("get", &r)),
         }
@@ -447,8 +461,34 @@ fn unxml(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#34;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
+/// An HTTP date (RFC 9110's IMF-fixdate, `Wed, 21 Oct 2015 07:28:00 GMT`)
+/// as Unix seconds.
+fn http_date(v: &str) -> Option<u64> {
+    let p: Vec<&str> = v.split_whitespace().collect();
+    let [_, d, mon, y, t, "GMT"] = p.as_slice() else { return None };
+    let m = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].iter().position(|x| x == mon)? as i64 + 1;
+    let (d, y): (i64, i64) = (d.parse().ok()?, y.parse().ok()?);
+    let hms: Vec<i64> = t.split(':').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    let [h, mi, s] = hms.as_slice() else { return None };
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + s).ok()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_dates_read_as_unix_seconds() {
+        assert_eq!(super::http_date("Wed, 21 Oct 2015 07:28:00 GMT"), Some(1_445_412_480));
+        assert_eq!(super::http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(super::http_date("Thu, 29 Feb 2024 23:59:59 GMT"), Some(1_709_251_199));
+        assert_eq!(super::http_date("21 Oct 2015"), None);
+    }
+
     /// How much keeping connections saves, against a real bucket:
     /// `COMBD_S3=... cargo test --release -- --ignored bucket_round_trips --nocapture`.
     #[test]

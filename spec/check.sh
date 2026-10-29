@@ -20,6 +20,17 @@ pass() {
         echo "FAIL  $2"; echo "$out" | tail -40; exit 1
     fi
 }
+# sim MODULE CFG SECONDS: a model too big to finish here, walked at random
+# for that long; it must break nothing. (perl: macOS has no timeout.)
+sim() {
+    out=$(perl -e 'alarm shift; exec @ARGV' "$3" java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -simulate -depth 80 -workers auto -deadlock -metadir ".tools/states/$2" -config "$2.cfg" "$1.tla" 2>&1 || true)
+    rm -rf ".tools/states/$2"
+    if echo "$out" | grep -q '^Starting' && ! echo "$out" | grep -q 'Error'; then
+        echo "ok    $2: no errors in $3 s of random runs"
+    else
+        echo "FAIL  $2"; echo "$out" | tail -40; exit 1
+    fi
+}
 # fail MODULE CFG...: each known-bad version must break an invariant.
 fail() {
     m=$1; shift
@@ -33,7 +44,9 @@ fail MCCatalog CatAckBeforeWrite CatBlindSlot CatApplyAnyOrder CatUncoveredCheck
 pass MCOwnership MCOwnership
 fail MCOwnership BugSkipProof BugLoadBeforeCas BugNoManifest BugReuseEpoch
 pass MCReplication MCReplication
-fail MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest RepAckNoProof RepLateManifest RepLeaseNoPromise RepLeaseOvertrust
-# With a peer's disk lost once (the slow one: about 20 minutes).
-pass MCReplication RepWipe
+fail MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest RepAckNoProof RepLateManifest RepLeaseNoPromise RepLeaseOvertrust RepNoTail
+# With a peer's disk lost once. Too big to finish on a laptop since peer sets
+# (stopped at 1.1 billion states and 96 GB, no error), so random runs: they
+# find each known wipe bug below in under 10 minutes.
+sim MCReplication RepWipe "${WIPE_SECS:-1800}"
 fail MCReplication RepTrustWiped RepWipeForgetsFence

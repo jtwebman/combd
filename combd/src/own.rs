@@ -76,6 +76,17 @@ pub struct Rec {
     /// fencing one peer stops every older epoch.
     #[serde(default)]
     pub peers: Vec<Node>,
+    /// The sealed epoch this one's peers were picked after (0: none). Kept
+    /// across takeovers of unsealed epochs, so a takeover that loads from
+    /// it knows the bucket has all of it, and needs no peer's tail (its
+    /// peers may hold none of it). 0 in records from before 0.1: they wait
+    /// for a tail, as then.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sealed_from: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -160,8 +171,11 @@ pub enum PeerCall {
     /// Refuse every epoch below `epoch` from now on, and hand back every tail.
     Fence { obj: Obj, epoch: u32 },
     /// Only in a peer store's own log, never on the wire: a store that lost
-    /// its disk relearned `obj` from the bucket, whose record said `epoch`.
-    Learn { obj: Obj, epoch: u32 },
+    /// its disk relearned `obj` from the bucket, whose record said `epoch`
+    /// (it refuses every epoch below), and `born`: the newest epoch that
+    /// began before it came back, by the bucket's times (`epoch` if it can't
+    /// tell). It saw all of every epoch after that.
+    Learn { obj: Obj, epoch: u32, born: u32 },
 }
 
 /// What a peer holds of one epoch: entries `from + 1 ..`.
@@ -186,6 +200,11 @@ pub enum PeerRes {
     /// As `Have`, but with no promise: a newer owner's fence is waiting here,
     /// so this store stops renewing the older epoch's lease.
     Kept(u64),
+    /// As `Kept`, from a store that lost its disk during this epoch: it took
+    /// the entries, but can't speak for the epoch in a takeover (see
+    /// `born`). Its owner reseats: seals, and claims a new epoch, which this
+    /// store sees whole.
+    Reborn(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -308,6 +327,9 @@ pub struct Bugs {
     /// Liveness: uploads wait even with a peer down, so writes (which need
     /// the bucket then) wait for the timer.
     pub wait_when_down: bool,
+    /// Liveness: an owner may be its own peer, and nothing reseats (as
+    /// before 0.1): one lost disk and one lost node can strand an object.
+    pub self_peer: bool,
     /// Read lease: peers let a newer owner fence them while they've promised
     /// the old one not to.
     pub lease_no_promise: bool,
@@ -321,6 +343,30 @@ pub struct Bugs {
     /// Compaction: delete by the newest image the listing shows, not the one
     /// the round proved (a later one may be unproven).
     pub gc_newest_image: bool,
+}
+
+/// For a store that lost its disk and is relearning `o` (record at `epoch`):
+/// the newest epoch that began before it came back, which it can't speak
+/// for. An epoch sends entries only once its manifest is written, so one
+/// whose manifest was written after the store came back sent it all of
+/// them. `written(key)`: is the key there, and written after the store came
+/// back (`Some(true)`) or not; `Err` if it can't tell. A missing manifest
+/// (never served, or compacted away) is passed over; past 16, it stops and
+/// speaks for no more.
+pub fn born_of(o: Obj, epoch: u32, mut written: impl FnMut(&str) -> Result<Option<bool>, ()>) -> Option<u32> {
+    // Every epoch from `lo` up began after it came back.
+    let mut lo = epoch + 1;
+    for _ in 0..16 {
+        if lo <= 1 {
+            return Some(0);
+        }
+        match written(&manifest_key(o, lo - 1)) {
+            Err(()) => return None,
+            Ok(Some(false)) => return Some(lo - 1),
+            Ok(Some(true) | None) => lo -= 1,
+        }
+    }
+    Some(lo - 1)
 }
 
 /// A node's peer store: the entries it keeps for other nodes' objects. The
@@ -407,6 +453,12 @@ impl PeerStore {
         res
     }
 
+    /// Can this store speak for `epoch` of `obj` in a takeover? Not if it
+    /// lost its disk and hasn't seen that epoch whole (see `born`).
+    pub fn speaks_for(&self, obj: Obj, epoch: u32) -> bool {
+        !self.wiped || self.objs.get(&obj).is_some_and(|po| po.born < epoch)
+    }
+
     /// Does a wiped store need to relearn this object first (`Learn`, with
     /// the epoch in the bucket's record)?
     pub fn must_learn(&self, call: &PeerCall) -> Option<Obj> {
@@ -418,11 +470,11 @@ impl PeerStore {
 
     pub fn handle(&mut self, call: PeerCall) -> PeerRes {
         match call {
-            PeerCall::Learn { obj, epoch } => {
+            PeerCall::Learn { obj, epoch, born } => {
                 let fenced = if self.forgets_fence { 0 } else { epoch.saturating_sub(1) };
                 let po = self.objs.entry(obj).or_default();
                 po.fenced = po.fenced.max(fenced);
-                po.born = po.born.max(epoch);
+                po.born = po.born.max(born.min(epoch));
                 PeerRes::Have(0)
             }
             PeerCall::Append { obj, epoch, from, ents, trunc } => {
@@ -434,10 +486,11 @@ impl PeerStore {
                 // manifest holds everything older: those logs aren't needed.
                 po.logs.retain(|&e, _| e >= epoch);
                 let len = po.logs.get(&epoch).map_or(0, |(d, l)| d + l.len() as u64);
+                let have = |n| if epoch <= po.born { PeerRes::Reborn(n) } else { PeerRes::Have(n) };
                 if from > len + 1 && from - 1 > trunc {
                     // A gap the bucket doesn't cover: say what we have (and
                     // don't start a log we can't fill).
-                    return PeerRes::Have(len);
+                    return have(len);
                 }
                 let (dropped, log) = po.logs.entry(epoch).or_default();
                 if from > len + 1 {
@@ -451,7 +504,7 @@ impl PeerStore {
                 let cut = trunc.min(len).saturating_sub(*dropped);
                 log.drain(..cut as usize);
                 *dropped += cut;
-                PeerRes::Have(len)
+                have(len)
             }
             PeerCall::Fence { obj, epoch } => {
                 let po = self.objs.entry(obj).or_default();
@@ -469,7 +522,7 @@ impl PeerStore {
         let mut out = vec![];
         for (&obj, po) in &self.objs {
             if po.born > 0 {
-                out.push(PeerCall::Learn { obj, epoch: po.born });
+                out.push(PeerCall::Learn { obj, epoch: po.born, born: po.born });
             }
             for (&epoch, (d, l)) in po.logs.iter().rev() {
                 out.push(PeerCall::Append { obj, epoch, from: d + 1, ents: l.clone(), trunc: *d });
@@ -678,8 +731,12 @@ struct Serve {
     sealing: Option<Vec<ReqId>>,
     pends: VecDeque<Pend>,
     /// Moving to this node (`Event::Move`), since then (our clock): new
-    /// requests wait until it has settled.
+    /// requests wait until it has settled. To our own node: a reseat.
     moving: Option<(Node, u64)>,
+    /// A peer lost its disk this epoch (`PeerRes::Reborn`): reseat.
+    reseat: bool,
+    /// Our record's `sealed_from`, kept when we seal it.
+    sealed_from: u32,
 }
 
 impl Serve {
@@ -715,9 +772,11 @@ struct ObjSt {
     waiting: VecDeque<ReqId>,
     /// Segment keys read before the CAS (only with `Bugs::load_before_cas`).
     early: Option<Vec<String>>,
-    /// The record we're claiming over, and what we claim: our peers.
+    /// The record we're claiming over, and what we claim: our peers, and
+    /// the sealed epoch they were picked after.
     prev: Option<Rec>,
     peers: Vec<Node>,
+    sealed_from: u32,
     etag: String,
     /// Fencing for epoch E, until the manifest is written.
     fence: Option<FenceSt>,
@@ -743,6 +802,9 @@ pub struct CoreStats {
     pub gc_deleted: u64,
     /// Objects handed to another node (`Event::Move`), sealed and gone.
     pub moves: u64,
+    /// Epochs sealed and claimed again here (a peer lost its disk, or we
+    /// were our own peer): see `PeerRes::Reborn`.
+    pub reseats: u64,
 }
 
 pub struct Core {
@@ -848,8 +910,14 @@ impl Core {
     }
 
     /// Rendezvous hashing: the `replicas` nodes that score highest for `o`.
+    /// An object's peers when we claim it fresh: never us. Our own store
+    /// goes down with us, so as a peer it would leave one copy where the
+    /// fleet counts two (`reseat` puts an epoch that kept us right).
     fn peers_of(&self, o: Obj) -> Vec<Node> {
         let mut f = self.fleet.clone();
+        if !self.bugs.self_peer {
+            f.retain(|&n| n != self.node);
+        }
         f.sort_by_key(|&n| std::cmp::Reverse(mix(o as u64 ^ mix((o >> 64) as u64 ^ mix(n as u64)))));
         f.truncate(self.replicas);
         f
@@ -878,6 +946,7 @@ impl Core {
             early: None,
             prev: None,
             peers: vec![],
+            sealed_from: 0,
             etag: String::new(),
             fence: None,
             act: 0,
@@ -947,7 +1016,7 @@ impl Core {
                     self.peer(Wait::Fence(o, e, n), n, PeerCall::Fence { obj: o, epoch: e });
                 }
                 let live: Vec<Obj> = self.objs.iter().filter(|(_, st)| matches!(st.phase, Phase::Serving(_))).map(|(&o, _)| o).collect();
-                let lease_ms = self.lease_ms;
+                let (lease_ms, me, self_peer) = (self.lease_ms, self.node, self.bugs.self_peer);
                 for o in live {
                     let mut late = vec![];
                     let mut stay = false;
@@ -959,6 +1028,15 @@ impl Core {
                         if s.moving.is_some_and(|(_, t)| now.saturating_sub(t) > lease_ms) {
                             s.moving = None;
                             stay = true;
+                        }
+                        // Reseat: our peers are us (an epoch taken over from
+                        // one that named us), or one lost its disk. Seal,
+                        // and claim the next epoch, with peers that aren't
+                        // us and stores that see it whole.
+                        if !self_peer && s.moving.is_none() && (s.reseat || s.peers.iter().any(|p| p.node == me)) {
+                            s.reseat = false;
+                            s.moving = Some((me, now));
+                            s.flush = true;
                         }
                         // Unconfirmed for a whole lease: we're likely cut
                         // off. Don't hold the clients; "retry" sends them
@@ -1069,7 +1147,7 @@ impl Core {
                     // our lease). If this fails, it fences: also fine.
                     if !s.peers.is_empty() {
                         let peers = s.peers.iter().map(|p| p.node).collect();
-                        let r = Rec { node: self.node, epoch: s.epoch, sealed: true, peers };
+                        let r = Rec { node: self.node, epoch: s.epoch, sealed: true, peers, sealed_from: s.sealed_from };
                         self.call(Wait::SealRec, Call::Put(own_key(obj), Val::Rec(r), Cond::IfMatch(s.etag)));
                     }
                 }
@@ -1118,6 +1196,8 @@ impl Core {
             sealing: None,
             pends: VecDeque::new(),
             moving: None,
+            reseat: false,
+            sealed_from: st.sealed_from,
         });
         let waiting: Vec<ReqId> = st.waiting.drain(..).collect();
         for r in waiting {
@@ -1346,7 +1426,7 @@ impl Core {
         }
         let Phase::Serving(s) = std::mem::replace(&mut st.phase, Phase::Leaving) else { unreachable!() };
         self.out.push(Effect::Drop { obj: o });
-        let r = Rec { node: self.node, epoch: s.epoch, sealed: true, peers: s.peers.iter().map(|p| p.node).collect() };
+        let r = Rec { node: self.node, epoch: s.epoch, sealed: true, peers: s.peers.iter().map(|p| p.node).collect(), sealed_from: s.sealed_from };
         self.call(Wait::Leave(o, to), Call::Put(own_key(o), Val::Rec(r), Cond::IfMatch(s.etag)));
     }
 
@@ -1388,6 +1468,13 @@ impl Core {
             // Sealed: it's `to`'s to claim, and what waited goes there. Not
             // (someone took it over, or we can't tell): what waited is
             // routed again from scratch.
+            // A reseat (to us): claim the next epoch now; what waited is
+            // served there. (Not sealed: someone took it over, as below.)
+            (Wait::Leave(o, to), Res::Put(Ok(_))) if to == self.node => {
+                self.stats.reseats += 1;
+                self.st(o).phase = Phase::Starting;
+                self.call(Wait::ReadRec(o), Call::Get(own_key(o)));
+            }
             (Wait::Leave(o, to), res) => {
                 let st = self.st(o);
                 st.phase = Phase::Idle;
@@ -1564,14 +1651,20 @@ impl Core {
                 let p = &mut s.peers[i];
                 p.busy = false;
                 match res {
-                    Res::Peer(r @ (PeerRes::Have(_) | PeerRes::Kept(_))) => {
-                        let (PeerRes::Have(n) | PeerRes::Kept(n)) = r else { unreachable!() };
+                    Res::Peer(r @ (PeerRes::Have(_) | PeerRes::Kept(_) | PeerRes::Reborn(_))) => {
+                        let (PeerRes::Have(n) | PeerRes::Kept(n) | PeerRes::Reborn(n)) = r else { unreachable!() };
+                        // It lost its disk this epoch: what it has counts for
+                        // writes, but no takeover can use it. Reseat.
+                        if matches!(r, PeerRes::Reborn(_)) {
+                            s.reseat = true;
+                        }
                         // One call in flight per peer: its answer is the truth.
                         p.have = n;
                         p.round = p.round.max(round);
                         p.down = false;
-                        // Kept: it has them, but promised nothing (a newer
-                        // owner waits there), so the lease can't count on it.
+                        // Kept (or Reborn): it has them, but promised nothing
+                        // (a newer owner waits there), so the lease can't
+                        // count on it.
                         if matches!(r, PeerRes::Have(_)) || trusts_kept {
                             p.acked_at = Some(p.acked_at.map_or(sent, |a| a.max(sent)));
                         }
@@ -1645,9 +1738,15 @@ impl Core {
         };
         // Keep the old peers unless the old epoch was sealed (or had none).
         let prev = self.st(o).prev.clone();
+        let sealed_from = match &prev {
+            Some(r) if r.sealed => r.epoch,
+            Some(r) => r.sealed_from,
+            None => 0,
+        };
         let peers = if self.must_fence(&prev) { prev.unwrap().peers } else { self.peers_of(o) };
         self.st(o).peers = peers.clone();
-        let v = Val::Rec(Rec { node: self.node, epoch: next, sealed: false, peers });
+        self.st(o).sealed_from = sealed_from;
+        let v = Val::Rec(Rec { node: self.node, epoch: next, sealed: false, peers, sealed_from });
         self.call(Wait::Cas(o, next), Call::Put(own_key(o), v, cond));
     }
 
@@ -1680,8 +1779,12 @@ impl Core {
         // A fenced peer's tail of q, if any (no fence: nothing to add).
         let trust_wiped = self.bugs.trust_wiped;
         let st = self.st(o);
+        // q was sealed: the bucket has all of it, and the peers we fenced
+        // (picked after it) may hold none of it. The fence is what counts.
+        let sealed_q = q > 0 && st.prev.as_ref().is_some_and(|r| r.sealed_from == q);
         let tails = match st.fence.as_mut().filter(|f| f.epoch == e) {
             None => vec![],
+            Some(_) if sealed_q => vec![],
             Some(f) => match f.replies[..f.listed].iter().position(|(born, _)| trust_wiped || q > *born) {
                 Some(i) => std::mem::take(&mut f.replies[i].1),
                 // None of them can speak for q: they lost their disk
@@ -1835,7 +1938,7 @@ mod tests {
     #[test]
     fn mangled_bucket_values_never_panic() {
         let o: Obj = 0xabc;
-        let rec = Val::Rec(Rec { node: 2, epoch: 7, sealed: false, peers: vec![0, 1] }).encode();
+        let rec = Val::Rec(Rec { node: 2, epoch: 7, sealed: false, peers: vec![0, 1], sealed_from: 0 }).encode();
         let man = Val::Manifest(vec![seg_key(o, 1, 4), tail_key(o, 2)]).encode();
         let seg = frame(&[vec![1, 2, 3], vec![9; 100]]);
         let mut rng = crate::sim::Rng::new(23);
@@ -1887,7 +1990,7 @@ mod tests {
         let mut p = PeerStore::wiped();
         let call = PeerCall::Append { obj: 1, epoch: 2, from: 1, ents: vec![vec![1]], trunc: 0 };
         assert_eq!(p.must_learn(&call), Some(1));
-        p.handle(PeerCall::Learn { obj: 1, epoch: 3 });
+        p.handle(PeerCall::Learn { obj: 1, epoch: 3, born: 3 });
         assert_eq!(p.must_learn(&call), None);
         assert_eq!(p.handle(call), PeerRes::Refused, "epoch 2 is older than the record: fenced");
         p.handle(PeerCall::Append { obj: 1, epoch: 3, from: 1, ents: vec![vec![1]], trunc: 0 });
@@ -1898,6 +2001,20 @@ mod tests {
             q.handle(c);
         }
         assert_eq!(q.handle(PeerCall::Fence { obj: 1, epoch: 4 }), p.handle(PeerCall::Fence { obj: 1, epoch: 4 }));
+        // Epoch 3 began after it came back: it saw all of it (and still
+        // refuses the ones before the record).
+        let mut p = PeerStore::wiped();
+        p.handle(PeerCall::Learn { obj: 1, epoch: 3, born: 2 });
+        assert_eq!(p.handle(PeerCall::Append { obj: 1, epoch: 2, from: 1, ents: vec![vec![1]], trunc: 0 }), PeerRes::Refused);
+        assert_eq!(p.handle(PeerCall::Append { obj: 1, epoch: 3, from: 1, ents: vec![vec![1]], trunc: 0 }), PeerRes::Have(1), "not Reborn: it speaks for 3");
+        let PeerRes::Tails { born, .. } = p.handle(PeerCall::Fence { obj: 1, epoch: 4 }) else { panic!() };
+        assert_eq!(born, 2);
+        assert!(p.speaks_for(1, 3) && !p.speaks_for(1, 2));
+        let mut q = PeerStore::wiped();
+        for c in p.snapshot() {
+            q.handle(c);
+        }
+        assert_eq!(q.handle(PeerCall::Fence { obj: 1, epoch: 5 }), p.handle(PeerCall::Fence { obj: 1, epoch: 5 }), "a snapshot keeps it");
     }
 
     #[test]
