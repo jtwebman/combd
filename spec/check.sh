@@ -45,8 +45,10 @@ pass MCOwnership MCOwnership
 fail MCOwnership BugSkipProof BugLoadBeforeCas BugNoManifest BugReuseEpoch
 pass MCReplication MCReplication
 fail MCReplication RepAckOne RepNoFence RepLoadBeforeFence RepTruncEarly RepSealEarly RepFenceIfManifest RepAckNoProof RepLateManifest RepLeaseNoPromise RepLeaseOvertrust RepNoTail
-# With a peer's disk lost once. Too big to finish on a laptop since peer sets
-# (stopped at 1.1 billion states and 96 GB, no error), so random runs: they
-# find each known wipe bug below in under 10 minutes.
-sim MCReplication RepWipe "${WIPE_SECS:-1800}"
+# With a peer's disk lost once, and one write (400 million states, about an
+# hour and a half). With two writes it's too big to finish on a laptop
+# (stopped clean at 1.1 billion states), so that one is walked at
+# random, 10 minutes by default (WIPE_SECS).
+pass MCReplication RepWipe
+sim MCReplication RepWipe2 "${WIPE_SECS:-600}"
 fail MCReplication RepTrustWiped RepWipeForgetsFence

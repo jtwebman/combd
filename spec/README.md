@@ -167,17 +167,21 @@ lost for good, in 3,000 runs), and the drill's
 (`combd/bench/drill/replace-node.sh`).
 
 With peer sets, the model with no wipes checks clean in 213,050,094
-distinct states (an hour on 14 cores). The wipe model no longer finishes on
-a laptop: TLC stopped at 1.1 billion distinct states, every behavior up to
-28 steps, with 389 million left and the disk full. No error in any of it.
-So `check.sh` walks it at random instead, for 30 minutes (`WIPE_SECS`).
-Random runs find both known wipe bugs, in about 8 minutes and 2. An hour
-of them, 3.67 billion states, found nothing on the fix (2026-10-29).
-That's evidence, not proof. The whole space needs a bigger machine.
+distinct states (an hour on 14 cores). With two writes, the wipe model is
+too big to finish on a laptop: TLC stopped clean at 1.1 billion distinct
+states and a full disk, and a 16-core, 128 GB droplet stopped clean at 377
+million. So the wipe models now have one write (`MCWrite1`). The second
+write only adds interleavings the model with no wipes already checks, and
+both known wipe bugs still fail with one (in about 180,000 and 260,000
+states). With one write, the wipe model checks clean in 400,345,394
+distinct states (an hour and a half, 2026-10-29). The two-write model
+(`RepWipe2.cfg`) is still walked at random: an hour of it, 3.67 billion
+states, found nothing, and `check.sh` walks it for 10 minutes
+(`WIPE_SECS`).
 
 Run `./check.sh` (needs Java; it fetches TLC 1.7.4 and checks its hash). The
-whole run takes about two hours: an hour for the model with no wipes, half
-an hour for the wipe model.
+whole run takes about three hours: an hour for the model with no wipes, an
+hour and a half for the wipe model, and 10 minutes of random runs.
 
 Not modeled yet: reads (they pass the same gate as writes), leases and
 clocks (liveness only), many objects, and checkpoints of old epochs.

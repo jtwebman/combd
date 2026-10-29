@@ -10,4 +10,8 @@ MCWrites == {w1, w2}
 \* The peers are interchangeable, and so are the writes: TLC checks one of
 \* each set of mirror-image states. Sound for invariants (all we check).
 MCSym == Permutations(MCPeers) \cup Permutations(MCWrites)
+\* One write: the wipe models. Two writes add interleavings the model with
+\* no wipes already checks, and made the wipe model too big to finish.
+MCWrite1 == {w1}
+MCSym1 == Permutations(MCPeers)
 ====
