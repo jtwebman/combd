@@ -126,6 +126,8 @@ and the rest of the plan is updated to match.
      Threads are named by role (`loop-N`, `pg-agent`, `pg-conn`).
    Left:
    - Whether the X race goes in the launch post (JT).
+   - **A second wall around the engine** (JT, 2026-10-29: before release).
+     See "Before release: a wall that holds when the engine doesn't".
    - Phoenix keeps the shorter p99 at 100 connections (23 ms to 29 to 37).
    - Show the agent's ceiling gone on a big machine (here Postgres runs out
      first): a many-core box, combd and Postgres apart.
@@ -2191,3 +2193,45 @@ Where combd differs, to lead with:
 - Any language that compiles to Wasm, not only JavaScript.
 - Every acked write on three machines with D3, and how it's checked (the
   spec, the simulator, the drills), shown with the numbers.
+
+## Before release: a wall that holds when the engine doesn't
+
+JT (2026-10-29), after the V8 Sandbox became a real security boundary
+(Samuel Groß, OffensiveCon; https://v8.dev/blog/sandbox). V8's idea:
+assume the engine already has a bug that gives an attacker read and write
+inside it, and make sure that bug alone can't reach the rest of the
+process.
+
+What we took from it (done, 2026-10-29): the guard-page wall tested as V8
+tests its sandbox (`aot/src/guard.rs` tests: a fault in the running cell's
+reservation traps, any other kills the process, each case seen to fail
+against a broken `trap.c` or `fiber.rs`; the reservation's bound checked
+when combd builds), and `fuzz-host` rewriting the cell's memory between
+calls. Both run in `check.sh`.
+
+What's left is the wall itself. combd's engine is safe Rust, and compiled
+cells are generated safe Rust, so its bugs should give wrong answers, not
+memory access. But rustc, LLVM, and our unsafe code (`combd-mem`,
+`combd-load`, `guard.rs`, `trap.c`, the fibers, about 50 sites) can still
+be wrong. And then one process holds every app on the node, every
+app's secrets once opened, the master key, and the bucket's keys.
+
+The four walls above ("The sandbox: what Wasm gives us") name the fix:
+one OS process per tenant, locked down. To work out first, in a spec if it
+touches ownership:
+
+- What a tenant process holds: its own cells, its own opened secrets, no
+  master key, no bucket keys. Bucket writes go through the parent, which
+  checks the object belongs to that tenant.
+- seccomp and landlock (Linux), so a taken-over process can make only the
+  system calls a cell's host needs, and touch only its own data folder.
+- How requests reach it (a socket per tenant, or passing the connection),
+  and what that costs per request. Measure before and after.
+- How it fails: a tenant process that dies takes only its own cells, and
+  they come back as after a crash today.
+- How to test it like V8: a test-only build where a cell gets real read
+  and write anywhere in its process (V8's memory corruption API), and
+  checks that it still can't read another tenant's data, the master key,
+  or the bucket keys.
+
+A bug bounty (V8's VRP) waits until someone backs the project.

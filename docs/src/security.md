@@ -136,6 +136,15 @@ fuzzing against Wasmtime, and fuzzing of the host API, the HTTP parser,
 and the wire. What each round found and fixed is in `plan.md`,
 "Security review, in rounds".
 
+The guard pages are tested the way V8 tests its sandbox. A fault in the
+running cell's memory must become a trap. Any other fault must still kill
+the process: one in another cell's memory, in a paused cell's, or in no
+cell's at all. Each of those tests was seen to fail against a wall broken
+on purpose. The host fuzzer acts like a cell that can rewrite any of its
+memory between calls. It plants addresses and lengths at the edges, so
+what the host wrote back last time, and the pointers inside a request,
+are hostile too.
+
 ## What it doesn't do (yet)
 
 - **One compromised node is the whole fleet.** Every node holds the

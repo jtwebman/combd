@@ -1877,14 +1877,16 @@ mod tests {
         let keep = || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         let held = (keep(), keep());
         let last = std::cell::Cell::new(Ok(()));
-        let refused = eventually(3000, || {
+        // 10 s: alone it takes about 2, and a loaded machine (the full suite
+        // beside a model checker) has run past 3.
+        let refused = eventually(10_000, || {
             last.set(from_elsewhere());
             last.get() == Err(std::io::ErrorKind::ConnectionRefused)
         });
         // (Its stats can't be asked for here: full, it turns this machine away too.)
         assert!(refused, "at max_conns, it stops listening: a connection from elsewhere got {:?}", last.get());
         drop(held);
-        assert!(eventually(3000, || from_elsewhere() == Ok(())), "room again: it listens");
+        assert!(eventually(10_000, || from_elsewhere() == Ok(())), "room again: it listens");
         assert_eq!(stat(port, "tcp_refusing"), 0);
         assert_eq!(http(port, "GET", "/_combd/ping", "").0, 200);
     }

@@ -76,6 +76,11 @@ The first release: Durable Objects on your own machines, as one binary.
   simulator of crashes, splits, lost messages, and moves; the Wasm spec
   test suite; differential fuzzing; three rounds of security review, each
   finding proven with a failing test.
+- The guard-page wall tested the way V8 tests its sandbox: a fault in the
+  running cell's memory traps, and any other fault (another cell's memory,
+  a paused cell's, no cell's) still kills the process. Each test was seen
+  to fail against a deliberately broken wall. The host fuzzer rewrites the
+  cell's memory between calls, with pointer-shaped values.
 
 **Known limits** (more in `plan.md`)
 - Apps in Rust for now (other languages that compile to Wasm work at the

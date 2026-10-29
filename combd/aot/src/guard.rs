@@ -16,6 +16,11 @@ pub const RESERVE: usize = (1 << 32) + GUARD;
 /// Static offsets up to this use the unchecked fast path. The rest of the
 /// guard covers the access size (at most 8 bytes).
 pub const MAX_FAST_OFFSET: u32 = (GUARD - 16) as u32;
+// The fast path's whole bound, checked when combd builds: the furthest it can
+// reach (a u32 address, the largest fast offset, a 16-byte access) is still
+// inside the reservation. Shrink GUARD or grow an access, and this fails to
+// build instead of the wall failing at run time.
+const _: () = assert!(u32::MAX as usize + MAX_FAST_OFFSET as usize + 16 <= RESERVE);
 
 pub struct Mem {
     base: *mut u8,
@@ -180,5 +185,113 @@ pub fn catch<F: FnOnce() -> R, R>(range: (usize, usize), f: F) -> Option<R> {
         Some(Ok(r)) => Some(r),
         Some(Err(p)) => std::panic::resume_unwind(p),
         None => None,
+    }
+}
+
+/// The wall itself, tested the way V8 tests its sandbox: a fault inside the
+/// running cell's reservation is a trap, and every other fault still kills
+/// the process. A fault that should kill runs in a child process (this test
+/// binary again, with `COMBD_GUARD_CASE` set), and the parent checks it died
+/// of the fault.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fiber::{yield_now, Fiber, Step};
+    use crate::rt::PAGE;
+
+    #[test]
+    fn a_fault_past_live_memory_traps() {
+        let m = Mem::new(PAGE);
+        assert_eq!(catch(m.range(), || m.load::<4>(PAGE - 4)), Some([0; 4]));
+        assert_eq!(catch(m.range(), || m.load::<4>(PAGE)), None);
+        // The furthest the fast path can reach is still in the reservation.
+        assert_eq!(catch(m.range(), || m.load::<8>(u32::MAX as usize + MAX_FAST_OFFSET as usize)), None);
+        let mut m = m;
+        assert_eq!(catch(m.range(), || m.store::<8>(PAGE + 8, [1; 8])), None);
+        // Grown, the guard page becomes memory, zeroed.
+        assert_eq!(m.grow(10, 1), 1);
+        assert_eq!(catch(m.range(), || m.load::<4>(PAGE)), Some([0; 4]));
+    }
+
+    #[test]
+    fn nested_cells_each_trap_their_own_and_restore_the_outer() {
+        let (a, b) = (Mem::new(PAGE), Mem::new(PAGE));
+        let r = catch(a.range(), || {
+            assert_eq!(catch(b.range(), || b.load::<4>(PAGE)), None);
+            // b's trap put a's range back: a's own fault still traps.
+            a.load::<4>(PAGE)
+        });
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn a_resumed_fiber_traps_in_its_own_memory() {
+        let m = Mem::new(PAGE);
+        let range = m.range();
+        let mut f = Fiber::start(None, move || catch(range, || {
+            assert!(yield_now());
+            m.load::<4>(PAGE)
+        }));
+        assert!(matches!(f.resume().0, Step::Paused));
+        assert!(matches!(f.resume().0, Step::Done(None)));
+    }
+
+    /// Faults that must not become traps. Run only as a child.
+    #[test]
+    fn child() {
+        let Ok(case) = std::env::var("COMBD_GUARD_CASE") else { return };
+        let (a, b) = (Mem::new(PAGE), Mem::new(PAGE));
+        match case.as_str() {
+            // Nothing armed: a cell's guard page is just a bad address.
+            "unarmed" => {
+                a.load::<4>(PAGE);
+            }
+            // Cell a is running; cell b's memory is as foreign as the host's.
+            "other-cell" => {
+                catch(a.range(), || b.load::<4>(PAGE));
+            }
+            // An address in no reservation at all.
+            "outside" => {
+                catch(a.range(), || unsafe { std::ptr::read_volatile(8 as *const u8) });
+            }
+            // After a trap, the range is disarmed again.
+            "after-trap" => {
+                assert_eq!(catch(a.range(), || a.load::<4>(PAGE)), None);
+                a.load::<4>(PAGE);
+            }
+            // A paused fiber takes its range with it: the scheduler's thread
+            // isn't running that cell.
+            "paused" => {
+                let range = a.range();
+                // If the fault jumps back into the paused cell, it says so
+                // before whatever crash follows.
+                let mut f = Fiber::start(None, move || {
+                    catch(range, || { yield_now(); });
+                    eprintln!("came back into the paused cell");
+                });
+                assert!(matches!(f.resume().0, Step::Paused));
+                a.load::<4>(PAGE);
+                std::mem::forget(f);
+            }
+            other => panic!("no case {other}"),
+        }
+        // Still alive: the fault was swallowed. Exit 0 so the parent sees it.
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn every_other_fault_kills_the_process() {
+        use std::os::unix::process::ExitStatusExt;
+        for case in ["unarmed", "other-cell", "outside", "after-trap", "paused"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "guard::tests::child", "--nocapture", "--test-threads=1"])
+                .env("COMBD_GUARD_CASE", case)
+                .output()
+                .unwrap();
+            let sig = out.status.signal();
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(sig == Some(libc::SIGSEGV) || sig == Some(libc::SIGBUS), "{case}: the fault didn't kill the process ({:?}): {err}", out.status);
+            assert!(!err.contains("came back"), "{case}: the fault jumped into a paused cell: {err}");
+        }
     }
 }

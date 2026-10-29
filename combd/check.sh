@@ -1,9 +1,9 @@
 #!/bin/sh
 # Everything we test, on this machine, before a push (CI doesn't run tests):
 # the suite with Postgres and a bucket (local containers, started if
-# needed), combd-mem's own tests, the Wasm spec testsuite, and a short
-# differential fuzz (freeze and thaw included). ./check.sh quick skips the
-# last two.
+# needed), combd-mem's own tests, the guard-page wall, the Wasm spec
+# testsuite, and short runs of the differential and host fuzzers.
+# ./check.sh quick skips compiled modules, the spec testsuite, and the fuzzers.
 set -e
 cd "$(dirname "$0")"
 start() { # name, image (and its command), port, env...
@@ -31,6 +31,10 @@ grep -E "test result|FAILED|panicked" "$out"
 grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { grep -E "^error" -A8 "$out" | head -30; echo "check: tests failed"; exit 1; }
 cargo test --release -q -p combd-mem -p combd-load >"$out" 2>&1 || true
 grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { grep -E "FAILED|panicked" "$out"; echo "check: combd-mem or combd-load failed"; exit 1; }
+# The guard-page wall: a fault in the running cell's memory traps, and every
+# other fault still kills the process (combd-aot's own tests).
+cargo test --release -q -p combd-aot --features guard >"$out" 2>&1 || true
+grep -q "test result: ok. [1-9]" "$out" && ! grep -q FAILED "$out" || { grep -E "FAILED|panicked|^error" "$out"; echo "check: the guard-page wall failed"; exit 1; }
 # The compiled tier too, when aot.sh has made its modules (they aren't in git).
 if [ -f aot/src/gen_rust.rs ]; then
     cargo test --release -q --features aot >"$out" 2>&1 || true
@@ -54,4 +58,6 @@ fi
 cargo test --release -q --features aot-lite -- --include-ignored a_build_loads a_compiled_deploy builds:: 2>&1 | grep -q "test result: ok. [1-9][0-9]* passed; 0 failed" || { echo "check: compiled modules failed"; exit 1; }
 ./spectest.sh | tail -1 | tee /dev/stderr | grep -q " 0 fail" || { echo "check: spec testsuite failed"; exit 1; }
 ./target/release/combd fuzz 3000 | grep -q "no mismatches" || { echo "check: fuzz found a mismatch"; exit 1; }
+# The host API, with memory the cell keeps rewriting between calls (15 s).
+./target/release/combd fuzz-host 1000 | tee "$out" | grep -q "no problems" || { cat "$out"; echo "check: fuzz-host found a problem"; exit 1; }
 echo "check: ok"

@@ -142,6 +142,24 @@ fn edge(rng: &mut Rng, mem_len: u32) -> u64 {
     if rng.chance(0.05) { rng.next() } else { v }
 }
 
+/// Half the time, overwrite up to 16 spots with pointer-shaped values (edge
+/// addresses and lengths), mostly near the start, where requests' arrays sit.
+fn scribble(rng: &mut Rng, mem: &mut [u8], mem_len: u32) {
+    if mem.len() < 8 || rng.chance(0.5) {
+        return;
+    }
+    for _ in 0..rng.below(16) + 1 {
+        let room = if rng.chance(0.5) { mem.len().min(256) } else { mem.len() } - 7;
+        let at = rng.below(room as u64) as usize;
+        let v = edge(rng, mem_len);
+        if rng.chance(0.5) {
+            mem[at..at + 4].copy_from_slice(&(v as u32).to_le_bytes());
+        } else {
+            mem[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
 /// A request for `sql`: usually well-formed JSON, sometimes not.
 fn sql_request(rng: &mut Rng, dir: &str) -> Vec<u8> {
     let q = SQL[rng.below(SQL.len() as u64) as usize].replace("%DIR%", dir);
@@ -219,6 +237,10 @@ fn one(seed: u64, slow: Duration, st: &mut Stats) {
         if name == "alarm_set" && arity >= 1 && rng.chance(0.5) {
             args[0] = (rng.below(3) as i64 - 1) as u64 * rng.below(1 << 40);
         }
+        // As V8 tests its sandbox: the cell may have rewritten any of its
+        // memory since the last call, so what the host wrote back, and the
+        // pointers inside a request (iovs, arrays), are hostile too.
+        scribble(&mut rng, &mut vm.0, mem_len);
         let imp = Import { module: module.into(), name: name.into(), results: 1 };
         let what = format!("{module}.{name}({args:x?})");
         // This thread's CPU time, not the wall clock: what a call can take
