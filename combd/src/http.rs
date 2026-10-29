@@ -3007,15 +3007,17 @@ impl<E: Engine> Loop<'_, E> {
     /// Send on a socket whose connection is on this loop. One that isn't here
     /// any more (it closed, or this node restarted) is lost: its object hears.
     fn ws_local(&mut self, name: &str, id: u64, op: u8, payload: &[u8]) -> std::io::Result<()> {
-        if !self.ws_frame(id, op, &crate::ws::encode(op, payload))? && op != 8 {
+        if !self.ws_frame(name, id, op, &crate::ws::encode(op, payload))? && op != 8 {
             self.socket_lost(name, id);
         }
         Ok(())
     }
 
-    /// A frame, made already, to a socket on this loop. `false`: it's gone.
-    fn ws_frame(&mut self, id: u64, op: u8, frame: &[u8]) -> std::io::Result<bool> {
-        let live = self.local_socks.get(&id).copied().filter(|&who| self.conn(who).and_then(|c| c.ws.as_ref()).is_some_and(|w| w.open && !w.gone));
+    /// A frame, made already, to a socket on this loop, for `obj` (the object
+    /// or session the socket belongs to). `false`: it's gone, or it's another's:
+    /// ids are easy to guess, so a socket is reached only through its own.
+    fn ws_frame(&mut self, obj: &str, id: u64, op: u8, frame: &[u8]) -> std::io::Result<bool> {
+        let live = self.local_socks.get(&id).copied().filter(|&who| self.conn(who).and_then(|c| c.ws.as_ref()).is_some_and(|w| w.open && !w.gone && w.obj == obj));
         let Some(who) = live else { return Ok(false) };
         let sh = self.sh;
         let c = self.conn(who).unwrap();
@@ -4339,7 +4341,7 @@ impl<E: Engine> Loop<'_, E> {
                     // ponytail: one wire frame per socket on another node; one per node is next.
                     (Some(f), _) if Self::sock_node(sock) != me => f.wire.push(Self::sock_node(sock), Frame::WsPush { name: self.app.object_name(t, &format!("~{sock}")), sock, op: 1, payload: text.as_bytes().to_vec() }),
                     (_, l) if l == self.me => {
-                        self.ws_frame(sock, 1, &frame).map_err(|e| e.to_string())?;
+                        self.ws_frame(&self.app.object_name(t, &format!("~{sock}")), sock, 1, &frame).map_err(|e| e.to_string())?;
                     }
                     (_, l) => {
                         let (tx, waker) = &self.sh.peers[l];

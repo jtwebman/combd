@@ -4181,6 +4181,47 @@ callers = ["api"]
         assert!(tg.as_secs_f64() < ta.as_secs_f64() * 0.6, "globex took {tg:?}, acme {ta:?}");
     }
 
+    /// A frame pushed to a socket process (`"ws"` with `"id"` or `"ids"`)
+    /// reaches only that process's own sessions' sockets. Socket ids are
+    /// easy to guess (a counter per loop), so an app that names another
+    /// app's socket must reach nothing: here the evil org learns its own
+    /// socket's id and aims at the next one, a victim's in another org.
+    #[test]
+    fn a_socket_push_reaches_only_its_own_sessions() {
+        let root = store::tempdir::Dir::new();
+        let mut dirs = vec![];
+        for (org, app, m) in [
+            ("evil", "x", "[app]\nname = \"x\"\ndomains = [\"x.evil.test\"]\n[http.api]\nmodule = \"ev\"\nroutes = [\"/send\"]\n[ws.sock]\nmodule = \"classic\"\nroutes = [\"/ws\"]\ncallers = [\"api\"]\n[durable.room]\nmodule = \"classic\"\nroutes = [\"/room/:id/*\"]\n"),
+            ("victim", "chat", "[app]\nname = \"chat\"\ndomains = [\"chat.victim.test\"]\n[durable.room]\nmodule = \"classic\"\nroutes = [\"/room/:id/*\"]\n"),
+        ] {
+            let d = root.0.join(org).join(app);
+            std::fs::create_dir_all(d.join("modules")).unwrap();
+            std::fs::write(d.join("combd.toml"), m).unwrap();
+            std::fs::copy(GUEST_EV, manifest::module_path(&d, "ev")).unwrap();
+            std::fs::copy(GUEST, manifest::module_path(&d, "classic")).unwrap();
+            dirs.push((org.to_string(), d));
+        }
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, _) = http::load_apps(&eng, &dirs).unwrap_or_else(|e| panic!("{e}"));
+        let data = store::tempdir::Dir::new();
+        // One loop: socket ids count up in the order sockets open.
+        let (port, _, _) = server_app(eng, cfg(&data.0, 1), move |_| a);
+        let mut mine = Ws::open_to(port, "x.evil.test", "/room/r/ws").unwrap();
+        mine.text("hi");
+        let v: serde_json::Value = serde_json::from_str(&mine.recv_text()).unwrap();
+        let my_id: u64 = v["from"].as_str().unwrap().parse().unwrap();
+        let mut theirs = Ws::open_to(port, "chat.victim.test", "/room/r/ws").unwrap();
+        let their_id = my_id + 1;
+        for body in [serde_json::json!({ "to": "sock", "ws": "pwned", "id": their_id.to_string() }), serde_json::json!({ "to": "sock", "ws": "pwned", "ids": [their_id] })] {
+            assert_eq!(http_to(port, "x.evil.test", "POST", "/send", &body.to_string()).0, 202);
+        }
+        // The victim's socket works, and hears only its own room.
+        theirs.text("mine");
+        let got = theirs.recv_text();
+        assert!(got.contains("\"text\":\"mine\""), "the victim got another app's frame: {got}");
+        assert_eq!(theirs.recv_within(300), None, "the victim got another app's frame");
+    }
+
     /// Six apps on three nodes (D3: two peers confirm every write), every
     /// node getting requests for every app: env vars and workers answer
     /// locally, objects are found on their owner wherever it is, `call` and

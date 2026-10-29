@@ -2213,25 +2213,159 @@ What's left is the wall itself. combd's engine is safe Rust, and compiled
 cells are generated safe Rust, so its bugs should give wrong answers, not
 memory access. But rustc, LLVM, and our unsafe code (`combd-mem`,
 `combd-load`, `guard.rs`, `trap.c`, the fibers, about 50 sites) can still
-be wrong. And then one process holds every app on the node, every
-app's secrets once opened, the master key, and the bucket's keys.
+be wrong. Today one process holds every app on the node, their opened
+secrets, Postgres passwords, the master key, the bucket's keys, the wire's
+key, and the TLS key. A cell that gets out of its sandbox has all of it.
 
-The four walls above ("The sandbox: what Wasm gives us") name the fix:
-one OS process per tenant, locked down. To work out first, in a spec if it
-touches ownership:
+### What one process holds today (mapped 2026-10-29)
 
-- What a tenant process holds: its own cells, its own opened secrets, no
-  master key, no bucket keys. Bucket writes go through the parent, which
-  checks the object belongs to that tenant.
-- seccomp and landlock (Linux), so a taken-over process can make only the
-  system calls a cell's host needs, and touch only its own data folder.
-- How requests reach it (a socket per tenant, or passing the connection),
-  and what that costs per request. Measure before and after.
-- How it fails: a tenant process that dies takes only its own cells, and
-  they come back as after a crash today.
-- How to test it like V8: a test-only build where a cell gets real read
-  and write anywhere in its process (V8's memory corruption API), and
-  checks that it still can't read another tenant's data, the master key,
-  or the bucket keys.
+- **Keys.** The master key lives in the admin and deploy-sync threads, not
+  the loops, but in the same address space. The bucket's keys are copied
+  into every loop (`sh.fleet.cfg.s3`), 32 bucket threads, the catalog,
+  builds, and the peer store, and `COMBD_S3_SECRET` stays in the
+  environment. The TLS key sits in `Shared.tls`, which every loop reads.
+- **Tenants mixed on every loop.** One `App` holds every tenant. Objects go
+  to loops by a hash of their name, so one loop runs cells of every
+  tenant on one heap. Each loop has its own ownership `Core` for all its
+  objects. Opened secrets are in `Tenant.environ`, readable by every loop.
+- **Node-wide, not per tenant:** leases, heartbeats, the wire, the peer
+  store (`peers/peers.log`), `alarms.sqlite`, `catalog.snap` (every
+  tenant's sealed secrets), the fsync pool, Postgres pools (threads
+  holding passwords), stats.
+- **Bucket keys carry no tenant.** `own/<h>`, `obj/<h>/...`,
+  `alarm/<h>/...` are a hash of the object's name.
+- **Same uid for everything.** Any code running as `combd` can read
+  `/etc/combd/*` (the master key, the bucket keys) and, while the process
+  is dumpable, `/proc/<pid>/environ` and `/mem`.
+- No seccomp or landlock in the code. The systemd unit locks the process
+  down well (no new privileges, read-only system, `@system-service`
+  syscalls, no W+X memory), but around all tenants at once.
+
+### Found while mapping it
+
+- **Fixed (2026-10-29):** a cell could write WebSocket frames to another
+  app's socket, even another org's. A push through a socket process
+  (`"ws"` with `"id"` or `"ids"`) found the socket by id alone, and ids are
+  a counter per loop. Now a socket is reached only for the object or
+  session it belongs to (`ws_frame`), and
+  `a_socket_push_reaches_only_its_own_sessions` failed before the fix.
+- **Open:** a Postgres pool's URL comes from the tenant's vars or secrets,
+  and the node dials it with no check. A tenant can point it at
+  `127.0.0.1` (the admin port), private addresses, or `169.254.169.254`.
+  It speaks only the Postgres protocol, so it's a probe, not a fetch. The
+  egress rules from "Security gaps we must not repeat" should apply:
+  refuse loopback, private, link-local and metadata addresses unless the
+  operator allows them.
+
+### The line: cells in the child, everything else in the parent
+
+Cloudflare's design is the model ("Mitigating Spectre and other security
+threats", 2020). Each machine runs several copies of the runtime
+("cordons"), with tenants grouped by trust. Each copy is locked down before
+it loads any code: an empty filesystem, seccomp, and no network but Unix
+sockets. A supervisor holds the code and the keys. Proxies end TLS and
+carry traffic in and out.
+
+For combd, the child (one per cordon) runs code and keeps files. The
+parent proves durability and talks to the world:
+
+| Child (a cordon: one org by default) | Parent (one per node, as today) |
+|---|---|
+| Event loops, the scheduler, cells (interpreter and compiled builds) | TLS, HTTP parsing, routing by domain |
+| Its tenants' SQLite files, fsync, checkpoints | The ownership core, leases, epochs, the output gate |
+| Host calls that stay local: `sql`, alarms, `call` and `send` inside the cordon | The bucket, the wire and peers, the peer store |
+| Its tenants' opened env vars and secrets, sent by the parent | The catalog, the master key, opening secrets |
+| | Postgres pools (passwords), egress |
+| | WebSocket connections (frames carried to the child) |
+| | Admin, deploys, builds, stats |
+
+Why here: the ownership core, the wire, and the bucket are per node by
+design (a node is one owner with one lease). Splitting them per tenant
+would mean a node is many owners, with a new spec. Keeping them in the
+parent leaves the protocol as it is: to the core, a cordon is a set of
+loops, like today's. The output gate stays where the answer leaves, in the
+parent, so a child can't answer before a write is safe.
+
+The cost: each request crosses a Unix socket twice, and each commit's WAL
+frames cross once, for the parent to send to peers and the bucket. To
+measure before deciding it's worth it. Budget: at most 10% on the arena
+and million benches at p50, and say what p99 does.
+
+### The child, locked down
+
+In order, after it starts and before it loads any module:
+
+- Started with an empty environment and only its socket pair open. The
+  parent reads the bucket's keys and clears them from its own environment
+  (`remove_var`), and sets itself non-dumpable (`PR_SET_DUMPABLE=0`), so
+  a process with the same uid can't read its memory or environment.
+- **landlock** (Linux 5.13 and up; the arena's 6.8 has ABI 4): read and
+  write only its cordon's data folder, read only its tenants' unpacked
+  bundles and builds. Nothing in `/etc/combd`. With ABI 4, no TCP bind or
+  connect at all.
+- **seccomp**, an allowlist: memory, futexes, epoll,
+  its socket pair, file calls on already-open folders, `mprotect`
+  without exec on anything but loading a signed build. No `socket`,
+  `connect`, `execve`, `ptrace`, or `process_vm_*`.
+- Its own uid per cordon would be stronger still. It needs the parent to
+  start with `CAP_SETUID`, so it's a later step, not the first.
+- On macOS (`combd dev`), there's no landlock or seccomp: the child runs
+  unsandboxed and says so. The wall is a Linux feature.
+
+### What the parent must not trust
+
+V8's lesson again: the new boundary is the messages between child and
+parent, and the child is hostile. Every message is checked like a host
+call today:
+
+- An object, session, or socket a child names must belong to one of its
+  tenants. The parent keeps the map from object to tenant, since bucket
+  keys don't carry one.
+- A child's WAL frames go only to its own objects' files and segments.
+- Sizes and counts are capped, as for cells.
+- `fuzz-ipc`: random and malformed messages from a fake child, checked
+  like `fuzz-host` (the parent never panics, never touches another
+  tenant, never stalls).
+
+### Failure
+
+A child that dies takes only its cordon's cells. Its in-flight requests get
+503, as when a cell crashes. Its objects' files are on disk and their
+writes are safe in peers or the bucket, so the restarted child loads them
+as after a crash today. To the core, the node didn't die, so there's no
+takeover. The simulator gets a "cordon crash" fault to check that.
+
+### Testing it like V8
+
+- A test-only build (`sandbox-testing`) where a cell has a host call that
+  reads and writes any address in its process: V8's memory corruption
+  API. Tests then try, from inside a child, to read the master key, the
+  bucket's keys, another cordon's files and memory, the parent's memory,
+  `/etc/combd`, and to open a socket or run a program. Each must fail.
+  Each test is seen to pass against a child with its lockdown turned off,
+  as with the guard tests.
+- `fuzz-ipc` in `check.sh`.
+
+### Steps
+
+1. **Now, small:** the WebSocket owner check (done), the parent clearing
+   `COMBD_S3_SECRET` from its environment and going non-dumpable, and the
+   Postgres egress check.
+2. **The line, in one process.** Loops talk to the parent side only
+   through messages: no `Shared`, no `App`, no bucket keys across the
+   line. All tests still pass, and the cost is measurable before any
+   process exists.
+3. **The child process,** over a socket pair. Measure against the budget.
+4. **The lockdown** and its V8-style tests, and `fuzz-ipc`.
+5. **Cordons:** config for which orgs share one (default: one per org),
+   stats per cordon, the docs ("What it doesn't do" in `security.md`).
+
+### Decided (JT, 2026-10-29)
+
+- Cordons come from config, and the default is one per org.
+- A node with one tenant runs its cells in a child too, so the keys stay
+  out of the process that runs code.
+- The budget is 10% at p50 on the arena and million benches, with p99
+  reported. Over it, we make it faster before it ships.
 
 A bug bounty (V8's VRP) waits until someone backs the project.
