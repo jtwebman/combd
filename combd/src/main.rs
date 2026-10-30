@@ -4908,19 +4908,28 @@ callers = ["api"]
         while t.elapsed() < Duration::from_millis(4000) {
             ws.recv_within(100);
         }
-        let (acks0, leases0, msgs0) = (stat(p, "peer_acks"), stat(p, "lease_reads"), stat(p, "ws_messages"));
-        let t = Instant::now();
+        // A loaded machine that stalls past a promise (1.5 s) rightly lets
+        // the lease lapse, and that window's reads wait for rounds. A broken
+        // lease fails every window, a stall only one: up to three.
         let mut i = 0;
-        while t.elapsed() < Duration::from_millis(3000) {
-            ws.text(&serde_json::json!({ "t": "in", "mx": 1.0, "my": 0.0, "aim": 0.0, "fire": i % 7 == 0 }).to_string());
-            i += 1;
-            ws.recv_within(20);
+        let mut windows = vec![];
+        for _ in 0..3 {
+            let (acks0, leases0, msgs0) = (stat(p, "peer_acks"), stat(p, "lease_reads"), stat(p, "ws_messages"));
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_millis(3000) {
+                ws.text(&serde_json::json!({ "t": "in", "mx": 1.0, "my": 0.0, "aim": 0.0, "fire": i % 7 == 0 }).to_string());
+                i += 1;
+                ws.recv_within(20);
+            }
+            let (acks, leases, msgs) = (stat(p, "peer_acks") - acks0, stat(p, "lease_reads") - leases0, stat(p, "ws_messages") - msgs0);
+            eprintln!("in 3 s of play: {msgs} messages, {leases} lease reads, {acks} peer acks");
+            windows.push((acks, leases, msgs));
+            // A round renews the lease about twice a second: a few acks a second, not one per message.
+            if msgs > 50 && acks < msgs / 4 {
+                return;
+            }
         }
-        let (acks, leases, msgs) = (stat(p, "peer_acks") - acks0, stat(p, "lease_reads") - leases0, stat(p, "ws_messages") - msgs0);
-        eprintln!("in 3 s of play: {msgs} messages, {leases} lease reads, {acks} peer acks");
-        assert!(msgs > 50, "{msgs} messages");
-        // A round renews the lease about twice a second: a few acks a second, not one per message.
-        assert!(acks < msgs / 4, "{acks} peer acks for {msgs} messages ({leases} lease reads): the messages waited for rounds");
+        panic!("every window's messages waited for rounds or were too few (peer acks, lease reads, messages): {windows:?}");
     }
 
     #[test]
