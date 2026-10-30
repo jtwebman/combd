@@ -56,6 +56,11 @@ The first release: Durable Objects on your own machines, as one binary.
   (`nearest`), spread by hash (`spread`), or pinned to regions (`pin`);
   hooks for your own rules (`policy.rs`).
 - mTLS between nodes; admin tokens; secrets sealed per app.
+- A pool's Postgres URL is a tenant's, so in a fleet a pool can't reach
+  the node itself, link-local addresses, or a cloud's metadata service,
+  unless `COMBD_PG_ALLOW` lists them, and it connects to the address it
+  checked. combd takes the bucket's keys out of its environment at
+  start, and on Linux it's non-dumpable.
 - Builders hold no bucket credentials: one asks any node's admin API for
   work and sends back what it built (`COMBD_FLEET`), each request signed
   with its builder key, which the nodes must list.

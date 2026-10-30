@@ -113,6 +113,22 @@ never sees more than 100.
   as `on_manager_loss` says. Until they're gone, the database may see more
   than `max` for a moment.
 
+## Where a pool may connect
+
+In a fleet, a pool's URL comes from a deploy, so a node checks where it
+points. A database on a public or private network works with no setting.
+A pool can't reach the node itself, link-local addresses, where the
+cloud's metadata service lives, or a Unix socket. So an app can't log in
+to a Postgres on the node that trusts local users, or probe the node's
+own ports. The name is looked up once, and the connection goes to the
+address that was checked.
+
+For a Postgres on the same machine as the node, list it in
+`COMBD_PG_ALLOW`, like `127.0.0.1/32`.
+
+On one node, with `combd dev` or `serve-apps`, the apps are your own, and
+nothing is checked.
+
 ## TLS
 
 With `sslmode=require` in the URL, a connection is TLS or nothing. The

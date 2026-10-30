@@ -24,7 +24,7 @@ fuzz = ["wasmtime", "dep:wasm-smith", "dep:arbitrary", "dep:wat"]
 [dependencies]
 combd-guest = { path = "../guest" }
 # The data folder's free space (statvfs), without unsafe here.
-rustix = { version = "1", features = ["fs", "time"] }
+rustix = { version = "1", features = ["fs", "time", "process"] }
 combd-aot = { path = "aot", optional = true, default-features = false }
 # Loading compiled modules' builds into a running node (the AOT tier's unsafe).
 combd-load = { path = "load", optional = true }

@@ -117,16 +117,33 @@ fn amz_date() -> String {
     format!("{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+/// The bucket's keys, once `take_keys` has taken them from the environment.
+static KEYS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// Takes the bucket's keys out of the environment, so a process combd
+/// starts doesn't inherit them. (`/proc/<pid>/environ` still holds them;
+/// only root can read it once `main` makes the process non-dumpable.)
+/// First thing in `main`, before any other thread runs.
+pub fn take_keys() {
+    let take = |k: &str| {
+        let v = std::env::var(k).unwrap_or_default();
+        std::env::remove_var(k);
+        v
+    };
+    let _ = KEYS.set((take("COMBD_S3_KEY"), take("COMBD_S3_SECRET")));
+}
+
 impl S3 {
     pub fn from_env() -> Option<S3> {
         let url = std::env::var("COMBD_S3").ok()?;
+        let (key, secret) = KEYS.get().cloned().unwrap_or_else(|| (std::env::var("COMBD_S3_KEY").unwrap_or_default(), std::env::var("COMBD_S3_SECRET").unwrap_or_default()));
         Some(S3 {
             pool: Default::default(),
             tls: url.starts_with("https://"),
             host: url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string(),
             bucket: std::env::var("COMBD_S3_BUCKET").unwrap_or_else(|_| "combd".into()),
-            key: std::env::var("COMBD_S3_KEY").unwrap_or_default(),
-            secret: std::env::var("COMBD_S3_SECRET").unwrap_or_default(),
+            key,
+            secret,
             region: std::env::var("COMBD_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
         })
     }
@@ -481,6 +498,32 @@ fn http_date(v: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// The keys leave the environment (a process combd starts doesn't get
+    /// them), and the bucket still has them. In a child process: they're
+    /// taken once per process.
+    #[test]
+    fn the_bucket_keys_leave_the_environment() {
+        if std::env::var("COMBD_KEYS_CASE").is_ok() {
+            super::take_keys();
+            let s3 = super::S3::from_env().unwrap();
+            assert_eq!((s3.key.as_str(), s3.secret.as_str()), ("kee-1y", "sekrit-9q"));
+            let env = std::process::Command::new("env").output().unwrap();
+            let env = String::from_utf8_lossy(&env.stdout);
+            assert!(env.contains("COMBD_KEYS_CASE=1"), "{env}");
+            assert!(!env.contains("COMBD_S3_KEY") && !env.contains("COMBD_S3_SECRET"), "{env}");
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "s3::tests::the_bucket_keys_leave_the_environment", "--test-threads=1"])
+            .env("COMBD_KEYS_CASE", "1")
+            .env("COMBD_S3", "http://127.0.0.1:1")
+            .env("COMBD_S3_KEY", "kee-1y")
+            .env("COMBD_S3_SECRET", "sekrit-9q")
+            .output()
+            .unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    }
+
     #[test]
     fn http_dates_read_as_unix_seconds() {
         assert_eq!(super::http_date("Wed, 21 Oct 2015 07:28:00 GMT"), Some(1_445_412_480));

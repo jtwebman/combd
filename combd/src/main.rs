@@ -890,6 +890,10 @@ where
 }
 
 fn main() {
+    s3::take_keys();
+    // Other processes of the same user can't read its memory or environment.
+    #[cfg(target_os = "linux")]
+    let _ = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
     let args: Vec<String> = std::env::args().skip(1).collect();
     main_with(&args.iter().map(String::as_str).collect::<Vec<_>>())
 }

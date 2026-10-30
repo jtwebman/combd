@@ -2249,13 +2249,15 @@ key, and the TLS key. A cell that gets out of its sandbox has all of it.
   a counter per loop. Now a socket is reached only for the object or
   session it belongs to (`ws_frame`), and
   `a_socket_push_reaches_only_its_own_sessions` failed before the fix.
-- **Open:** a Postgres pool's URL comes from the tenant's vars or secrets,
-  and the node dials it with no check. A tenant can point it at
-  `127.0.0.1` (the admin port), private addresses, or `169.254.169.254`.
-  It speaks only the Postgres protocol, so it's a probe, not a fetch. The
-  egress rules from "Security gaps we must not repeat" should apply:
-  refuse loopback, private, link-local and metadata addresses unless the
-  operator allows them.
+- **Fixed (2026-10-29):** a Postgres pool's URL comes from the tenant's
+  vars or secrets, and the node dialed it with no check: `127.0.0.1` (the
+  admin port), `169.254.169.254`. Now a fleet's pools reach public and
+  private networks but not loopback, link-local, or metadata addresses,
+  unless `COMBD_PG_ALLOW` lists them (JT: private networks allowed by
+  default, so a database in the VPC needs no setting), resolved once and
+  pinned (`hostaddr`), and never a Unix socket. One
+  node (`dev`, `serve-apps`) runs the operator's own apps and isn't
+  checked.
 
 ### The line: cells in the child, everything else in the parent
 
@@ -2348,9 +2350,11 @@ takeover. The simulator gets a "cordon crash" fault to check that.
 
 ### Steps
 
-1. **Now, small:** the WebSocket owner check (done), the parent clearing
-   `COMBD_S3_SECRET` from its environment and going non-dumpable, and the
-   Postgres egress check.
+1. **Now, small (done, 2026-10-29):** the WebSocket owner check, the
+   bucket's keys out of the environment at start (`s3::take_keys`), the
+   process non-dumpable on Linux, and the Postgres egress check
+   (`pg::Egress`, `COMBD_PG_ALLOW`, `a_fleet_pool_connects_only_where_allowed`;
+   `deploys_reach_every_node` fails without the allow list).
 2. **The line, in one process.** Loops talk to the parent side only
    through messages: no `Shared`, no `App`, no bucket keys across the
    line. All tests still pass, and the cost is measurable before any

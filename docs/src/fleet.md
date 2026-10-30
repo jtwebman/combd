@@ -413,6 +413,7 @@ otherwise.
 | `COMBD_S3_BUCKET` | `combd` | The bucket. |
 | `COMBD_S3_KEY`, `COMBD_S3_SECRET` | none | Its credentials. |
 | `COMBD_S3_REGION` | `us-east-1` | Its region. R2 uses `auto`. |
+| `COMBD_PG_ALLOW` | none | Addresses a Postgres pool may reach that it otherwise can't, like a Postgres on the node itself: `127.0.0.1/32` ([Postgres](postgres.md#where-a-pool-may-connect)). |
 | `COMBD_NODE` | none | This node's number. |
 | `COMBD_PEERS` | none | Every node's wire address: `0=host:7100,1=host:7100,...`. |
 | `COMBD_WIRE_PORT` | 7100 | Where this node listens for peers. |

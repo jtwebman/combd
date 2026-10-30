@@ -124,6 +124,14 @@ writable and executable. It makes only the system calls a service
 makes, and can run nothing but its own binary, its libraries, and its
 builds.
 
+combd takes the bucket's keys out of its environment when it starts, so
+a process it runs never gets them. On Linux it makes itself non-dumpable,
+so another process of the same user can't read its memory or its
+environment.
+
+In a fleet, a Postgres pool can't reach the node's own ports or the
+cloud's metadata service ([Postgres](postgres.md#where-a-pool-may-connect)).
+
 ## How it's been checked
 
 There were three rounds of security review. Each finding was proven with

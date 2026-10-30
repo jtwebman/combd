@@ -16,6 +16,8 @@ if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     start combd-pg-test postgres:16-alpine 25432:5432 -e POSTGRES_PASSWORD="$(openssl rand -hex 12)"
     start combd-s3-test "pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data" 29000:9000 -e MINIO_ROOT_USER=combd -e MINIO_ROOT_PASSWORD="$(openssl rand -hex 12)"
     export COMBD_PG_TEST="postgres://postgres:$(env_of combd-pg-test POSTGRES_PASSWORD)@127.0.0.1:25432/postgres"
+    # A fleet's pools reach loopback only where it's listed.
+    export COMBD_PG_ALLOW=127.0.0.1/32
     export COMBD_S3=http://127.0.0.1:29000 COMBD_S3_REGION=us-east-1
     COMBD_S3_KEY=$(env_of combd-s3-test MINIO_ROOT_USER); COMBD_S3_SECRET=$(env_of combd-s3-test MINIO_ROOT_PASSWORD)
     export COMBD_S3_KEY COMBD_S3_SECRET

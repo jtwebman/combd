@@ -1621,7 +1621,7 @@ where
     let fleet = cfg.fleet.take().map(|fc| start_fleet(fc, &peers, cfg.threads, &cfg.data, cfg.catalog.clone()));
     // Always a set of pools (maybe empty): a deploy can add to it. In a
     // fleet with a catalog, each pool is one for the whole fleet.
-    let pool_fleet = fleet.as_ref().zip(cfg.catalog.clone()).map(|(f, cat)| crate::pg::PoolFleet { me: f.cfg.node, wire: f.wire.clone(), cat, heard: f.heard.clone(), lease_ms: f.cfg.lease_ms });
+    let pool_fleet = fleet.as_ref().zip(cfg.catalog.clone()).map(|(f, cat)| crate::pg::PoolFleet { me: f.cfg.node, wire: f.wire.clone(), cat, heard: f.heard.clone(), lease_ms: f.cfg.lease_ms, egress: crate::pg::Egress::from_env() });
     let pools = Arc::new(crate::pg::Pools::start(&cfg.pg.clone().unwrap_or_default(), pool_fleet, cfg.stop.clone()));
     if let Some(f) = &fleet {
         let _ = f.pools.set(pools.clone());

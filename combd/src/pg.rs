@@ -286,6 +286,108 @@ pub struct PoolFleet {
     /// When each node was last heard from (its heartbeats).
     pub heard: Arc<Mutex<HashMap<u32, (u64, Instant)>>>,
     pub lease_ms: u64,
+    /// Where its pools may connect.
+    pub egress: Egress,
+}
+
+/// Where a fleet's pools may connect: any public or private network, and
+/// what the operator lists in `COMBD_PG_ALLOW` (say `127.0.0.1/32`, for a
+/// Postgres on the node itself). A pool's URL is the tenant's, so without
+/// this it could reach the node's own ports (a local Postgres that trusts
+/// local logins, the admin port) or the cloud's metadata service.
+#[derive(Clone, Default)]
+pub struct Egress(Vec<(std::net::IpAddr, u8)>);
+
+impl Egress {
+    pub fn from_env() -> Egress {
+        Egress::parse(&std::env::var("COMBD_PG_ALLOW").unwrap_or_default())
+    }
+
+    /// A bad entry is left out (so it allows less, never more), with a warning.
+    pub fn parse(s: &str) -> Egress {
+        Egress(
+            s.split(',')
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .filter_map(|n| {
+                    let net = n.split_once('/').and_then(|(ip, bits)| Some((v4(ip.parse().ok()?), bits.parse().ok()?)));
+                    let net = net.filter(|&(ip, bits)| bits <= if ip.is_ipv4() { 32 } else { 128 });
+                    if net.is_none() {
+                        eprintln!("combd     COMBD_PG_ALLOW: {n} isn't a network (like 127.0.0.1/32), left out");
+                    }
+                    net
+                })
+                .collect(),
+        )
+    }
+
+    pub fn allows(&self, ip: std::net::IpAddr) -> bool {
+        let ip = v4(ip);
+        ordinary(ip) || self.0.iter().any(|&(net, bits)| within(ip, net, bits))
+    }
+
+    /// `pg` with each host pinned to an address it allows, resolved now, so
+    /// the connection goes where it was checked (a name can't change
+    /// between the check and the connect).
+    fn pin(&self, pg: &Config) -> Result<Config, String> {
+        use tokio_postgres::config::Host;
+        if !pg.get_hostaddrs().is_empty() {
+            return match pg.get_hostaddrs().iter().find(|&&ip| !self.allows(ip)) {
+                Some(ip) => Err(format!("{ip} isn't allowed (COMBD_PG_ALLOW)")),
+                None => Ok(pg.clone()),
+            };
+        }
+        let mut out = pg.clone();
+        let ports = pg.get_ports();
+        for (i, h) in pg.get_hosts().iter().enumerate() {
+            let Host::Tcp(name) = h else {
+                return Err("a Unix socket isn't allowed".into());
+            };
+            let port = ports.get(i).or(ports.first()).copied().unwrap_or(5432);
+            let addrs: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), port)).map_err(|e| format!("{name}: {e}"))?.map(|a| a.ip()).collect();
+            let ip = addrs.iter().copied().find(|&ip| self.allows(ip)).ok_or_else(|| match addrs.first() {
+                Some(a) if a.to_string() != *name => format!("{name} is at {a}, which isn't allowed (COMBD_PG_ALLOW)"),
+                Some(_) => format!("{name} isn't allowed (COMBD_PG_ALLOW)"),
+                None => format!("{name}: no address"),
+            })?;
+            out.hostaddr(ip);
+        }
+        Ok(out)
+    }
+}
+
+/// An IPv6 address that holds an IPv4 one (`::ffff:a.b.c.d`, NAT64's
+/// `64:ff9b::a.b.c.d`) as that IPv4 address.
+fn v4(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(a) if a.segments()[..6] == [0x64, 0xff9b, 0, 0, 0, 0] => std::net::Ipv4Addr::from(u128::from(a) as u32).into(),
+        std::net::IpAddr::V6(a) => a.to_ipv4_mapped().map_or(ip, Into::into),
+        _ => ip,
+    }
+}
+
+/// Somewhere a database could be, public or private: not this machine,
+/// not link-local or a cloud's metadata service (169.254.169.254, AWS's
+/// fd00:ec2::254, Alibaba's 100.100.100.200), not multicast or reserved.
+fn ordinary(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(a) => {
+            let o = a.octets();
+            !(a.is_loopback() || a.is_link_local() || a.is_unspecified() || a.is_multicast() || o[0] == 0 || o[0] >= 240 || o == [100, 100, 100, 200])
+        }
+        std::net::IpAddr::V6(a) => {
+            let s = a.segments()[0];
+            !(a.is_loopback() || a.is_unspecified() || a.is_multicast() || s & 0xffc0 == 0xfe80 || a.to_ipv4().is_some() || a == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254))
+        }
+    }
+}
+
+fn within(ip: std::net::IpAddr, net: std::net::IpAddr, bits: u8) -> bool {
+    match (ip, net) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(n)) => bits == 0 || u32::from(a) >> (32 - bits) == u32::from(n) >> (32 - bits),
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(n)) => bits == 0 || u128::from(a) >> (128 - bits) == u128::from(n) >> (128 - bits),
+        _ => false,
+    }
 }
 
 /// Every pool on this node, by name. A deploy can add pools (`ensure`).
@@ -759,9 +861,10 @@ impl Agent {
                 self.members.insert(key, Mine { tx, busy: true, resetting: false, kept: true, free_since: Instant::now(), recalled: false, let_go: let_go.clone() });
                 self.starting.insert(key, (ask, lease));
                 let (pg, me, lease_ms, retries, work) = (self.pg.clone(), self.tx.clone(), self.cfg.lease_ms, self.cfg.retries, self.work.clone());
+                let egress = self.fleet.as_ref().map(|f| f.egress.clone());
                 std::thread::Builder::new()
                     .name("pg-conn".into())
-                    .spawn(move || run_member(key, pg, retries, lease, lease_ms, jobs, me, work, let_go))
+                    .spawn(move || run_member(key, pg, egress, retries, lease, lease_ms, jobs, me, work, let_go))
                     .expect("pg connection thread");
             }
             Net::Grant { ask, asker, member, lease } => match self.members.get_mut(&(epoch, member)) {
@@ -1088,10 +1191,18 @@ fn connect(rt: &tokio::runtime::Runtime, pg: &Config) -> Result<tokio_postgres::
 /// One member: a connection on its own thread, leased to one holder at a
 /// time, from its first lease (the ask it started for).
 #[allow(clippy::too_many_arguments)]
-fn run_member(id: Key, pg: Config, retries: u32, first: u64, lease_ms: u64, jobs: Receiver<Job>, pool: Sender<Msg>, work: Arc<Work<Item>>, let_go: Arc<AtomicBool>) {
+fn run_member(id: Key, pg: Config, egress: Option<Egress>, retries: u32, first: u64, lease_ms: u64, jobs: Receiver<Job>, pool: Sender<Msg>, work: Arc<Work<Item>>, let_go: Arc<AtomicBool>) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(_) => return drop(pool.send(Msg::Started(id, Err(false)))),
+    };
+    // In a fleet, only where the operator allows.
+    let pg = match egress.map_or(Ok(pg.clone()), |e| e.pin(&pg)) {
+        Ok(pg) => pg,
+        Err(e) => {
+            eprintln!("combd     postgres: won't connect: {e}");
+            return drop(pool.send(Msg::Started(id, Err(false))));
+        }
     };
     // A failed connect is tried again, 100 ms then doubling, `retries`
     // times. "Too many clients" isn't: the pool puts the ask back in line.
@@ -1394,6 +1505,32 @@ fn column(row: &tokio_postgres::Row, i: usize, t: &Type) -> Result<Json, Json> {
 #[cfg(test)]
 mod tls_tests {
     use super::*;
+
+    /// A fleet's pools reach public and private networks, and loopback
+    /// only where the operator lists it, never link-local or a metadata
+    /// service (not even dressed as IPv6), and connect to the address they
+    /// checked.
+    #[test]
+    fn a_fleet_pool_connects_only_where_allowed() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let none = Egress::default();
+        for s in ["127.0.0.1", "127.9.9.9", "169.254.169.254", "100.100.100.200", "0.0.0.0", "255.255.255.255", "::1", "::", "fe80::1", "fd00:ec2::254", "::ffff:169.254.169.254", "64:ff9b::a9fe:a9fe", "::ffff:127.0.0.1"] {
+            assert!(!none.allows(ip(s)), "{s}");
+        }
+        for s in ["8.8.8.8", "10.1.2.3", "172.16.0.1", "192.168.1.1", "100.64.0.1", "::ffff:10.0.0.1", "fd00::1", "2606:4700::1111"] {
+            assert!(none.allows(ip(s)), "{s}");
+        }
+        let lan = Egress::parse("127.0.0.1/32, junk, 1.2.3.4/40");
+        assert_eq!(lan.0.len(), 1, "bad entries left out");
+        for (s, ok) in [("127.0.0.1", true), ("::ffff:127.0.0.1", true), ("127.0.0.2", false), ("169.254.169.254", false)] {
+            assert_eq!(lan.allows(ip(s)), ok, "{s}");
+        }
+        let pin = |e: &Egress, url: &str| e.pin(&url.parse().unwrap());
+        for url in ["postgres://u@localhost/db", "postgres://u@169.254.169.254/db", "postgres://u@db.example.com/db?hostaddr=127.0.0.1", "host=/tmp user=u"] {
+            assert!(pin(&none, url).is_err(), "{url}");
+        }
+        assert_eq!(pin(&lan, "postgres://u@localhost:5433/db").unwrap().get_hostaddrs(), [ip("127.0.0.1")]);
+    }
 
     /// `sslmode=require` means TLS or nothing: against a server without it
     /// (the test Postgres), no connection, not a quiet fall back to plain.
