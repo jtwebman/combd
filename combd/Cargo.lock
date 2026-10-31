@@ -166,6 +166,7 @@ dependencies = [
  "combd-guest",
  "combd-load",
  "combd-mem",
+ "combd-wall",
  "corosensei",
  "hmac 0.12.1",
  "httparse",
@@ -224,6 +225,13 @@ dependencies = [
 
 [[package]]
 name = "combd-mem"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "combd-wall"
 version = "0.0.0"
 dependencies = [
  "libc",

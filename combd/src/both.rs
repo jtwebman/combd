@@ -10,8 +10,10 @@ use std::sync::Arc;
 pub struct Both {
     pub interp: Interp,
     pub aot: Aot,
-    /// In a fleet: where builds come from (the bucket, from builders).
-    pub builds: Option<Arc<crate::builds::Builds>>,
+    /// In a fleet: this node's builds, fetched from the bucket and checked
+    /// where deploys land (`http::fetch_builds`). The engine only reads
+    /// this folder: it never holds the bucket's keys.
+    pub builds: Option<std::path::PathBuf>,
 }
 
 pub enum Program {
@@ -27,6 +29,11 @@ pub enum Cell {
 }
 
 impl Engine for Both {
+    fn child(&self) -> String {
+        let builds = self.builds.as_ref().map(|d| d.to_string_lossy().into_owned());
+        format!("both:{}:{}", self.interp.max_pages, builds.unwrap_or_default())
+    }
+
     type Program = Program;
     type Vm = Cell;
 
@@ -38,15 +45,11 @@ impl Engine for Both {
     fn load_as(&self, wasm: &[u8], kind: Kind) -> Result<Program, String> {
         match kind {
             Kind::Interpreted => self.interp.load(wasm).map(Program::Interpreted),
-            // Built in (or in COMBD_AOT_DIR), else this node's build from the
-            // bucket; until there is one, the deploy waits.
+            // Built in (or in COMBD_AOT_DIR), else this node's build, fetched.
             Kind::Compiled => match (self.aot.load(wasm), &self.builds) {
                 (Ok(c), _) => Ok(Program::Compiled(c)),
                 (Err(e), None) => Err(e),
-                (Err(_), Some(b)) => match b.fetch(wasm)? {
-                    crate::builds::Fetch::Ready => crate::aot::built(&b.dir, wasm).map(Program::Compiled),
-                    crate::builds::Fetch::Building => Err(format!("module {} {}", crate::builds::module_id(wasm), crate::engine::BEING_BUILT)),
-                },
+                (Err(_), Some(dir)) => crate::aot::built(dir, wasm).map(Program::Compiled),
             },
         }
     }

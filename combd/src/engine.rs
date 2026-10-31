@@ -37,6 +37,8 @@ pub enum Kind {
 pub trait Engine {
     type Program;
     type Vm: CellVm;
+    /// How the cells make this engine again where they run (`cells::start`).
+    fn child(&self) -> String;
     /// Validate and prepare a module, once per deploy.
     fn load(&self, wasm: &[u8]) -> Result<Self::Program, String>;
     /// The same, to run `kind`: an engine that can't says so, and the deploy

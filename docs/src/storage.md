@@ -157,4 +157,6 @@ dies mid-match, that match is lost. The players' records are in SQLite.
   less, a node takes no new objects. A request that would make one gets
   `507 {"error":"no room for new objects"}`.
 - Data lives under `COMBD_DATA` (default `data`), one file per object,
-  named by a hash of its name, in a folder per app, `<org>/<app>/`.
+  named by a hash of its name, in a folder per app, `objects/<org>/<app>/`.
+  A node that kept them in the data folder itself moves them into
+  `objects/` when it starts.

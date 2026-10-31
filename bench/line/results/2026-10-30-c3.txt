@@ -1,0 +1,50 @@
+C3 (cells on their own thread, a Unix socket to the node) against S0, back to back, 2026-10-30.
+PIN=1: million's server has one CPU of its own, as a 1 vCPU droplet. The arena runs natively (many cores).
+pa: S0 (b638325). pb: C3, uncommitted. In order pa1 pb1 pb2 pa2.
+
+== pa1
+line bench 2026-10-30 22:46, b638325, Darwin arm64, 14 CPUs, load 5.14 5.65 6.02
+arena 8 bots 120s  all: 25722 ticks seen by players, 0.05% late (over 75 ms apart), worst gap 141 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 14227 pings in play, p50 0.20 ms, p99 0.40 ms
+million combd           req    10 conns  GET /             90087 req/s  p50  80.00us  p99 275.00us  errors      0  memory    4 MiB peak  cpu  97% avg 
+million combd           req    10 conns  GET /api/count    67647 req/s  p50 112.00us  p99 225.00us  errors      0  memory    4 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /             97641 req/s  p50   0.97ms  p99   1.60ms  errors      0  memory   12 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /api/count    94607 req/s  p50   1.00ms  p99   1.80ms  errors      0  memory   12 MiB peak  cpu 100% avg 
+million combd           req  1000 conns  GET /             74521 req/s  p50  13.25ms  p99  17.17ms  errors      0  memory   91 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /api/count    75129 req/s  p50  13.13ms  p99  18.68ms  errors      0  memory   88 MiB peak  cpu  99% avg 
+million combd             1000 pages  changes/s    1184 avg    1736 peak  clicks  12364  lost     0 (0.00%)  worst p50   151 ms  p99   758 ms  up 1000 closed 0  refused 0  memory   58 MiB peak (base   3)  cpu   3% avg 
+== pb1
+line bench 2026-10-30 22:57, b638325, Darwin arm64, 14 CPUs, load 5.29 5.09 5.46
+arena 8 bots 120s  all: 25526 ticks seen by players, 0.03% late (over 75 ms apart), worst gap 164 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 13652 pings in play, p50 0.23 ms, p99 0.47 ms
+million combd           req    10 conns  GET /             70895 req/s  p50 102.00us  p99 233.00us  errors      0  memory    6 MiB peak  cpu  99% avg 
+million combd           req    10 conns  GET /api/count    51160 req/s  p50 144.00us  p99 456.00us  errors      0  memory    5 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /             79316 req/s  p50   1.21ms  p99   2.17ms  errors      0  memory   16 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /api/count    91451 req/s  p50   1.03ms  p99   1.86ms  errors      0  memory   14 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /             61847 req/s  p50  16.27ms  p99  24.90ms  errors      0  memory  114 MiB peak  cpu 100% avg 
+million combd           req  1000 conns  GET /api/count    65117 req/s  p50  15.21ms  p99  20.84ms  errors      0  memory  115 MiB peak  cpu  99% avg 
+million combd             1000 pages  changes/s    1168 avg    1722 peak  clicks  12102  lost     0 (0.00%)  worst p50   151 ms  p99   463 ms  up 1000 closed 0  refused 0  memory   60 MiB peak (base   4)  cpu   4% avg 
+== pb2
+line bench 2026-10-30 23:11, b638325, Darwin arm64, 14 CPUs, load 4.51 5.50 5.71
+arena 8 bots 120s  all: 24236 ticks seen by players, 0.00% late (over 75 ms apart), worst gap 67 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 13178 pings in play, p50 0.23 ms, p99 0.46 ms
+million combd           req    10 conns  GET /             68945 req/s  p50 105.00us  p99 245.00us  errors      0  memory    6 MiB peak  cpu  99% avg 
+million combd           req    10 conns  GET /api/count    49890 req/s  p50 147.00us  p99 453.00us  errors      8  memory    4 MiB peak  cpu  92% avg 
+million combd           req   100 conns  GET /             82772 req/s  p50   1.17ms  p99   2.06ms  errors      0  memory   16 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /api/count    91446 req/s  p50   1.03ms  p99   1.88ms  errors      0  memory   14 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /             66088 req/s  p50  15.16ms  p99  22.74ms  errors      0  memory  113 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /api/count    64038 req/s  p50  15.39ms  p99  22.29ms  errors      0  memory  114 MiB peak  cpu  99% avg 
+million combd             1000 pages  changes/s    1161 avg    1630 peak  clicks  12220  lost     0 (0.00%)  worst p50   151 ms  p99   335 ms  up 1000 closed 0  refused 0  memory   59 MiB peak (base   4)  cpu   4% avg 
+== pa2
+line bench 2026-10-30 23:22, b638325, Darwin arm64, 14 CPUs, load 4.81 5.25 5.45
+arena 8 bots 120s  all: 25430 ticks seen by players, 0.03% late (over 75 ms apart), worst gap 104 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 13662 pings in play, p50 0.19 ms, p99 0.38 ms
+million combd           req    10 conns  GET /             91557 req/s  p50  79.00us  p99 178.00us  errors      0  memory    4 MiB peak  cpu 100% avg 
+million combd           req    10 conns  GET /api/count    64586 req/s  p50 117.00us  p99 332.00us  errors      0  memory    3 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /             93663 req/s  p50   1.01ms  p99   1.76ms  errors      0  memory   12 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /api/count    95666 req/s  p50   0.99ms  p99   1.74ms  errors      0  memory   12 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /             69648 req/s  p50  14.02ms  p99  20.35ms  errors      0  memory   90 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /api/count    69866 req/s  p50  13.95ms  p99  20.76ms  errors      0  memory   88 MiB peak  cpu  99% avg 
+million combd             1000 pages  changes/s    1181 avg    1737 peak  clicks  12116  lost     0 (0.00%)  worst p50   151 ms  p99   388 ms  up 1000 closed 0  refused 0  memory   58 MiB peak (base   3)  cpu   4% avg 
+
+pb2's 8 errors at /api/count, 10 connections, were wrk timeouts (requests over 2 s); eight more runs of that test since found none (worst 8 ms).

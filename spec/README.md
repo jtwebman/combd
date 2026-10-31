@@ -179,9 +179,50 @@ distinct states (an hour and a half, 2026-10-29). The two-write model
 states, found nothing, and `check.sh` walks it for 10 minutes
 (`WIPE_SECS`).
 
+**Alarms** (`Alarms.tla`, 2026-10-30). An object's alarm lives in its
+SQLite, so it moves with its history. A fleet also keeps an index of
+alarms in the bucket, so a node can find a due alarm of an object nobody
+is running. The claim, `AlarmFound`: every state the object could be
+restored to has its alarm in the index. Otherwise that alarm never fires
+until something else wakes the object. Replication is abstract here. Every
+sealed state from the last acknowledged one on could come back, and a claim
+restores any of them, which is more than the real protocol allows. So a
+proof here holds there.
+
+Planning the second wall turned up three ways the code could lose an
+alarm. A key was deleted as soon as a commit moved the alarm off it, before
+that commit was acknowledged, so a crash brought back the old state with no
+key. A seal read the alarm mid transaction, not the committed one. And a
+key was its due time alone, so a delete that timed out could land after
+the same key was put again.
+
+The fix. A seal waits for a key its owner put itself and saw land, never
+one it only listed, since an older owner may be deleting that one. Each put
+is a new key. A key goes only once a state is proven (an answer went out),
+and only if no state from that one on has its due time, or the owner has
+its own key for that time. Old owners keep acting until they crash, and
+bucket calls land and answer in any order, or fail and land later, or
+never. The code's rules are `combd/src/alarm_keys.rs`. Its test walks the
+same world at random, 100,000 runs, and catches each old rule too.
+
+662,907,659 distinct states (with symmetry), no errors (an hour and 20
+minutes, 2026-10-30). Five known-bad
+versions must fail:
+
+| Bug | Caught by |
+|---|---|
+| delete a key once the committed alarm moves off it | AlarmFound |
+| a seal reads the alarm mid transaction | AlarmFound |
+| a seal counts a key it listed, not one it put | AlarmFound |
+| a key is its due time alone | AlarmFound |
+| before anything is proven, keep only the latest key | AlarmFound |
+
+All five were in the code.
+
 Run `./check.sh` (needs Java; it fetches TLC 1.7.4 and checks its hash). The
-whole run takes about three hours: an hour for the model with no wipes, an
-hour and a half for the wipe model, and 10 minutes of random runs.
+whole run takes about four and a half hours: an hour for the model with no
+wipes, an hour and a half for the wipe model, an hour and 20 minutes for
+the alarms, and 10 minutes of random runs.
 
 Not modeled yet: reads (they pass the same gate as writes), leases and
 clocks (liveness only), many objects, and checkpoints of old epochs.

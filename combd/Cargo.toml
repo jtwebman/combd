@@ -24,7 +24,7 @@ fuzz = ["wasmtime", "dep:wasm-smith", "dep:arbitrary", "dep:wat"]
 [dependencies]
 combd-guest = { path = "../guest" }
 # The data folder's free space (statvfs), without unsafe here.
-rustix = { version = "1", features = ["fs", "time", "process"] }
+rustix = { version = "1", features = ["fs", "time", "process", "net"] }
 combd-aot = { path = "aot", optional = true, default-features = false }
 # Loading compiled modules' builds into a running node (the AOT tier's unsafe).
 combd-load = { path = "load", optional = true }
@@ -34,6 +34,8 @@ socket2 = { version = "0.6", features = ["all"] }
 # Cells' memory, copy-on-write from their module's image: the interpreter's
 # only unsafe code.
 combd-mem = { path = "mem" }
+# The cells' lockdown on Linux, landlock and seccomp, with libc alone.
+combd-wall = { path = "wall" }
 corosensei = { version = "0.3.4", optional = true }
 wasmparser = "0.261"
 # The HTTP front: epoll/kqueue event loop and hyper's request parser.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Model-check the specs (the catalog, D2 ownership, D3 replication). The correct protocol must pass, and every
+# Model-check the specs (the catalog, D2 ownership, D3 replication, the alarm index). The correct protocol must pass, and every
 # known-bad version must fail; if a bad one passes, the checker is blind.
 set -e
 cd "$(dirname "$0")"
@@ -41,6 +41,8 @@ fail() {
 }
 pass MCCatalog MCCatalog
 fail MCCatalog CatAckBeforeWrite CatBlindSlot CatApplyAnyOrder CatUncoveredCheck CatTrimNoGate CatTrimEarly CatReadNoGate
+pass MCAlarms Alarms
+fail MCAlarms AlarmDeleteOnCommit AlarmSealReadsTxn AlarmSealTrustsListed AlarmReuseKeys AlarmRestoreKeepsNewest
 pass MCOwnership MCOwnership
 fail MCOwnership BugSkipProof BugLoadBeforeCas BugNoManifest BugReuseEpoch
 pass MCReplication MCReplication

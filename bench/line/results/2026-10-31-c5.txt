@@ -1,0 +1,48 @@
+C4b (cells in a child process, combd cells) against S0, back to back, 2026-10-31.
+PIN=1: million's server has one CPU of its own, as a 1 vCPU droplet. The arena runs natively (many cores).
+qa: S0 (b638325). qb: C4b, uncommitted. In order qa1 qb1 qb2 qa2.
+
+== qa1
+line bench 2026-10-31 01:17, b638325, Darwin arm64, 14 CPUs, load 7.94 10.73 10.22
+arena 8 bots 120s  all: 28286 ticks seen by players, 0.02% late (over 75 ms apart), worst gap 103 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 14445 pings in play, p50 0.20 ms, p99 0.35 ms
+million combd           req    10 conns  GET /             87225 req/s  p50  82.00us  p99 212.00us  errors      0  memory    9 MiB peak  cpu  99% avg 
+million combd           req    10 conns  GET /api/count    63361 req/s  p50 117.00us  p99 377.00us  errors      0  memory    8 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /             93523 req/s  p50   1.02ms  p99   1.77ms  errors      0  memory   12 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /api/count    94512 req/s  p50   0.99ms  p99   1.88ms  errors      0  memory   12 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /             71801 req/s  p50  13.68ms  p99  19.64ms  errors      0  memory   91 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /api/count    71539 req/s  p50  13.73ms  p99  19.69ms  errors      0  memory   88 MiB peak  cpu  99% avg 
+million combd             1000 pages  changes/s    1204 avg    1717 peak  clicks  12388  lost     0 (0.00%)  worst p50   151 ms  p99   589 ms  up 1000 closed 0  refused 0  memory   58 MiB peak (base   3)  cpu   4% avg 
+== qb1
+line bench 2026-10-31 01:28, b638325, Darwin arm64, 14 CPUs, load 4.58 6.21 7.85
+arena 8 bots 120s  all: 31846 ticks seen by players, 0.02% late (over 75 ms apart), worst gap 103 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 16762 pings in play, p50 0.21 ms, p99 0.39 ms
+million combd           req    10 conns  GET /             69127 req/s  p50 105.00us  p99 232.00us  errors      0  memory    8 MiB peak  cpu  99% avg 
+million combd           req    10 conns  GET /api/count    48846 req/s  p50 151.00us  p99 494.00us  errors      0  memory    7 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /             70296 req/s  p50   1.39ms  p99   2.43ms  errors      0  memory   17 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /api/count    88827 req/s  p50   1.07ms  p99   1.96ms  errors      0  memory   15 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /             58071 req/s  p50  17.55ms  p99  24.64ms  errors      0  memory  118 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /api/count    64945 req/s  p50  15.21ms  p99  21.80ms  errors      0  memory  113 MiB peak  cpu  99% avg 
+million combd             1000 pages  changes/s    1197 avg    1770 peak  clicks  12307  lost     0 (0.00%)  worst p50   151 ms  p99   555 ms  up 1000 closed 0  refused 0  memory   61 MiB peak (base   5)  cpu   4% avg 
+== qb2
+line bench 2026-10-31 01:43, b638325, Darwin arm64, 14 CPUs, load 4.90 6.02 6.64
+arena 8 bots 120s  all: 25152 ticks seen by players, 0.05% late (over 75 ms apart), worst gap 253 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 13237 pings in play, p50 0.22 ms, p99 0.40 ms
+million combd           req    10 conns  GET /             64888 req/s  p50 109.00us  p99 406.00us  errors      0  memory    7 MiB peak  cpu  99% avg 
+million combd           req    10 conns  GET /api/count    47450 req/s  p50 155.00us  p99 359.00us  errors      0  memory    6 MiB peak  cpu  96% avg 
+million combd           req   100 conns  GET /             68713 req/s  p50   1.42ms  p99   2.58ms  errors      0  memory   17 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /api/count    90793 req/s  p50   1.04ms  p99   1.90ms  errors      0  memory   15 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /             56941 req/s  p50  17.55ms  p99  31.07ms  errors      0  memory  119 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /api/count    68075 req/s  p50  14.49ms  p99  21.63ms  errors      0  memory  113 MiB peak  cpu  99% avg 
+million combd             1000 pages  changes/s    1198 avg    1723 peak  clicks  12366  lost     0 (0.00%)  worst p50   151 ms  p99   263 ms  up 1000 closed 0  refused 0  memory   64 MiB peak (base   5)  cpu   4% avg 
+== qa2
+line bench 2026-10-31 01:53, b638325, Darwin arm64, 14 CPUs, load 4.80 5.44 6.04
+arena 8 bots 120s  all: 28220 ticks seen by players, 0.01% late (over 75 ms apart), worst gap 272 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 14409 pings in play, p50 0.24 ms, p99 0.52 ms
+million combd           req    10 conns  GET /             89474 req/s  p50  80.00us  p99 241.00us  errors      0  memory    9 MiB peak  cpu  99% avg 
+million combd           req    10 conns  GET /api/count    66157 req/s  p50 115.00us  p99 229.00us  errors      0  memory    9 MiB peak  cpu  96% avg 
+million combd           req   100 conns  GET /             96495 req/s  p50   0.98ms  p99   1.65ms  errors      0  memory   12 MiB peak  cpu  99% avg 
+million combd           req   100 conns  GET /api/count    91819 req/s  p50   1.01ms  p99   1.95ms  errors      0  memory   12 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /             71936 req/s  p50  13.54ms  p99  20.62ms  errors      0  memory   94 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /api/count    75960 req/s  p50  12.93ms  p99  18.93ms  errors      0  memory   92 MiB peak  cpu  99% avg 
+million combd             1000 pages  changes/s    1195 avg    1732 peak  clicks  12336  lost     0 (0.00%)  worst p50   151 ms  p99  2695 ms  up 1000 closed 0  refused 0  memory   63 MiB peak (base   3)  cpu   3% avg 

@@ -2258,6 +2258,15 @@ key, and the TLS key. A cell that gets out of its sandbox has all of it.
   pinned (`hostaddr`), and never a Unix socket. One
   node (`dev`, `serve-apps`) runs the operator's own apps and isn't
   checked.
+- **Fixed (2026-10-30):** a fleet could lose an alarm. The index in the
+  bucket lets a node find a due alarm of an object nobody runs, and a key
+  was deleted as soon as a commit moved the alarm, before that commit was
+  acknowledged. A crash then restored the old state with no key, and the
+  alarm never fired until a request woke the object. A seal also read the
+  alarm mid transaction, and keys were reused, so a delete that timed out
+  could remove a later put. `spec/Alarms.tla` models it (five known-bad
+  versions fail), and `alarm_keys.rs` holds the rules, with a random test
+  that catches each old one.
 
 ### The line: cells in the child, everything else in the parent
 
@@ -2359,8 +2368,308 @@ takeover. The simulator gets a "cordon crash" fault to check that.
    through messages: no `Shared`, no `App`, no bucket keys across the
    line. All tests still pass, and the cost is measurable before any
    process exists.
+   In pieces, each one green before the next (2026-10-30):
+   - S0: benches before anything moves (done: `bench/line/run.sh`,
+     `bench/line/results/`). Arena, 8 bots, a ping every 100 ms through
+     the match: p50 0.22 ms, p99 0.45 ms. Million, `GET /api/count` from
+     10, 100, and 1000 connections: p50 117 us, 1.00 ms, 14.22 ms (p99 232
+     us, 1.56 ms, 18.29 ms); 1000 clicking pages, echo p50 151 ms, none
+     lost. A laptop with other work on it, so for the budget, run both
+     commits back to back.
+   - S1: the alarm index (done, see "Found while mapping it").
+   - S2: builds fetched where deploys land (`sync_apps`, `deploy_bundle`),
+     not in `Both::load_as`, so the engine holds no bucket keys (done:
+     the engine gets the builds folder, `http::Config` the `Builds`).
+   - S3: what the child shares across its loops in one place (`cells.rs`:
+     the fsync pool, the local alarm index; done). Settings stay in
+     `http::Config` until the child gets its own over the socket.
+   - S4: stats split (done in one process: the cells' counters are
+     `cells::Stats`). Once it's a child, it sends its counts before each
+     answer, and its health on a timer.
+   - S5: an app's code travels as bytes. `App` keeps the Wasm, opened env
+     vars move to the child, and a deploy is a message. (Done in one
+     process: `App` holds each module's bytes and is no longer generic;
+     `cells::Code` holds the loaded programs and each app's env vars, made
+     from the `App` at each deploy, before it goes live. The parent keeps
+     the env vars too, to send a child that restarts.)
+   - S6: sockets as messages (open, gone, lost, frames, broadcast). Bench.
+     (Done in one process: `line.rs`, `Down` and `Up`. The cells keep
+     their own set of open sockets, told by `SockOpen` and `SockGone`;
+     a lost socket and an object's close that went out come down as
+     messages, and a session's own close goes up. Broadcast (`"ids"`)
+     is the node's already, in `start_call`, which moves with calls in
+     S8. The bench waits for S11, when the line is a socket.)
+   - S7: Postgres as messages. The parent keeps the handles. (Done in
+     one process: `Up::Db` and `Down::Db`, for parked cells and event
+     cells alike. The node checks the binding and the pool's callers,
+     holds every lease, and gives the cells a handle number; the cells
+     keep which object or request owns each handle, and when one has
+     sat unused too long.)
+   - S8: requests and answers by token, and calls between processes.
+     (Done in one process: where the node hands a request to the cells,
+     a connection's, a socket's, another loop's or node's, or a call's
+     origin becomes `Origin::Token`; its answer goes up as `Up::Answer`.
+     A connection that closes cancels its waiting request (`Cancel`).
+     A cell's `call` and `send` go up as `Up::Call`; the node routes them
+     and keeps the calls' timeouts. The core's requests already carry its
+     own token, `Origin::Fleet`.)
+   - S9: the fleet. Run and ran (with the committed alarm, for
+     `AlarmKeys`, which stays in the parent), seals and images, restores
+     and drops. (Done in one process: the node keeps each object's
+     activation, alarm keys, held seal, and image (`Owned`); `Ran`,
+     `Skipped`, `Seal`/`Sealed`, `Restore`/`Restored`, and `Drop` cross
+     the line. Eviction: the cells name idle objects (`Idle`) and the node
+     decides. Placement reads the node's own list of objects and which
+     hold a beat or a database session (`Anchor`). Beats, local alarms,
+     and lost sockets go up as `Submit`. The mailbox is checked at the
+     cells' door: in a fleet, a core's request that's refused there runs
+     as a 503 that changed nothing.)
+   - S10: the child side moves into `cells.rs`, its messages into
+     `line.rs`, and `check.sh` greps that nothing else crosses. (Each
+     loop is two structs now: `Loop`, the node's, holds `CellLoop`, the
+     cells'. Each side queues what it sends, and the loop hands it over
+     between turns (`exchange`), never inside the other's turn, as a
+     socket will. The cells know the node's memory pressure and disk by
+     `Health`. `check.sh` fails if `impl CellLoop` reaches `Shared`
+     past the cells' own state and settings, or names a node's origin.)
+   - S11: every message encoded and decoded as it will be on the socket.
+     Bench against S0. (Done: `line.rs` encodes each message by hand,
+     and decoding never panics or trusts a length (a test feeds it cut,
+     padded, and mangled messages). Bench, back to back with S0
+     (`bench/line/results/2026-10-30-s11.txt`): million's page was 16%
+     slower at 1000 connections, because a round's answers waited on the
+     line until it ended, out of cache by then. Handed over every 32
+     slices (`LINE_BATCH`): at 1000 connections, p50 13.91 ms against
+     13.70 for the page (+1.5%) and 13.63 against 13.55 for
+     `/api/count`, within the noise; the arena's pings and million's
+     clicks unchanged.)
+
+   Where things land: the local (D1) fsync gate stays with the child,
+   next to its files. The fleet's output gate stays in the parent, where
+   the answer leaves. Only the child loads programs.
 3. **The child process,** over a socket pair. Measure against the budget.
+
+   In pieces, each one green before the next:
+   - C1: what the cells still read from the node's memory comes as
+     messages. Their settings (`Down::Start`), and each deploy: the
+     `App` as bytes, its programs loaded by the cells, which answer
+     whether it loaded (`Down::Deploy`, `Up::Deployed`). A deploy goes
+     live only once the cells say so; the admin API waits for that.
+     (Done in one process: the cells get `cells::Settings` and their
+     `Cells`, never `Shared` or `Live`, and start with nothing; each loop
+     sends its cells every deploy, the first included, as
+     `app::ForCells`: the programs they don't have yet, and the process
+     and app tables. A request for a process they don't have gets 500.
+     The node still loads a deploy first, to check it (`load_code`);
+     asking the child instead is C4's, with `Up::Deployed`.)
+   - C2: stats as messages: the cells' counts (`cells::Stats`) go up on
+     a timer, and the stats page adds them in (S4's second half). (Done:
+     not on a timer: the stats page asks (`Down::Stats`) and answers
+     when the counts come (`Up::Stats`), so they're never stale. The
+     node counts a fleet's evictions and alarms fired itself.)
+   - C3: the cells get a loop of their own, on a thread, and each node
+     loop talks to its cells' loop over a Unix socket pair, framed. Both
+     ways in one process, so tests reach both. (Done: `line::End`, and
+     `CellLoop::run`, with its own poll; fsyncs report to the cells. A
+     bug the bench found: a socket that never empties under steady load
+     kept every byte ever sent, and a 1 GB node ran out in seconds
+     (`the_line_keeps_order_and_lets_go_of_what_it_sent`). Natively, on
+     many cores, no slower (69,000 page requests a second against
+     67,000). In the bench's container, `--cpus=1`, much worse: 47,000
+     against 74,000 for the page, p99 61 ms against 17. That limit is a
+     quota of one CPU's time, not one CPU: two busy threads spend a
+     period's quota on two CPUs in half of it, then wait out the rest. A
+     1 vCPU droplet is one CPU (`PIN=1` in `bench/click/run.sh` now); a
+     container with a CPU limit, Kubernetes's included, is a quota.
+     Pinned, with a copy that was quadratic fixed (27% of the time:
+     `End::flush` moved the unsent rest on every short write), the whole
+     bench back to back with S0 (`bench/line/results/2026-10-30-c3.txt`),
+     p50: the page +30% at 10 connections, +20% at 100, +15% at 1000;
+     `/api/count` +27%, +3%, +13%; the arena's pings +18% (0.23 ms);
+     million's clicks the same. At 10 connections each request waits on
+     two thread switches, and on one CPU no line between two processes
+     avoids them: under 10% there isn't likely on a 1 vCPU node.)
+   - C4: the child process. `combd cells`, started with an empty
+     environment and only its socket pairs; settings and deploys come
+     over them. A child that dies: its requests in flight get 503, it
+     starts again, gets the deploys again, and reopens the objects the
+     node still owns from their files (to the core, the node didn't die).
+     In pieces:
+     - C4a (done): `cells::spawn` and `combd cells`. The child gets a
+       control socket as stdin, its loops' sockets over it
+       (`SCM_RIGHTS`), then a `line::Start`: the parent's build (a hash
+       of the binary; on Linux the child is `/proc/self/exe`, the binary
+       running even after an update replaced its file), the engine
+       (`Engine::child`), and the settings. `COMBD_CELLS=threads` keeps
+       them on threads, as the tests do (their binary is the test
+       runner); `tests/child.rs` runs the built binary. For now a child
+       that dies stops the node.
+     - C4b (done): the parent loads no program. `cells::start` makes a
+       `Link` first, and a deploy's check (`Link::check`, `line::Ctl`)
+       goes to the cells, which load programs once each (`Progs`) for
+       their loops and their checks alike. With threads (tests), the
+       cells run the same code on threads here, from the same `Start`, so
+       `Live` holds only the `App` and the node is engine-free. A deploy
+       reaches all three test nodes in 31 to 59 ms, against 22 to 26
+       before (the cells' check). `check.sh` fails if `http.rs` loads a
+       program. Two tests fixed that read too soon on a loaded machine
+       (`a_full_node_refuses_at_tcp`, `stats_count_each_process_time`).
+     - C4c: a child that dies starts again, as above. Until then it stops
+       the node, which systemd starts again: to the fleet a node crash,
+       which the model and the simulator already cover. Starting only the
+       child keeps the node's objects, but its requests and seals in
+       flight, and the objects it owns, need the simulator's "cordon
+       crash" first. With one cordon a node, stopping the node costs no
+       more than a child alone would: everything on it was in that child.
+       It matters with several (step 5), where one org's crash mustn't
+       take the rest, so it comes with cordons. What a crash loses: the
+       files keep every commit (a process crash doesn't lose the page
+       cache); runs with no `Ran`, seals with no `Sealed`, and restores
+       in flight are what the simulator must cover.
+   - C5 (done, 2026-10-31): bench against S0, back to back, million's
+     server pinned to one CPU (`bench/line/results/2026-10-31-c5.txt`,
+     S0, child, child, S0, each pair averaged). Arena (native, many
+     cores): ping p50 0.22 ms both, p99 0.44 to 0.40. Million,
+     `GET /api/count`, p50 at 10, 100, and 1000 connections: 116 us to
+     153 (+32%), 1.00 ms to 1.06 (+5%), 13.3 ms to 14.9 (+11%); p99 303
+     us to 426, 1.92 ms to 1.93, 19.3 ms to 21.7. `GET /` (the page):
+     81 us to 107 (+32%), 1.00 ms to 1.41 (+40%), 13.6 ms to 17.6 (+29%);
+     p99 226 us to 319, 1.71 ms to 2.51, 20.1 ms to 27.9. 1000 clicking
+     pages: echo p50 151 ms both, none lost. So on one CPU it's over the
+     10% budget, about what threads cost (C3), the page a little worse:
+     each request is two switches between processes on the one CPU. Per
+     the decision, it gets faster before it ships: profile first (where
+     the page's extra goes: its body crosses twice).
+   - C6, faster (2026-10-31). perf on the pinned CPU (`perf record -C 0`
+     from a privileged container beside the server), S0 against the
+     child, 20 s of wrk:
+     - `GET /api/count`, 10 connections: S0 makes 1,200 context switches
+       a second, the child 53,000 (one a request: the node and the cells
+       take turns on the one CPU). CPU a request 14.5 us to 19.8: 2 us in
+       user code (encode, decode, copies), 2.6 in the kernel (the line's
+       reads and writes, epoll, the switches). No one hot spot.
+     - `GET /`, 100 connections: 7,000 switches a second (batched), but
+       3.6 us more a request: the 8 KB page crossing. The node's line
+       read was a fresh buffer each round (past glibc's mmap threshold, a
+       new mapping: page faults and zeroing, 2%), a copy of every byte
+       through a 64 KB buffer on the stack, and a UTF-8 check of a body
+       it only writes out (1.9%).
+     - Now: reads go straight into the line's buffer, which keeps its
+       room (two buffers, swapped: `take_whole`, `recycle`); one read a
+       round (a short read means the socket is empty, and mio's edge
+       wakes the loop for what comes next) instead of one more to hear
+       it would block, but read to the end when the wake-up says the
+       other end closed (a message and the close in one edge: else a
+       child outlives its node; `a_close_right_after_a_message_is_heard`); an answer for a connection goes out as bytes, only
+       its header lines checked as text. The page at 100 connections:
+       71,200 requests a second to 89,500 (S0 95,800), p50 1.38 ms to 1.08
+       (S0 0.98). Count at 10: 147 us to 138 (S0 about 113). What's left
+       at low concurrency is the switch between processes itself, one a
+       request on one CPU, which no transport removes.
+     - The whole bench again, back to back (`2026-10-31-c6.txt`), p50
+       against S0, each pair averaged, C5's in brackets. `/api/count` at
+       10, 100, 1000 connections: +24% (+32), +3% (+5), +10% (+11). The
+       page: +25% (+32), +13% (+40), -4% (+29). p99, count: +54%, +5%,
+       +12%; page: +16%, +9%, -14%. Clicks: echo p50 151 ms, none lost.
+       Arena pings (native): 0.22 ms against 0.19, though S0 alone has
+       ranged 0.18 to 0.24 over the day's runs. Over budget still: low
+       concurrency on one CPU (a switch a request), and the page at 100.
 4. **The lockdown** and its V8-style tests, and `fuzz-ipc`.
+   - L1: `combd/wall`, a crate of its own for the `unsafe` (as combd-mem
+     and combd-load), with no crate but libc (JT: stay light on
+     dependencies; take what's needed from the landlock and seccompiler
+     projects, not the crates). Written from the kernel's headers.
+     `lock(Walls { rw, ro, exec })`: no new privileges, then landlock
+     (every right the kernel knows held back; `rw` and `ro` folders
+     given theirs; with ABI 4 no TCP bind or connect; with ABI 6 no
+     abstract Unix sockets and no signals out), then a seccomp allowlist
+     on every thread (`TSYNC`). Off the list kills the process
+     (`SIGSYS`), loud, not a quiet error; `clone3` answers `ENOSYS`
+     (its flags are behind a pointer) and glibc falls back to `clone`,
+     which must have `CLONE_THREAD`; `prctl` only names things; `ioctl`
+     only `FIONBIO`, `FIOCLEX`, `FIONCLEX`; `tgkill` only to itself; no
+     `PROT_EXEC` in `mmap` or `mprotect` unless `exec`. It refuses a
+     process with more than one thread (landlock holds the thread that
+     asks and the ones it starts after).
+   - L2: the child locks before it makes its engine: rw its objects'
+     folder, ro `COMBD_AOT_DIR` and a fleet's builds, `exec` for any
+     engine but the interpreter (compiled builds are `dlopen`ed).
+     `COMBD_LOCKDOWN=off` runs it without (a kernel with no landlock);
+     missing walls are otherwise an error. The node says when the child
+     died of `SIGSYS`.
+   - L3: the walls tested as V8 tests its sandbox (`combd/wall/tests`,
+     its own main: each case a process locked as the cells are). 25
+     cases: its folders read and written, a given file read but not
+     written, a memfd image mapped, a thread started; and refused (by
+     landlock) builds written, a file beside the data, `/etc`, the
+     parent's `environ`, the same from a thread; and killed (by seccomp)
+     a TCP connect, any socket, running a program, `fork`, `ptrace`,
+     `process_vm_readv`, signalling the parent, memory made executable
+     at once or later (allowed with `exec`), a second lockdown, moving a
+     file. Each case also gets through with no walls. On Linux in Docker
+     (kernel 7.0, landlock ABI 8, under Docker's own seccomp profile):
+     all pass. `check.sh` runs them, and `tests/child.rs`, in Docker.
+   - L4: the allowlist from `strace -f` of the cells' process (lockdown
+     off) under plain objects coming and going, the arena with 8 bots,
+     and million compiled with 50 clicking pages: 43 calls, all on the
+     list once `fchown` was added (SQLite, as root, gives a new `-wal` its
+     database's owner). Then trimmed what nothing uses (`dup`, `rename`,
+     `getdents64`, `sendmsg`, `poll`, ...) and kept what a rare path needs
+     (`abort`'s `tgkill`, a guard page's `rt_sigreturn`, SQLite's busy
+     sleep and `faccessat`, `mremap` for a big `realloc`). The same three
+     workloads locked: nothing killed. Not yet seen: x86-64 (the
+     droplets); a node there says `cells locked down` or why not.
+   - L5: `fuzz-ipc` (`combd fuzz-ipc N [seed [fleet]]`, in `check.sh`):
+     a node whose cells are fake, sent messages built from what it said
+     (tokens, names, sockets, calls, requests, activations) or made up,
+     while clients ask it for things; a fleet of one on the bucket too.
+     Even seeds start with no app (a fleet node before its first
+     deploy). Found and fixed: a message naming a process past the app's
+     (`Call`'s `from`, `Db`'s `proc`) panicked the loop, and so did a
+     socket's `send` to a process with no app yet (`apply_ws` asks
+     `start_call` for the object's process, which is 0 when there are
+     none): `start_call` and `db_ask` now check the process themselves,
+     for every caller. A fleet's message to a node in none (`Sealed`,
+     `Ran`, ...) panicked on the missing fleet: dropped with a line. And,
+     reading the handlers, `submit` indexed past the processes for a
+     session with no app. Since: 160,000 messages over 8 seeds alone and
+     60,000 in a fleet, no panic, and junk on one line stops only its
+     loop. The node's check, bounded at 500 ms: 4 to 11 ms worst on a
+     quiet machine, up to 440 ms with this one at load 7 and a flood of
+     `call`s (real work for the node, each). For step 5: what a cordon
+     may name (its tenants' objects, sockets, Postgres handles,
+     `Submit`'s object) is checked with cordons, as today one process
+     holds every tenant; and `Behind(true)`, which stops the node taking
+     connections, must stop only its cordon's share, or one cordon could
+     say it forever.
+   - The child is non-dumpable too (`main` does it for every combd
+     process), so `tests/child.rs` can't read its `environ`: it checks
+     that it can't, or, for a reader that may trace anyone, that it's
+     empty. The cells' side reads three experiment knobs from the
+     environment (`COMBD_CPU_LIMIT_TICKS`, `COMBD_NO_YIELD`,
+     `COMBD_EXPERIMENT_NO_FSYNC`), which a child, with none, ignores.
+   - Found on the way: the child would have had read and write on the
+     whole data folder, which holds the node's `catalog.snap` (loaded at
+     start) and `peers/peers.log` (its durability state). A hostile child
+     could rewrite them and the node would trust them after a restart.
+     Objects now live in `data/objects/` (`store::objects_dir`), and a
+     node moves what it kept at the top into it when it starts (each a
+     rename, so a crash part way is finished by the next start; a name in
+     both places is an error, not a guess). It also ends a clash: an org
+     named `apps`, `scratch`, `peers`, or `builds` had its objects in the
+     node's folders of those names. Left there by the move: such an org's
+     old files (pre-release, none known).
+   - Seen on the way, and not a bug: with `COMBD_IDLE_MS=2000`, million's
+     clicking pages lose echoes (50 pages, 30 s: S0 lost 31, 10, 8; cells
+     on threads 6, 11; in a child 1 to 14), and at 30 or 60 s none. Every
+     run that lost some evicted chunks (10 to 35), and runs with none
+     evicted lost none. A chunk keeps its watchers in memory, and they
+     renew every 20 s: idle 2 s, a quiet chunk leaves memory between
+     renewals and forgets them. At the default idle a watched chunk hears
+     from each watcher every 20 s and stays.
+   - Step 5 must keep builds out of every cordon's `rw` (a planted `.so`
+     loaded by another cordon would cross the wall): today they're
+     `data/builds`, beside `objects/`, so they are.
 5. **Cordons:** config for which orgs share one (default: one per org),
    stats per cordon, the docs ("What it doesn't do" in `security.md`).
 

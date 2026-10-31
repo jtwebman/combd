@@ -59,6 +59,7 @@ impl<T> Work<T> {
 
     /// The next item for a puller, now. None: the line is empty (or the
     /// puller is let go, `set_yield`), and the caller is no longer pulling.
+    #[cfg(test)]
     pub fn pull(&self) -> Option<T> {
         self.pull_wait(Duration::ZERO, &AtomicBool::new(false))
     }

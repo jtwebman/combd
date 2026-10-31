@@ -1,6 +1,8 @@
 reference/
 .DS_Store
 target/
+# Linux builds from a Mac (check.sh's lockdown step, in Docker).
+target-linux*/
 langs/out/
 combd/aot/src/gen_*.rs
 # Terraform: plans hold variable values (tokens) in plain text; state, a

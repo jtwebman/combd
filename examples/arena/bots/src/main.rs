@@ -228,15 +228,20 @@ fn spread(rtt: &mut Value, home: usize, ms: u64) {
 }
 
 /// How a match kept time, from the server's own count.
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 struct Timing {
     ticks: u64,
     max_gap: u64,
     late: u64,
     stale: u64,
-    /// Round trips to the match's node, measured in play: total and count.
-    ping_ms: u64,
-    pings: u64,
+    /// Round trips to the match's node, measured in play, in µs.
+    rtts: Vec<u64>,
+}
+
+/// The p-th percentile (0 to 100) of some round trips, in ms.
+fn pct_ms(rtts: &mut [u64], p: usize) -> f64 {
+    rtts.sort_unstable();
+    rtts.get((rtts.len() * p / 100).min(rtts.len().saturating_sub(1))).map_or(0.0, |&us| us as f64 / 1000.0)
 }
 
 /// One match: join, wait, play. Ok(Some(true)): won; Ok(None): a draw.
@@ -273,11 +278,12 @@ fn play(url: &str, name: &str, s: Strategy, rng: &mut Rng, home: usize, timing: 
     let start = Instant::now();
     let mut last_ping: Option<Instant> = None;
     let env_num = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let ping_every = env_num("ARENA_PING_MS", 1000.0) as u64;
     let mut brain = Brain::new(s, rng.next(), env_num("ARENA_BOT_REACT_MS", 300.0) as u64, env_num("ARENA_BOT_AIM", 0.15));
     loop {
-        // Once a second: a round trip to the match's node, and then tell it
-        // (the other player and spectators see it).
-        if last_ping.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+        // Once a second (`ARENA_PING_MS`): a round trip to the match's node,
+        // and then tell it (the other player and spectators see it).
+        if last_ping.is_none_or(|t| t.elapsed() >= Duration::from_millis(ping_every)) {
             last_ping = Some(Instant::now());
             ws.send(&json!({ "t": "ping", "c": start.elapsed().as_micros() as u64 }).to_string()).map_err(|e| e.to_string())?;
         }
@@ -286,9 +292,9 @@ fn play(url: &str, name: &str, s: Strategy, rng: &mut Rng, home: usize, timing: 
                 let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                 if v["t"] == "pong" {
                     if let Some(c) = v["c"].as_u64() {
-                        let ms = (start.elapsed().as_micros() as u64).saturating_sub(c) / 1000;
-                        timing.ping_ms += ms;
-                        timing.pings += 1;
+                        let us = (start.elapsed().as_micros() as u64).saturating_sub(c);
+                        timing.rtts.push(us);
+                        let ms = us / 1000;
                         ws.send(&json!({ "t": "rtt", "ms": ms }).to_string()).map_err(|e| e.to_string())?;
                     }
                 }
@@ -391,14 +397,17 @@ fn main() {
         .collect();
     let mut all = Timing::default();
     for h in handles {
-        let (name, w, l, d, f, t) = h.join().unwrap();
+        let (name, w, l, d, f, mut t) = h.join().unwrap();
         let pct = |x: u64| if t.ticks == 0 { 0.0 } else { 100.0 * x as f64 / t.ticks as f64 };
-        println!("{name}: {w} won, {l} lost, {d} drawn, {f} failed | {} ticks, {:.1}% late, worst gap {} ms, {:.1}% without my input, ping {} ms", t.ticks, pct(t.late), t.max_gap, pct(t.stale), t.ping_ms.checked_div(t.pings).unwrap_or(0));
+        println!("{name}: {w} won, {l} lost, {d} drawn, {f} failed | {} ticks, {:.1}% late, worst gap {} ms, {:.1}% without my input, ping p50 {:.2} ms", t.ticks, pct(t.late), t.max_gap, pct(t.stale), pct_ms(&mut t.rtts, 50));
         all.ticks += t.ticks;
         all.late += t.late;
         all.stale += t.stale;
         all.max_gap = all.max_gap.max(t.max_gap);
+        all.rtts.extend(t.rtts);
     }
     let pct = |x: u64| if all.ticks == 0 { 0.0 } else { 100.0 * x as f64 / all.ticks as f64 };
     println!("all: {} ticks seen by players, {:.2}% late (over 75 ms apart), worst gap {} ms, {:.2}% of a player's ticks had no new input from them", all.ticks, pct(all.late), all.max_gap, pct(all.stale));
+    let n = all.rtts.len();
+    println!("all: {n} pings in play, p50 {:.2} ms, p99 {:.2} ms", pct_ms(&mut all.rtts, 50), pct_ms(&mut all.rtts, 99));
 }

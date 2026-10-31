@@ -30,6 +30,11 @@ SECS=${SECS:-180}              # clicking, once every page is open
 REQ_SECS=${REQ_SECS:-30}       # each route, in a req<n> test
 IDLE_MAX=${IDLE_MAX:-240000}   # idle pages to try for
 IDLE_SECS=${IDLE_SECS:-900}    # longest an idle ramp may take
+# The server's CPU: a quota of one CPU's time (--cpus=1, as a container
+# limit is), or PIN=1: one CPU of its own (--cpuset-cpus=0, as a 1 vCPU
+# droplet is). A server with two busy threads can spend a quota's period
+# in half of it on two CPUs, then waits out the rest.
+CPU=$([ "${PIN:-0}" = 1 ] && echo "--cpuset-cpus=0" || echo "--cpus=1")
 OUT=${OUT:-/tmp/click-race-$(date +%Y%m%d-%H%M%S)}
 NET=combd-click
 mkdir -p "$OUT"
@@ -69,7 +74,7 @@ start() {
         workerd-object|workerd-worker) args="-e SESSIONS=${1#workerd-} bench-click-workerd" ;;
         *) args="bench-click-$1" ;;
     esac
-    docker run -d --name srv --network $NET --cpus=1 --memory=1g --memory-swap=1g \
+    docker run -d --name srv --network $NET $CPU --memory=1g --memory-swap=1g \
         --ulimit nofile=1048576:1048576 $args >/dev/null || exit 1
     docker run -d --name click-net --network container:srv debian:bookworm-slim sleep infinity >/dev/null
     for _ in $(seq 1 120); do

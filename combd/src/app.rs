@@ -1,5 +1,6 @@
 //! What a node serves: its tenants' apps, every app's processes, the
-//! programs they run, and the routes that reach them (from each app's
+//! programs they run (as bytes: only the cells' side loads them, into
+//! `cells::Code`), and the routes that reach them (from each app's
 //! manifest). With no manifest it's one program and the old fixed routes:
 //! `/do/<name>` for objects, everything else for the cell.
 //!
@@ -34,14 +35,14 @@ pub struct Pin {
     pub fallback: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Proc {
     pub name: String,
     /// An older version's: it runs out what it has, and takes nothing new.
     pub retired: bool,
     /// Its app (`App::tenants`).
     pub tenant: usize,
-    /// Index into `App::progs`.
+    /// Index into `App::progs` (and `cells::Code::progs`).
     pub prog: usize,
     pub durable: bool,
     /// One instance per WebSocket (a session), in memory on the loop that
@@ -118,8 +119,18 @@ impl Tenant {
     }
 }
 
-pub struct App<P> {
-    pub progs: Vec<Arc<P>>,
+/// A module, as deployed: what the cells' side loads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prog {
+    pub wasm: Arc<[u8]>,
+    /// As its manifest says, or (`None`: no manifest) as the engine likes.
+    pub kind: Option<crate::engine::Kind>,
+    /// Which module, for errors: `<org>/<app>: modules/<name>.wasm`.
+    pub what: String,
+}
+
+pub struct App {
+    pub progs: Vec<Prog>,
     pub procs: Vec<Proc>,
     pub tenants: Vec<Tenant>,
     pub router: Router,
@@ -167,36 +178,81 @@ pub struct AppDir<'a> {
     pub domains: &'a [String],
 }
 
-impl<P> App<P> {
+/// What the cells need of an `App` (its routes, domains, pools, and
+/// static files are the node's): a deploy sends this, with only the
+/// programs they don't have yet.
+#[derive(Debug, PartialEq)]
+pub struct ForCells {
+    /// The programs from this one on (`App::progs`).
+    pub from: usize,
+    pub progs: Vec<Prog>,
+    pub procs: Vec<Proc>,
+    /// Each app's org, name, and env vars.
+    pub tenants: Vec<(String, String, Arc<Vec<Vec<u8>>>)>,
+    pub legacy: bool,
+    pub gone: Vec<usize>,
+}
+
+impl App {
+    /// What the cells need of this `App`, if they have its programs up to
+    /// `from`.
+    pub fn for_cells(&self, from: usize) -> ForCells {
+        ForCells {
+            from,
+            progs: self.progs[from.min(self.progs.len())..].to_vec(),
+            procs: self.procs.clone(),
+            tenants: self.tenants.iter().map(|t| (t.org.clone(), t.app.clone(), t.environ.clone())).collect(),
+            legacy: self.router.legacy,
+            gone: self.gone.clone(),
+        }
+    }
+
+    /// The cells' `App`, from the one they had and what the node sent:
+    /// `None` if it doesn't follow on from it, or points past itself.
+    pub fn from_node(prev: &App, d: ForCells) -> Option<App> {
+        if d.from != prev.progs.len() {
+            return None;
+        }
+        let progs: Vec<Prog> = prev.progs.iter().cloned().chain(d.progs).collect();
+        let ok = d.procs.iter().all(|p| p.prog < progs.len() && p.tenant < d.tenants.len() && p.callers.iter().all(|&c| c < d.procs.len())) && d.gone.iter().all(|&t| t < d.tenants.len());
+        if !ok {
+            return None;
+        }
+        let tenants = d.tenants.into_iter().map(|(org, app, environ)| Tenant { org, app, domains: vec![], environ, pools: vec![], statics: None }).collect();
+        let router = Router { routes: vec![], domains: vec![], legacy: d.legacy, statics: vec![] };
+        Some(App { progs, procs: d.procs, tenants, router, by_hash: HashMap::new(), gone: d.gone })
+    }
+
     /// One program, the old routes.
-    pub fn single(prog: P, max_concurrent: usize) -> App<P> {
+    pub fn single(wasm: &[u8], max_concurrent: usize) -> App {
         let proc = Proc { name: "main".into(), retired: false, tenant: 0, prog: 0, durable: false, socket: false, fresh: false, hibernate: Duration::ZERO, sleep: Sleep::Off, wake_on_close: true, state_max: 0, mailbox: usize::MAX, batch: 100, spread: None, nearest: true, pin: None, memory_pages: None, engine: crate::engine::Kind::Interpreted, max_concurrent, timeout: Duration::from_secs(30), callers: vec![], owns: vec![] };
         let tenant = Tenant { org: String::new(), app: "main".into(), domains: vec![], environ: Arc::default(), pools: vec![], statics: None };
-        App { progs: vec![Arc::new(prog)], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
+        let prog = Prog { wasm: wasm.into(), kind: None, what: "the module".into() };
+        App { progs: vec![prog], procs: vec![proc], tenants: vec![tenant], router: Router::legacy(), by_hash: HashMap::new(), gone: vec![] }
     }
 
     /// No apps yet.
-    pub fn empty() -> App<P> {
+    pub fn empty() -> App {
         App { progs: vec![], procs: vec![], tenants: vec![], router: Router::new(vec![], vec![]), by_hash: HashMap::new(), gone: vec![] }
     }
 
     /// Every app, from its resolved manifest: each module loaded once (the
     /// same bytes in two apps are one program), each process with its
     /// settings and rights, all scoped to its app.
-    pub fn from_apps(apps: &[AppDir], load: impl Fn(&[u8], crate::engine::Kind) -> Result<P, String>) -> Result<App<P>, String> {
+    pub fn from_apps(apps: &[AppDir]) -> Result<App, String> {
         let mut seen = std::collections::HashSet::new();
         for a in apps {
             if !seen.insert((a.org, a.app)) {
                 return Err(format!("{}/{}: two apps with the same name in one org", a.org, a.app));
             }
         }
-        App::empty().with_apps(apps, &[], load)
+        App::empty().with_apps(apps, &[])
     }
 
     /// A new `App`: this one, with `apps` deployed (new, or new versions of
     /// apps it has) and the apps in `remove` taken down. Append-only: see the
     /// module's notes.
-    pub fn with_apps(&self, apps: &[AppDir], remove: &[(String, String)], load: impl Fn(&[u8], crate::engine::Kind) -> Result<P, String>) -> Result<App<P>, String> {
+    pub fn with_apps(&self, apps: &[AppDir], remove: &[(String, String)]) -> Result<App, String> {
         let mut progs = self.progs.clone();
         let mut by_hash = self.by_hash.clone();
         let mut procs = self.procs.clone();
@@ -258,7 +314,7 @@ impl<P> App<P> {
                 let prog = match by_hash.get(&(hash, kind)) {
                     Some(&i) => i,
                     None => {
-                        progs.push(Arc::new(load(&wasm, kind).map_err(|e| format!("{key}: modules/{}.wasm: {e}", p.kind))?));
+                        progs.push(Prog { wasm: wasm.into(), kind: Some(kind), what: format!("{key}: modules/{}.wasm", p.kind) });
                         by_hash.insert((hash, kind), progs.len() - 1);
                         progs.len() - 1
                     }

@@ -132,6 +132,40 @@ environment.
 In a fleet, a Postgres pool can't reach the node's own ports or the
 cloud's metadata service ([Postgres](postgres.md#where-a-pool-may-connect)).
 
+## The cells' own process
+
+Cells run in a process of their own, apart from the one that holds the
+keys. The node keeps TLS, routing, the bucket and its keys, the wire to
+other nodes, Postgres passwords, and sockets. The cells' process gets
+requests and sends answers over Unix sockets, and holds only the
+objects' files. It starts with an empty environment. If a cell ever broke
+out of its sandbox, this is what it would be in.
+
+On Linux, before that process loads any module, it locks itself down
+for good:
+
+- **Files** (landlock): it reads and writes only `objects/` in the data
+  folder, and reads only compiled builds. The node's own files beside
+  them, the catalog's copy and the peer store, are out of its reach, as
+  is everything else on the machine.
+- **System calls** (seccomp): a short list, the ones it is seen to make.
+  It can't open a socket, connect anywhere, run a program, start a
+  process, trace or read another process, or signal one. A call off the
+  list kills it, and the node stops and says why.
+- **No code of its own**: with only interpreted modules, no memory can be
+  made executable. Compiled builds need it, so a node that loads them
+  allows it.
+
+A program can't gain rights either (no new privileges). Each of these is
+tested by trying it from a locked process, and each try is also seen to
+work with the lockdown off. `COMBD_LOCKDOWN=off` runs without it, for a
+kernel that has no landlock (Linux 5.13 and up has it). On macOS the
+cells' process runs without it and says so.
+
+The node reads what that process sends as it reads a cell's host calls:
+every message is checked, and a fuzzer plays a hostile cells' process
+against it.
+
 ## How it's been checked
 
 There were three rounds of security review. Each finding was proven with
@@ -155,6 +189,9 @@ are hostile too.
 
 ## What it doesn't do (yet)
 
+- **One cells' process for every tenant on a node.** A cell that broke
+  out of its sandbox could read other tenants' objects on that node,
+  though not the node's keys. A process per org is next.
 - **One compromised node is the whole fleet.** Every node holds the
   bucket's credentials, and mTLS proves "a fleet member", not which one.
 - **No rules between tenants.** combd runs your own apps. Any org with a

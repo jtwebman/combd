@@ -1,0 +1,66 @@
+S11 against S0, back to back on one laptop (other work running), 2026-10-30.
+a: S0 (b638325, the last commit). b: S11 (b638325 and the line, uncommitted).
+
+First, the whole bench, a b b a:
+== a1
+line bench 2026-10-30 19:32, b638325, Darwin arm64, 14 CPUs, load 7.43 8.16 8.06
+arena 8 bots 120s  all: 32074 ticks seen by players, 0.05% late (over 75 ms apart), worst gap 103 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 16692 pings in play, p50 0.21 ms, p99 0.48 ms
+million combd           req    10 conns  GET /             91651 req/s  p50  80.00us  p99 157.00us  errors      0  memory    5 MiB peak  cpu 100% avg 
+million combd           req    10 conns  GET /api/count    66445 req/s  p50 115.00us  p99 214.00us  errors      0  memory    4 MiB peak  cpu 100% avg 
+million combd           req   100 conns  GET /             95832 req/s  p50   1.01ms  p99   1.48ms  errors      0  memory   12 MiB peak  cpu 100% avg 
+million combd           req   100 conns  GET /api/count    96902 req/s  p50   0.99ms  p99   1.61ms  errors      0  memory   12 MiB peak  cpu 100% avg 
+million combd           req  1000 conns  GET /             70280 req/s  p50  14.06ms  p99  17.33ms  errors      0  memory   90 MiB peak  cpu 100% avg 
+million combd           req  1000 conns  GET /api/count    67812 req/s  p50  14.50ms  p99  19.36ms  errors      0  memory   88 MiB peak  cpu 100% avg 
+million combd             1000 pages  changes/s    1237 avg    1789 peak  clicks  12490  lost     0 (0.00%)  worst p50   151 ms  p99   544 ms  up 1000 closed 0  refused 0  memory   61 MiB peak (base   3)  cpu   4% avg 
+== b1
+line bench 2026-10-30 19:47, b638325, Darwin arm64, 14 CPUs, load 5.79 6.25 7.03
+arena 8 bots 120s  all: 28980 ticks seen by players, 0.05% late (over 75 ms apart), worst gap 109 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 15263 pings in play, p50 0.19 ms, p99 0.40 ms
+million combd           req    10 conns  GET /             86976 req/s  p50  86.00us  p99 165.00us  errors      0  memory    5 MiB peak  cpu 100% avg 
+million combd           req    10 conns  GET /api/count    65632 req/s  p50 114.00us  p99 217.00us  errors      0  memory    4 MiB peak  cpu 100% avg 
+million combd           req   100 conns  GET /             89274 req/s  p50   1.09ms  p99   1.60ms  errors      0  memory   13 MiB peak  cpu 100% avg 
+million combd           req   100 conns  GET /api/count    92348 req/s  p50   1.05ms  p99   1.59ms  errors      0  memory   12 MiB peak  cpu 100% avg 
+million combd           req  1000 conns  GET /             61036 req/s  p50  16.19ms  p99  19.46ms  errors      0  memory   98 MiB peak  cpu  99% avg 
+million combd           req  1000 conns  GET /api/count    74943 req/s  p50  13.25ms  p99  15.96ms  errors      0  memory   91 MiB peak  cpu 100% avg 
+million combd             1000 pages  changes/s    1223 avg    1771 peak  clicks  12513  lost     0 (0.00%)  worst p50   151 ms  p99   338 ms  up 1000 closed 0  refused 0  memory   62 MiB peak (base   3)  cpu   4% avg 
+== b2
+line bench 2026-10-30 20:01, b638325, Darwin arm64, 14 CPUs, load 4.75 5.83 6.41
+arena 8 bots 120s  all: 28608 ticks seen by players, 0.02% late (over 75 ms apart), worst gap 103 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 14838 pings in play, p50 0.22 ms, p99 0.43 ms
+million combd           req    10 conns  GET /             89257 req/s  p50  84.00us  p99 153.00us  errors      0  memory    4 MiB peak  cpu 100% avg 
+million combd           req    10 conns  GET /api/count    68419 req/s  p50 110.00us  p99 198.00us  errors      0  memory    4 MiB peak  cpu 100% avg 
+million combd           req   100 conns  GET /             89828 req/s  p50   1.08ms  p99   1.54ms  errors      0  memory   13 MiB peak  cpu 100% avg 
+million combd           req   100 conns  GET /api/count    96584 req/s  p50   1.00ms  p99   1.54ms  errors      0  memory   12 MiB peak  cpu 100% avg 
+million combd           req  1000 conns  GET /             61466 req/s  p50  16.08ms  p99  19.09ms  errors      0  memory   99 MiB peak  cpu 100% avg 
+million combd           req  1000 conns  GET /api/count    73255 req/s  p50  13.50ms  p99  17.85ms  errors      0  memory   91 MiB peak  cpu 100% avg 
+million combd             1000 pages  changes/s    1162 avg    1679 peak  clicks  11939  lost     0 (0.00%)  worst p50   151 ms  p99   397 ms  up 1000 closed 0  refused 0  memory   62 MiB peak (base   3)  cpu   4% avg 
+== a2
+line bench 2026-10-30 20:11, b638325, Darwin arm64, 14 CPUs, load 4.97 5.60 6.01
+arena 8 bots 120s  all: 26408 ticks seen by players, 0.05% late (over 75 ms apart), worst gap 104 ms, 0.00% of a player's ticks had no new input from them
+arena 8 bots 120s  all: 13681 pings in play, p50 0.18 ms, p99 0.35 ms
+million combd           req    10 conns  GET /             93575 req/s  p50  79.00us  p99 148.00us  errors      0  memory    4 MiB peak  cpu 100% avg 
+million combd           req    10 conns  GET /api/count    65434 req/s  p50 117.00us  p99 215.00us  errors      0  memory    3 MiB peak  cpu 100% avg 
+million combd           req   100 conns  GET /             97346 req/s  p50   0.99ms  p99   1.50ms  errors     89  memory   12 MiB peak  cpu 100% avg 
+million combd           req   100 conns  GET /api/count    96313 req/s  p50   0.99ms  p99   1.57ms  errors      0  memory   12 MiB peak  cpu 100% avg 
+million combd           req  1000 conns  GET /             71318 req/s  p50  13.81ms  p99  17.14ms  errors      0  memory   90 MiB peak  cpu 100% avg 
+million combd           req  1000 conns  GET /api/count    72294 req/s  p50  13.72ms  p99  16.76ms  errors      0  memory   88 MiB peak  cpu 100% avg 
+million combd             1000 pages  changes/s    1184 avg    1677 peak  clicks  12270  lost     0 (0.00%)  worst p50   151 ms  p99   407 ms  up 1000 closed 0  refused 0  memory   61 MiB peak (base   3)  cpu   4% avg 
+
+GET / was 16% slower at 1000 connections: a round's answers (1000 of 8 KB) waited on the line until the round ended. Handed over every 32 slices (LINE_BATCH), then the request race at 1000 connections again, a b a b, two runs each:
+a1 combd           req  1000 conns  GET /             75618 req/s  p50  13.11ms  p99  15.57ms  errors      0  memory   90 MiB peak  cpu  99% avg 
+a1 combd           req  1000 conns  GET /api/count    75754 req/s  p50  13.04ms  p99  16.51ms  errors      0  memory   88 MiB peak  cpu 100% avg 
+a1 combd           req  1000 conns  GET /             72895 req/s  p50  13.49ms  p99  16.97ms  errors      0  memory   91 MiB peak  cpu 100% avg 
+a1 combd           req  1000 conns  GET /api/count    73917 req/s  p50  13.36ms  p99  17.04ms  errors      0  memory   88 MiB peak  cpu 100% avg 
+b1 combd           req  1000 conns  GET /             70376 req/s  p50  13.97ms  p99  17.93ms  errors      0  memory   91 MiB peak  cpu 100% avg 
+b1 combd           req  1000 conns  GET /api/count    71735 req/s  p50  13.76ms  p99  18.08ms  errors      0  memory   90 MiB peak  cpu 100% avg 
+b1 combd           req  1000 conns  GET /             70624 req/s  p50  13.89ms  p99  19.39ms  errors      0  memory   91 MiB peak  cpu 100% avg 
+b1 combd           req  1000 conns  GET /api/count    71618 req/s  p50  13.80ms  p99  17.56ms  errors      0  memory   89 MiB peak  cpu  99% avg 
+a2 combd           req  1000 conns  GET /             68739 req/s  p50  14.36ms  p99  17.17ms  errors      0  memory   90 MiB peak  cpu 100% avg 
+a2 combd           req  1000 conns  GET /api/count    69696 req/s  p50  14.15ms  p99  18.86ms  errors      0  memory   88 MiB peak  cpu  99% avg 
+a2 combd           req  1000 conns  GET /             71020 req/s  p50  13.85ms  p99  18.90ms  errors      0  memory   90 MiB peak  cpu 100% avg 
+a2 combd           req  1000 conns  GET /api/count    72470 req/s  p50  13.63ms  p99  17.09ms  errors      0  memory   88 MiB peak  cpu 100% avg 
+b2 combd           req  1000 conns  GET /             73152 req/s  p50  13.47ms  p99  17.01ms  errors      0  memory   92 MiB peak  cpu 100% avg 
+b2 combd           req  1000 conns  GET /api/count    73436 req/s  p50  13.48ms  p99  16.71ms  errors      0  memory   89 MiB peak  cpu 100% avg 
+b2 combd           req  1000 conns  GET /             69100 req/s  p50  14.30ms  p99  17.89ms  errors      0  memory   92 MiB peak  cpu 100% avg 
+b2 combd           req  1000 conns  GET /api/count    73664 req/s  p50  13.47ms  p99  16.64ms  errors      0  memory   89 MiB peak  cpu 100% avg 

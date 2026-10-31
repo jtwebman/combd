@@ -1166,6 +1166,10 @@ pub struct Interp {
 }
 
 impl Engine for Interp {
+    fn child(&self) -> String {
+        format!("interp:{}", self.max_pages)
+    }
+
     type Program = Arc<Module>;
     type Vm = Vm;
 

@@ -89,6 +89,41 @@ pub fn path_for(dir: &Path, name: &str) -> PathBuf {
     }
 }
 
+/// The cells' folder in a node's data, `objects/`: theirs alone to read and
+/// write (the lockdown), so the node's own files beside it (the catalog's
+/// copy, the peer store, builds) are out of their reach. Objects a node
+/// kept in `data` itself, as before, move in (each a rename, so a crash
+/// part way leaves each where one of the two looks, and the next start
+/// moves the rest). Made if new, and `data` fsynced.
+pub fn objects_dir(data: &Path) -> std::io::Result<PathBuf> {
+    let dir = data.join("objects");
+    let new = !dir.exists();
+    std::fs::create_dir_all(&dir)?;
+    // The node's own: its bundles, scratch, peer store, and builds, and
+    // the catalog's copy. Anything else at the top was the cells'.
+    const NODE: [&str; 6] = ["objects", "apps", "scratch", "peers", "builds", "catalog.snap"];
+    let mut moved = false;
+    for e in std::fs::read_dir(data)? {
+        let e = e?;
+        let name = e.file_name();
+        let s = name.to_string_lossy();
+        let object = s.ends_with(".sqlite") || s.ends_with(".sqlite-wal") || s.ends_with(".sqlite-shm") || (e.file_type()?.is_dir() && !s.starts_with('.'));
+        if NODE.contains(&&*s) || !object {
+            continue;
+        }
+        if dir.join(&name).exists() {
+            return Err(std::io::Error::other(format!("{} is in both {} and {}: which is the object's?", s, data.display(), dir.display())));
+        }
+        std::fs::rename(e.path(), dir.join(&name))?;
+        moved = true;
+    }
+    if new || moved {
+        std::fs::File::open(&dir)?.sync_all()?;
+        std::fs::File::open(data)?.sync_all()?;
+    }
+    Ok(dir)
+}
+
 /// The folders between `dir` and an object's file that don't exist yet:
 /// made now, and fsynced (with their parents) once the object first commits,
 /// or a power cut could lose the new file.
@@ -673,6 +708,29 @@ mod tests {
         assert_ne!(path_for(Path::new("/d"), "acme/shop/room/r1"), path_for(Path::new("/d"), "acme/shop/room/r2"));
         // No length limit: the file name is always 64 hex digits.
         assert_eq!(path_for(Path::new("/d"), &"x".repeat(5000)).file_name().unwrap().len(), 64 + ".sqlite".len());
+    }
+
+    #[test]
+    fn objects_move_into_their_folder_and_the_nodes_files_stay() {
+        let d = tempdir::Dir::new();
+        for f in ["catalog.snap", "alarms.sqlite", "alarms.sqlite-wal", "ab.sqlite", "peers/peers.log", "apps/acme/shop/combd.toml", "builds/x.so", "acme/shop/cd.sqlite", ".hidden/x"] {
+            std::fs::create_dir_all(d.0.join(f).parent().unwrap()).unwrap();
+            std::fs::write(d.0.join(f), f).unwrap();
+        }
+        let o = objects_dir(&d.0).unwrap();
+        for f in ["alarms.sqlite", "alarms.sqlite-wal", "ab.sqlite", "acme/shop/cd.sqlite"] {
+            assert_eq!(std::fs::read_to_string(o.join(f)).unwrap(), f, "{f} moved in");
+            assert!(!d.0.join(f).exists());
+        }
+        for f in ["catalog.snap", "peers/peers.log", "apps/acme/shop/combd.toml", "builds/x.so", ".hidden/x"] {
+            assert!(d.0.join(f).exists() && !o.join(f).exists(), "{f} stays");
+        }
+        // Again: nothing left to move, and what's there stays.
+        assert_eq!(objects_dir(&d.0).unwrap(), o);
+        assert!(o.join("acme/shop/cd.sqlite").exists());
+        // In both places: which one is the object's isn't guessed.
+        std::fs::write(d.0.join("ab.sqlite"), "old").unwrap();
+        assert!(objects_dir(&d.0).unwrap_err().to_string().contains("ab.sqlite is in both"));
     }
 
     #[test]

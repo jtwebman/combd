@@ -387,6 +387,7 @@ otherwise.
 |---|---|---|
 | `COMBD_DATA` | `data` | Where objects, the catalog's copy, and builds live. |
 | `COMBD_THREADS` | the CPU count | Event loops. |
+| `COMBD_LOCKDOWN` | on | `off` runs the cells' process without its lockdown ([Security](security.md#the-cells-own-process)). |
 | `COMBD_IDLE_MS` | 60000 | An object idle this long leaves memory. |
 | `COMBD_MAX_OBJECTS` | 10000 | Objects in memory, per loop. |
 | `COMBD_MAX_CONNS` | 200000 | Connections open at once, and at most three quarters of the open-files limit. |

@@ -54,26 +54,29 @@
 //! - Eviction hands an idle object back to the core; the next request claims
 //!   it again (a new epoch) and restores it from the bucket.
 //! - Alarms live in the object's SQLite, so they travel with its segments.
-//!   An index in the bucket (`alarm/<id>/<due>`, holding the name) lets the
-//!   fleet find due alarms of objects that aren't running anywhere. It's
-//!   written before the segment that sets the alarm is uploaded, so it's never
-//!   missing; a stale entry costs one wasted fire, which checks storage and
-//!   cleans it up. Loop 0 scans it each second and fires due alarms as
-//!   ordinary routed requests; a fire that finds nothing due does nothing.
+//!   An index in the bucket (`alarm/<id>/<due>-<key id>`, holding the name)
+//!   lets the fleet find due alarms of objects that aren't running anywhere.
+//!   Every state the object could be restored to has its alarm there: a key
+//!   goes up before a seal that needs it, and goes only once a state without
+//!   it is proven (`alarm_keys.rs`, `spec/Alarms.tla`). A stale key costs one
+//!   wasted fire, which checks storage, and its answer lets the key go. Loop
+//!   0 scans the index each second and fires due alarms as ordinary routed
+//!   requests; a fire that finds nothing due does nothing.
 //!   ponytail: every node scans the whole index. At scale each node scans
 //!   only the objects that place onto it.
 
-use crate::engine::{CellVm, Engine, Outcome};
+use crate::engine::Engine;
 use crate::fleet::{DiskPeers, FleetCfg, Frame};
 use crate::wire::{self, Wire};
 use crate::own::{self, Act, Core, Effect};
-use crate::app::{App, Hit, Router, Sleep};
-use crate::host::{now_ms, AsyncOp, EvAction, HostState, WsOut};
-use crate::store::{self, AlarmIndex, Db};
+use crate::app::{App, Hit, Router};
+use crate::host::{now_ms, WsOut};
+use crate::alarm_keys::{self, AlarmKeys};
+use crate::cells;
+use crate::line::{self, Asked, Back, CallTo, DbAsk, Down, Up};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -102,6 +105,8 @@ const LISTENER: Token = Token(usize::MAX);
 const WAKER: Token = Token(usize::MAX - 1);
 const REDIRECT: Token = Token(usize::MAX - 2);
 const LOCAL: Token = Token(usize::MAX - 3);
+/// The line to this loop's cells.
+const LINE: Token = Token(usize::MAX - 4);
 /// A full node stops listening for at least this long, and listens again
 /// for at least this long, so it doesn't flap.
 const REFUSE_MIN: Duration = Duration::from_secs(1);
@@ -111,19 +116,17 @@ const MAX_WS_WRITE: usize = 8 << 20;
 const MAX_WS_INFLIGHT: u32 = 64;
 /// Slices per round of the run queue, shared between orgs when more than
 /// one has work (fewer tasks than this: everyone runs every round).
-const ROUND: usize = 64;
+pub(crate) const ROUND: usize = 64;
 
 /// File names are a hash of the name (`store::path_for`), so this is only a
 /// sanity cap: `<org>/<app>/<process>/<id>` fits with room to spare.
 const MAX_NAME: usize = 512;
 /// An alarm that keeps failing is tried this many times, then dropped.
-const ALARM_TRIES: u32 = 6;
+pub(crate) const ALARM_TRIES: u32 = 6;
 /// The first retry waits this long; each next one waits twice as long.
-const ALARM_BACKOFF_MS: i64 = 500;
+pub(crate) const ALARM_BACKOFF_MS: i64 = 500;
 /// The loop wakes at least this often (alarms, eviction, stop).
-const TICK: Duration = Duration::from_millis(100);
-/// Threads that run fsyncs, so the event loops never wait on the disk.
-const SYNC_THREADS: usize = 16;
+pub(crate) const TICK: Duration = Duration::from_millis(100);
 
 pub struct Config {
     pub threads: usize,
@@ -179,7 +182,24 @@ pub struct Config {
     /// A port that only redirects to HTTPS (`COMBD_REDIRECT_PORT`, 80).
     pub redirect_port: Option<u16>,
     pub limits: Limits,
+    /// The cells in a process of their own (`COMBD_CELLS`, `child` unless
+    /// it's `threads`), if the engine can be made there (`Engine::child`).
+    /// Tests always use threads: their binary is the test runner.
+    pub cells_child: bool,
+    /// The cells' process locked down before it loads a module, as
+    /// `combd_wall` does on Linux (`COMBD_LOCKDOWN`, on unless `off`).
+    pub lockdown: bool,
+    /// Fleet mode, with compiled modules: where this node's builds come
+    /// from (the bucket, from builders). Fetched where deploys land, into
+    /// the folder the engine loads them from.
+    pub builds: Option<Arc<Builds>>,
 }
+
+#[cfg(feature = "aot-lite")]
+pub type Builds = crate::builds::Builds;
+/// Without the AOT tier there are no builds.
+#[cfg(not(feature = "aot-lite"))]
+pub enum Builds {}
 
 /// What a client may send, and how long it may take (node-wide, from the
 /// environment). Defaults are close to nginx's and HAProxy's.
@@ -224,17 +244,6 @@ impl Limits {
             tls_handshake: ms("COMBD_TLS_HANDSHAKE_MS", d.tls_handshake),
         }
     }
-}
-
-/// What a cell wrote (stdout, stderr) in the request that trapped, for the
-/// log: a panic's message, from a guest that prints one (combd-sdk does).
-fn said<E: Engine>(cell: &mut Cell<E>) -> String {
-    let out = &cell.host().out;
-    if out.is_empty() {
-        return String::new();
-    }
-    let tail = String::from_utf8_lossy(&out[out.len().saturating_sub(500)..]).trim().replace('\n', " | ");
-    format!(" ({tail})")
 }
 
 /// The status line for a request we refuse before it runs.
@@ -325,28 +334,24 @@ impl Config {
             max_awake: num("COMBD_MAX_AWAKE", 1000).max(1),
             tls: std::env::var("COMBD_TLS_CERT").ok().zip(std::env::var("COMBD_TLS_KEY").ok()).map(|(c, k)| (PathBuf::from(c), PathBuf::from(k))),
             redirect_port: std::env::var("COMBD_REDIRECT_PORT").ok().and_then(|p| p.parse().ok()),
+            builds: None,
+            cells_child: !cfg!(test) && std::env::var("COMBD_CELLS").map_or(true, |v| v != "threads"),
+            lockdown: std::env::var("COMBD_LOCKDOWN").map_or(true, |v| v != "off"),
             limits: Limits::from_env(),
             public: std::env::var("COMBD_PUBLIC_URLS").unwrap_or_default().split(',').filter_map(|kv| kv.split_once('=')).filter_map(|(n, u)| Some((n.trim().parse().ok()?, u.trim().to_string()))).collect(),
         }
     }
 }
 
-/// Counters for `/_combd/stats`, for the whole node.
+/// Counters for `/_combd/stats`, for the whole node (the cells keep their
+/// own: `cells::Stats`).
 #[derive(Default)]
 struct Stats {
-    objects_live: AtomicU64,
-    objects_opened: AtomicU64,
+    /// Fleet mode: objects handed back to the core when idle, and alarms
+    /// fired from the index (the cells count a node alone's).
     evictions: AtomicU64,
     alarms_fired: AtomicU64,
-    alarms_failed: AtomicU64,
     forwarded: AtomicU64,
-    /// Commits that wrote something, and the fsyncs that made them durable.
-    commits: AtomicU64,
-    fsyncs: AtomicU64,
-    checkpoints: Arc<AtomicU64>,
-    /// fsync times: slow ones (10 ms or more), and the slowest, in us.
-    fsyncs_slow: Arc<AtomicU64>,
-    fsync_max_us: Arc<AtomicU64>,
     /// Fleet mode: batches acknowledged by the peers (D3) or the bucket
     /// (D2), takeovers that fenced, and entries recovered from peers.
     peer_acks: AtomicU64,
@@ -381,58 +386,22 @@ struct Stats {
     memory_used: AtomicU64,
     machine_available: AtomicU64,
     pressure: AtomicU64,
-    /// Socket processes' sessions, how many of them are hibernating, and
-    /// how many times one has woken.
-    sessions_live: AtomicU64,
-    sessions_hibernated: AtomicU64,
-    sessions_woken: AtomicU64,
-    /// Sleeping sessions with work, waiting for a cell under `max_awake`;
-    /// and how many times one has had to.
-    sessions_ready: AtomicU64,
-    sessions_waited: AtomicU64,
-    /// Requests refused because their object's or session's mailbox was full.
-    mailbox_refused: AtomicU64,
-    /// Requests that ran in a batch (`handle_batch`).
-    batched: AtomicU64,
     /// WebSocket frames sent, and the flushes that sent them (several
     /// frames for a socket go in one).
     ws_frames: AtomicU64,
     ws_flushes: AtomicU64,
-    /// Event cells: instances started, and requests they took.
-    ev_instances: AtomicU64,
-    ev_requests: AtomicU64,
-}
-
-/// Make an object's commits up to `gen` durable, then tell loop `back`.
-struct SyncJob {
-    file: Arc<std::fs::File>,
-    db_path: PathBuf,
-    /// Checkpoint after the fsync. The object is paused (no request runs on
-    /// it), so the checkpoint copies the whole WAL and the WAL can restart.
-    ckpt: bool,
-    obj: String,
-    gen: u64,
-    back: usize,
-    /// A new object's folders: fsynced too, or a power cut could lose its file.
-    dirs: Vec<PathBuf>,
 }
 
 /// What the loops share.
-struct Shared {
+pub(crate) struct Shared {
     /// Postgres pools, one per binding (`pg.rs`).
     pg: Option<Arc<crate::pg::Pools>>,
-    cfg: Config,
+    pub(crate) cfg: Config,
     peers: Vec<(Sender<Msg>, Arc<LoopWaker>)>,
-    sync: Mutex<Sender<SyncJob>>,
-    index: Mutex<AlarmIndex>,
     stats: Stats,
-    fleet: Option<FleetShared>,
+    pub(crate) fleet: Option<FleetShared>,
     /// TLS as loaded, and when its certificate's file last changed.
     tls: Mutex<Option<(Arc<rustls::ServerConfig>, std::time::SystemTime)>>,
-    /// Per process (`org/app/proc`): the time its cells ran, in us, host
-    /// calls included, and the slices they ran in. Each loop adds its own
-    /// every 250 ms.
-    procs: Mutex<BTreeMap<String, (u64, u64, crate::engine::Kind)>>,
     /// The listening socket, while the node takes connections (`None`
     /// while it's full); `listen_gen` counts changes, and every loop
     /// follows (`follow_listener`).
@@ -448,11 +417,11 @@ struct Shared {
 
 /// How long a cell runs before others get a turn: a slice, and the host
 /// calls it makes that are done at once.
-const SLICE_TIME: Duration = Duration::from_micros(100);
+pub(crate) const SLICE_TIME: Duration = Duration::from_micros(100);
 
 /// Fleet mode: what the loops share.
-struct FleetShared {
-    cfg: FleetCfg,
+pub(crate) struct FleetShared {
+    pub(crate) cfg: FleetCfg,
     /// This process's boot number, in its heartbeats.
     boot: u64,
     /// Bucket work, done by a pool of threads.
@@ -479,8 +448,8 @@ enum Job {
     /// Write an object's image (write-once), for the next owner to start
     /// from. No answer: without it, the next one reads the long way.
     Image { obj: own::Obj, act: Act, key: String, entry: Vec<u8>, back: usize },
-    /// Move an object's alarm index entry from `old` to `new` (due times).
-    Index { name: String, obj: own::Obj, old: Option<i64>, new: Option<i64>, back: usize },
+    /// Put or delete one of an object's alarm index keys.
+    Index { name: String, op: alarm_keys::Op, back: usize },
     /// The due alarms in the index.
     AlarmScan { back: usize },
 }
@@ -490,14 +459,6 @@ enum Job {
 enum PeerBack {
     Wire(usize, u64),
     Loop(usize, u64),
-}
-
-fn alarm_prefix(obj: own::Obj) -> String {
-    format!("alarm/{obj:032x}/")
-}
-
-fn alarm_key(obj: own::Obj, at: i64) -> String {
-    format!("alarm/{obj:032x}/{at:013}")
 }
 
 /// Loop 0 scans the alarm index when its soonest alarm is due (at most once
@@ -538,9 +499,9 @@ const ACCEPT_MEASURE: u32 = 64;
 /// close() stretched one refusal to a second).
 const ACCEPT_SLICE: Duration = Duration::from_millis(5);
 /// How long an idle object stays while memory is short (`idle_limit`).
-const SQUEEZED_IDLE: Duration = Duration::from_secs(10);
+pub(crate) const SQUEEZED_IDLE: Duration = Duration::from_secs(10);
 /// The most an event-cell instance may have in flight (open tickets).
-const MAX_EV_TICKETS: usize = 10_000;
+pub(crate) const MAX_EV_TICKETS: usize = 10_000;
 /// Placement: an object moves only if one node sent it at least this many
 /// requests in a window (and two thirds of them), two windows running.
 const PLACE_MIN: u32 = 20;
@@ -558,8 +519,8 @@ const EXPECT: Duration = Duration::from_secs(300);
 type Who = (usize, u64);
 
 /// Where a request came from, so its answer can go back.
-#[derive(Clone, Copy)]
-enum Origin {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Origin {
     /// A connection on this loop.
     Local(Who),
     /// A connection on another loop.
@@ -582,15 +543,9 @@ enum Origin {
     Discard,
     /// An object's beat (`tick_every`): nobody hears the answer either.
     Tick,
-}
-
-/// Who waits on a `call`'s answer.
-#[derive(Clone, Copy)]
-enum CallTo {
-    /// An event cell's ticket (instance, generation, ticket).
-    Ev(usize, u64, u64),
-    /// A parked cell.
-    Park(u64),
+    /// What the cells see of a request from a connection, a socket, another
+    /// loop or node, or a `call`: the node keeps where it came from.
+    Token(u64),
 }
 
 /// Between loops.
@@ -599,18 +554,14 @@ enum Msg {
     Run { origin: Origin, obj: String, req: String },
     /// Here is the answer for one of your connections.
     Reply { who: Who, reply: (u16, String) },
-    /// An fsync finished: the object's commits up to `gen` are on disk.
-    Synced { obj: String, gen: u64, ok: bool },
-    /// The object's checkpoint finished; it can run requests again.
-    Checkpointed { obj: String },
     /// Fleet mode: a bucket call's result.
     Bucket { op: own::OpId, res: own::Res },
     /// Fleet mode: an object's segments, for a restore, and its alarm index entries.
-    Fetched { obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>, image: Option<String> },
+    Fetched { obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<String>, image: Option<String> },
     /// An object's image is written.
     Imaged { obj: own::Obj, act: Act, key: String },
-    /// Fleet mode: an alarm index move finished.
-    Indexed { name: String, new: Option<i64>, ok: bool },
+    /// Fleet mode: an alarm index call came back.
+    Indexed { name: String, op: alarm_keys::Op, ok: bool },
     /// Fleet mode: due alarms from the index: (name, due).
     /// And the soonest alarm still to come, if any.
     AlarmsDue { due: Vec<(String, i64)>, next: Option<i64> },
@@ -628,63 +579,17 @@ enum Msg {
     WsPush { name: String, sock: u64, op: u8, payload: Vec<u8> },
     /// Fleet mode: a push of ours couldn't reach the socket's node.
     WsLost { name: String, sock: u64 },
-    /// A database call a parked cell waits on is done.
-    DbDone { park: u64, done: DbDone },
-    /// An event cell's async call is done: (instance, its generation, ticket).
-    EvDone { inst: usize, gen: u64, ticket: u64, done: DbDone },
+    /// A database call is done (the node's: a lease becomes a handle).
+    DbDone { to: CallTo, done: DbDone },
     /// The answer to a `call` this loop made.
     CallDone { id: u64, reply: (u16, String) },
 }
-
-/// An event cell: one instance serving many requests at once, like a Node
-/// process. It runs one callback at a time; requests interleave only where
-/// the cell waits (an async call), which it chose.
-struct EvInst<E: Engine> {
-    gen: u64,
-    /// Its process.
-    proc: usize,
-    /// `None` while a callback runs.
-    cell: Option<Cell<E>>,
-    reqs: HashMap<u64, EvReq>,
-    /// Async calls out: ticket -> request.
-    tickets: HashMap<u64, u64>,
-    queue: VecDeque<EvCall>,
-    /// The request whose event the running callback handles, if any.
-    running: Option<u64>,
-}
-
-struct EvReq {
-    origin: Origin,
-    responded: bool,
-    /// Async calls started and events not yet handled.
-    open: u32,
-    handles: Vec<u64>,
-    start: Instant,
-}
-
-enum EvCall {
-    Request(u64, String),
-    Event { ticket: u64, req: u64, payload: Vec<u8> },
-}
-
-/// An event cell request gets this long to answer, and this long in all
-/// (work after answering included: waitUntil).
-const EV_ANSWER: Duration = Duration::from_secs(30);
-const EV_TOTAL: Duration = Duration::from_secs(60);
 
 /// What a database call came back with.
 enum DbDone {
     Answer(Vec<u8>),
     /// A connection was leased, or why not.
     Pinned(Result<crate::pg::Lease, String>),
-}
-
-/// A leased Postgres connection a cell holds.
-struct PgHandle {
-    lease: crate::pg::Lease,
-    /// The object it belongs to (it outlives requests), or `None` for a
-    /// stateless request's (it closes when the request ends).
-    obj: Option<String>,
 }
 
 /// Fleet mode: a request the decision core knows about.
@@ -700,6 +605,9 @@ struct FReq {
     ws: Vec<WsOut>,
     /// Times it was routed again after "never ran".
     retries: u8,
+    /// The object's last commit when it ran: its answer proves that state
+    /// (the alarm index lets older keys go then).
+    seq: Option<u64>,
 }
 
 struct Conn {
@@ -734,6 +642,8 @@ struct Conn {
     /// WebSocket frames are waiting in `wbuf` to go out with the loop's next
     /// flush (`Loop::unsent` has it).
     unsent: bool,
+    /// Its request's token, while the cells have it.
+    token: Option<u64>,
 }
 
 /// A WebSocket. It belongs to an object, but outlives it: an idle object
@@ -752,160 +662,16 @@ struct WsConn {
     inflight: u32,
 }
 
-/// A warm cell, reused across requests like a Worker instance.
-struct Cell<E: Engine> {
-    vm: E::Vm,
-    st: HostState,
-    /// Its process (`App::procs`).
-    proc: usize,
-}
-
-impl<E: Engine> Cell<E> {
-    /// The host state host calls see: the engine's own, if it keeps one.
-    fn host(&mut self) -> &mut HostState {
-        if self.vm.host_state().is_some() {
-            self.vm.host_state().unwrap()
-        } else {
-            &mut self.st
-        }
-    }
-}
-
-fn fresh<E: Engine>(eng: &E, app: &App<E::Program>, proc: usize, environ: &Arc<Vec<Vec<u8>>>) -> std::io::Result<Cell<E>> {
-    let mut vm = eng.spawn(&app.progs[app.procs[proc].prog]).map_err(std::io::Error::other)?;
-    if let Some(pages) = app.procs[proc].memory_pages {
-        vm.cap_memory(pages).map_err(std::io::Error::other)?;
-    }
-    let mut st = HostState { environ: environ.clone(), ..HostState::default() };
-    // An engine that runs host calls itself (compiled) has its own state:
-    // its env vars go there too, or it sees none.
-    if let Some(h) = vm.host_state() {
-        h.environ = environ.clone();
-    }
-    crate::init(&mut vm, &mut st).map_err(std::io::Error::other)?;
-    Ok(Cell { vm, st, proc })
-}
-
-/// A cell again, from what `CellVm::freeze` kept. It doesn't run the
-/// module's initializer: that would undo the state it just got back.
-fn thawed<E: Engine>(eng: &E, app: &App<E::Program>, proc: usize, environ: &Arc<Vec<Vec<u8>>>, frozen: &[u8]) -> std::io::Result<Cell<E>> {
-    let mut vm = eng.thaw(&app.progs[app.procs[proc].prog], frozen).map_err(std::io::Error::other)?;
-    if let Some(pages) = app.procs[proc].memory_pages {
-        vm.cap_memory(pages).map_err(std::io::Error::other)?;
-    }
-    if let Some(h) = vm.host_state() {
-        h.environ = environ.clone();
-    }
-    Ok(Cell { vm, st: HostState { environ: environ.clone(), ..HostState::default() }, proc })
-}
-
-/// A request in flight.
-struct Task<E: Engine> {
-    origin: Origin,
-    cell: Cell<E>,
-    /// The Durable Object it runs in, if any.
-    obj: Option<String>,
-    /// A WebSocket handshake (it joins the object's list if the answer is
-    /// 101), and gone sockets this request takes off the list.
-    ws_open: Option<u64>,
-    ws_drop: Vec<u64>,
-    /// Postgres handles a stateless request opened (they close with it).
-    pg: Vec<u64>,
-    /// An event cell's callback: its instance.
-    ev: Option<usize>,
-    /// A batch (`handle_batch`): the requests after the first, in order.
-    more: Vec<Origin>,
-}
-
-/// A Durable Object in memory.
-struct Object<E: Engine> {
+/// Fleet mode: the node's part of an object it runs (the cells have the
+/// object itself).
+struct Owned {
+    /// The activation it was restored for, its keys in the alarm index,
+    /// and a seal held until the index has the alarm it carries.
+    act: Act,
+    keys: AlarmKeys,
+    seal_wait: Option<(Act, Vec<u8>)>,
     /// An image taken at a seal, until the core says to put it.
     image: Option<(String, Vec<u8>)>,
-    /// The warm cell, when no request is using it. `None` after a crash.
-    cell: Option<Cell<E>>,
-    db: Arc<Mutex<Db>>,
-    busy: bool,
-    /// Requests waiting their turn.
-    waiting: VecDeque<(Origin, String)>,
-    last_used: Instant,
-    /// Commits that wrote (numbered), and how many of them are on disk.
-    committed: u64,
-    synced: u64,
-    syncing: bool,
-    /// A new object's folders, fsynced with its first commit.
-    new_dirs: Vec<PathBuf>,
-    /// Answers waiting for an fsync: (the commit they need, origin, answer,
-    /// and the WebSocket sends that wait with it).
-    held: Vec<(u64, Origin, (u16, String), Vec<WsOut>)>,
-    /// Paused for a checkpoint: requests wait until it's done.
-    checkpointing: bool,
-    /// Fleet mode: the alarm index entry, as far as we know; one move at a
-    /// time; and a seal held until the index has the alarm it carries.
-    index_at: Option<i64>,
-    index_busy: bool,
-    seal_wait: Option<(Act, Vec<u8>)>,
-    /// Its WebSocket list (`_combd_sockets`), read once it's needed.
-    socks: Option<BTreeSet<u64>>,
-    /// Postgres handles it holds (pinned connections), and when one was last used.
-    pg: Vec<u64>,
-    pg_used: Instant,
-}
-
-impl<E: Engine> Object<E> {
-    fn new(db: Db) -> Object<E> {
-        Object {
-            image: None,
-            new_dirs: vec![],
-            cell: None,
-            db: Arc::new(Mutex::new(db)),
-            busy: false,
-            waiting: VecDeque::new(),
-            last_used: Instant::now(),
-            committed: 0,
-            synced: 0,
-            syncing: false,
-            held: vec![],
-            checkpointing: false,
-            index_at: None,
-            index_busy: false,
-            seal_wait: None,
-            socks: None,
-            pg: vec![],
-            pg_used: Instant::now(),
-        }
-    }
-}
-
-/// A socket process's instance: one per WebSocket, on the loop that holds
-/// the connection. In memory only: no bucket, no storage, no output gate.
-struct Session<E: Engine> {
-    sock: u64,
-    proc: usize,
-    /// `None`: not started, or hibernating: then `frozen` is what its cell
-    /// changed (`hibernate = "auto"`), or `state` what the app kept.
-    cell: Option<Cell<E>>,
-    frozen: Option<Vec<u8>>,
-    state: Option<Vec<u8>>,
-    busy: bool,
-    /// The event it's running (`WSMSG`, `HIBERNATE`, ...).
-    running: String,
-    waiting: VecDeque<(Origin, String)>,
-    last_used: Instant,
-    /// In the loop's `ready` line.
-    ready: bool,
-}
-
-/// A session's mailbox while its loop is behind (`max_awake`).
-const BEHIND_MAILBOX: usize = 8;
-
-/// What the host asks a session that's idle past `hibernate_ms`.
-const HIBERNATE: &str = "do HIBERNATE /";
-
-/// A burst leaves a pool as big as it was: keep only what's been used in
-/// the last `idle` (the newest stays, warm for the next request).
-fn trim_idle<T>(pool: &mut Vec<(T, Instant)>, idle: Duration) {
-    let stale = pool.iter().take(pool.len().saturating_sub(1)).take_while(|(_, at)| at.elapsed() >= idle).count();
-    pool.drain(..stale);
 }
 
 /// A parsed request.
@@ -958,7 +724,7 @@ fn parse_uuid(s: &str) -> Option<String> {
 }
 
 /// The loop that owns an object.
-fn owner(name: &str, threads: usize) -> usize {
+pub(crate) fn owner(name: &str, threads: usize) -> usize {
     // A session lives on the loop that holds its socket, and its id says which.
     if let Some(sock) = session_sock(name) {
         return ((sock >> 28) & 0xff) as usize % threads;
@@ -968,38 +734,29 @@ fn owner(name: &str, threads: usize) -> usize {
 }
 
 /// A session's socket id, from its name (`<org>/<app>/<process>/~<socket>`).
-fn session_sock(name: &str) -> Option<u64> {
+pub(crate) fn session_sock(name: &str) -> Option<u64> {
     name.rsplit('/').next()?.strip_prefix('~')?.parse().ok()
 }
 
 /// One program, the old fixed routes, no manifest.
-pub fn serve<E>(eng: &E, prog: E::Program, port: u16)
-where
-    E: Engine + Sync,
-    E::Program: Sync + Send,
-{
+pub fn serve<E: Engine>(eng: &E, wasm: &[u8], port: u16) {
     let cfg = Config::from_env();
-    let app = App::single(prog, cfg.ev_max);
-    serve_with(eng, app, port, cfg)
+    let app = App::single(wasm, cfg.ev_max);
+    let mut link = start_cells(eng, &cfg);
+    link.check(&app).unwrap_or_else(|e| panic!("{e}"));
+    let ends = std::mem::take(&mut link.ends);
+    serve_linked(&Live::new(app), port, cfg, ends);
 }
 
 /// The app in `dir`: its manifest, resolved for the local `dev` environment,
 /// and its modules. Any mistake and nothing starts.
-pub fn serve_app<E>(eng: &E, dir: &std::path::Path, port: u16)
-where
-    E: Engine + Sync,
-    E::Program: Sync + Send,
-{
+pub fn serve_app<E: Engine>(eng: &E, dir: &std::path::Path, port: u16) {
     serve_apps_in(eng, &[("local".into(), dir.to_path_buf())], port)
 }
 
 /// Every app under `root`, laid out as `<org>/<app>/` (the org is the
 /// tenant: in a fleet it comes from who deployed, here from the folder).
-pub fn serve_apps<E>(eng: &E, root: &std::path::Path, port: u16)
-where
-    E: Engine + Sync,
-    E::Program: Sync + Send,
-{
+pub fn serve_apps<E: Engine>(eng: &E, root: &std::path::Path, port: u16) {
     let mut apps = vec![];
     let dirs = |d: &std::path::Path| -> Vec<std::path::PathBuf> {
         let mut v: Vec<_> = std::fs::read_dir(d).map(|r| r.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect()).unwrap_or_default();
@@ -1014,15 +771,17 @@ where
     serve_apps_in(eng, &apps, port)
 }
 
-fn serve_apps_in<E>(eng: &E, apps: &[(String, std::path::PathBuf)], port: u16)
-where
-    E: Engine + Sync,
-    E::Program: Sync + Send,
-{
-    match load_apps(eng, apps) {
+fn serve_apps_in<E: Engine>(eng: &E, apps: &[(String, std::path::PathBuf)], port: u16) {
+    match load_apps_dirs(apps) {
         Ok((app, pg)) => {
             let cfg = Config { pg, ..Config::from_env() };
-            serve_with(eng, app, port, cfg)
+            let mut link = start_cells(eng, &cfg);
+            if let Err(e) = link.check(&app) {
+                eprintln!("combd     {e}");
+                std::process::exit(1);
+            }
+            let ends = std::mem::take(&mut link.ends);
+            serve_linked(&Live::new(app), port, cfg, ends);
         }
         Err(e) => {
             // Any mistake in any app, and nothing starts.
@@ -1036,11 +795,7 @@ where
 /// version of each is live (and its vars), and whenever this node's copy of
 /// the catalog moves, it swaps in what changed. Deploys come in through
 /// `deploy_bundle` (the admin API), on any node.
-pub fn serve_fleet_apps<E>(eng: &E, port: u16, mut cfg: Config, admin: Option<crate::admin::AdminCfg>) -> Result<(), String>
-where
-    E: Engine + Sync,
-    E::Program: Sync + Send,
-{
+pub fn serve_fleet_apps<E: Engine>(eng: &E, port: u16, mut cfg: Config, admin: Option<crate::admin::AdminCfg>) -> Result<(), String> {
     let fc = cfg.fleet.as_ref().ok_or("fleet mode needs a bucket (COMBD_S3)")?;
     let s3 = fc.s3.clone();
     // The storage test first (it makes the bucket too): never serve on one
@@ -1058,7 +813,13 @@ where
     let cache = cfg.data.join("apps");
     let mut known = crate::deploy::Known::new();
     let (state, mut gen) = cat.now();
-    let (first, mut building) = sync_apps(eng, &s3, &cache, &mut known, &App::empty(), &state, master)?;
+    let builds = cfg.builds.clone();
+    let builds = builds.as_deref();
+    // The cells first: they check what's deployed before it goes live.
+    let mut link = start_cells(eng, &cfg);
+    let ends = std::mem::take(&mut link.ends);
+    let link = &link;
+    let (first, mut building) = sync_apps(link, builds, &s3, &cache, &mut known, &App::empty(), &state, master)?;
     let live = Live::new(first.unwrap_or_else(App::empty));
     let scratch = cfg.data.join("scratch");
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
@@ -1068,7 +829,7 @@ where
             let (s3, stop, cat, public) = (&s3, cfg.stop.clone(), cat.clone(), cfg.public.clone());
             let scratch = scratch.clone();
             sc.spawn(move || {
-                let api = NodeApi { eng, public, live, s3, cat, scratch, master, pending: Default::default() };
+                let api = NodeApi { link, builds, public, live, s3, cat, scratch, master, pending: Default::default() };
                 if let Err(e) = crate::admin::serve(admin, &api, &stop) {
                     eprintln!("combd     the admin API stopped: {e}");
                 }
@@ -1086,7 +847,7 @@ where
                     continue;
                 }
                 (gen, last) = (g, Instant::now());
-                match sync_apps(eng, &s3, &cache, &mut known, &live.now(), &state, master) {
+                match sync_apps(link, builds, &s3, &cache, &mut known, &live.now(), &state, master) {
                     Ok((next, b)) => {
                         building = b;
                         if let Some(next) = next {
@@ -1097,17 +858,19 @@ where
                 }
             }
         });
-        serve_live(eng, live, port, cfg);
+        serve_linked(live, port, cfg, ends);
     });
     Ok(())
 }
 
 /// The admin API's work on a node of a fleet.
-struct NodeApi<'a, E: Engine> {
-    eng: &'a E,
+struct NodeApi<'a> {
+    /// The cells: they check a deploy.
+    link: &'a cells::Link,
+    builds: Option<&'a Builds>,
     /// Every node's public address (`COMBD_PUBLIC_URLS`), to gather stats.
     public: BTreeMap<u32, String>,
-    live: &'a Live<E::Program>,
+    live: &'a Live,
     s3: &'a crate::s3::S3,
     cat: Arc<crate::catnode::CatNode>,
     scratch: std::path::PathBuf,
@@ -1131,7 +894,7 @@ struct Pending {
 /// How long a deploy may wait for its builds.
 const BUILD_WAIT: Duration = Duration::from_secs(60 * 60);
 
-impl<E: Engine> NodeApi<'_, E> {
+impl NodeApi<'_> {
     /// The live version's manifest, if one is live.
     fn manifest(&self, state: &crate::catalog::State, org: &str, app: &str) -> Result<Option<crate::manifest::Manifest>, String> {
         let Some(v) = crate::deploy::live(state, org, app) else { return Ok(None) };
@@ -1143,12 +906,9 @@ impl<E: Engine> NodeApi<'_, E> {
     }
 }
 
-impl<E: Engine + Sync> crate::admin::Api for NodeApi<'_, E>
-where
-    E::Program: Sync + Send,
-{
+impl crate::admin::Api for NodeApi<'_> {
     fn deploy(&self, org: &str, app: &str, bundle: &[u8]) -> Result<serde_json::Value, String> {
-        match deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, self.master, org, app, bundle)? {
+        match deploy_bundle(self.link, self.builds, self.live, &self.cat, self.s3, &self.scratch, self.master, org, app, bundle)? {
             Deployed::Live(v) => Ok(serde_json::json!({ "version": v })),
             Deployed::Building(v, compiled) => {
                 let mut p = self.pending.lock().unwrap();
@@ -1163,7 +923,7 @@ where
     fn tick(&self) {
         let waiting: Vec<(String, String, Vec<u8>, Instant)> = self.pending.lock().unwrap().iter().filter(|p| p.failed.is_none()).map(|p| (p.org.clone(), p.app.clone(), p.bundle.clone(), p.since)).collect();
         for (org, app, bundle, since) in waiting {
-            let r = deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, self.master, &org, &app, &bundle);
+            let r = deploy_bundle(self.link, self.builds, self.live, &self.cat, self.s3, &self.scratch, self.master, &org, &app, &bundle);
             let mut p = self.pending.lock().unwrap();
             let Some(i) = p.iter().position(|x| x.org == org && x.app == app) else { continue };
             match r {
@@ -1228,7 +988,7 @@ where
     /// An earlier version, checked again (vars may have changed since).
     fn rollback(&self, org: &str, app: &str, version: &str) -> Result<(), String> {
         let b = crate::deploy::get_version(self.s3, org, app, version)?;
-        match deploy_bundle(self.eng, self.live, &self.cat, self.s3, &self.scratch, self.master, org, app, &b)? {
+        match deploy_bundle(self.link, self.builds, self.live, &self.cat, self.s3, &self.scratch, self.master, org, app, &b)? {
             Deployed::Live(_) => Ok(()),
             Deployed::Building(..) => Err("that version's builds are gone: deploy it again".into()),
         }
@@ -1300,14 +1060,15 @@ where
 /// What changed in the catalog since `known`, as a new app (`None`:
 /// nothing), and whether a change waits on builds (try again soon: the
 /// catalog won't say when they're done).
-fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, known: &mut crate::deploy::Known, now: &App<E::Program>, state: &crate::catalog::State, master: Option<&crate::secrets::Key>) -> Result<(Option<App<E::Program>>, bool), String> {
+fn sync_apps(link: &cells::Link, builds: Option<&Builds>, s3: &crate::s3::S3, cache: &std::path::Path, known: &mut crate::deploy::Known, now: &App, state: &crate::catalog::State, master: Option<&crate::secrets::Key>) -> Result<(Option<App>, bool), String> {
     let (changes, gone) = crate::deploy::changes(state, s3, cache, known, master)?;
     if changes.is_empty() && gone.is_empty() {
         return Ok((None, false));
     }
     // Take down what's gone, then each change on its own: one app that
     // won't load is skipped (and tried again next time), not the rest.
-    let mut next = now.with_apps(&[], &gone, |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))?;
+    let mut next = now.with_apps(&[], &gone)?;
+    link.check(&next)?;
     for g in &gone {
         known.remove(g);
     }
@@ -1319,9 +1080,12 @@ fn sync_apps<E: Engine>(eng: &E, s3: &crate::s3::S3, cache: &std::path::Path, kn
             }
             // Ask for every compiled module's build at once, for every kind
             // of node (a new combd needs them all; loading stops at the first).
-            let _ = compiled_wasms(&m, &c.dir).and_then(|w| compiled_built(s3, &w));
+            let compiled = compiled_wasms(&m, &c.dir)?;
+            let _ = compiled_built(s3, &compiled);
+            fetch_builds(builds, &compiled)?;
             let a = crate::app::AppDir { org: &c.org, dir: &c.dir, resolved: &r, app: &m.app, domains: &m.domains };
-            next.with_apps(&[a], &[], |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))
+            let n = next.with_apps(&[a], &[])?;
+            link.check(&n).map(|()| n)
         });
         match one {
             Ok(n) => {
@@ -1389,7 +1153,7 @@ fn idents(org: &str, app: &str) -> Result<(), String> {
     if ident(org) && ident(app) { Ok(()) } else { Err("org and app: lowercase letters, digits, - and _".into()) }
 }
 
-pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::catnode::CatNode, s3: &crate::s3::S3, scratch: &std::path::Path, master: Option<&crate::secrets::Key>, org: &str, app: &str, bundle: &[u8]) -> Result<Deployed, String> {
+pub fn deploy_bundle(link: &cells::Link, builds: Option<&Builds>, live: &Live, cat: &crate::catnode::CatNode, s3: &crate::s3::S3, scratch: &std::path::Path, master: Option<&crate::secrets::Key>, org: &str, app: &str, bundle: &[u8]) -> Result<Deployed, String> {
     idents(org, app)?;
     let v = crate::deploy::version_of(bundle);
     let dir = scratch.join(format!("{org}-{app}-{v}"));
@@ -1406,7 +1170,7 @@ pub fn deploy_bundle<E: Engine>(eng: &E, live: &Live<E::Program>, cat: &crate::c
             return Ok((None, compiled));
         }
         let a = crate::app::AppDir { org, dir: &dir, resolved: &r, app: &m.app, domains: &m.domains };
-        match live.now().with_apps(&[a], &[], |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a)) {
+        match fetch_builds(builds, &compiled).and_then(|()| live.now().with_apps(&[a], &[])).and_then(|next| link.check(&next)) {
             Ok(_) => Ok((Some(m.domains.clone()), compiled)),
             Err(e) if e.contains(crate::engine::BEING_BUILT) => Ok((None, compiled)),
             Err(e) => Err(e),
@@ -1431,6 +1195,26 @@ pub enum Deployed {
 #[cfg(feature = "aot-lite")]
 fn compiled_built(s3: &crate::s3::S3, wasms: &[Vec<u8>]) -> Result<bool, String> {
     crate::builds::all_built(s3, wasms)
+}
+
+/// This node's builds of `wasms`, fetched from the bucket and checked, into
+/// the folder its engine loads them from: the engine never reads the
+/// bucket. One not built yet: the deploy waits (`BEING_BUILT`).
+#[cfg(feature = "aot-lite")]
+fn fetch_builds(builds: Option<&Builds>, wasms: &[Vec<u8>]) -> Result<(), String> {
+    let Some(b) = builds else { return Ok(()) };
+    // Built in (or in COMBD_AOT_DIR): no build to fetch.
+    for w in wasms.iter().filter(|w| Engine::load(&crate::aot::Aot, w).is_err()) {
+        if let crate::builds::Fetch::Building = b.fetch(w)? {
+            return Err(format!("module {} {}", crate::builds::module_id(w), crate::engine::BEING_BUILT));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "aot-lite"))]
+fn fetch_builds(_: Option<&Builds>, _: &[Vec<u8>]) -> Result<(), String> {
+    Ok(())
 }
 
 /// Without the AOT tier: as built as it'll get (and the load says why not).
@@ -1463,42 +1247,36 @@ fn builders(_: &crate::s3::S3) -> Vec<serde_json::Value> {
 /// Deploy the app in `dir` (org `org`) onto a running node: checked and
 /// loaded in full first, so a bad version never goes live and the old one
 /// keeps serving.
-pub fn deploy_dir<E: Engine>(eng: &E, live: &Live<E::Program>, org: &str, dir: &std::path::Path) -> Result<(), String> {
+pub fn deploy_dir<E: Engine>(eng: &E, live: &Live, org: &str, dir: &std::path::Path) -> Result<(), String> {
     let at = format!("{org}/{}", dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
     let m = crate::manifest::load(dir).map_err(|e| format!("{at}: {e}"))?.ok_or(format!("{at}: no manifest"))?;
     let r = m.resolve(&crate::manifest::load_dev(dir).map_err(|e| format!("{at}: {e}"))?).map_err(|e| format!("{at}: {e}"))?;
     let a = crate::app::AppDir { org, dir, resolved: &r, app: &m.app, domains: &m.domains };
-    let next = live.now().with_apps(&[a], &[], |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))?;
+    let next = live.now().with_apps(&[a], &[])?;
+    crate::cells::check(eng, &crate::cells::Progs::new(), &next)?;
     live.swap(next);
     Ok(())
 }
 
-/// A `memory_kb` under what its module starts with could never start a
-/// cell: the app is refused here, with why, not at its first request. And
-/// what's worth knowing about a ws process the host freezes is said.
-fn check_caps<E: Engine>(eng: &E, app: App<E::Program>) -> Result<App<E::Program>, String> {
-    for p in app.procs.iter().filter(|p| !p.retired) {
-        if let (true, Sleep::Auto, Some(note)) = (p.socket, p.sleep, eng.note(&app.progs[p.prog])) {
-            eprintln!("combd     warning: {}/{}: {note}", app.tenants[p.tenant].key(), p.name);
-        }
-        if let Some(pages) = p.memory_pages {
-            let mut vm = eng.spawn(&app.progs[p.prog])?;
-            vm.cap_memory(pages).map_err(|e| format!("{}/{}: {e}", app.tenants[p.tenant].key(), p.name))?;
-        }
-    }
-    Ok(app)
-}
-
 #[cfg(test)]
 /// One app in `dir` (org `local`), ready to serve.
-pub fn load_app<E: Engine>(eng: &E, dir: &std::path::Path) -> Result<(App<E::Program>, Option<crate::pg::PgCfg>), String> {
+pub fn load_app<E: Engine>(eng: &E, dir: &std::path::Path) -> Result<(App, Option<crate::pg::PgCfg>), String> {
     load_apps(eng, &[("local".into(), dir.to_path_buf())])
 }
 
 /// Apps (org, folder), each from its manifest resolved for the local `dev`
 /// environment: their processes and modules, and their pools (named
 /// `<org>/<app>/<pool>`).
-pub fn load_apps<E: Engine>(eng: &E, apps: &[(String, std::path::PathBuf)]) -> Result<(App<E::Program>, Option<crate::pg::PgCfg>), String> {
+/// Checked here, as the cells would (`cells::check`).
+#[cfg(test)]
+pub fn load_apps<E: Engine>(eng: &E, apps: &[(String, std::path::PathBuf)]) -> Result<(App, Option<crate::pg::PgCfg>), String> {
+    let (app, pg) = load_apps_dirs(apps)?;
+    crate::cells::check(eng, &crate::cells::Progs::new(), &app)?;
+    Ok((app, pg))
+}
+
+/// ... unchecked: the cells check them (`cells::Link::check`).
+fn load_apps_dirs(apps: &[(String, std::path::PathBuf)]) -> Result<(App, Option<crate::pg::PgCfg>), String> {
     let mut loaded = vec![];
     for (org, dir) in apps {
         let at = format!("{org}/{}", dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
@@ -1507,50 +1285,82 @@ pub fn load_apps<E: Engine>(eng: &E, apps: &[(String, std::path::PathBuf)]) -> R
         loaded.push((org.clone(), dir.clone(), m, r));
     }
     let list: Vec<crate::app::AppDir> = loaded.iter().map(|(org, dir, m, r)| crate::app::AppDir { org, dir, resolved: r, app: &m.app, domains: &m.domains }).collect();
-    let app = App::from_apps(&list, |w, k| eng.load_as(w, k)).and_then(|a| check_caps(eng, a))?;
+    let app = App::from_apps(&list)?;
     let pools: Vec<crate::pg::PoolCfg> = loaded.iter().flat_map(|(org, _, m, r)| crate::pg::PgCfg::from_manifest(r, &format!("{org}/{}", m.app)).map(|c| c.pools).unwrap_or_default()).collect();
     Ok((app, (!pools.is_empty()).then_some(crate::pg::PgCfg { pools })))
 }
 
 /// What a node serves right now. A deploy `swap`s in a new `App` (made with
 /// `App::with_apps`); each loop picks it up between rounds (within a tick).
-pub struct Live<P> {
-    app: Mutex<Arc<App<P>>>,
-    gen: AtomicU64,
+pub struct Live {
+    now: Mutex<Arc<App>>,
+    pub(crate) gen: AtomicU64,
 }
 
-impl<P> Live<P> {
-    pub fn new(app: App<P>) -> Live<P> {
-        Live { app: Mutex::new(Arc::new(app)), gen: AtomicU64::new(0) }
+impl Live {
+    pub fn new(app: App) -> Live {
+        Live { now: Mutex::new(Arc::new(app)), gen: AtomicU64::new(0) }
     }
 
-    pub fn now(&self) -> Arc<App<P>> {
-        self.app.lock().unwrap().clone()
+    pub fn now(&self) -> Arc<App> {
+        self.now.lock().unwrap().clone()
     }
 
-    pub fn swap(&self, app: App<P>) {
-        *self.app.lock().unwrap() = Arc::new(app);
+    pub fn swap(&self, app: App) {
+        *self.now.lock().unwrap() = Arc::new(app);
         self.gen.fetch_add(1, Relaxed);
     }
 }
 
 /// Serve `app`, fixed: nothing swaps it.
-pub fn serve_with<E>(eng: &E, app: App<E::Program>, port: u16, cfg: Config)
-where
-    E: Engine + Sync,
-    E::Program: Sync + Send,
-{
-    serve_live(eng, &Live::new(app), port, cfg)
+#[cfg(test)]
+pub fn serve_with<E: Engine>(eng: &E, app: App, port: u16, cfg: Config) {
+    let mut link = start_cells(eng, &cfg);
+    link.check(&app).unwrap_or_else(|e| panic!("{e}"));
+    let ends = std::mem::take(&mut link.ends);
+    serve_linked(&Live::new(app), port, cfg, ends);
 }
 
-pub fn serve_live<E>(eng: &E, live: &Live<E::Program>, port: u16, mut cfg: Config)
-where
-    E: Engine + Sync,
-    E::Program: Sync + Send,
-{
+/// Serve what's `live`, with cells of its own.
+#[cfg(test)]
+pub fn serve_live<E: Engine>(eng: &E, live: &Live, port: u16, cfg: Config) {
+    let mut link = start_cells(eng, &cfg);
+    let ends = std::mem::take(&mut link.ends);
+    serve_linked(live, port, cfg, ends);
+}
+
+/// Start the node's cells (`cells::start`): in a process of their own
+/// unless `COMBD_CELLS=threads` (always on threads in tests), told what they
+/// need of `cfg`. The node can't go on without them: a child that ends ends
+/// it. ponytail: started again on its own comes with cordons (plan.md, C4c).
+fn start_cells<E: Engine>(eng: &E, cfg: &Config) -> cells::Link {
+    std::fs::create_dir_all(&cfg.data).unwrap_or_else(|e| panic!("create the data directory {}: {e}", cfg.data.display()));
+    let objects = crate::store::objects_dir(&cfg.data).unwrap_or_else(|e| panic!("the objects' folder in {}: {e}", cfg.data.display()));
+    let set = cells::Settings { data: objects, threads: cfg.threads, idle: cfg.idle, max_awake: cfg.max_awake, max_objects: cfg.max_objects, environ: cfg.environ.clone(), node: cfg.fleet.as_ref().map(|f| f.node) };
+    let start = line::Start { build: if cfg.cells_child { cells::build_id() } else { String::new() }, engine: eng.child(), aot_dir: std::env::var_os("COMBD_AOT_DIR").map(PathBuf::from), set, sync_delay: cfg.sync_delay, lock: cfg.lockdown };
+    let mut link = cells::start(start, cfg.cells_child).unwrap_or_else(|e| panic!("the cells: {e}"));
+    if let Some(mut child) = link.child.take() {
+        println!("combd     cells in process {}", child.id());
+        let stop = cfg.stop.clone();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            if !stop.load(Relaxed) {
+                use std::os::unix::process::ExitStatusExt;
+                // `SIGSYS`: seccomp's, for a call off the lockdown's list.
+                let why = if status.as_ref().is_ok_and(|s| s.signal() == Some(rustix::process::Signal::SYS.as_raw())) { ", killed by its lockdown for a system call it may not make" } else { "" };
+                eprintln!("combd     the cells' process ended ({status:?}{why}): stopping");
+                std::process::exit(1);
+            }
+        });
+    }
+    link
+}
+
+/// Serve what's `live`, on `port`, each loop with its line to the cells
+/// (`ends`, from `start_cells`).
+pub(crate) fn serve_linked(live: &Live, port: u16, mut cfg: Config, ends: Vec<mio::net::UnixStream>) {
     let app = live.now();
     std::fs::create_dir_all(&cfg.data).unwrap_or_else(|e| panic!("create the data directory {}: {e}", cfg.data.display()));
-    let index = Mutex::new(AlarmIndex::open(&cfg.data).expect("open the alarm index"));
     // Every connection is a file: the limit goes to its ceiling, and the
     // connections stay under three quarters of it (objects' storage files,
     // the wire, and the bucket need the rest), so a full node answers 503
@@ -1578,46 +1388,7 @@ where
         peers.push((tx, waker));
         inboxes.push(rx);
     }
-    let (sync_tx, sync_rx) = channel::<SyncJob>();
-    let sync_rx = Arc::new(Mutex::new(sync_rx));
-    let no_fsync = std::env::var_os("COMBD_EXPERIMENT_NO_FSYNC").is_some();
-    let delay = cfg.sync_delay;
-    let checkpoints = Arc::new(AtomicU64::new(0));
-    let (slow, max_us) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-    for _ in 0..SYNC_THREADS {
-        let (rx, peers, checkpoints) = (sync_rx.clone(), peers.clone(), checkpoints.clone());
-        let (slow, max_us) = (slow.clone(), max_us.clone());
-        std::thread::Builder::new().name("fsync".into()).spawn(move || loop {
-            let Ok(job) = rx.lock().unwrap().recv() else { return };
-            // EXPERIMENT ONLY, never ship: COMBD_EXPERIMENT_NO_FSYNC measures
-            // what the fsync costs. It breaks the output gate's promise.
-            std::thread::sleep(delay);
-            let t = Instant::now();
-            let ok = no_fsync || (job.file.sync_data().is_ok() && job.dirs.iter().all(|d| std::fs::File::open(d).and_then(|f| f.sync_all()).is_ok()));
-            let us = t.elapsed().as_micros() as u64;
-            max_us.fetch_max(us, Relaxed);
-            if us >= 10_000 {
-                slow.fetch_add(1, Relaxed);
-            }
-            // Release the answers first; the checkpoint doesn't hold them up.
-            let (tx, waker) = &peers[job.back];
-            let _ = tx.send(Msg::Synced { obj: job.obj.clone(), gen: job.gen, ok });
-            let _ = waker.wake();
-            // Keep the WAL small, here instead of on the event loop.
-            if job.ckpt {
-                if ok {
-                    match store::checkpoint(&job.db_path) {
-                        Ok(()) => {
-                            checkpoints.fetch_add(1, Relaxed);
-                        }
-                        Err(e) => eprintln!("object {:?}: checkpoint: {e}", job.obj),
-                    }
-                }
-                let _ = tx.send(Msg::Checkpointed { obj: job.obj });
-                let _ = waker.wake();
-            }
-        }).expect("fsync thread");
-    }
+    let node_ends = ends;
     let fleet = cfg.fleet.take().map(|fc| start_fleet(fc, &peers, cfg.threads, &cfg.data, cfg.catalog.clone()));
     // Always a set of pools (maybe empty): a deploy can add to it. In a
     // fleet with a catalog, each pool is one for the whole fleet.
@@ -1631,12 +1402,9 @@ where
         pg,
         cfg,
         peers,
-        sync: Mutex::new(sync_tx),
-        index,
-        stats: Stats { checkpoints, fsyncs_slow: slow, fsync_max_us: max_us, ..Stats::default() },
+        stats: Stats::default(),
         fleet,
         tls: Mutex::new(tls),
-        procs: Mutex::new(BTreeMap::new()),
         public: Mutex::new(Some(listener)),
         listen_gen: AtomicU64::new(0),
         port,
@@ -1645,30 +1413,25 @@ where
     };
     let sh = &sh;
     std::thread::scope(|sc| {
-        for (me, (poll, inbox)) in polls.into_iter().zip(inboxes).enumerate() {
+        for (me, ((poll, inbox), node_end)) in polls.into_iter().zip(inboxes).zip(node_ends).enumerate() {
             let l = sh.public.lock().unwrap().as_ref().unwrap().try_clone().expect("clone listener");
             let local = local.try_clone().expect("clone listener");
             let r = redirect.as_ref().map(|r| r.try_clone().expect("clone listener"));
             let app = app.clone();
             std::thread::Builder::new().name(format!("loop-{me}")).spawn_scoped(sc, move || {
                 let mut lp = Loop {
-                    eng,
                     app: app.clone(),
                     live,
-                    app_gen: live.gen.load(Relaxed),
+                    // None yet: the first turn sends the cells all of it.
+                    app_gen: u64::MAX,
+                    cells_progs: 0,
                     sh,
                     me,
                     inbox,
                     poll,
-                    pools: (0..app.procs.len()).map(|_| vec![]).collect(),
-                    tasks: VecDeque::new(),
-                    objects: HashMap::new(),
-                    alarms: BinaryHeap::new(),
-                    tries: HashMap::new(),
                     conns: vec![],
                     free: vec![],
                     next_gen: 0,
-                    last_sweep: Instant::now(),
                     core: sh.fleet.as_ref().map(|f| {
                         let mut fleet: Vec<own::Node> = f.cfg.peers.keys().copied().chain([f.cfg.node]).collect();
                         fleet.sort();
@@ -1676,6 +1439,9 @@ where
                         Core::with_lease(f.cfg.node, own::Bugs::default(), f.cfg.lease_ms).replicate(fleet, f.cfg.replicas).uploads(f.cfg.upload_ms, f.cfg.upload_bytes).read_lease(if f.cfg.read_lease { f.cfg.lease_ms / 2 } else { 0 })
                     }),
                     freqs: HashMap::new(),
+                    owned: HashMap::new(),
+                    restore_index: HashMap::new(),
+                    anchored: Default::default(),
                     next_req: 0,
                     names: HashMap::new(),
                     wire_out: HashMap::new(),
@@ -1686,12 +1452,9 @@ where
                     quiet: Vec::new(),
                     last_tick: Instant::now(),
                     local_socks: HashMap::new(),
-                    sessions: HashMap::new(),
                     last_tls_check: Instant::now(),
                     last_conn_check: Instant::now(),
-                    ran: vec![],
                     unsent: vec![],
-                    ready: VecDeque::new(),
                     last_accept_warning: Instant::now(),
                     next_sock: 0,
                     boot: {
@@ -1699,7 +1462,6 @@ where
                         let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
                         u64::from_le_bytes(b) ^ now_ms() as u64
                     },
-                    ws_gone: HashMap::new(),
                     traffic: HashMap::new(),
                     picks: HashMap::new(),
                     asks: HashMap::new(),
@@ -1707,22 +1469,21 @@ where
                     taken: 0,
                     restoring: 0,
                     restores: VecDeque::new(),
-                    ws_lost: Default::default(),
-                    parked: HashMap::new(),
-                    next_park: 0,
                     pg_handles: HashMap::new(),
-                    ev_mode: vec![false; app.procs.len()],
-                    ev: vec![],
-                    ev_gen: 0,
-                    next_ev_req: 0,
-                    ev_timers: BinaryHeap::new(),
+                    next_handle: 0,
                     calls: HashMap::new(),
                     next_call: 0,
-                    ticks: HashMap::new(),
+                    tokens: HashMap::new(),
+                    next_token: 0,
                     public: None,
                     listen_gen: 0,
                     listen_changed: Instant::now(),
-                    behind: false,
+                    cells_behind: false,
+                    health: (0, false),
+                    stats_waiting: vec![],
+                    last_sweep: Instant::now(),
+                    line: line::End::new(node_end, line::MAX_UP),
+                    line_writable: false,
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l), TcpListener::from_std(local), r.map(TcpListener::from_std)) {
                     eprintln!("event loop stopped: {e}");
@@ -1732,40 +1493,36 @@ where
     });
 }
 
-/// Everything one event loop owns.
-struct Loop<'a, E: Engine> {
-    eng: &'a E,
+/// One event loop: the node's side (connections, routing, the fleet, the
+/// bucket), and its cells (`CellLoop`), which it hands work to over the
+/// line (`line.rs`).
+struct Loop<'a> {
     /// The app as of the last round; `live` has the newest.
-    app: Arc<App<E::Program>>,
-    live: &'a Live<E::Program>,
+    app: Arc<App>,
+    live: &'a Live,
     app_gen: u64,
     sh: &'a Shared,
     me: usize,
     inbox: Receiver<Msg>,
     poll: Poll,
-    /// Warm worker cells per process, and when each was put back (the
-    /// newest last). The sweep trims ones idle too long (`trim_idle`).
-    pools: Vec<Vec<(Cell<E>, Instant)>>,
-    tasks: VecDeque<Task<E>>,
-    objects: HashMap<String, Object<E>>,
-    /// Alarms of objects this loop owns: (due, name). Entries can be stale;
-    /// the object's storage is checked when one fires.
-    alarms: BinaryHeap<Reverse<(i64, String)>>,
-    /// Retries so far, for alarms that failed.
-    tries: HashMap<String, u32>,
     conns: Vec<Option<Conn>>,
     free: Vec<usize>,
     next_gen: u64,
-    last_sweep: Instant,
     /// This loop's copy of the listening socket (`Shared::public`), the
     /// change it follows, and (loop 0) when listening last changed.
     public: Option<TcpListener>,
     listen_gen: u64,
     listen_changed: Instant,
-    /// Counted in `Shared::behind`.
-    behind: bool,
+    cells_behind: bool,
     // Fleet mode only.
     core: Option<Core>,
+    owned: HashMap<String, Owned>,
+    /// Restores the cells are doing: what the bucket listed of each one's
+    /// alarm keys.
+    restore_index: HashMap<(String, Act), Vec<String>>,
+    /// Objects the cells say hold a database session or have a beat
+    /// (`Up::Anchor`); and, the cells', what they've said.
+    anchored: std::collections::HashSet<String>,
     freqs: HashMap<own::ReqId, FReq>,
     next_req: own::ReqId,
     /// Object ids back to names.
@@ -1788,28 +1545,17 @@ struct Loop<'a, E: Engine> {
     /// WebSocket connections this loop holds: socket id -> connection. They
     /// stay while their object is out of memory, or runs on another node.
     local_socks: HashMap<u64, Who>,
-    /// Socket processes' sessions on this loop, by name.
-    sessions: HashMap<String, Session<E>>,
     /// When loop 0 last looked at the certificate's file, and this loop at
     /// its connections' timeouts.
     last_tls_check: Instant,
     last_conn_check: Instant,
-    /// Per process (by index): the ns its cells ran and the slices, since
-    /// they last went into `Shared::procs`.
-    ran: Vec<(u64, u64)>,
     /// Connections with WebSocket frames written but not sent yet: they go
     /// out together, before the loop next waits.
     unsent: Vec<usize>,
-    /// Sleeping sessions with work, in order, for when there's room
-    /// (`max_awake`).
-    ready: VecDeque<String>,
     last_accept_warning: Instant,
     next_sock: u64,
     /// Random bits for socket ids, so a restart never reuses one.
     boot: u64,
-    /// Sockets that are gone, per object, until a committed request has
-    /// taken them off the object's list (`_combd_sockets`).
-    ws_gone: HashMap<String, BTreeSet<u64>>,
     /// Placement (`place`): per object run here, its requests by the node
     /// they came in through, this window; last window's pick per object;
     /// offers out (wire id -> the object and the node); when this window
@@ -1822,26 +1568,26 @@ struct Loop<'a, E: Engine> {
     /// Restores out (`Config::restores_at_once`), and those waiting.
     restoring: usize,
     restores: VecDeque<Job>,
-    /// Lost sockets we've told their object about already.
-    ws_lost: std::collections::HashSet<u64>,
-    /// Cells waiting on the database, by park number; and the Postgres
-    /// handles cells on this loop hold.
-    parked: HashMap<u64, (Task<E>, bool)>,
-    next_park: u64,
-    pg_handles: HashMap<u64, PgHandle>,
-    /// Event cells: which processes are (their module exports
-    /// `on_request`), their instances, and their timers (due, instance,
-    /// generation, ticket).
-    ev_mode: Vec<bool>,
-    ev: Vec<Option<EvInst<E>>>,
-    ev_gen: u64,
-    next_ev_req: u64,
-    ev_timers: BinaryHeap<Reverse<(Instant, usize, u64, u64)>>,
+    /// The node's: leased connections, by handle.
+    pg_handles: HashMap<u64, crate::pg::Lease>,
+    next_handle: u64,
     /// `call`s out: id -> who waits, and when it gives up.
     calls: HashMap<u64, (CallTo, Instant)>,
     next_call: u64,
-    /// Objects' beats: name -> (every, next, count).
-    ticks: HashMap<String, (Duration, Instant, u64)>,
+    /// The node's: where each request it handed the cells came from.
+    tokens: HashMap<u64, Origin>,
+    next_token: u64,
+    /// The health the cells were last told (`Down::Health`).
+    health: (u64, bool),
+    /// Stats pages waiting for the cells' counts.
+    stats_waiting: Vec<Who>,
+    /// How many of the app's programs the cells have (`Down::Deploy`).
+    cells_progs: usize,
+    /// When the node last swept (`sweep_node`).
+    last_sweep: Instant,
+    /// The line to this loop's cells, and whether it waits to be writable.
+    line: line::End,
+    line_writable: bool,
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
@@ -1926,8 +1672,13 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<LoopWaker>)], threads: u
             let (back, msg) = match job {
                 Job::Call { op, call, back } => (back, Msg::Bucket { op, res: crate::fleet::run_call(&s3, &call) }),
                 Job::Fetch { obj, act, segs, image, back } => {
-                    let index = s3.list(&alarm_prefix(obj)).unwrap_or_default().iter().filter_map(|k| k.rsplit('/').next()?.parse().ok()).collect();
-                    (back, Msg::Fetched { obj, act, data: crate::fleet::fetch(&s3, &segs), index, image })
+                    // Without its alarm keys it can't delete a stale one, which
+                    // would fire every second while the object stays here.
+                    let (data, index) = match s3.list(&alarm_keys::prefix(obj)) {
+                        Ok(index) => (crate::fleet::fetch(&s3, &segs), index),
+                        Err(e) => (Err(format!("its alarm keys: {e}")), vec![]),
+                    };
+                    (back, Msg::Fetched { obj, act, data, index, image })
                 }
                 Job::Image { obj, act, key, entry, back } => match s3.put(&key, &own::frame(&[entry]), &crate::s3::Cond::IfAbsent) {
                     Ok(Ok(_)) => (back, Msg::Imaged { obj, act, key }),
@@ -1940,18 +1691,16 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<LoopWaker>)], threads: u
                         continue;
                     }
                 },
-                Job::Index { name, obj, old, new, back } => {
-                    // The new entry first, then the old one goes: never a moment with neither.
-                    let put = new.map_or(Ok(()), |at| s3.put(&alarm_key(obj, at), name.as_bytes(), &crate::s3::Cond::Any).map(|_| ()));
-                    let del = match old.filter(|o| Some(*o) != new) {
-                        Some(o) if put.is_ok() => s3.delete(&alarm_key(obj, o)),
-                        _ => Ok(()),
+                Job::Index { name, op, back } => {
+                    let ok = match &op {
+                        alarm_keys::Op::Put(k) => s3.put(k, name.as_bytes(), &crate::s3::Cond::Any).is_ok(),
+                        alarm_keys::Op::Delete(k) => s3.delete(k).is_ok(),
                     };
-                    (back, Msg::Indexed { name, new, ok: put.is_ok() && del.is_ok() })
+                    (back, Msg::Indexed { name, op, ok })
                 }
                 Job::AlarmScan { back } => {
                     let now = now_ms();
-                    let all: Vec<(String, i64)> = s3.list("alarm/").unwrap_or_default().into_iter().filter_map(|k| Some((k.rsplit('/').next()?.parse().ok()?, k)).map(|(at, k)| (k, at))).collect();
+                    let all: Vec<(String, i64)> = s3.list("alarm/").unwrap_or_default().into_iter().filter_map(|k| Some((alarm_keys::due(&k)?, k)).map(|(at, k)| (k, at))).collect();
                     let next = all.iter().map(|&(_, at)| at).filter(|&at| at > now).min();
                     let due = all
                         .into_iter()
@@ -2074,7 +1823,7 @@ fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<LoopWaker>)], threads: u
     }
 }
 
-impl<E: Engine> Loop<'_, E> {
+impl Loop<'_> {
     fn run(&mut self, mut listener: TcpListener, mut local: TcpListener, mut redirect: Option<TcpListener>) -> std::io::Result<()> {
         let mut events = Events::with_capacity(1024);
         self.poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
@@ -2083,32 +1832,16 @@ impl<E: Engine> Loop<'_, E> {
         if let Some(r) = redirect.as_mut() {
             self.poll.registry().register(r, REDIRECT, Interest::READABLE)?;
         }
-        self.warm(0)?;
-        // Alarms from before a restart.
-        let threads = self.sh.cfg.threads;
-        for (name, at) in self.sh.index.lock().unwrap().all().unwrap_or_default() {
-            if owner(&name, threads) == self.me {
-                self.alarms.push(Reverse((at, name)));
-            }
-        }
+        self.ensure_pools();
+        self.poll.registry().register(&mut self.line.s, LINE, Interest::READABLE)?;
         let mut touched: Vec<usize> = vec![];
         // Listeners whose last accept stopped at its slice: more may be waiting.
         let mut more: Vec<Token> = vec![];
         while !self.sh.cfg.stop.load(Relaxed) {
             self.flush_unsent()?;
-            self.pick_up_app()?;
-            // Never block while requests are waiting to run.
-            let timeout = if self.tasks.is_empty() && more.is_empty() {
-                let next = self.alarms.peek().map(|Reverse((at, _))| Duration::from_millis((at - now_ms()).max(0) as u64));
-                let timer = self.ev_timers.peek().map(|Reverse((at, ..))| *at).into_iter().chain(self.ticks.values().map(|t| t.1)).min().map(|at| at.saturating_duration_since(Instant::now()));
-                let next = match (next, timer) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
-                next.map_or(TICK, |n| n.min(TICK))
-            } else {
-                Duration::ZERO
-            };
+            self.pick_up_app();
+            self.flush_line()?;
+            let timeout = if more.is_empty() { TICK } else { Duration::ZERO };
             // A signal (SIGCONT after a freeze, say) interrupts the wait: just
             // wait again. Treating it as an error stopped the loop for good.
             match self.poll.poll(&mut events, Some(timeout)) {
@@ -2136,6 +1869,7 @@ impl<E: Engine> Loop<'_, E> {
                 }
                 match token {
                     LISTENER | LOCAL | REDIRECT => {}
+                    LINE => self.read_line(ev.is_some_and(|e| e.is_read_closed()))?,
                     WAKER => {
                         // Before the inbox, so a message sent while it's read
                         // wakes the loop again (and an Acquire: what was sent
@@ -2195,96 +1929,85 @@ impl<E: Engine> Loop<'_, E> {
                     }
                     self.core_on(own::Event::Tick);
                 }
-                if self.last_sweep.elapsed() >= TICK {
-                    self.fleet_sweep();
-                }
-            } else {
-                self.fire_alarms();
-                if self.last_sweep.elapsed() >= TICK {
-                    self.sweep();
+            }
+            if self.last_sweep.elapsed() >= TICK {
+                self.last_sweep = Instant::now();
+                self.sweep_node();
+                if self.core.is_some() {
+                    self.place_due();
                 }
             }
-            self.ev_tick();
-            self.fire_ticks();
-            // One round of the run queue: every request gets one slice, but
-            // each org gets an equal share of the round, so one busy tenant
-            // can't crowd out the rest. An org that needs less than its share
-            // gets all it needs; what it leaves goes unspent this round, and
-            // the round is shorter (the poll comes sooner).
-            let share = self.round_share();
-            let app = self.app.clone();
-            let mut used: HashMap<&str, usize> = HashMap::new();
-            for _ in 0..self.tasks.len() {
-                let mut t = self.tasks.pop_front().unwrap();
-                if let Some(share) = share {
-                    let org = app.tenants[app.procs[t.cell.proc].tenant].org.as_str();
-                    let n = used.entry(org).or_default();
-                    if *n >= share {
-                        self.tasks.push_back(t);
-                        continue;
-                    }
-                    *n += 1;
-                }
-                // A host call that's done at once (a send, the clock, a query
-                // that didn't wait) costs the cell no round: it goes on, in
-                // its slice's time. Before, each was a trip round the loop
-                // (14 us on an M4), so a chunk telling 160 watchers took 160.
-                let (proc, started) = (t.cell.proc, Instant::now());
-                let outcome = loop {
-                    let o = t.cell.vm.run(crate::SLICE);
-                    let Outcome::HostCall { import, args } = o else { break Ok(o) };
-                    let r = crate::serve(&mut t.cell.vm, import, &args, &mut t.cell.st);
-                    if r.is_err() || t.cell.st.pending.is_some() || started.elapsed() >= SLICE_TIME {
-                        break Err(r);
-                    }
-                };
-                self.ran(proc, started, 1);
-                // Out of time after a host call, or one that waits: as before.
-                let outcome = match outcome {
-                    Ok(o) => o,
-                    Err(Ok(())) => {
-                        match t.cell.st.pending.take() {
-                            Some(op) => self.park(t, op, true),
-                            None => self.tasks.push_back(t),
-                        }
-                        continue;
-                    }
-                    Err(Err(trap)) => Outcome::Trap(trap),
-                };
-                let answer = match outcome {
-                    Outcome::Yield => {
-                        // A compiled cell paused inside a database call: park it.
-                        match t.cell.vm.db_pending() {
-                            Some(op) => self.park(t, op, false),
-                            None => self.tasks.push_back(t),
-                        }
-                        continue;
-                    }
-                    Outcome::HostCall { .. } => unreachable!("served above"),
-                    // An event cell's callback answers by `respond`, not by return.
-                    Outcome::Done(_) if t.ev.is_some() => Ok(String::new()),
-                    Outcome::Done(r) => {
-                        let a = crate::response(&t.cell.vm, &r);
-                        // Cells that export `release` free the answer once we've read it.
-                        if t.cell.vm.begin("release", &[r[0] >> 32, r[0] & 0xffff_ffff]).is_ok() {
-                            let _ = crate::finish(&mut t.cell.vm, u32::MAX, &mut t.cell.st);
-                        }
-                        Ok(a)
-                    }
-                    Outcome::Trap(trap) => Err(trap),
-                };
-                if t.ev.is_some() {
-                    self.ev_finish(t, answer.is_ok());
-                    continue;
-                }
-                let (origin, name) = (t.origin, t.obj.clone());
-                if let Some((reply, ws)) = self.finish_task(t, answer) {
-                    self.release(name.as_deref(), origin, reply, ws)?;
-                }
-            }
-            self.wake_ready();
+            self.calls_due();
+            self.flush_line()?;
         }
         Ok(())
+    }
+
+    /// Send the cells what's queued; what the socket doesn't take goes when
+    /// it's writable again.
+    fn flush_line(&mut self) -> std::io::Result<()> {
+        self.line.flush()?;
+        if self.line.pending() != self.line_writable {
+            self.line_writable = self.line.pending();
+            let interest = if self.line_writable { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
+            self.poll.registry().reregister(&mut self.line.s, LINE, interest)?;
+        }
+        Ok(())
+    }
+
+    /// What the cells sent. They're gone, or sent what doesn't decode: this
+    /// loop can't go on without them.
+    fn read_line(&mut self, closed: bool) -> std::io::Result<()> {
+        self.flush_line()?;
+        if !self.line.fill(closed)? {
+            return Err(std::io::Error::other("the cells closed the line"));
+        }
+        // An answer for a connection here goes from the line's bytes into
+        // the connection's; the rest are decoded.
+        let whole = self.line.take_whole()?;
+        for m in line::frames(&whole) {
+            match Up::answer(m) {
+                Some((token, status, body)) => match self.tokens.remove(&token) {
+                    Some(Origin::Local(who)) => self.reply_local(who, status, body)?,
+                    Some(origin) => {
+                        let body = String::from_utf8(body.to_vec()).map_err(|_| std::io::Error::other("an answer from the cells that isn't text"))?;
+                        self.deliver(origin, (status, body))?
+                    }
+                    None => {}
+                },
+                None => self.on_up(Up::decode(m).ok_or_else(|| std::io::Error::other("a message from the cells that doesn't decode"))?)?,
+            }
+        }
+        self.line.recycle(whole);
+        Ok(())
+    }
+
+    /// The node sends to the cells.
+    fn down(&mut self, m: Down) {
+        self.line.send(|b| m.encode(b));
+    }
+
+    /// A deploy swapped in a new app: the node takes its routes and starts
+    /// its apps' database pools, and the cells get what they need of it.
+    fn pick_up_app(&mut self) {
+        let gen = self.live.gen.load(Relaxed);
+        if gen != self.app_gen {
+            self.app_gen = gen;
+            self.app = self.live.now();
+            self.ensure_pools();
+            // The cells get it before any request that needs it: the line
+            // keeps its order.
+            let d = self.app.for_cells(self.cells_progs);
+            self.cells_progs = self.app.progs.len();
+            self.down(Down::Deploy(d));
+        }
+    }
+
+    /// The apps' pools: started here if they're new (idempotent).
+    fn ensure_pools(&self) {
+        if let Some(pools) = &self.sh.pg {
+            pools.ensure(&self.app.pools());
+        }
     }
 
     /// Take what's waiting on `listener`, for `ACCEPT_SLICE` at most:
@@ -2361,19 +2084,10 @@ impl<E: Engine> Loop<'_, E> {
                     self.upgrade(id, name, path, key);
                 }
                 Msg::WsPush { name, sock, op, payload } => self.ws_local(&name, sock, op, &payload)?,
-                Msg::WsLost { name, sock } => self.socket_lost(&name, sock),
-                Msg::DbDone { park, done } => self.db_done(park, done),
-                Msg::EvDone { inst, gen, ticket, done } => self.ev_done(inst, gen, ticket, done),
+                Msg::WsLost { name, sock } => self.down(Down::SockLost { name, sock }),
+                Msg::DbDone { to, done } => self.db_back(to, done),
                 Msg::CallDone { id, reply } => self.call_done(id, reply),
                 Msg::Reply { who, reply } => self.deliver(Origin::Local(who), reply)?,
-                Msg::Synced { obj, gen, ok } => self.synced(&obj, gen, ok)?,
-                Msg::Checkpointed { obj } => {
-                    if let Some(o) = self.objects.get_mut(&obj) {
-                        o.checkpointing = false;
-                    }
-                    self.next_waiting(&obj);
-                    self.kick_sync(&obj);
-                }
                 Msg::Bucket { op, res } => self.core_on(own::Event::Reply { op, res }),
                 Msg::Fetched { obj, act, data, index, image } => {
                     self.restoring = self.restoring.saturating_sub(1);
@@ -2384,15 +2098,12 @@ impl<E: Engine> Loop<'_, E> {
                     self.fetched(obj, act, data, index, image)
                 }
                 Msg::Imaged { obj, act, key } => self.core_on(own::Event::Imaged { obj, act, key }),
-                Msg::Indexed { name, new, ok } => {
-                    if let (true, Some(at), Some(f)) = (ok, new, self.sh.fleet.as_ref()) {
-                        f.next_alarm.fetch_min(at, Relaxed);
+                Msg::Indexed { name, op, ok } => {
+                    if let (true, alarm_keys::Op::Put(k), Some(f)) = (ok, &op, self.sh.fleet.as_ref()) {
+                        f.next_alarm.fetch_min(alarm_keys::due(k).unwrap_or(i64::MAX), Relaxed);
                     }
-                    if let Some(o) = self.objects.get_mut(&name) {
-                        o.index_busy = false;
-                        if ok {
-                            o.index_at = new;
-                        }
+                    if let Some(f) = self.owned.get_mut(&name) {
+                        f.keys.done(&op, ok);
                     }
                     self.reconcile(&name);
                 }
@@ -2427,7 +2138,7 @@ impl<E: Engine> Loop<'_, E> {
                         // A yes: move it, if it's still ours to move.
                         // Not if it started a beat or took a database
                         // session since the offer (`place` checked then).
-                        let still = self.objects.get(&name).is_some_and(|o| o.pg.is_empty()) && !self.ticks.contains_key(&name);
+                        let still = self.owned.contains_key(&name) && !self.anchored.contains(&name);
                         if reply.0 == 200 && still {
                             self.core_on(own::Event::Move { obj: own::obj_id(&name), to });
                         }
@@ -2449,17 +2160,19 @@ impl<E: Engine> Loop<'_, E> {
         Ok(())
     }
 
+    /// An answer for a connection on this loop: queued, and on its way.
+    fn reply_local(&mut self, who: Who, status: u16, payload: &[u8]) -> std::io::Result<()> {
+        let Some(c) = self.conn(who) else { return Ok(()) };
+        c.token = None;
+        self.queue_reply_str(who, status, payload);
+        self.start_next(who.0)?;
+        self.settle(who.0)
+    }
+
     /// Send an answer back where its request came from.
     fn deliver(&mut self, origin: Origin, reply: (u16, String)) -> std::io::Result<()> {
         match origin {
-            Origin::Local(who) => {
-                if self.conn(who).is_none() {
-                    return Ok(());
-                }
-                self.queue_reply(who, reply);
-                self.start_next(who.0)?;
-                self.settle(who.0)
-            }
+            Origin::Local(who) => self.reply_local(who, reply.0, reply.1.as_bytes()),
             Origin::Remote(l, who) => {
                 let (tx, waker) = &self.sh.peers[l];
                 let _ = tx.send(Msg::Reply { who, reply });
@@ -2473,6 +2186,13 @@ impl<E: Engine> Loop<'_, E> {
                 Ok(())
             }
             Origin::Ev | Origin::Discard | Origin::Tick => Ok(()),
+            // Never: tokens are the cells', answered up the line.
+            Origin::Token(_) => {
+                #[cfg(test)]
+                panic!("a token reached the node's deliver");
+                #[cfg(not(test))]
+                Ok(())
+            }
             Origin::Call(l, id) if l == self.me => {
                 self.call_done(id, reply);
                 Ok(())
@@ -2503,465 +2223,81 @@ impl<E: Engine> Loop<'_, E> {
                 let _ = write!(c.wbuf, "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", reply.0, reply.1.len());
                 c.wbuf.extend_from_slice(reply.1.as_bytes());
                 c.close_after = true;
-                self.local_socks.remove(&sock);
+                if self.local_socks.remove(&sock).is_some() {
+                    self.down(Down::SockGone(sock));
+                }
                 self.settle(who.0)
             }
         }
     }
 
-    /// An answer is ready (after the output gate): send it, then do the
-    /// WebSocket sends that waited with it.
-    fn release(&mut self, name: Option<&str>, origin: Origin, reply: (u16, String), ws: Vec<WsOut>) -> std::io::Result<()> {
-        self.deliver(origin, reply)?;
-        match name {
-            Some(n) if !ws.is_empty() => self.apply_ws(n, ws),
-            _ => Ok(()),
-        }
-    }
-
-    /// A request for an event cell: the least busy instance with room takes
-    /// it, or a new one starts.
-    fn ev_request(&mut self, origin: Origin, proc: usize, req: String) -> std::io::Result<()> {
-        let cap = self.app.procs[proc].max_concurrent;
-        let pick = self.ev.iter().enumerate().filter_map(|(i, e)| e.as_ref().filter(|e| e.proc == proc && e.reqs.len() < cap).map(|e| (e.reqs.len(), i))).min().map(|(_, i)| i);
-        let i = match pick {
-            Some(i) => i,
-            None => {
-                self.ev_gen += 1;
-                let inst = EvInst { gen: self.ev_gen, proc, cell: Some(fresh(self.eng, &self.app, proc, &self.environ_for(proc))?), reqs: HashMap::new(), tickets: HashMap::new(), queue: VecDeque::new(), running: None };
-                self.sh.stats.ev_instances.fetch_add(1, Relaxed);
-                match self.ev.iter().position(Option::is_none) {
-                    Some(i) => {
-                        self.ev[i] = Some(inst);
-                        i
-                    }
-                    None => {
-                        self.ev.push(Some(inst));
-                        self.ev.len() - 1
-                    }
-                }
-            }
-        };
-        self.next_ev_req += 1;
-        let id = self.next_ev_req;
-        self.sh.stats.ev_requests.fetch_add(1, Relaxed);
-        let inst = self.ev[i].as_mut().unwrap();
-        inst.reqs.insert(id, EvReq { origin, responded: false, open: 0, handles: vec![], start: Instant::now() });
-        inst.queue.push_back(EvCall::Request(id, req));
-        self.ev_kick(i);
-        Ok(())
-    }
-
-    /// Start the instance's next callback, if it's free.
-    fn ev_kick(&mut self, i: usize) {
-        let Some(inst) = self.ev.get_mut(i).and_then(Option::as_mut) else { return };
-        if inst.cell.is_none() {
-            return;
-        }
-        let Some(call) = inst.queue.pop_front() else { return };
-        let mut cell = inst.cell.take().unwrap();
-        let ids: Vec<u64> = inst.reqs.keys().copied().collect();
-        let h = cell.host();
-        h.ev_reqs = ids;
-        h.ev_out.clear();
-        h.ev_bytes = 0;
-        // A fresh host-time budget per callback, as a classic cell gets one
-        // per request: an instance lives long, and it would run out.
-        h.host_time = Default::default();
-        cell.st.host_time = Default::default();
-        let started = match call {
-            EvCall::Request(id, req) => {
-                inst.running = None;
-                (|| -> Result<(), String> {
-                    cell.vm.begin("alloc", &[req.len() as u64])?;
-                    let ptr = crate::finish(&mut cell.vm, u32::MAX, &mut cell.st)?[0] as u32;
-                    if !cell.vm.write(ptr, req.as_bytes()) {
-                        return Err("bad alloc pointer".into());
-                    }
-                    cell.vm.begin("on_request", &[id, ptr as u64, req.len() as u64])
-                })()
-            }
-            EvCall::Event { ticket, req, payload } => {
-                inst.running = Some(req);
-                let n = payload.len() as u64;
-                cell.host().ev_payload = payload;
-                cell.vm.begin("on_event", &[ticket, n])
-            }
-        };
-        let t = Task { origin: Origin::Ev, cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: Some(i), more: vec![] };
-        match started {
-            Ok(()) => self.tasks.push_back(t),
-            Err(e) => {
-                eprintln!("event cell: can't start a callback: {e}");
-                self.ev_finish(t, false);
-            }
-        }
-    }
-
-    /// A callback returned: do what it asked, finish requests that are done,
-    /// and start the next callback. A trap takes the instance down.
-    fn ev_finish(&mut self, t: Task<E>, ok: bool) {
-        let i = t.ev.unwrap();
-        // Handles from blocking pg_open last one callback.
-        for h in t.pg {
-            self.pg_close(h);
-        }
-        let mut cell = t.cell;
-        let Some(inst) = self.ev.get_mut(i).and_then(Option::as_mut) else { return };
-        if !ok {
-            return self.ev_crash(i);
-        }
-        let actions = std::mem::take(&mut cell.host().ev_out);
-        // Open tickets, capped per instance: each callback may ask for
-        // 10,000 things, timers included, and each timer's callback for
-        // 10,000 more. Past the cap it's broken, or an attack: it crashes.
-        let asks = actions.iter().filter(|a| matches!(a, EvAction::Async { .. })).count();
-        if inst.tickets.len() + asks > MAX_EV_TICKETS {
-            eprintln!("event cell: over {MAX_EV_TICKETS} things in flight: crashed");
-            return self.ev_crash(i);
-        }
-        inst.cell = Some(cell);
-        if let Some(q) = inst.running.take().and_then(|r| inst.reqs.get_mut(&r)) {
-            q.open = q.open.saturating_sub(1);
-        }
-        let (gen, mut replies, mut ops, mut closes, mut sends) = (inst.gen, vec![], vec![], vec![], vec![]);
-        let from = inst.proc;
-        for a in actions {
-            match a {
-                EvAction::Respond(req, text) => {
-                    if let Some(q) = inst.reqs.get_mut(&req).filter(|q| !q.responded) {
-                        q.responded = true;
-                        replies.push((q.origin, split_answer(&text)));
-                    }
-                }
-                EvAction::Async { req, ticket, op } => {
-                    if let Some(q) = inst.reqs.get_mut(&req) {
-                        q.open += 1;
-                        inst.tickets.insert(ticket, req);
-                        ops.push((req, ticket, op));
-                    }
-                }
-                EvAction::Send(m) => sends.push(m),
-                EvAction::PgClose(req, h) => {
-                    if let Some(q) = inst.reqs.get_mut(&req) {
-                        if q.handles.contains(&h) {
-                            q.handles.retain(|&x| x != h);
-                            closes.push(h);
-                        }
-                    }
-                }
-            }
-        }
-        for (origin, reply) in replies {
-            let _ = self.deliver(origin, reply);
-        }
-        for h in closes {
-            self.pg_close(h);
-        }
-        for (req, ticket, op) in ops {
-            self.ev_start(i, gen, req, ticket, op);
-        }
-        for m in sends {
-            if let Err(e) = self.start_call(from, &m, None) {
-                eprintln!("send: {e}");
-            }
-        }
-        self.ev_reap(i);
-        self.ev_kick(i);
-    }
-
-    /// Start an async call for an event cell's request.
-    fn ev_start(&mut self, i: usize, gen: u64, req: u64, ticket: u64, op: AsyncOp) {
+    /// The node's side of a database call: the binding must be the cell's
+    /// app's, and its process one of the pool's callers. The answer comes
+    /// back through the inbox (`db_back`).
+    fn db_ask(&mut self, to: CallTo, proc: usize, ask: DbAsk) {
         let (tx, waker) = self.sh.peers[self.me].clone();
         let reply = move |done: DbDone| {
-            let _ = tx.send(Msg::EvDone { inst: i, gen, ticket, done });
+            let _ = tx.send(Msg::DbDone { to, done });
             let _ = waker.wake();
         };
+        // The errors name the call the cell made.
+        let (open, query) = match to {
+            CallTo::Park(_) => ("pg_open", "pg_query"),
+            CallTo::Ev(..) => ("pg_open_async", "pg_query_async"),
+        };
         let binding = |req: &[u8]| serde_json::from_slice::<serde_json::Value>(req).ok().and_then(|v| v["db"].as_str().map(String::from));
-        let proc = self.ev[i].as_ref().map_or(0, |e| e.proc);
-        if let AsyncOp::Call(msg) = &op {
-            let from = proc;
-            if let Err(e) = self.start_call(from, msg, Some(CallTo::Ev(i, gen, ticket))) {
-                reply(DbDone::Answer(json_err(&e)));
-            }
-            return;
+        if proc >= self.app.procs.len() {
+            return self.db_failed(to, format!("no process {proc}"));
         }
-        let Some(pools) = &self.sh.pg else {
-            if let AsyncOp::Timer(ms) = op {
-                return self.ev_timers.push(Reverse((Instant::now() + Duration::from_millis(ms), i, gen, ticket)));
-            }
-            return reply(DbDone::Answer(json_err("no database bindings are set up")));
-        };
-        match op {
-            AsyncOp::Timer(ms) => self.ev_timers.push(Reverse((Instant::now() + Duration::from_millis(ms), i, gen, ticket))),
-            AsyncOp::Call(_) => unreachable!("handled above"),
-            AsyncOp::PgOpen(r) => match binding(&r).filter(|b| pools.has(&self.app.pool_key(proc, b))).map(|b| self.may_lease(proc, &b).map(|()| self.app.pool_key(proc, &b))) {
-                Some(Ok(b)) => pools.lease(&b, Box::new(move |r| reply(DbDone::Pinned(r)))),
-                Some(Err(e)) => reply(DbDone::Answer(json_err(&e))),
-                None => reply(DbDone::Answer(json_err("pg_open_async: name a database binding (\"db\")"))),
+        let Some(pools) = self.sh.pg.clone() else { return self.db_failed(to, "no database bindings are set up".into()) };
+        let err = match ask {
+            DbAsk::Open(r) => match binding(&r).filter(|b| pools.has(&self.app.pool_key(proc, b))) {
+                None => format!("{open}: name a database binding (\"db\")"),
+                Some(b) => match self.may_lease(proc, &b) {
+                    Ok(()) => return pools.lease(&self.app.pool_key(proc, &b), Box::new(move |r| reply(DbDone::Pinned(r)))),
+                    Err(e) => e,
+                },
             },
-            AsyncOp::PgQuery(0, r) => match binding(&r).map(|b| self.may_lease(proc, &b).map(|()| self.app.pool_key(proc, &b))) {
-                Some(Ok(b)) => pools.query(&b, r, Box::new(move |a| reply(DbDone::Answer(a)))),
-                Some(Err(e)) => reply(DbDone::Answer(json_err(&e))),
-                None => reply(DbDone::Answer(json_err("pg_query_async: name a database binding (\"db\"), or use a handle"))),
+            DbAsk::Query(r) => match binding(&r) {
+                None => format!("{query}: name a database binding (\"db\"), or use a handle"),
+                Some(b) => match self.may_lease(proc, &b) {
+                    Ok(()) => return pools.query(&self.app.pool_key(proc, &b), r, Box::new(move |a| reply(DbDone::Answer(a)))),
+                    Err(e) => e,
+                },
             },
-            AsyncOp::PgQuery(h, r) => {
-                let owned = self.ev[i].as_ref().and_then(|e| e.reqs.get(&req)).is_some_and(|q| q.handles.contains(&h));
-                match self.pg_handles.get(&h).filter(|_| owned) {
-                    Some(ph) => ph.lease.query(r, Box::new(move |a| reply(DbDone::Answer(a)))),
-                    None => reply(DbDone::Answer(json_err(&format!("pg_query_async: no such handle {h}")))),
-                }
-            }
-        }
-    }
-
-    /// An async call is back: queue its event for the instance.
-    fn ev_done(&mut self, i: usize, gen: u64, ticket: u64, done: DbDone) {
-        let live = self.ev.get(i).and_then(Option::as_ref).is_some_and(|e| e.gen == gen);
-        let req = if live { self.ev[i].as_mut().unwrap().tickets.remove(&ticket) } else { None };
-        let alive_req = req.filter(|r| self.ev[i].as_ref().is_some_and(|e| e.reqs.contains_key(r)));
-        let payload = match done {
-            DbDone::Answer(a) => a,
-            DbDone::Pinned(Err(e)) => json_err(&e),
-            DbDone::Pinned(Ok(lease)) => {
-                let Some(r) = alive_req else {
-                    // Its request (or instance) is gone: give it straight back.
-                    return lease.release();
-                };
-                self.next_park += 1;
-                let h = self.next_park << 8 | self.me as u64;
-                self.pg_handles.insert(h, PgHandle { lease, obj: None });
-                self.ev[i].as_mut().unwrap().reqs.get_mut(&r).unwrap().handles.push(h);
-                serde_json::json!({ "handle": h }).to_string().into_bytes()
-            }
+            DbAsk::QueryOn(h, r) => match self.pg_handles.get(&h) {
+                Some(lease) => return lease.query(r, Box::new(move |a| reply(DbDone::Answer(a)))),
+                None => format!("{query}: no such handle {h}"),
+            },
         };
-        let Some(r) = alive_req else { return };
-        self.ev[i].as_mut().unwrap().queue.push_back(EvCall::Event { ticket, req: r, payload });
-        self.ev_kick(i);
+        self.db_failed(to, err)
     }
 
-    /// Requests that are answered and have nothing open are done; their
-    /// handles close.
-    fn ev_reap(&mut self, i: usize) {
-        let Some(inst) = self.ev.get_mut(i).and_then(Option::as_mut) else { return };
-        let done: Vec<u64> = inst.reqs.iter().filter(|(_, q)| q.responded && q.open == 0).map(|(&id, _)| id).collect();
-        let mut closes = vec![];
-        for id in done {
-            closes.extend(inst.reqs.remove(&id).unwrap().handles);
-        }
-        for h in closes {
-            self.pg_close(h);
-        }
-        // An idle instance goes, unless it's the first: that one stays warm.
-        // ponytail: drops at once; keep it for `idle` if start-up cost shows.
-        let inst = self.ev[i].as_ref().unwrap();
-        let first = self.ev.iter().position(|e| e.as_ref().is_some_and(|e| e.proc == inst.proc));
-        let retired = self.app.procs[inst.proc].retired;
-        if (first != Some(i) || retired) && inst.reqs.is_empty() && inst.queue.is_empty() && inst.cell.is_some() {
-            self.ev[i] = None;
+    /// A database call refused here: a parked cell hears at once (0, and
+    /// why), an event cell after its callback.
+    fn db_failed(&mut self, to: CallTo, e: String) {
+        match to {
+            CallTo::Park(_) => self.down(Down::Back { to, back: Back::Failed(e) }),
+            CallTo::Ev(..) => self.down(Down::Back { to, back: Back::Answer(json_err(&e)) }),
         }
     }
 
-    /// An instance trapped: its unanswered requests fail, its handles close,
-    /// and it's gone (a fresh one starts when needed). Let it crash.
-    fn ev_crash(&mut self, i: usize) {
-        let Some(inst) = self.ev.get_mut(i).and_then(Option::take) else { return };
-        eprintln!("event cell crashed, with {} requests in flight", inst.reqs.len());
-        for q in inst.reqs.into_values() {
-            if !q.responded {
-                let _ = self.deliver(q.origin, (500, "{\"error\":\"the cell crashed\"}".into()));
-            }
-            for h in q.handles {
-                self.pg_close(h);
-            }
-        }
-    }
-
-    /// Timers that are due, calls and requests past their time.
-    fn ev_tick(&mut self) {
-        let now = Instant::now();
-        let late: Vec<u64> = self.calls.iter().filter(|(_, (_, at))| *at <= now).map(|(&id, _)| id).collect();
-        for id in late {
-            let (to, _) = self.calls.remove(&id).unwrap();
-            self.call_reply(to, json_err("timeout"));
-        }
-        while self.ev_timers.peek().is_some_and(|Reverse((at, ..))| *at <= now) {
-            let Reverse((_, i, gen, ticket)) = self.ev_timers.pop().unwrap();
-            self.ev_done(i, gen, ticket, DbDone::Answer(vec![]));
-        }
-        for i in 0..self.ev.len() {
-            let Some(inst) = self.ev[i].as_mut() else { continue };
-            let mut late = vec![];
-            let mut over = vec![];
-            for (&id, q) in inst.reqs.iter_mut() {
-                if !q.responded && q.start.elapsed() > EV_ANSWER {
-                    q.responded = true;
-                    late.push(q.origin);
-                }
-                if q.start.elapsed() > EV_TOTAL {
-                    over.push(id);
-                }
-            }
-            let mut closes = vec![];
-            for id in over {
-                closes.extend(inst.reqs.remove(&id).unwrap().handles);
-                inst.tickets.retain(|_, r| *r != id);
-            }
-            for origin in late {
-                let _ = self.deliver(origin, (504, "{\"error\":\"the cell didn't answer in time\"}".into()));
-            }
-            for h in closes {
-                self.pg_close(h);
-            }
-        }
-    }
-
-    /// An object leaves memory: its database handles close (rolling back and
-    /// releasing locks; Postgres would too once the connection went).
-    fn remove_object(&mut self, name: &str) -> Option<Object<E>> {
-        self.ticks.remove(name);
-        let o = self.objects.remove(name)?;
-        for &h in &o.pg {
-            self.pg_close(h);
-        }
-        Some(o)
-    }
-
-    /// Close a database handle: its connection is reset and goes back.
-    fn pg_close(&mut self, h: u64) {
-        let Some(ph) = self.pg_handles.remove(&h) else { return };
-        if let Some(o) = ph.obj.as_ref().and_then(|n| self.objects.get_mut(n)) {
-            o.pg.retain(|&x| x != h);
-        }
-        ph.lease.release();
-    }
-
-    /// A cell waits on a database call: hand it to the pool and park the
-    /// cell (paused, no CPU) until the answer is back. `interp`: it paused at
-    /// a host call (the interpreter); else on its fiber (compiled).
-    fn park(&mut self, t: Task<E>, op: crate::host::DbOp, interp: bool) {
-        use crate::host::DbOp;
-        // A call to another process: nothing to do with the database.
-        if let DbOp::Call(msg) = &op {
-            self.next_park += 1;
-            let park = self.next_park;
-            let from = t.cell.proc;
-            self.parked.insert(park, (t, interp));
-            if let Err(e) = self.start_call(from, msg, Some(CallTo::Park(park))) {
-                self.db_done(park, DbDone::Answer(json_err(&e)));
-            }
-            return;
-        }
-        let fail = |m: String| json_err(&m);
-        let binding = |req: &[u8]| serde_json::from_slice::<serde_json::Value>(req).ok().and_then(|v| v["db"].as_str().map(String::from));
-        // May this cell use handle `h`? Its object's, or its request's.
-        let owns = |me: &Self, t: &Task<E>, h: u64| match &t.obj {
-            Some(n) => me.objects.get(n).is_some_and(|o| o.pg.contains(&h)),
-            None => t.pg.contains(&h),
-        };
-        let Some(pools) = &self.sh.pg else { return self.db_resume(t, interp, 0, fail("no database bindings are set up".into())) };
-        self.next_park += 1;
-        let park = self.next_park;
-        let (tx, waker) = self.sh.peers[self.me].clone();
-        let reply = move |done: DbDone| {
-            let _ = tx.send(Msg::DbDone { park, done });
-            let _ = waker.wake();
-        };
-        match op {
-            DbOp::Call(_) => unreachable!("handled above"),
-            DbOp::Open(_) if t.obj.as_ref().is_some_and(|n| self.sessions.contains_key(n)) => {
-                return self.db_resume(t, interp, 0, fail("pg_open: a socket process uses pooled queries (pg_query with no handle)".into()));
-            }
-            DbOp::Open(req) => {
-                let proc = t.cell.proc;
-                let Some(b) = binding(&req).filter(|b| pools.has(&self.app.pool_key(proc, b))) else { return self.db_resume(t, interp, 0, fail("pg_open: name a database binding (\"db\")".into())) };
-                if let Err(e) = self.may_lease(proc, &b) {
-                    return self.db_resume(t, interp, 0, fail(e));
-                }
-                pools.lease(&self.app.pool_key(proc, &b), Box::new(move |r| reply(DbDone::Pinned(r))));
-            }
-            DbOp::Query(0, req) => {
-                let Some(b) = binding(&req) else { return self.db_resume(t, interp, 0, fail("pg_query: name a database binding (\"db\"), or use a handle".into())) };
-                if let Err(e) = self.may_lease(t.cell.proc, &b) {
-                    return self.db_resume(t, interp, 0, fail(e));
-                }
-                pools.query(&self.app.pool_key(t.cell.proc, &b), req, Box::new(move |a| reply(DbDone::Answer(a))));
-            }
-            DbOp::Query(h, req) => {
-                if !owns(self, &t, h) {
-                    return self.db_resume(t, interp, 0, fail(format!("pg_query: no such handle {h}")));
-                }
-                let ph = &self.pg_handles[&h];
-                if let Some(o) = ph.obj.as_ref().and_then(|n| self.objects.get_mut(n)) {
-                    o.pg_used = Instant::now();
-                }
-                ph.lease.query(req, Box::new(move |a| reply(DbDone::Answer(a))));
-            }
-            DbOp::Close(h) => {
-                let ok = owns(self, &t, h);
-                if ok {
-                    self.pg_close(h);
-                }
-                let mut t = t;
-                t.pg.retain(|&x| x != h);
-                return self.db_resume(t, interp, (!ok) as u64, vec![]);
-            }
-        }
-        self.parked.insert(park, (t, interp));
-    }
-
-    /// A database call is back: hand the answer to its cell, and run it again.
-    fn db_done(&mut self, park: u64, done: DbDone) {
-        let Some((mut t, interp)) = self.parked.remove(&park) else { return };
-        let (value, out) = match done {
-            DbDone::Answer(a) => (a.len() as u64, a),
-            DbDone::Pinned(Err(e)) => (0, json_err(&e)),
+    /// A database call is back (from a pool's thread): a lease becomes a
+    /// handle here, and the cells get its number.
+    fn db_back(&mut self, to: CallTo, done: DbDone) {
+        let back = match done {
+            DbDone::Answer(a) => Back::Answer(a),
+            DbDone::Pinned(Err(e)) => Back::Failed(e),
             DbDone::Pinned(Ok(lease)) => {
                 // A handle id: unique on this loop, never 0.
-                self.next_park += 1;
-                let h = self.next_park << 8 | self.me as u64;
-                self.pg_handles.insert(h, PgHandle { lease, obj: t.obj.clone() });
-                match &t.obj {
-                    Some(n) => {
-                        if let Some(o) = self.objects.get_mut(n) {
-                            o.pg.push(h);
-                            o.pg_used = Instant::now();
-                        }
-                    }
-                    None => t.pg.push(h),
-                }
-                (h, vec![])
+                self.next_handle += 1;
+                let h = self.next_handle << 8 | self.me as u64;
+                let idle = lease.session_idle;
+                self.pg_handles.insert(h, lease);
+                Back::Handle(h, idle)
             }
         };
-        self.db_resume(t, interp, value, out);
-    }
-
-    fn db_resume(&mut self, mut t: Task<E>, interp: bool, value: u64, out: Vec<u8>) {
-        if interp {
-            t.cell.st.pg_out = out;
-            let r: &[u64] = if t.cell.st.pending_results == 0 { &[] } else { &[value] };
-            t.cell.vm.resume(r);
-        } else {
-            t.cell.vm.db_done(value, out);
-        }
-        self.tasks.push_back(t);
-    }
-
-    /// A request committed: its handshake joined the socket list, and the
-    /// gone sockets it took off are done with.
-    fn sockets_committed(&mut self, name: &str, joined: Option<u64>, dropped: &[u64]) {
-        let Some(socks) = self.objects.get_mut(name).and_then(|o| o.socks.as_mut()) else { return };
-        socks.extend(joined);
-        for id in dropped {
-            socks.remove(id);
-        }
-        let socks = socks.clone();
-        if let Some(g) = self.ws_gone.get_mut(name) {
-            g.retain(|id| socks.contains(id));
-            if g.is_empty() {
-                self.ws_gone.remove(name);
-            }
-        }
+        self.down(Down::Back { to, back });
     }
 
     /// The node a socket's connection is on: its id says.
@@ -2982,9 +2318,7 @@ impl<E: Engine> Loop<'_, E> {
             }
             let id = out.id();
             if let WsOut::Close(..) = out {
-                // Closed by the object: it hears nothing back, and the socket
-                // leaves its list with the next request.
-                self.ws_gone.entry(name.to_string()).or_default().insert(id);
+                self.down(Down::SockClosed { name: name.to_string(), sock: id });
             }
             let (op, payload) = match out {
                 WsOut::Send(_, m) => (1, m.into_bytes()),
@@ -3008,7 +2342,7 @@ impl<E: Engine> Loop<'_, E> {
     /// any more (it closed, or this node restarted) is lost: its object hears.
     fn ws_local(&mut self, name: &str, id: u64, op: u8, payload: &[u8]) -> std::io::Result<()> {
         if !self.ws_frame(name, id, op, &crate::ws::encode(op, payload))? && op != 8 {
-            self.socket_lost(name, id);
+            self.down(Down::SockLost { name: name.to_string(), sock: id });
         }
         Ok(())
     }
@@ -3062,28 +2396,161 @@ impl<E: Engine> Loop<'_, E> {
         Ok(())
     }
 
-    /// A socket in an object's list is gone without a close: tell the
-    /// object once (1006), wherever it runs.
-    fn socket_lost(&mut self, name: &str, id: u64) {
-        // A session ends with its socket: nothing to tell.
-        if session_sock(name).is_some() {
-            return;
+    /// The stats page: the node's counts and the cells' (`Up::Stats`).
+    fn stats_page(&self, c: &cells::Counts) -> String {
+        let s = &self.sh.stats;
+        let body = format!(
+            "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"moves\":{},\"reseats\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"disk_low\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+            c.objects_live,
+            c.objects_opened,
+            c.evictions + s.evictions.load(Relaxed),
+            c.alarms_fired + s.alarms_fired.load(Relaxed),
+            c.alarms_failed,
+            s.forwarded.load(Relaxed),
+            c.commits,
+            c.fsyncs,
+            c.checkpoints,
+            c.fsyncs_slow,
+            c.fsync_max_us,
+            s.peer_acks.load(Relaxed),
+            s.bucket_acks.load(Relaxed),
+            s.fences.load(Relaxed),
+            s.tail_entries.load(Relaxed),
+            s.uploads.load(Relaxed),
+            s.lease_reads.load(Relaxed),
+            s.fence_waits.load(Relaxed),
+            s.gc_deleted.load(Relaxed),
+            s.moves.load(Relaxed),
+            s.reseats.load(Relaxed),
+            s.sockets_open.load(Relaxed),
+            s.ws_messages.load(Relaxed),
+            s.ws_handoffs.load(Relaxed),
+            c.sessions_live,
+            c.sessions_hibernated,
+            c.sessions_woken,
+            c.sessions_ready,
+            c.sessions_waited,
+            c.mailbox_refused,
+            c.batched,
+            s.ws_frames.load(Relaxed),
+            s.ws_flushes.load(Relaxed),
+            combd_mem::heap_in_use(),
+            s.conns_open.load(Relaxed),
+            s.conns_refused.load(Relaxed),
+            s.tcp_refusing.load(Relaxed),
+            s.disk_low.load(Relaxed),
+            s.accept_failed.load(Relaxed),
+            s.memory_used.load(Relaxed),
+            self.sh.cfg.memory_budget.unwrap_or(0),
+            s.machine_available.load(Relaxed),
+            s.pressure.load(Relaxed),
+            c.ev_instances,
+            c.ev_requests
+        );
+        // Per process: the time its cells ran (us, host calls in) and their slices.
+        let engine = |k: crate::engine::Kind| if k == crate::engine::Kind::Compiled { "compiled" } else { "interpreted" };
+        let procs: serde_json::Map<String, serde_json::Value> = c.procs.iter().map(|(k, us, slices, e)| (k.clone(), serde_json::json!({ "cpu_us": us, "slices": slices, "engine": engine(*e) }))).collect();
+        let node = self.sh.fleet.as_ref().map(|f| f.cfg.node);
+        let tail = serde_json::json!({ "node": node, "version": option_env!("COMBD_VERSION").unwrap_or("dev"), "procs": procs }).to_string();
+        format!("{},{}", &body[..body.len() - 1], &tail[1..])
+    }
+
+    /// The node's side of the line: what the cells ask of it.
+    fn on_up(&mut self, m: Up) -> std::io::Result<()> {
+        // The cells run anyone's code: what they say is checked as a host
+        // call's is (a process they name: `start_call`, `db_ask`). What only
+        // a fleet's cells say, to a node in none, is dropped.
+        if self.core.is_none() && matches!(m, Up::Ran { .. } | Up::Skipped { .. } | Up::Sealed { .. } | Up::Restored { .. } | Up::Idle(_) | Up::Anchor { .. }) {
+            eprintln!("combd     the cells sent a fleet's message to a node in no fleet: dropped");
+            return Ok(());
         }
-        // ponytail: forgotten wholesale past 64K, not per socket; a socket
-        // lost after that may be told of twice (a second close: harmless).
-        if self.ws_lost.len() >= 1 << 16 {
-            self.ws_lost.clear();
+        match m {
+            Up::Answer { token, reply } => match self.tokens.remove(&token) {
+                Some(origin) => self.deliver(origin, reply),
+                None => Ok(()),
+            },
+            Up::Call { to, from, msg } => {
+                if let Err(e) = self.start_call(from, &msg, to) {
+                    match to {
+                        Some(to @ CallTo::Park(_)) => self.down(Down::Back { to, back: Back::Answer(json_err(&e)) }),
+                        Some(to) => self.down(Down::Back { to, back: Back::Answer(json_err(&e)) }),
+                        None => eprintln!("send: {e}"),
+                    }
+                }
+                Ok(())
+            }
+            Up::Ws { name, out } => self.apply_ws(&name, out),
+            Up::Stats(c) => {
+                for who in std::mem::take(&mut self.stats_waiting) {
+                    let body = self.stats_page(&c);
+                    self.deliver(Origin::Local(who), (200, body))?;
+                }
+                Ok(())
+            }
+            Up::Ran { name, req, reply, wrote, ws, rest } => {
+                self.core_ran(name, req, reply, wrote, ws, rest);
+                Ok(())
+            }
+            Up::Skipped { name, req } => {
+                self.skipped(&name, req);
+                Ok(())
+            }
+            Up::Sealed { name, act, changes, image } => {
+                self.sealed(name, act, changes, image);
+                Ok(())
+            }
+            Up::Restored { name, act, alarm, image } => {
+                self.restored(name, act, alarm, image);
+                Ok(())
+            }
+            Up::Submit { from, name, req } => {
+                let origin = match from {
+                    Asked::Tick => Origin::Tick,
+                    Asked::Alarm { at, tries } => Origin::Alarm { at, tries },
+                    Asked::Lost => Origin::Discard,
+                };
+                self.submit(origin, name, req);
+                Ok(())
+            }
+            Up::Idle(names) => {
+                self.idle(names);
+                Ok(())
+            }
+            Up::Behind(b) => {
+                if b != self.cells_behind {
+                    self.cells_behind = b;
+                    if b { self.sh.behind.fetch_add(1, Relaxed) } else { self.sh.behind.fetch_sub(1, Relaxed) };
+                }
+                Ok(())
+            }
+            Up::Anchor { name, on } => {
+                if on {
+                    self.anchored.insert(name);
+                } else {
+                    self.anchored.remove(&name);
+                }
+                Ok(())
+            }
+            Up::Db { to, proc, ask } => {
+                self.db_ask(to, proc, ask);
+                Ok(())
+            }
+            Up::DbClose(h) => {
+                if let Some(lease) = self.pg_handles.remove(&h) {
+                    lease.release();
+                }
+                Ok(())
+            }
         }
-        if self.ws_gone.get(name).is_some_and(|g| g.contains(&id)) || !self.ws_lost.insert(id) {
-            return;
-        }
-        self.submit(Origin::Socket((usize::MAX, 0), id, false), name.to_string(), format!("do WSCLOSE /{id} 1006"));
     }
 
     /// This loop no longer holds a socket's connection.
     fn forget(&mut self, id: u64, was_open: bool) {
-        if self.local_socks.remove(&id).is_some() && was_open {
-            self.sh.stats.sockets_open.fetch_sub(1, Relaxed);
+        if self.local_socks.remove(&id).is_some() {
+            self.down(Down::SockGone(id));
+            if was_open {
+                self.sh.stats.sockets_open.fetch_sub(1, Relaxed);
+            }
         }
     }
 
@@ -3162,6 +2629,7 @@ impl<E: Engine> Loop<'_, E> {
         c.busy = true; // no more HTTP on this connection
         c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: crate::ws::Decoder::with_max(self.sh.cfg.limits.max_ws_message), open: false, gone: false, inflight: 0 });
         self.local_socks.insert(sock, who);
+        self.down(Down::SockOpen(sock));
         self.submit(Origin::Socket(who, sock, true), name, format!("do WSOPEN {path} {sock}"));
     }
 
@@ -3183,215 +2651,9 @@ impl<E: Engine> Loop<'_, E> {
         c.busy = true;
         c.ws = Some(WsConn { obj: name.clone(), id: sock, key, dec: crate::ws::Decoder::with_max(self.sh.cfg.limits.max_ws_message), open: false, gone: false, inflight: 0 });
         self.local_socks.insert(sock, who);
-        self.sessions.insert(name.clone(), Session { sock, proc: p, cell: None, frozen: None, state: None, busy: false, running: String::new(), waiting: VecDeque::new(), last_used: Instant::now(), ready: false });
-        self.sh.stats.sessions_live.fetch_add(1, Relaxed);
+        self.down(Down::SockOpen(sock));
+        self.down(Down::Session { name: name.clone(), sock, proc: p });
         self.submit(Origin::Socket(who, sock, true), name, format!("do WSOPEN {path} {sock}"));
-    }
-
-    /// An event for a session: now, or after the ones ahead of it. One
-    /// that's gone gets 410; only a socket starts one.
-    fn session_submit(&mut self, origin: Origin, name: String, req: String) {
-        let Some(s) = self.sessions.get_mut(&name) else {
-            let _ = self.deliver(origin, (410, "{\"error\":\"that session is gone\"}".into()));
-            return;
-        };
-        // `on_close = "drop"`: the socket's gone, so the session is, unwoken.
-        // Everyone leaving at once (a deploy, a network blip) is then cheap.
-        if req.starts_with("do WSCLOSE ") && !self.app.procs[s.proc].wake_on_close {
-            self.remove_session(&name);
-            let _ = self.deliver(origin, (200, "{}".into()));
-            return;
-        }
-        // Behind (sessions waiting to wake): a short mailbox, so 40,000 of
-        // them can't hold a node's memory in queued messages.
-        let mailbox = if self.ready.is_empty() { self.app.procs[s.proc].mailbox } else { self.app.procs[s.proc].mailbox.min(BEHIND_MAILBOX) };
-        if s.waiting.len() >= mailbox && !req.starts_with("do WSCLOSE ") {
-            return self.overloaded(origin);
-        }
-        s.waiting.push_back((origin, req));
-        self.session_next(&name);
-    }
-
-    /// Start a session's next event. A hibernating one wakes first, with
-    /// what it kept (`do WAKE / <len>`, the bytes by `ws_msg`).
-    fn session_next(&mut self, name: &str) {
-        loop {
-            let Some(s) = self.sessions.get_mut(name) else { return };
-            if s.busy {
-                return;
-            }
-            // Asleep, with work: it wakes only if there's room for one more
-            // cell at work; else it waits its turn (`wake_ready`).
-            if s.cell.is_none() && (s.frozen.is_some() || s.state.is_some()) && !s.waiting.is_empty() && self.tasks.len() + self.parked.len() >= self.sh.cfg.max_awake {
-                if !s.ready {
-                    s.ready = true;
-                    self.ready.push_back(name.to_string());
-                    self.sh.stats.sessions_ready.fetch_add(1, Relaxed);
-                    self.sh.stats.sessions_waited.fetch_add(1, Relaxed);
-                }
-                return;
-            }
-            let Some((origin, req)) = s.waiting.pop_front() else { return };
-            let (origin, req, ws_in) = if req == HIBERNATE {
-                if s.cell.is_none() || !s.waiting.is_empty() {
-                    continue; // asleep already, or more to do first
-                }
-                (origin, req, vec![])
-            } else if let Some(frozen) = s.frozen.take() {
-                // Frozen by the host: the same cell again, where it was.
-                self.sh.stats.sessions_hibernated.fetch_sub(1, Relaxed);
-                self.sh.stats.sessions_woken.fetch_add(1, Relaxed);
-                let proc = s.proc;
-                match thawed(self.eng, &self.app, proc, &self.environ_for(proc), &frozen) {
-                    Ok(cell) => {
-                        self.sessions.get_mut(name).unwrap().cell = Some(cell);
-                        (origin, req, vec![])
-                    }
-                    Err(e) => {
-                        eprintln!("session {name:?}: can't thaw: {e}");
-                        let _ = self.deliver(origin, (500, "{\"error\":\"the session was lost\"}".into()));
-                        let sock = self.sessions.get(name).map(|s| s.sock);
-                        self.remove_session(name);
-                        if let Some(sock) = sock {
-                            let _ = self.ws_local(name, sock, 8, &1011u16.to_be_bytes());
-                        }
-                        return;
-                    }
-                }
-            } else if let Some(state) = s.state.take() {
-                s.waiting.push_front((origin, req));
-                self.sh.stats.sessions_hibernated.fetch_sub(1, Relaxed);
-                self.sh.stats.sessions_woken.fetch_add(1, Relaxed);
-                (Origin::Discard, format!("do WAKE / {}", state.len()), state)
-            } else {
-                (origin, req, vec![])
-            };
-            if let Err(reply) = self.run_session(name, origin, req, ws_in) {
-                // Let it crash: the session goes, and so does its socket.
-                let _ = self.deliver(origin, reply);
-                let sock = self.sessions.get(name).map(|s| s.sock);
-                self.remove_session(name);
-                if let Some(sock) = sock {
-                    let _ = self.ws_local(name, sock, 8, &1011u16.to_be_bytes());
-                }
-                return;
-            }
-            return;
-        }
-    }
-
-    /// Begin one event on a session: its warm cell, or a fresh one.
-    fn run_session(&mut self, name: &str, origin: Origin, mut req: String, mut ws_in: Vec<u8>) -> Result<(), (u16, String)> {
-        let (eng, app) = (self.eng, self.app.clone());
-        let proc = app.object_proc(name);
-        if let Some(rest) = req.strip_prefix("do WSBIN ") {
-            let (sock, b64) = rest.split_once(' ').unwrap_or((rest, ""));
-            ws_in = crate::ws::unbase64(b64).unwrap_or_default();
-            req = format!("do WSBIN {sock} {}", ws_in.len());
-        }
-        let environ = self.environ_for(proc);
-        let s = self.sessions.get_mut(name).unwrap();
-        let open = self.local_socks.contains_key(&s.sock);
-        let mut cell = match s.cell.take() {
-            Some(c) => c,
-            None => fresh(eng, &app, proc, &environ).map_err(|e| (500, format!("{{\"error\":{:?}}}", e.to_string())))?,
-        };
-        cell.host().ws_ids = if open { vec![s.sock] } else { vec![] };
-        cell.host().ws_out.clear();
-        cell.host().out.clear();
-        cell.host().ws_in = ws_in;
-        if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
-            eprintln!("session {name:?} trapped starting an event: {trap}");
-            return Err((500, String::new()));
-        }
-        s.busy = true;
-        s.last_used = Instant::now();
-        s.running = req.split(' ').nth(1).unwrap_or("").to_string();
-        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open: None, ws_drop: vec![], pg: vec![], ev: None, more: vec![] });
-        Ok(())
-    }
-
-    /// A session's event is done. No output gate: it has no storage, so its
-    /// answer and sends go now. A `HIBERNATE` answered `200 <state>` puts it
-    /// to sleep; a crash, a close, or a refused handshake ends it.
-    fn session_finish(&mut self, name: &str, mut cell: Cell<E>, answer: Result<String, String>, mut ws: Vec<WsOut>) -> Option<((u16, String), Vec<WsOut>)> {
-        let p = &self.app.procs[cell.proc];
-        let (hibernate, sleep, state_max) = (p.hibernate, p.sleep, p.state_max);
-        let s = self.sessions.get_mut(name)?;
-        s.busy = false;
-        s.last_used = Instant::now();
-        let method = std::mem::take(&mut s.running);
-        let (reply, ok) = match answer {
-            Ok(a) => (split_answer(&a), true),
-            Err(trap) => {
-                eprintln!("session {name:?} trapped: {trap}{}", said(&mut cell));
-                ((500, format!("{{\"error\":{trap:?}}}")), false)
-            }
-        };
-        let gone = !ok || method == "WSCLOSE" || (method == "WSOPEN" && reply.0 != 101);
-        let mut freeze = false;
-        if ok && method == "HIBERNATE" && reply.0 == 200 && reply.1.len() <= state_max {
-            // Its cell goes; what it kept is all that's left.
-            s.state = Some(reply.1.clone().into_bytes());
-            self.sh.stats.sessions_hibernated.fetch_add(1, Relaxed);
-        } else if ok {
-            if method == "HIBERNATE" && reply.0 == 200 {
-                eprintln!("session {name:?}: {} bytes of state is over state_kb, so it stays warm", reply.1.len());
-            }
-            s.cell = Some(cell);
-            // `hibernate_ms = 0`, or memory short: asleep after every event.
-            // (A burst of new sockets otherwise keeps a cell awake for each
-            // until its idle time, or the next sweep: thousands of them,
-            // tens of KB each, past a 1 GB node's limit.)
-            let short = self.sh.stats.pressure.load(Relaxed) >= 1;
-            if (hibernate.is_zero() || short) && !gone && method != "HIBERNATE" && s.waiting.is_empty() && !self.ticks.contains_key(name) {
-                match sleep {
-                    Sleep::App => s.waiting.push_back((Origin::Discard, HIBERNATE.into())),
-                    Sleep::Auto => freeze = true,
-                    Sleep::Off => {}
-                }
-            }
-        }
-        if !ok && self.local_socks.contains_key(&s.sock) {
-            ws.push(WsOut::Close(s.sock, 1011));
-        }
-        if gone {
-            self.remove_session(name);
-        } else if freeze {
-            self.freeze_session(name);
-        } else {
-            self.session_next(name);
-        }
-        Some((reply, ws))
-    }
-
-    /// The host puts an idle session to sleep: it keeps what the cell
-    /// changed (up to `state_kb`), and the cell goes. Too big, or an engine
-    /// that can't: it stays warm.
-    fn freeze_session(&mut self, name: &str) {
-        let max = self.sessions.get(name).map_or(0, |s| self.app.procs[s.proc].state_max);
-        let Some(s) = self.sessions.get_mut(name).filter(|s| !s.busy && s.waiting.is_empty()) else { return };
-        let Some(cell) = s.cell.take() else { return };
-        match cell.vm.freeze() {
-            Some(f) if f.len() <= max => {
-                s.frozen = Some(f);
-                self.sh.stats.sessions_hibernated.fetch_add(1, Relaxed);
-            }
-            _ => s.cell = Some(cell),
-        }
-    }
-
-    /// A session ends: what waits for it gets 410.
-    fn remove_session(&mut self, name: &str) {
-        let Some(s) = self.sessions.remove(name) else { return };
-        self.sh.stats.sessions_live.fetch_sub(1, Relaxed);
-        if s.state.is_some() || s.frozen.is_some() {
-            self.sh.stats.sessions_hibernated.fetch_sub(1, Relaxed);
-        }
-        self.ticks.remove(name);
-        for (origin, _) in s.waiting {
-            let _ = self.deliver(origin, (410, "{\"error\":\"that session is gone\"}".into()));
-        }
     }
 
     /// A new connection, in a free slot.
@@ -3402,340 +2664,8 @@ impl<E: Engine> Loop<'_, E> {
         });
         self.poll.registry().register(&mut s, Token(id), Interest::READABLE)?;
         self.next_gen += 1;
-        self.conns[id] = Some(Conn { s, gen: self.next_gen, rbuf, wbuf: vec![], wpos: 0, writing: false, close_after: false, busy: false, ws: None, tls: None, redirect: false, at: Instant::now(), reading: None, served: false, peer_done: false, linger: None, unsent: false });
+        self.conns[id] = Some(Conn { s, gen: self.next_gen, rbuf, wbuf: vec![], wpos: 0, writing: false, close_after: false, busy: false, ws: None, tls: None, redirect: false, at: Instant::now(), reading: None, served: false, peer_done: false, linger: None, unsent: false, token: None });
         Ok(id)
-    }
-
-    /// A request is done: put its cell back (or drop it after a crash), close
-    /// its object's transaction, and say what to answer now. `None`: the
-    /// answer is held until an fsync covers it.
-    ///
-    /// A cell that trapped is never used again. Its memory is half an
-    /// operation, and the guard-page AOT tier doesn't promise it's exact
-    /// at a trap either (LLVM may drop a store around a load that faults).
-    fn finish_task(&mut self, t: Task<E>, answer: Result<String, String>) -> Option<((u16, String), Vec<WsOut>)> {
-        let Task { mut cell, obj, origin, ws_open, ws_drop, pg, more, .. } = t;
-        // A batch: an answer each, in order. A count that's off fails them all.
-        let (answer, rest) = if more.is_empty() {
-            (answer, vec![])
-        } else {
-            match answer.and_then(|a| unframe(&a, 1 + more.len())) {
-                Ok(mut all) => {
-                    let first = all.remove(0);
-                    (Ok(first), more.into_iter().zip(all.into_iter().map(Ok)).collect())
-                }
-                Err(e) => (Err(e.clone()), more.into_iter().map(|o| (o, Err(e.clone()))).collect::<Vec<(Origin, Result<String, String>)>>()),
-            }
-        };
-        // A beat the request asked for, if it succeeded.
-        if let (Some(ms), Some(name), true) = (cell.host().tick.take(), &obj, answer.is_ok()) {
-            if ms == 0 {
-                self.ticks.remove(name);
-            } else {
-                let every = Duration::from_millis(ms);
-                let count = self.ticks.get(name).map_or(0, |t| t.2);
-                self.ticks.insert(name.clone(), (every, Instant::now() + every, count));
-            }
-        }
-        // A stateless request's handles end with it; a crash ends an
-        // object's (rolling back, releasing its locks).
-        for h in pg {
-            self.pg_close(h);
-        }
-        if answer.is_err() {
-            if let Some(name) = &obj {
-                let hs = self.objects.get(name).map(|o| o.pg.clone()).unwrap_or_default();
-                for h in hs {
-                    self.pg_close(h);
-                }
-            }
-        }
-        // WebSocket sends go out only if the request succeeds, and only
-        // after its writes are on disk (with the answer).
-        let ws = if answer.is_ok() { std::mem::take(&mut cell.host().ws_out) } else { vec![] };
-        cell.host().ws_out.clear();
-        let Some(name) = obj else {
-            return Some((match answer {
-                Ok(a) => {
-                    for out in ws {
-                        if let WsOut::Message(m) = out {
-                            if let Err(e) = self.start_call(cell.proc, &m, None) {
-                                eprintln!("send: {e}");
-                            }
-                        }
-                    }
-                    // `fresh`: the next request starts from the module's image.
-                    if !self.app.procs[cell.proc].retired && !self.app.procs[cell.proc].fresh {
-                        self.pools[cell.proc].push((cell, Instant::now()));
-                    }
-                    split_answer(&a)
-                }
-                Err(trap) => {
-                    // Let it crash: this cell is dropped; the pool makes a fresh one when needed.
-                    eprintln!("cell trapped: {trap}{}", said(&mut cell));
-                    (500, format!("{{\"error\":{trap:?}}}"))
-                }
-            }, vec![]));
-        };
-        // A session's, even if it's gone while this ran (its socket closed,
-        // with `on_close = "drop"`): `session_finish` lets that go.
-        if self.app.procs[cell.proc].socket {
-            return self.session_finish(&name, cell, answer, ws);
-        }
-        if let Origin::Fleet(req) = origin {
-            return self.fleet_finish(name, req, cell, answer, ws, ws_open, ws_drop, rest).map(|r| (r, vec![]));
-        }
-        let o = self.objects.get_mut(&name).expect("object of a running task");
-        o.busy = false;
-        o.last_used = Instant::now();
-        let dirty = std::mem::take(&mut cell.host().alarm_dirty) || matches!(origin, Origin::Alarm { .. });
-        let mut ok = false;
-        let mut new_alarm = None;
-        let mut wrote = false;
-        let mut joined = None;
-        let reply = {
-            let db = o.db.lock().unwrap();
-            match answer {
-                Ok(a) if ws_accepted(&a, ws_open).is_some_and(|id| db.update_sockets(Some(id), &[]).is_err()) => {
-                    eprintln!("object {name:?}: socket list: can't add");
-                    db.rollback();
-                    (500, "{\"error\":\"storage\"}".into())
-                }
-                Ok(a) => {
-                    let alarm = if dirty { db.alarm() } else { None };
-                    // A new alarm goes in the index before the commit, so it can't be lost.
-                    if let Some(at) = alarm {
-                        if let Err(e) = self.sh.index.lock().unwrap().set(&name, Some(at)) {
-                            eprintln!("object {name:?}: alarm index: {e}");
-                        }
-                    }
-                    match db.commit() {
-                        Ok(w) => {
-                            o.cell = Some(cell);
-                            ok = true;
-                            wrote = w;
-                            new_alarm = alarm;
-                            joined = ws_accepted(&a, ws_open);
-                            split_answer(&a)
-                        }
-                        Err(e) => {
-                            // Memory and disk no longer agree, so the cell goes too.
-                            eprintln!("object {name:?}: commit failed: {e}");
-                            db.rollback();
-                            (500, "{\"error\":\"storage\"}".into())
-                        }
-                    }
-                }
-                Err(trap) => {
-                    eprintln!("object {name:?} trapped: {trap}{}", said(&mut cell));
-                    db.rollback();
-                    (500, format!("{{\"error\":{trap:?}}}"))
-                }
-            }
-        };
-        // The rest of a batch: their own answers if it committed, else the
-        // first's failure.
-        let rest: Vec<(Origin, (u16, String))> = rest.into_iter().map(|(o, a)| (o, match a { Ok(a) if ok => split_answer(&a), _ => reply.clone() })).collect();
-        if ok {
-            self.sockets_committed(&name, joined, &ws_drop);
-        }
-        if ok && dirty {
-            match new_alarm {
-                Some(at) => self.alarms.push(Reverse((at, name.clone()))),
-                // A cleared alarm leaves the index only after the commit.
-                None => {
-                    let _ = self.sh.index.lock().unwrap().set(&name, None);
-                }
-            }
-        }
-        if let Origin::Alarm { tries, .. } = origin {
-            self.alarm_done(&name, ok, tries);
-        }
-        // The output gate: an answer leaves only once every commit up to now
-        // is on disk, its own included. Reads wait too, since they may have
-        // seen a write that isn't on disk yet.
-        let mut out = Some((reply, ws));
-        if let Some(o) = self.objects.get_mut(&name) {
-            if wrote {
-                o.committed += 1;
-                self.sh.stats.commits.fetch_add(1, Relaxed);
-            }
-            if ok && o.committed > o.synced {
-                let (reply, ws) = out.take().unwrap();
-                o.held.push((o.committed, origin, reply, ws));
-                let gen = o.committed;
-                o.held.extend(rest.iter().map(|(origin, reply)| (gen, *origin, reply.clone(), vec![])));
-                self.kick_sync(&name);
-            }
-        }
-        if out.is_some() {
-            for (origin, reply) in rest {
-                let _ = self.deliver(origin, reply);
-            }
-        }
-        self.next_waiting(&name);
-        out
-    }
-
-    /// Start an fsync for an object if it has commits that aren't on disk
-    /// and none is running.
-    fn kick_sync(&mut self, name: &str) {
-        let Some(o) = self.objects.get_mut(name) else { return };
-        if o.syncing || o.checkpointing {
-            return;
-        }
-        let (file, db_path, wants) = {
-            let db = o.db.lock().unwrap();
-            if o.committed <= o.synced && !db.wants_checkpoint() {
-                return;
-            }
-            (db.wal_file(), db.path().to_path_buf(), db.wants_checkpoint())
-        };
-        // Pause the object for a checkpoint only between requests.
-        let ckpt = wants && !o.busy;
-        if o.committed <= o.synced && !ckpt {
-            return;
-        }
-        let gen = o.committed;
-        match file {
-            Ok(file) => {
-                o.syncing = true;
-                o.checkpointing = ckpt;
-                self.sh.stats.fsyncs.fetch_add(1, Relaxed);
-                let job = SyncJob { file, db_path, ckpt, obj: name.to_string(), gen, back: self.me, dirs: std::mem::take(&mut o.new_dirs) };
-                let _ = self.sh.sync.lock().unwrap().send(job);
-            }
-            Err(e) => {
-                eprintln!("object {name:?}: can't open its WAL to fsync: {e}");
-                let _ = self.synced(name, gen, false);
-            }
-        }
-    }
-
-    /// An fsync finished: release the answers it covers.
-    fn synced(&mut self, name: &str, gen: u64, ok: bool) -> std::io::Result<()> {
-        let Some(o) = self.objects.get_mut(name) else { return Ok(()) };
-        o.syncing = false;
-        let ready: Vec<(Origin, (u16, String), Vec<WsOut>)> = if ok {
-            o.synced = o.synced.max(gen);
-            let synced = o.synced;
-            let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut o.held).into_iter().partition(|(g, ..)| *g <= synced);
-            o.held = rest;
-            done.into_iter().map(|(_, origin, reply, ws)| (origin, reply, ws)).collect()
-        } else {
-            // After a failed fsync, nothing in memory can be trusted to be on
-            // disk (the "fsyncgate" lesson). Fail what's held, and drop the
-            // object so the next request reads what's really there.
-            eprintln!("object {name:?}: fsync failed, dropping it");
-            let o = self.remove_object(name).unwrap();
-            self.sh.stats.objects_live.fetch_sub(1, Relaxed);
-            let mut failed: Vec<(Origin, (u16, String), Vec<WsOut>)> =
-                o.held.into_iter().map(|(_, origin, ..)| (origin, (500, "{\"error\":\"storage\"}".to_string()), vec![])).collect();
-            failed.extend(o.waiting.into_iter().map(|(origin, _)| (origin, (503, "{\"error\":\"storage\"}".to_string()), vec![])));
-            failed
-        };
-        for (origin, reply, ws) in ready {
-            self.release(Some(name), origin, reply, ws)?;
-        }
-        self.kick_sync(name);
-        Ok(())
-    }
-
-    /// After an alarm ran: forget its retries, or schedule the next one.
-    fn alarm_done(&mut self, name: &str, ok: bool, tries: u32) {
-        if ok {
-            self.sh.stats.alarms_fired.fetch_add(1, Relaxed);
-            self.tries.remove(name);
-            return;
-        }
-        self.sh.stats.alarms_failed.fetch_add(1, Relaxed);
-        if tries + 1 < ALARM_TRIES {
-            self.tries.insert(name.to_string(), tries + 1);
-            let at = now_ms() + (ALARM_BACKOFF_MS << tries);
-            self.alarms.push(Reverse((at, name.to_string())));
-            return;
-        }
-        // Out of tries: drop the alarm, as Cloudflare does.
-        eprintln!("object {name:?}: alarm failed {ALARM_TRIES} times, dropping it");
-        self.tries.remove(name);
-        if let Some(o) = self.objects.get(name) {
-            let db = o.db.lock().unwrap();
-            if db.begin().is_ok() && db.set_alarm(None).is_ok() && db.commit().is_ok() {
-                let _ = self.sh.index.lock().unwrap().set(name, None);
-            } else {
-                db.rollback();
-            }
-            drop(db);
-            if let Some(o) = self.objects.get_mut(name) {
-                o.committed += 1;
-            }
-            self.kick_sync(name);
-        }
-    }
-
-    /// Run every alarm that's due.
-    /// Objects' beats that are due. A beat is skipped, not queued, while the
-    /// object is busy, so a slow tick never piles up; an object that's left
-    /// memory (or this node) has no beat.
-    fn fire_ticks(&mut self) {
-        let now = Instant::now();
-        let due: Vec<String> = self.ticks.iter().filter(|(_, t)| t.1 <= now).map(|(n, _)| n.clone()).collect();
-        for name in due {
-            let Some(o) = self.objects.get(&name) else {
-                self.ticks.remove(&name);
-                continue;
-            };
-            let idle = !o.busy && o.waiting.is_empty();
-            let t = self.ticks.get_mut(&name).unwrap();
-            t.1 = now + t.0;
-            if idle {
-                t.2 += 1;
-                let n = t.2;
-                self.submit(Origin::Tick, name, format!("do TICK / {n}"));
-            }
-        }
-    }
-
-    fn fire_alarms(&mut self) {
-        let now = now_ms();
-        while self.alarms.peek().is_some_and(|Reverse((at, _))| *at <= now) {
-            let Reverse((at, name)) = self.alarms.pop().unwrap();
-            let tries = self.tries.get(&name).copied().unwrap_or(0);
-            self.submit(Origin::Alarm { at, tries }, name, format!("do ALARM / {tries}"));
-        }
-    }
-
-    /// Drop objects from memory that have been idle too long, or the least
-    /// recently used ones past the limit.
-    fn sweep(&mut self) {
-        self.last_sweep = Instant::now();
-        self.retire_cells();
-        let idle = self.idle_limit();
-        self.sweep_cells();
-        // Database handles keep an object here until they've been idle for
-        // their pool's `session_idle_ms`; then they close, and it can leave.
-        let handles = &self.pg_handles;
-        let idle_for = |o: &Object<E>| o.pg.iter().filter_map(|h| handles.get(h)).map(|ph| ph.lease.session_idle).min();
-        let stale: Vec<u64> = self.objects.values().filter(|o| !o.busy && idle_for(o).is_some_and(|d| o.pg_used.elapsed() >= d)).flat_map(|o| o.pg.clone()).collect();
-        for h in stale {
-            self.pg_close(h);
-        }
-        let free = |o: &Object<E>| !o.busy && o.waiting.is_empty() && !o.syncing && o.held.is_empty() && !o.checkpointing && o.pg.is_empty();
-        // A ticking object stays: its beat is its life.
-        let ticks = &self.ticks;
-        let mut gone: Vec<String> = self.objects.iter().filter(|(n, o)| free(o) && !ticks.contains_key(*n) && o.last_used.elapsed() >= idle).map(|(n, _)| n.clone()).collect();
-        let over = self.objects.len().saturating_sub(gone.len()).saturating_sub(self.sh.cfg.max_objects);
-        if over > 0 {
-            let mut lru: Vec<(&String, Instant)> =
-                self.objects.iter().filter(|(n, o)| free(o) && !gone.contains(n)).map(|(n, o)| (n, o.last_used)).collect();
-            lru.sort_by_key(|(_, t)| *t);
-            gone.extend(lru.into_iter().take(over).map(|(n, _)| n.clone()));
-        }
-        for name in gone {
-            self.remove_object(&name);
-            self.sh.stats.objects_live.fetch_sub(1, Relaxed);
-            self.sh.stats.evictions.fetch_add(1, Relaxed);
-        }
     }
 
     /// A new certificate on disk (a renewal, a new name): new connections get
@@ -3763,7 +2693,7 @@ impl<E: Engine> Loop<'_, E> {
     /// sessions waiting to wake as may be at work): no new connections or
     /// sockets.
     fn full(&self) -> bool {
-        self.sh.stats.pressure.load(Relaxed) >= 2 || self.ready.len() >= self.sh.cfg.max_awake
+        self.sh.stats.pressure.load(Relaxed) >= 2 || self.cells_behind
     }
 
     /// A full node stops listening, so a new connection is refused at TCP
@@ -3774,11 +2704,6 @@ impl<E: Engine> Loop<'_, E> {
     /// stays, and `accept` still turns away what gets in meanwhile.
     fn follow_listener(&mut self) {
         let sh = self.sh;
-        let behind = self.ready.len() >= sh.cfg.max_awake;
-        if behind != self.behind {
-            self.behind = behind;
-            if behind { sh.behind.fetch_add(1, Relaxed) } else { sh.behind.fetch_sub(1, Relaxed) };
-        }
         if self.me == 0 && self.listen_changed.elapsed() >= REFUSE_MIN {
             let full = sh.stats.pressure.load(Relaxed) >= 2 || sh.stats.conns_open.load(Relaxed) >= sh.cfg.max_conns || sh.behind.load(Relaxed) == sh.cfg.threads;
             let mut public = sh.public.lock().unwrap();
@@ -3809,26 +2734,6 @@ impl<E: Engine> Loop<'_, E> {
         }
     }
 
-    /// Wake sleeping sessions with work, in order, while there's room.
-    fn wake_ready(&mut self) {
-        while self.tasks.len() + self.parked.len() < self.sh.cfg.max_awake {
-            let Some(name) = self.ready.pop_front() else { return };
-            self.sh.stats.sessions_ready.fetch_sub(1, Relaxed);
-            if let Some(s) = self.sessions.get_mut(&name) {
-                s.ready = false;
-                self.session_next(&name);
-            }
-        }
-    }
-
-    /// How long idle is too long: shorter while memory is short.
-    /// How long an idle object stays: shorter while memory is short, but
-    /// not a second (letting an object go and bringing it back costs more
-    /// than keeping it: on a node, every chunk went and came back in turn).
-    fn idle_limit(&self) -> Duration {
-        if self.sh.stats.pressure.load(Relaxed) >= 1 { SQUEEZED_IDLE.min(self.sh.cfg.idle) } else { self.sh.cfg.idle }
-    }
-
     /// What every sweep does, one node or a fleet: warm worker cells back to
     /// what's been needed lately, and sessions idle past their
     /// `hibernate_ms` give up their cell for their state. Loop 0 also
@@ -3854,7 +2759,9 @@ impl<E: Engine> Loop<'_, E> {
         st.pressure.store(p, Relaxed);
     }
 
-    fn sweep_cells(&mut self) {
+    /// The node's sweep: memory and disk (loop 0), the listener, TLS, and
+    /// connections' timeouts.
+    fn sweep_node(&mut self) {
         if self.me == 0 {
             let st = &self.sh.stats;
             self.measure();
@@ -3876,92 +2783,12 @@ impl<E: Engine> Loop<'_, E> {
         if self.last_conn_check.elapsed() >= Duration::from_millis(250) {
             self.last_conn_check = Instant::now();
             self.check_conns();
-            self.publish_ran();
         }
-        let squeeze = self.sh.stats.pressure.load(Relaxed) >= 1;
-        // Warm worker cells are cheap to make again: they go after a second.
-        let idle = if squeeze { Duration::from_secs(1).min(self.sh.cfg.idle) } else { self.sh.cfg.idle };
-        for pool in &mut self.pools {
-            trim_idle(pool, idle);
+        let health = (self.sh.stats.pressure.load(Relaxed), self.sh.stats.disk_low.load(Relaxed) == 1);
+        if health != self.health {
+            self.health = health;
+            self.down(Down::Health { pressure: health.0, disk_low: health.1 });
         }
-        // Those whose socket is gone (they closed it) go.
-        let (procs, ticks, socks) = (&self.app.procs, &self.ticks, &self.local_socks);
-        let mut sleepy = vec![];
-        let mut ended = vec![];
-        for (n, s) in self.sessions.iter().filter(|(_, s)| !s.busy && s.waiting.is_empty()) {
-            if !socks.contains_key(&s.sock) {
-                ended.push(n.clone());
-            } else if s.cell.is_some() && !ticks.contains_key(n) && (squeeze || s.last_used.elapsed() >= procs[s.proc].hibernate) {
-                sleepy.push((n.clone(), procs[s.proc].sleep));
-            }
-        }
-        for n in ended {
-            self.remove_session(&n);
-        }
-        for (n, sleep) in sleepy {
-            match sleep {
-                Sleep::App => self.session_submit(Origin::Discard, n, HIBERNATE.into()),
-                Sleep::Auto => self.freeze_session(&n),
-                Sleep::Off => {}
-            }
-        }
-    }
-
-    /// Start the next request queued on an object, skipping closed connections.
-    fn next_waiting(&mut self, name: &str) {
-        if self.objects.get(name).is_some_and(|o| o.checkpointing || o.busy) {
-            return;
-        }
-        while let Some((origin, req)) = self.objects.get_mut(name).and_then(|o| o.waiting.pop_front()) {
-            if let Origin::Local(who) = origin {
-                if self.conn(who).is_none() {
-                    continue;
-                }
-            }
-            // Waiting requests are a batch, if the object takes them so: one
-            // run, one transaction, an answer each.
-            let (req, more) = self.batch_after(name, origin, req);
-            let n = 1 + more.len() as u64;
-            match self.run_object(name, origin, req, more.clone()) {
-                Ok(true) => {
-                    if n > 1 {
-                        self.sh.stats.batched.fetch_add(n, Relaxed);
-                    }
-                    return;
-                }
-                Ok(false) => {
-                    self.fleet_skip(name, origin); // a stale alarm: nothing ran
-                    continue;
-                }
-                Err(reply) => {
-                    for o in std::iter::once(origin).chain(more) {
-                        let _ = self.deliver(o, reply.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    /// After `first`, the plain requests waiting behind it, up to the
-    /// process's `batch`, if its cell takes batches (exports `handle_batch`):
-    /// all of them framed, and the others' origins. Else `first` alone.
-    /// WebSocket events, alarms, and beats go one at a time.
-    fn batch_after(&mut self, name: &str, origin: Origin, first: String) -> (String, Vec<Origin>) {
-        let max = self.app.procs[self.app.object_proc(name)].batch;
-        let plain = |o: &Origin, r: &str| !matches!(o, Origin::Alarm { .. } | Origin::Tick) && matches!(r.split(' ').nth(1), Some("GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"));
-        let Some(o) = self.objects.get_mut(name) else { return (first, vec![]) };
-        let takes = max > 1 && plain(&origin, &first) && o.waiting.front().is_some_and(|(o, r)| plain(o, r)) && o.cell.as_mut().is_some_and(|c| c.vm.has_export("handle_batch"));
-        if !takes {
-            return (first, vec![]);
-        }
-        let mut reqs = vec![first];
-        let mut more = vec![];
-        while reqs.len() < max && o.waiting.front().is_some_and(|(o, r)| plain(o, r)) {
-            let (o, r) = o.waiting.pop_front().unwrap();
-            more.push(o);
-            reqs.push(r);
-        }
-        (frame(&reqs), more)
     }
 
     fn conn(&mut self, (id, gen): Who) -> Option<&mut Conn> {
@@ -3970,8 +2797,12 @@ impl<E: Engine> Loop<'_, E> {
 
     /// Buffer an answer for `who`, if it's still connected.
     fn queue_reply(&mut self, who: Who, (status, payload): (u16, String)) {
+        self.queue_reply_str(who, status, payload.as_bytes());
+    }
+
+    fn queue_reply_str(&mut self, who: Who, status: u16, payload: &[u8]) {
         if let Some(c) = self.conn(who) {
-            let (head, body) = reply_parts(&payload);
+            let (head, body) = reply_parts(payload);
             let _ = write!(c.wbuf, "HTTP/1.1 {status} OK\r\n");
             if !head.iter().any(|h| h.starts_with("content-type:")) {
                 let _ = write!(c.wbuf, "content-type: application/json\r\n");
@@ -3980,7 +2811,7 @@ impl<E: Engine> Loop<'_, E> {
                 let _ = write!(c.wbuf, "{h}\r\n");
             }
             let _ = write!(c.wbuf, "content-length: {}\r\n\r\n", body.len());
-            c.wbuf.extend_from_slice(body.as_bytes());
+            c.wbuf.extend_from_slice(body);
             c.busy = false;
             c.at = Instant::now();
         }
@@ -4016,37 +2847,6 @@ impl<E: Engine> Loop<'_, E> {
         }
         c.busy = false;
         c.at = Instant::now();
-    }
-
-    /// Connections past their time (`Limits`): a request still arriving
-    /// past the read timeout gets 408; a new one that sent nothing, a kept
-    /// one idle past keep-alive, or a TLS handshake that drags, just closes.
-    /// WebSockets and requests at work are left alone.
-    fn ran(&mut self, proc: usize, at: Instant, slices: u64) {
-        if self.ran.len() <= proc {
-            self.ran.resize(proc + 1, (0, 0));
-        }
-        let r = &mut self.ran[proc];
-        r.0 += at.elapsed().as_nanos() as u64;
-        r.1 += slices;
-    }
-
-    /// This loop's time per process, into what the node shows (by name, as
-    /// a deploy renumbers them).
-    fn publish_ran(&mut self) {
-        if self.ran.iter().all(|r| r.1 == 0 && r.0 == 0) {
-            return;
-        }
-        let mut procs = self.sh.procs.lock().unwrap();
-        for (i, r) in self.ran.iter_mut().enumerate().filter(|(_, r)| r.0 > 0) {
-            let Some(p) = self.app.procs.get(i) else { continue };
-            let t = &self.app.tenants[p.tenant];
-            let e = procs.entry(format!("{}/{}/{}", t.org, t.app, p.name)).or_insert((0, 0, p.engine));
-            e.0 += r.0 / 1000;
-            e.1 += r.1;
-            e.2 = p.engine;
-            *r = (0, 0);
-        }
     }
 
     fn check_conns(&mut self) {
@@ -4110,6 +2910,9 @@ impl<E: Engine> Loop<'_, E> {
                 let _ = self.poll.registry().deregister(&mut c.s);
                 self.free.push(id);
                 self.sh.stats.conns_open.fetch_sub(1, Relaxed);
+                if let Some(t) = c.token.filter(|t| self.tokens.remove(t).is_some()) {
+                    self.down(Down::Cancel(t));
+                }
             }
             return Ok(());
         }
@@ -4182,62 +2985,9 @@ impl<E: Engine> Loop<'_, E> {
                 }
             }
             Req::Stats => {
-                let s = &self.sh.stats;
-                let body = format!(
-                    "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"moves\":{},\"reseats\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"disk_low\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
-                    s.objects_live.load(Relaxed),
-                    s.objects_opened.load(Relaxed),
-                    s.evictions.load(Relaxed),
-                    s.alarms_fired.load(Relaxed),
-                    s.alarms_failed.load(Relaxed),
-                    s.forwarded.load(Relaxed),
-                    s.commits.load(Relaxed),
-                    s.fsyncs.load(Relaxed),
-                    s.checkpoints.load(Relaxed),
-                    s.fsyncs_slow.load(Relaxed),
-                    s.fsync_max_us.load(Relaxed),
-                    s.peer_acks.load(Relaxed),
-                    s.bucket_acks.load(Relaxed),
-                    s.fences.load(Relaxed),
-                    s.tail_entries.load(Relaxed),
-                    s.uploads.load(Relaxed),
-                    s.lease_reads.load(Relaxed),
-                    s.fence_waits.load(Relaxed),
-                    s.gc_deleted.load(Relaxed),
-                    s.moves.load(Relaxed),
-                    s.reseats.load(Relaxed),
-                    s.sockets_open.load(Relaxed),
-                    s.ws_messages.load(Relaxed),
-                    s.ws_handoffs.load(Relaxed),
-                    s.sessions_live.load(Relaxed),
-                    s.sessions_hibernated.load(Relaxed),
-                    s.sessions_woken.load(Relaxed),
-                    s.sessions_ready.load(Relaxed),
-                    s.sessions_waited.load(Relaxed),
-                    s.mailbox_refused.load(Relaxed),
-                    s.batched.load(Relaxed),
-                    s.ws_frames.load(Relaxed),
-                    s.ws_flushes.load(Relaxed),
-                    combd_mem::heap_in_use(),
-                    s.conns_open.load(Relaxed),
-                    s.conns_refused.load(Relaxed),
-                    s.tcp_refusing.load(Relaxed),
-                    s.disk_low.load(Relaxed),
-                    s.accept_failed.load(Relaxed),
-                    s.memory_used.load(Relaxed),
-                    self.sh.cfg.memory_budget.unwrap_or(0),
-                    s.machine_available.load(Relaxed),
-                    s.pressure.load(Relaxed),
-                    s.ev_instances.load(Relaxed),
-                    s.ev_requests.load(Relaxed)
-                );
-                // Per process: the time its cells ran (us, host calls in) and their slices.
-                let engine = |k: crate::engine::Kind| if k == crate::engine::Kind::Compiled { "compiled" } else { "interpreted" };
-                let procs: serde_json::Map<String, serde_json::Value> = self.sh.procs.lock().unwrap().iter().map(|(k, &(us, slices, e))| (k.clone(), serde_json::json!({ "cpu_us": us, "slices": slices, "engine": engine(e) }))).collect();
-                let node = self.sh.fleet.as_ref().map(|f| f.cfg.node);
-                let tail = serde_json::json!({ "node": node, "version": option_env!("COMBD_VERSION").unwrap_or("dev"), "procs": procs }).to_string();
-                let body = format!("{},{}", &body[..body.len() - 1], &tail[1..]);
-                self.queue_reply(who, (200, body));
+                // The cells' counts are theirs: ask (`on_up` answers).
+                self.stats_waiting.push(who);
+                self.down(Down::Stats);
             }
             Req::NewId => self.queue_reply(who, (200, format!("{{\"id\":\"{}\"}}", uuid_v7()))),
             Req::NotFound => self.queue_reply(who, (404, "{\"error\":\"no route\"}".into())),
@@ -4260,19 +3010,8 @@ impl<E: Engine> Loop<'_, E> {
 
     /// A request for a worker process, on this loop.
     fn run_cell(&mut self, origin: Origin, p: usize, req: String) -> std::io::Result<()> {
-        if self.ev_mode[p] {
-            return self.ev_request(origin, p, req);
-        }
-        let mut cell = match self.pools[p].pop().map(|(c, _)| c) {
-            Some(cell) => cell,
-            None => fresh(self.eng, &self.app, p, &self.environ_for(p))?,
-        };
-        cell.host().out.clear();
-        if let Err(trap) = crate::start(&mut cell.vm, &req, &mut cell.st) {
-            eprintln!("cell trapped starting a request: {trap}");
-            return self.deliver(origin, (500, String::new()));
-        }
-        self.tasks.push_back(Task { origin, cell, obj: None, ws_open: None, ws_drop: vec![], pg: vec![], ev: None, more: vec![] });
+        let origin = self.tok(origin);
+        self.down(Down::Worker { origin, proc: p, req });
         Ok(())
     }
 
@@ -4300,8 +3039,10 @@ impl<E: Engine> Loop<'_, E> {
     fn start_call(&mut self, from: usize, msg: &[u8], to: Option<CallTo>) -> Result<(), String> {
         let v: serde_json::Value = serde_json::from_slice(msg).map_err(|_| "want JSON: {\"to\", \"method\", \"path\", \"body\"}".to_string())?;
         let target = v["to"].as_str().ok_or("name the process: \"to\"")?;
-        let caller = &self.app.procs[from].name;
-        let tenant = self.app.procs[from].tenant;
+        // The cells never have a newer app than the node's: a process past
+        // its own is a broken or hostile message (or no app yet).
+        let me = self.app.procs.get(from).ok_or_else(|| format!("no process {from}"))?;
+        let (caller, tenant) = (&me.name, me.tenant);
         // By name: a caller still on an older version (a deploy just came)
         // is the same process as far as `callers` goes.
         let allowed = |t: &usize| !self.app.router.legacy && self.app.procs[*t].callers.iter().any(|&c| self.app.procs[c].name == *caller);
@@ -4370,7 +3111,7 @@ impl<E: Engine> Loop<'_, E> {
                     }
                 },
                 (None, Some(_)) if node != me => {
-                    self.forward(node, FReq { origin, name, cell_req: line("do"), hops: 0, act: 0, resp: None, ws: vec![], retries: 0 });
+                    self.forward(node, FReq { origin, name, cell_req: line("do"), hops: 0, act: 0, resp: None, ws: vec![], retries: 0, seq: None });
                     Ok(())
                 }
                 (None, _) => self.run_obj(origin, name, line("do")),
@@ -4385,7 +3126,7 @@ impl<E: Engine> Loop<'_, E> {
             // matchmaker does to put a match near both players.
             match (v["node"].as_u64(), &self.sh.fleet) {
                 (Some(n), Some(f)) if n as u32 != f.cfg.node && f.cfg.peers.contains_key(&(n as u32)) => {
-                    self.forward(n as u32, FReq { origin, name, cell_req: line("do"), hops: 0, act: 0, resp: None, ws: vec![], retries: 0 });
+                    self.forward(n as u32, FReq { origin, name, cell_req: line("do"), hops: 0, act: 0, resp: None, ws: vec![], retries: 0, seq: None });
                     Ok(())
                 }
                 _ => self.run_obj(origin, name, line("do")),
@@ -4394,93 +3135,6 @@ impl<E: Engine> Loop<'_, E> {
             self.run_cell(origin, t, line("api"))
         };
         r.map_err(|e: std::io::Error| e.to_string())
-    }
-
-    /// A deploy swapped in a new app: take it. Processes it retired keep
-    /// what's running and get nothing new; their warm cells go, and an
-    /// object's old cell gives way to a fresh one (its storage stays).
-    fn pick_up_app(&mut self) -> std::io::Result<()> {
-        let gen = self.live.gen.load(Relaxed);
-        if gen == self.app_gen {
-            return Ok(());
-        }
-        self.app_gen = gen;
-        let from = self.app.procs.len();
-        self.app = self.live.now();
-        let app = self.app.clone();
-        for (p, pool) in self.pools.iter_mut().enumerate() {
-            if app.procs[p].retired {
-                pool.clear();
-            }
-        }
-        self.retire_cells();
-        self.warm(from)
-    }
-
-    /// Objects still on an older version's code move to the new one (their
-    /// cell goes; the next request starts one) once they're not in the
-    /// middle of something: no request running, no open sockets, no beat.
-    /// So a deploy never ends a game in play. ponytail: an object that keeps
-    /// sockets open forever stays on its old version until they close.
-    fn retire_cells(&mut self) {
-        let (app, ticks) = (&self.app, &self.ticks);
-        for (name, o) in self.objects.iter_mut() {
-            let old = o.cell.as_ref().is_some_and(|c| app.procs[c.proc].retired);
-            let mid = o.busy || ticks.contains_key(name) || o.socks.as_ref().is_some_and(|s| !s.is_empty());
-            if old && !mid {
-                o.cell = None;
-            }
-        }
-    }
-
-    /// New processes (from `from` on): a warm cell each, and whether it's an
-    /// event cell.
-    fn warm(&mut self, from: usize) -> std::io::Result<()> {
-        // The apps' pools: started here if they're new (idempotent).
-        if let Some(pools) = &self.sh.pg {
-            pools.ensure(&self.app.pools());
-        }
-        self.pools.resize_with(self.app.procs.len(), Vec::new);
-        self.ev_mode.resize(self.app.procs.len(), false);
-        for p in from..self.app.procs.len() {
-            if self.app.procs[p].retired {
-                continue;
-            }
-            // A ws process's sessions start their own.
-            if self.app.procs[p].socket {
-                continue;
-            }
-            let mut first = fresh(self.eng, &self.app, p, &self.environ_for(p))?;
-            self.ev_mode[p] = first.vm.has_export("on_request");
-            self.pools[p].push((first, Instant::now()));
-        }
-        Ok(())
-    }
-
-    /// Each org's slices this round (`None`: one org, no limit).
-    fn round_share(&self) -> Option<usize> {
-        if self.app.router.legacy || self.tasks.len() <= ROUND {
-            return None;
-        }
-        let mut orgs: Vec<&str> = self.tasks.iter().map(|t| self.app.tenants[self.app.procs[t.cell.proc].tenant].org.as_str()).collect();
-        orgs.sort_unstable();
-        orgs.dedup();
-        (orgs.len() > 1).then(|| (ROUND / orgs.len()).max(1))
-    }
-
-    /// The env vars a process's cells get: its app's (no manifest: the node's).
-    /// ... plus the host's own: `COMBD_ORG`, `COMBD_APP`, `COMBD_PROCESS`,
-    /// `COMBD_NODE` (an app can't declare `COMBD_` names).
-    fn environ_for(&self, proc: usize) -> Arc<Vec<Vec<u8>>> {
-        if self.app.router.legacy {
-            return self.sh.cfg.environ.clone();
-        }
-        let p = &self.app.procs[proc];
-        let t = &self.app.tenants[p.tenant];
-        let node = self.sh.fleet.as_ref().map_or(0, |f| f.cfg.node);
-        let mut e = (*t.environ).clone();
-        e.extend([format!("COMBD_ORG={}", t.org), format!("COMBD_APP={}", t.app), format!("COMBD_PROCESS={}", p.name), format!("COMBD_NODE={node}")].map(String::into_bytes));
-        Arc::new(e)
     }
 
     /// May process `proc` lease from pool `pool`? Its `callers` decide (with
@@ -4495,33 +3149,57 @@ impl<E: Engine> Loop<'_, E> {
     /// A `call` is answered: tell whoever waits (once; a late answer is dropped).
     fn call_done(&mut self, id: u64, (status, body): (u16, String)) {
         let Some((to, _)) = self.calls.remove(&id) else { return };
-        let (_, body) = reply_parts(&body);
+        let (_, body) = reply_parts(body.as_bytes());
+        let body = String::from_utf8_lossy(body);
         self.call_reply(to, serde_json::json!({ "status": status, "body": body }).to_string().into_bytes());
     }
 
     fn call_reply(&mut self, to: CallTo, payload: Vec<u8>) {
-        match to {
-            CallTo::Ev(inst, gen, ticket) => self.ev_done(inst, gen, ticket, DbDone::Answer(payload)),
-            CallTo::Park(park) => self.db_done(park, DbDone::Answer(payload)),
+        self.down(Down::Back { to, back: Back::Answer(payload) });
+    }
+
+    /// `call`s past their time get a timeout.
+    fn calls_due(&mut self) {
+        let now = Instant::now();
+        let late: Vec<u64> = self.calls.iter().filter(|(_, (_, at))| *at <= now).map(|(&id, _)| id).collect();
+        for id in late {
+            let (to, _) = self.calls.remove(&id).unwrap();
+            self.call_reply(to, json_err("timeout"));
         }
     }
 
-    fn overloaded(&mut self, origin: Origin) {
-        self.sh.stats.mailbox_refused.fetch_add(1, Relaxed);
-        let _ = self.deliver(origin, (503, "{\"error\":\"overloaded\"}".into()));
+    /// The node's: a request goes to the cells as a token (`Origin::Token`),
+    /// unless it's one of their own kinds (an alarm, a beat, the core's).
+    fn tok(&mut self, origin: Origin) -> Origin {
+        if !matches!(origin, Origin::Local(_) | Origin::Remote(..) | Origin::Wire(..) | Origin::Socket(..) | Origin::Call(..)) {
+            return origin;
+        }
+        self.next_token += 1;
+        let t = self.next_token;
+        self.tokens.insert(t, origin);
+        if let Origin::Local(who) = origin {
+            if let Some(c) = self.conn(who) {
+                c.token = Some(t);
+            }
+        }
+        Origin::Token(t)
     }
 
     /// Run a request on an object this loop owns, now or after the ones ahead of it.
     fn submit(&mut self, origin: Origin, name: String, req: String) {
-        if session_sock(&name).is_some() && self.app.procs[self.app.object_proc(&name)].socket {
-            return self.session_submit(origin, name, req);
+        if session_sock(&name).is_some() && self.app.procs.get(self.app.object_proc(&name)).is_some_and(|p| p.socket) {
+            let origin = self.tok(origin);
+            return self.down(Down::Run { origin, name, req, new: false });
         }
-        // A full mailbox refuses what's new. Not what the host itself owes
-        // the object: the core's runs, alarms, beats, and closes.
-        let new = !matches!(origin, Origin::Fleet(_) | Origin::Alarm { .. } | Origin::Tick) && !req.starts_with("do WSCLOSE ");
-        if new && self.objects.get(&name).is_some_and(|o| o.waiting.len() >= self.app.procs[self.app.object_proc(&name)].mailbox) {
-            return self.overloaded(origin);
-        }
+        // A full mailbox refuses what's new: not what the host itself owes
+        // the object (alarms, beats, closes). The cells, who hold the
+        // mailbox, check; a core's request is new if what it carries is.
+        let host_owes = |o: &Origin| matches!(o, Origin::Alarm { .. } | Origin::Tick);
+        let new = !req.starts_with("do WSCLOSE ")
+            && match origin {
+                Origin::Fleet(r) => self.freqs.get(&r).is_some_and(|fr| !host_owes(&fr.origin)),
+                o => !host_owes(&o),
+            };
         if self.core.is_some() && !matches!(origin, Origin::Fleet(_)) {
             let hops = if let Origin::Wire(_, id, _) = origin { ((id >> HOP_SHIFT) as u8).saturating_add(1) } else { 0 };
             // Pinned, and this node isn't in its regions: there, if one is
@@ -4539,7 +3217,7 @@ impl<E: Engine> Loop<'_, E> {
                     }
                     if hops == 0 {
                         if let Some(n) = core.place(now, obj, &ok) {
-                            return self.forward(n, FReq { origin, name, cell_req: req, hops: 0, act: 0, resp: None, ws: vec![], retries: 0 });
+                            return self.forward(n, FReq { origin, name, cell_req: req, hops: 0, act: 0, resp: None, ws: vec![], retries: 0, seq: None });
                         }
                     } else if !pin.fallback {
                         return drop(self.deliver(origin, (503, "{\"error\":\"retry\"}".into())));
@@ -4554,168 +3232,15 @@ impl<E: Engine> Loop<'_, E> {
                 let among = crate::fleet::among(&f.regions, f.node, &all, scope);
                 let now = self.core_now();
                 if let Some(n) = self.core.as_ref().unwrap().place(now, own::obj_id(&name), &among) {
-                    return self.forward(n, FReq { origin, name, cell_req: req, hops: 0, act: 0, resp: None, ws: vec![], retries: 0 });
+                    return self.forward(n, FReq { origin, name, cell_req: req, hops: 0, act: 0, resp: None, ws: vec![], retries: 0, seq: None });
                 }
             }
             return self.fleet_request(origin, name, req, hops);
         }
-        if !self.objects.contains_key(&name) {
-            if self.core.is_some() {
-                return; // dropped while its request waited; the core failed it
-            }
-            let path = store::path_for(&self.sh.cfg.data, &name);
-            if !path.exists() {
-                if self.sh.stats.disk_low.load(Relaxed) == 1 {
-                    let _ = self.deliver(origin, (507, "{\"error\":\"no room for new objects\"}".into()));
-                    return;
-                }
-                if let Err(why) = crate::policy::new_object(&name) {
-                    let _ = self.deliver(origin, (403, serde_json::json!({ "error": why }).to_string()));
-                    return;
-                }
-            }
-            let dirs = if path.exists() { Ok(vec![]) } else { store::make_dirs(&self.sh.cfg.data, &path) };
-            let db = match dirs.and_then(|d| Db::open(&path).map(|db| (db, d)).map_err(std::io::Error::other)) {
-                Ok(db) => db,
-                Err(e) => {
-                    eprintln!("object {name:?}: can't open storage: {e}");
-                    let _ = self.deliver(origin, (500, "{\"error\":\"storage\"}".into()));
-                    return;
-                }
-            };
-            self.sh.stats.objects_live.fetch_add(1, Relaxed);
-            self.sh.stats.objects_opened.fetch_add(1, Relaxed);
-            let mut o = Object::new(db.0);
-            o.new_dirs = db.1;
-            self.objects.insert(name.clone(), o);
-        }
-        let o = self.objects.get_mut(&name).unwrap();
-        if o.busy || o.checkpointing {
-            o.waiting.push_back((origin, req));
-            return;
-        }
-        match self.run_object(&name, origin, req, vec![]) {
-            Ok(true) => {}
-            Ok(false) => self.fleet_skip(&name, origin),
-            Err(reply) => {
-                let _ = self.deliver(origin, reply);
-            }
-        }
+        let origin = self.tok(origin);
+        self.down(Down::Run { origin, name, req, new });
     }
 
-    /// Begin one request on an object: its warm cell (or a fresh one), inside
-    /// a transaction. `Ok(false)`: nothing to run (a stale alarm).
-    /// `more`: a batch, the requests after the first (`req` holds them all,
-    /// framed for `handle_batch`).
-    fn run_object(&mut self, name: &str, origin: Origin, mut req: String, more: Vec<Origin>) -> Result<bool, (u16, String)> {
-        let (eng, app) = (self.eng, self.app.clone());
-        let ticking = self.ticks.contains_key(name);
-        let proc = app.object_proc(name);
-        let environ = self.environ_for(proc);
-        // WebSocket events say what they are in their text, the same here
-        // and when forwarded from the node that holds the connection.
-        let sock_of = |s: &str| s.trim_start_matches('/').parse::<u64>().ok();
-        let mut ws_open = None;
-        let mut ws_in = vec![];
-        if let Some(rest) = req.strip_prefix("do WSOPEN ") {
-            ws_open = rest.rsplit(' ').next().and_then(sock_of);
-        } else if let Some(rest) = req.strip_prefix("do WSCLOSE ") {
-            if let Some(id) = rest.split(' ').next().and_then(sock_of) {
-                self.ws_gone.entry(name.to_string()).or_default().insert(id);
-            }
-        } else if let Some(rest) = req.strip_prefix("do WSBIN ") {
-            // Bytes for `ws_msg`; the cell sees their length.
-            let (sock, b64) = rest.split_once(' ').unwrap_or((rest, ""));
-            ws_in = crate::ws::unbase64(b64).unwrap_or_default();
-            req = format!("do WSBIN {sock} {}", ws_in.len());
-        }
-        let gone: BTreeSet<u64> = self.ws_gone.get(name).cloned().unwrap_or_default();
-        let o = self.objects.get_mut(name).unwrap();
-        o.last_used = Instant::now();
-        {
-            let db = o.db.lock().unwrap();
-            if let Err(e) = db.begin() {
-                eprintln!("object {name:?}: begin failed: {e}");
-                return Err((500, "{\"error\":\"storage\"}".into()));
-            }
-            if matches!(origin, Origin::Fleet(_)) && req.starts_with("do ALARM ") {
-                // Fleet alarms: run only if storage says one is due now.
-                match db.alarm() {
-                    Some(t) if t <= now_ms() => {
-                        let _ = db.set_alarm(None); // the handler can set a new one
-                    }
-                    _ => {
-                        db.rollback();
-                        return Ok(false);
-                    }
-                }
-            }
-            if let Origin::Alarm { at, .. } = origin {
-                // The index and the heap are hints: storage says if it's still due.
-                match db.alarm() {
-                    Some(t) if t <= now_ms() => {
-                        let _ = db.set_alarm(None); // the handler can set a new one
-                    }
-                    t => {
-                        db.rollback();
-                        if let Some(t) = t.filter(|t| *t != at) {
-                            self.alarms.push(Reverse((t, name.to_string())));
-                        }
-                        return Ok(false);
-                    }
-                }
-            }
-            if o.socks.is_none() {
-                o.socks = Some(db.sockets().into_iter().collect());
-            }
-        }
-        // Gone sockets leave the list in this request's transaction; the
-        // rest are the ones it may use (and, for a handshake, its own: sends
-        // to it go out after the 101).
-        let socks = o.socks.as_ref().unwrap();
-        let ws_drop: Vec<u64> = gone.iter().copied().filter(|id| socks.contains(id)).collect();
-        let ids: Vec<u64> = socks.iter().copied().filter(|id| !gone.contains(id)).chain(ws_open).collect();
-        if !ws_drop.is_empty() {
-            let db = o.db.lock().unwrap();
-            if let Err(e) = db.update_sockets(None, &ws_drop) {
-                eprintln!("object {name:?}: socket list: {e}");
-                db.rollback();
-                return Err((500, "{\"error\":\"storage\"}".into()));
-            }
-        }
-        let mut cell = match o.cell.take() {
-            // A cell of the old code (a deploy came since) gives way, but not
-            // in the middle of something (open sockets, a beat: a game in
-            // play): it finishes on the version it started on.
-            Some(c) if !app.procs[c.proc].retired || ticking || !ids.is_empty() => c,
-            _ => match fresh(eng, &app, proc, &environ) {
-                Ok(mut c) => {
-                    c.host().db = Some(o.db.clone());
-                    c
-                }
-                Err(e) => {
-                    o.db.lock().unwrap().rollback();
-                    return Err((500, format!("{{\"error\":{:?}}}", e.to_string())));
-                }
-            },
-        };
-        cell.host().ws_ids = ids;
-        cell.host().ws_out.clear();
-        cell.host().out.clear();
-        cell.host().ws_in = ws_in;
-        let export = if more.is_empty() { "handle" } else { "handle_batch" };
-        if let Err(trap) = crate::start_export(&mut cell.vm, export, &req, &mut cell.st) {
-            eprintln!("object {name:?} trapped starting a request: {trap}");
-            o.db.lock().unwrap().rollback();
-            return Err((500, String::new()));
-        }
-        o.busy = true;
-        self.tasks.push_back(Task { origin, cell, obj: Some(name.to_string()), ws_open, ws_drop, pg: vec![], ev: None, more });
-        Ok(true)
-    }
-}
-
-impl<E: Engine> Loop<'_, E> {
     fn core_now(&self) -> u64 {
         self.sh.fleet.as_ref().map_or(0, |f| f.start.elapsed().as_millis() as u64)
     }
@@ -4764,7 +3289,7 @@ impl<E: Engine> Loop<'_, E> {
         let req = self.next_req;
         let obj = own::obj_id(&name);
         self.names.insert(obj, name.clone());
-        self.freqs.insert(req, FReq { origin, name, cell_req, hops, act: 0, resp: None, ws: vec![], retries: 0 });
+        self.freqs.insert(req, FReq { origin, name, cell_req, hops, act: 0, resp: None, ws: vec![], retries: 0, seq: None });
         // Sent here by another node: it thinks we own it, so read the
         // record, not a hint that may point straight back.
         self.core_on(if hops > 0 { own::Event::Forwarded { obj, req } } else { own::Event::Request { obj, req } });
@@ -4782,6 +3307,14 @@ impl<E: Engine> Loop<'_, E> {
                 if matches!(ans, own::Answer::Done { .. }) && !fr.ws.is_empty() {
                     let _ = self.apply_ws(&fr.name, fr.ws.clone());
                 }
+                // Its answer proves the state it ran on: alarm keys only
+                // older states needed may go.
+                if let (own::Answer::Done { .. }, Some(seq)) = (&ans, fr.seq) {
+                    if let Some(f) = self.owned.get_mut(&fr.name).filter(|f| f.act == fr.act) {
+                        f.keys.proven(seq);
+                        self.reconcile(&fr.name);
+                    }
+                }
                 let reply = match ans {
                     own::Answer::Done { .. } => fr.resp.unwrap_or((500, "{\"error\":\"no answer\"}".into())),
                     own::Answer::Failed => (503, "{\"error\":\"retry\"}".into()),
@@ -4792,7 +3325,7 @@ impl<E: Engine> Loop<'_, E> {
                         let req = self.next_req;
                         let obj = own::obj_id(&fr.name);
                         self.names.insert(obj, fr.name.clone());
-                        self.freqs.insert(req, FReq { retries: fr.retries + 1, act: 0, resp: None, ws: vec![], ..fr });
+                        self.freqs.insert(req, FReq { retries: fr.retries + 1, act: 0, resp: None, ws: vec![], seq: None, ..fr });
                         return self.core_on(own::Event::Request { obj, req });
                     }
                     own::Answer::NotRun => (503, "{\"error\":\"retry\"}".into()),
@@ -4821,54 +3354,13 @@ impl<E: Engine> Loop<'_, E> {
                 self.submit(Origin::Fleet(req), name, cell_req);
             }
             Effect::Seal { obj, act, image } => {
-                let Some(name) = self.names.get(&obj).cloned() else { return };
-                let Some(o) = self.objects.get_mut(&name) else { return };
-                let changes = {
-                    let db = o.db.lock().unwrap();
-                    let c = db.seal();
-                    // An image as of this seal, if asked and nothing's running
-                    // (else none this time; the core asks again later).
-                    // ponytail: read on the loop, the whole file; a big object
-                    // stalls its loop that long every compact_segs uploads.
-                    o.image = match (&c, image) {
-                        (Ok(_), Some(key)) if !o.busy => match db.image_now() {
-                            Ok(Some(entry)) => Some((key, entry)),
-                            Ok(None) => None,
-                            Err(e) => {
-                                eprintln!("object {name:?}: no image: {e}");
-                                None
-                            }
-                        },
-                        _ => None,
-                    };
-                    // Checkpoint right after a seal, never mid-request.
-                    if c.is_ok() && !o.busy && db.wants_checkpoint() {
-                        let _ = db.checkpoint_local();
-                    }
-                    c
-                };
-                match changes {
-                    Ok(changes) => {
-                        // The index must have an alarm before the segment that sets it
-                        // goes up, or a crash could leave an alarm nobody finds.
-                        let o = self.objects.get_mut(&name).unwrap();
-                        let alarm = o.db.lock().unwrap().alarm();
-                        if alarm.is_some() && o.index_at != alarm {
-                            o.seal_wait = Some((act, changes));
-                            self.reconcile(&name);
-                        } else {
-                            self.core_on(own::Event::Sealed { obj, act, changes });
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("object {name:?}: seal failed: {e}");
-                        self.remove_object(&name);
-                    }
+                if let Some(name) = self.names.get(&obj).cloned() {
+                    self.down(Down::Seal { name, act, image });
                 }
             }
             Effect::PutImage { obj, act } => {
                 let Some(name) = self.names.get(&obj).cloned() else { return };
-                if let Some((key, entry)) = self.objects.get_mut(&name).and_then(|o| o.image.take()) {
+                if let Some((key, entry)) = self.owned.get_mut(&name).and_then(|f| f.image.take()) {
                     self.job(Job::Image { obj, act, key, entry, back: self.me });
                 }
             }
@@ -4905,150 +3397,119 @@ impl<E: Engine> Loop<'_, E> {
             // would stay on its disk.
             Effect::Drop { obj } => {
                 if let Some(name) = self.names.get(&obj).cloned() {
-                    if self.remove_object(&name).is_some() {
-                        self.sh.stats.objects_live.fetch_sub(1, Relaxed);
-                    }
-                    let path = store::path_for(&self.sh.cfg.data, &name);
-                    for ext in ["", "-wal", "-shm"] {
-                        let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
-                    }
+                    self.owned.remove(&name);
+                    self.anchored.remove(&name);
+                    self.down(Down::Drop { name });
                 }
             }
         }
     }
 
-    /// An object's segments arrived: rebuild its database, then serve.
-    fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<i64>, image: Option<String>) {
+    /// An object's segments arrived: the cells rebuild its database.
+    fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<String>, image: Option<String>) {
         let Some(name) = self.names.get(&obj).cloned() else { return };
         // A new object (nothing to restore) on a disk nearly full, or one
         // the policy refuses (`policy::new_object`): refused, as alone
         // (`submit`). One that exists still comes back.
-        let data = match data {
+        let segs = match data {
             Ok(segs) if segs.is_empty() && self.sh.stats.disk_low.load(Relaxed) == 1 => Err("no room for new objects".to_string()),
             Ok(segs) if segs.is_empty() => crate::policy::new_object(&name).map(|()| segs),
             d => d,
         };
-        let path = store::path_for(&self.sh.cfg.data, &name);
-        // Its folder; durability here comes from the peers and the bucket.
-        if data.is_ok() {
-            let _ = store::make_dirs(&self.sh.cfg.data, &path);
-        }
-        if self.remove_object(&name).is_some() {
-            self.sh.stats.objects_live.fetch_sub(1, Relaxed);
-        }
-        let restored = data.and_then(|segs| store::restore(&path, &segs).map_err(|e| e.to_string()));
-        // The image: the file as restored, before anything runs on it.
-        if let (Ok(()), Some(key)) = (&restored, image) {
-            match store::image(&path) {
-                Ok(Some(entry)) => self.job(Job::Image { obj, act, key, entry, back: self.me }),
-                Ok(None) => {}
-                Err(e) => eprintln!("object {name:?}: no image: {e}"),
-            }
-        }
-        let db = restored.and_then(|()| Db::open(&path).map_err(|e| e.to_string()));
-        let ok = match db {
-            Ok(db) => {
-                self.sh.stats.objects_live.fetch_add(1, Relaxed);
-                self.sh.stats.objects_opened.fetch_add(1, Relaxed);
-                let mut o = Object::new(db);
-                // The newest index entry counts; older ones (from a crash) go.
-                let mut index = index;
-                index.sort();
-                o.index_at = index.pop();
-                for old in index {
-                    self.job(Job::Index { name: name.clone(), obj, old: Some(old), new: None, back: self.me });
-                }
-                self.objects.insert(name.clone(), o);
-                self.reconcile(&name);
-                true
-            }
-            Err(e) => {
-                eprintln!("object {name:?}: restore failed: {e}");
-                false
-            }
-        };
-        self.core_on(own::Event::Restored { obj, act, ok });
+        self.owned.remove(&name);
+        self.restore_index.insert((name.clone(), act), index);
+        self.down(Down::Restore { name, act, segs, image });
     }
 
-    /// A request the core ran is done: commit locally (no fsync: the bucket
-    /// is what makes it durable), hold the answer, and tell the core.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    fn fleet_finish(&mut self, name: String, req: own::ReqId, mut cell: Cell<E>, answer: Result<String, String>, ws: Vec<WsOut>, ws_open: Option<u64>, ws_drop: Vec<u64>, rest: Vec<(Origin, Result<String, String>)>) -> Option<(u16, String)> {
-        let Some(o) = self.objects.get_mut(&name) else { return None };
-        o.busy = false;
-        o.last_used = Instant::now();
-        let mut committed = None;
-        let (reply, changed) = {
-            let db = o.db.lock().unwrap();
-            match answer {
-                Ok(a) if ws_accepted(&a, ws_open).is_some_and(|id| db.update_sockets(Some(id), &[]).is_err()) => {
-                    db.rollback();
-                    ((500, "{\"error\":\"storage\"}".into()), false)
-                }
-                Ok(a) => match db.commit() {
-                    Ok(w) => {
-                        o.cell = Some(cell);
-                        committed = Some(ws_accepted(&a, ws_open));
-                        (split_answer(&a), w)
-                    }
-                    Err(e) => {
-                        eprintln!("object {name:?}: commit failed: {e}");
-                        db.rollback();
-                        ((500, "{\"error\":\"storage\"}".into()), false)
-                    }
-                },
-                Err(trap) => {
-                    eprintln!("object {name:?} trapped: {trap}{}", said(&mut cell));
-                    db.rollback();
-                    ((500, format!("{{\"error\":{trap:?}}}")), false)
-                }
+    /// The node's side of eviction: hand idle objects back to the core,
+    /// unless their alarm keys or a seal are still on their way.
+    fn idle(&mut self, names: Vec<String>) {
+        for name in names {
+            if self.owned.get(&name).is_some_and(|f| f.keys.busy() || f.seal_wait.is_some()) {
+                continue;
             }
-        };
-        if let Some(joined) = committed {
-            self.sockets_committed(&name, joined, &ws_drop);
+            self.core_on(own::Event::Release { obj: own::obj_id(&name) });
+            if !self.owned.contains_key(&name) {
+                self.sh.stats.evictions.fetch_add(1, Relaxed);
+            }
         }
-        // The sends wait with the answer, for the core to say it's proven.
-        let ok = committed.is_some();
-        // The rest of a batch: answers of their own (or the first's failure).
-        // They changed nothing more than the first did, so they go to the
-        // core as unchanged, after it: answered once its writes are proven.
+    }
+
+    /// The node's side of a restore: the object's keys in the alarm index,
+    /// from what the bucket listed and the alarm it holds; then the core.
+    fn restored(&mut self, name: String, act: Act, alarm: Option<Option<i64>>, image: Option<(String, Vec<u8>)>) {
+        let obj = own::obj_id(&name);
+        let index = self.restore_index.remove(&(name.clone(), act)).unwrap_or_default();
+        if let Some((key, entry)) = image {
+            self.job(Job::Image { obj, act, key, entry, back: self.me });
+        }
+        if let Some(alarm) = alarm {
+            self.owned.insert(name.clone(), Owned { act, keys: AlarmKeys::restored(obj, alarm, index, Default::default()), seal_wait: None, image: None });
+            self.reconcile(&name);
+        }
+        self.core_on(own::Event::Restored { obj, act, ok: alarm.is_some() });
+    }
+
+    /// The node's side of a seal. The index must have the committed alarm
+    /// before the segment that holds it goes up, or a crash could leave an
+    /// alarm nobody finds. (Not what storage reads now: a request may be
+    /// mid-transaction.)
+    fn sealed(&mut self, name: String, act: Act, changes: Result<Vec<u8>, String>, image: Option<(String, Vec<u8>)>) {
+        let Ok(changes) = changes else {
+            self.owned.remove(&name);
+            return;
+        };
+        if let Some(f) = self.owned.get_mut(&name) {
+            f.image = image;
+        }
+        if let Some(f) = self.owned.get_mut(&name).filter(|f| !f.keys.sealable()) {
+            f.seal_wait = Some((act, changes));
+            self.reconcile(&name);
+        } else {
+            self.core_on(own::Event::Sealed { obj: own::obj_id(&name), act, changes });
+        }
+    }
+
+    /// The node's side of `Ran`: hold the answer (and its sends) for the
+    /// core, and say what ran. The rest of a batch changed nothing more
+    /// than the first did, so they go to the core as unchanged, after it:
+    /// answered once its writes are proven.
+    fn core_ran(&mut self, name: String, req: own::ReqId, reply: (u16, String), wrote: Option<Option<i64>>, ws: Vec<WsOut>, rest: Vec<(own::ReqId, (u16, String))>) {
+        if let (Some(alarm), Some(f)) = (wrote, self.owned.get_mut(&name)) {
+            f.keys.committed(alarm);
+        }
+        let seq = self.owned.get(&name).map(|f| f.keys.seq());
         let rest: Vec<(own::Act, own::ReqId, bool)> = rest
             .into_iter()
-            .filter_map(|(o, a)| {
-                let Origin::Fleet(r) = o else { return None };
+            .filter_map(|(r, resp)| {
                 let fr = self.freqs.get_mut(&r)?;
-                fr.resp = Some(match a {
-                    Ok(a) if ok => split_answer(&a),
-                    _ => reply.clone(),
-                });
+                fr.seq = seq;
+                fr.resp = Some(resp);
                 Some((fr.act, r, !matches!(fr.origin, Origin::Tick)))
             })
             .collect();
         let act = self.freqs.get_mut(&req).map(|fr| {
             fr.resp = Some(reply);
-            if ok {
-                fr.ws = ws;
-            }
+            fr.seq = seq;
+            fr.ws = ws;
             // An object's own beat: its answer goes nowhere (see `Ran`).
             (fr.act, !matches!(fr.origin, Origin::Tick))
         });
         self.reconcile(&name);
-        self.next_waiting(&name);
         if let Some((act, proof)) = act {
-            self.core_on(own::Event::Ran { obj: own::obj_id(&name), act, req, changed, proof });
+            self.core_on(own::Event::Ran { obj: own::obj_id(&name), act, req, changed: wrote.is_some(), proof });
         }
         for (act, req, proof) in rest {
             self.core_on(own::Event::Ran { obj: own::obj_id(&name), act, req, changed: false, proof });
         }
-        None
     }
 
-    /// An alarm request found nothing due: it's done, and changed nothing.
-    fn fleet_skip(&mut self, name: &str, origin: Origin) {
-        let Origin::Fleet(req) = origin else { return };
+    /// The node's side of `Skipped`.
+    fn skipped(&mut self, name: &str, req: own::ReqId) {
+        let seq = self.owned.get(name).map(|f| f.keys.seq());
         let act = self.freqs.get_mut(&req).map(|fr| {
             fr.resp = Some((200, "{}".into()));
+            fr.seq = seq;
             fr.act
         });
         self.reconcile(name);
@@ -5057,49 +3518,22 @@ impl<E: Engine> Loop<'_, E> {
         }
     }
 
-    /// Move the object's alarm index entry toward what its storage says, one
-    /// move at a time, and release a seal that was waiting for it.
+    /// Make the object's next alarm index call, if one is due, and release
+    /// a seal that was waiting for the index.
     fn reconcile(&mut self, name: &str) {
-        let me = self.me;
-        let Some(o) = self.objects.get_mut(name) else { return };
-        // Mid-request, the alarm may be about to change; look again after.
-        if o.busy {
-            return;
+        let Some(f) = self.owned.get_mut(name) else { return };
+        let op = f.keys.next(rand_u64);
+        let sealed = if f.keys.sealable() { f.seal_wait.take() } else { None };
+        if let Some(op) = op {
+            self.job(Job::Index { name: name.to_string(), op, back: self.me });
         }
-        let want = o.db.lock().unwrap().alarm();
-        if o.index_at == want {
-            if let Some((act, changes)) = o.seal_wait.take() {
-                self.core_on(own::Event::Sealed { obj: own::obj_id(name), act, changes });
-            }
-            return;
+        if let Some((act, changes)) = sealed {
+            self.core_on(own::Event::Sealed { obj: own::obj_id(name), act, changes });
         }
-        if o.index_busy {
-            return;
-        }
-        o.index_busy = true;
-        let old = o.index_at;
-        self.job(Job::Index { name: name.to_string(), obj: own::obj_id(name), old, new: want, back: me });
     }
 
-    /// Eviction: hand objects that have been idle too long back to the core.
-    fn fleet_sweep(&mut self) {
-        self.last_sweep = Instant::now();
-        self.retire_cells();
-        self.sweep_cells();
-        let idle = self.idle_limit();
-        let gone: Vec<String> = self
-            .objects
-            .iter()
-            .filter(|(_, o)| !o.busy && o.waiting.is_empty() && !o.index_busy && o.seal_wait.is_none() && o.last_used.elapsed() >= idle)
-            .map(|(n, _)| n.clone())
-            .collect();
-        for name in gone {
-            let before = self.objects.len();
-            self.core_on(own::Event::Release { obj: own::obj_id(&name) });
-            if self.objects.len() < before {
-                self.sh.stats.evictions.fetch_add(1, Relaxed);
-            }
-        }
+    /// Placement, when its window is up (the node's).
+    fn place_due(&mut self) {
         let place_ms = self.sh.fleet.as_ref().unwrap().cfg.place_ms;
         if place_ms > 0 && self.last_place.elapsed() >= Duration::from_millis(place_ms) {
             self.place();
@@ -5125,7 +3559,7 @@ impl<E: Engine> Loop<'_, E> {
         let now = self.core_now();
         let traffic = std::mem::take(&mut self.traffic);
         let mut picks = HashMap::new();
-        let names: Vec<String> = self.objects.keys().cloned().collect();
+        let names: Vec<String> = self.owned.keys().cloned().collect();
         for name in names {
             let Some(p) = app.procs.get(app.object_proc(&name)) else { continue };
             let by = traffic.get(&name).cloned().unwrap_or_default();
@@ -5145,7 +3579,7 @@ impl<E: Engine> Loop<'_, E> {
             let Some(home) = crate::policy::home(&name, f.cfg.node, &by, builtin).filter(|&h| h != f.cfg.node) else { continue };
             let again = self.picks.get(&name) == Some(&home);
             picks.insert(name.clone(), home);
-            let busy = self.objects.get(&name).is_none_or(|o| !o.pg.is_empty()) || self.ticks.contains_key(&name);
+            let busy = self.anchored.contains(&name);
             if !again || busy {
                 continue;
             }
@@ -5212,9 +3646,7 @@ impl<E: Engine> Loop<'_, E> {
         self.wire_out.insert(id, (fr.origin, node, Instant::now(), limit, fr.name.clone()));
         f.wire.send(node, Frame::Forward { id, name: fr.name, req: fr.cell_req }, self.me);
     }
-}
 
-impl<E: Engine> Loop<'_, E> {
     /// A round trip to `node`, in TCP's way (RFC 6298).
     fn measured(&mut self, node: own::Node, d: Duration) {
         let r = d.as_secs_f64();
@@ -5309,7 +3741,7 @@ impl wire::Sink for LoopSink {
     }
 }
 
-fn json_err(m: &str) -> Vec<u8> {
+pub(crate) fn json_err(m: &str) -> Vec<u8> {
     serde_json::json!({ "error": m }).to_string().into_bytes()
 }
 
@@ -5343,7 +3775,7 @@ pub fn unframe(s: &str, n: usize) -> Result<Vec<String>, String> {
     Ok(parts)
 }
 
-fn ws_accepted(answer: &str, ws_open: Option<u64>) -> Option<u64> {
+pub(crate) fn ws_accepted(answer: &str, ws_open: Option<u64>) -> Option<u64> {
     ws_open.filter(|_| split_answer(answer).0 == 101)
 }
 
@@ -5352,7 +3784,7 @@ fn ws_accepted(answer: &str, ws_open: Option<u64>) -> Option<u64> {
 /// body as `\0<lines>\0<body>` (so they cross loops and the wire unchanged),
 /// and only safe ones get through: never one that frames the message
 /// (`content-length`, `connection`...), so a cell can't split a response.
-fn split_answer(a: &str) -> (u16, String) {
+pub(crate) fn split_answer(a: &str) -> (u16, String) {
     let code = a.get(..3).and_then(|c| c.parse::<u16>().ok()).unwrap_or(500);
     match a.as_bytes().get(3) {
         Some(b'\n') => {
@@ -5378,8 +3810,9 @@ fn split_answer(a: &str) -> (u16, String) {
 }
 
 /// An answer's headers (the safe ones `split_answer` kept) and its body.
-fn reply_parts(payload: &str) -> (Vec<&str>, &str) {
-    match payload.strip_prefix('\0').and_then(|r| r.split_once('\0')) {
+fn reply_parts(payload: &[u8]) -> (Vec<&str>, &[u8]) {
+    let split = payload.strip_prefix(b"\0").and_then(|r| Some(r.split_at(r.iter().position(|&b| b == 0)?)));
+    match split.and_then(|(head, body)| Some((std::str::from_utf8(head).ok()?, &body[1..]))) {
         Some((head, body)) => (head.lines().collect(), body),
         None => (vec![], payload),
     }
@@ -5816,18 +4249,6 @@ mod tests {
     fn the_machine_presses_before_it_swaps() {
         let m = |avail, was| machine_pressure(961, avail, was);
         assert_eq!([m(600, 0), m(255, 0), m(200, 0), m(130, 1), m(160, 2), m(200, 2)], [0, 0, 1, 2, 2, 1]);
-    }
-
-    #[test]
-    fn idle_pooled_cells_go_but_the_newest_stays() {
-        let now = Instant::now();
-        let old = now - Duration::from_secs(120);
-        let mut pool = vec![(1, old), (2, old), (3, now), (4, now)];
-        trim_idle(&mut pool, Duration::from_secs(60));
-        assert_eq!(pool.iter().map(|x| x.0).collect::<Vec<_>>(), [3, 4], "the idle ones go");
-        let mut pool = vec![(1, old), (2, old)];
-        trim_idle(&mut pool, Duration::from_secs(60));
-        assert_eq!(pool.iter().map(|x| x.0).collect::<Vec<_>>(), [2], "the newest stays, however old");
     }
 
     #[test]

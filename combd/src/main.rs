@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod admin;
+mod alarm_keys;
 #[cfg(feature = "aot-lite")]
 mod aot;
 #[cfg(feature = "aot-lite")]
@@ -19,6 +20,7 @@ mod builds;
 mod aot_gen;
 mod app;
 mod catalog;
+mod cells;
 mod click;
 mod catnode;
 mod catsim;
@@ -46,9 +48,11 @@ mod spectest;
 #[cfg(feature = "fuzz")]
 mod fuzz;
 mod fuzz_host;
+mod fuzz_ipc;
 mod http;
 mod interp;
 mod kv;
+mod line;
 #[cfg(feature = "wasmtime")]
 mod wt;
 
@@ -441,16 +445,17 @@ fn both() -> both::Both {
 }
 
 /// A fleet node's: its builds from the bucket, trusting COMBD_BUILDER_KEYS,
-/// kept in COMBD_BUILDS_DIR (default `<data>/builds`).
+/// kept in COMBD_BUILDS_DIR (default `<data>/builds`). The engine gets only
+/// the folder; the node fetches into it where deploys land.
 #[cfg(feature = "aot-lite")]
-fn both_in(fc: &fleet::FleetCfg, data: &std::path::Path) -> Result<both::Both, String> {
+fn both_in(fc: &fleet::FleetCfg, data: &std::path::Path) -> Result<(both::Both, builds::Builds), String> {
     let keys = match std::env::var("COMBD_BUILDER_KEYS") {
         Ok(f) => builds::parse_keys(&std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?),
         Err(_) => vec![],
     };
     let dir = std::env::var_os("COMBD_BUILDS_DIR").map_or(data.join("builds"), Into::into);
     let b = builds::Builds::new(fc.s3.clone(), dir, keys, fc.node)?;
-    Ok(both::Both { builds: Some(std::sync::Arc::new(b)), ..both() })
+    Ok((both::Both { builds: Some(b.dir.clone()), ..both() }, b))
 }
 
 /// Copy a request into the cell and begin `handle`. Nothing runs yet.
@@ -1138,6 +1143,23 @@ fn main_with(args: &[&str]) {
             }
             println!("fuzz     no mismatches");
         }
+        // Fuzzing the line from the node's side: `fuzz-ipc N [seed [fleet]]`.
+        ["fuzz-ipc", n, ref rest @ ..] => {
+            let seed: u64 = rest.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let t = Instant::now();
+            let st = fuzz_ipc::run(n.parse().unwrap(), seed, &wasm(), rest.get(1) == Some(&"fleet"));
+            println!("fuzz-ipc seed {seed}: {} messages ({} answers) in {:.1} s, the node's check {:?} at worst", st.sent, st.answered, t.elapsed().as_secs_f64(), st.slowest);
+            for p in st.problems.iter().take(30) {
+                println!("fuzz-ipc PROBLEM {p}");
+            }
+            if !st.problems.is_empty() {
+                println!("fuzz-ipc {} problems", st.problems.len());
+                std::process::exit(1);
+            }
+            println!("fuzz-ipc no problems");
+            // Its node is still serving: done is done.
+            std::process::exit(0);
+        }
         // Fuzzing the host API: `fuzz-host N [start]`.
         ["fuzz-host", n, ref rest @ ..] => {
             let start: u64 = rest.first().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -1224,6 +1246,8 @@ fn main_with(args: &[&str]) {
         [test, "aot"] => run(test, "aot", &aot::Aot),
         // A fleet node serving what's deployed to its bucket (COMBD_S3,
         // COMBD_NODE, COMBD_PEERS...), with the admin API if COMBD_ADMIN_PORT.
+        // A node's cells, in a process of their own: the node starts it.
+        ["cells"] => cells::child(),
         ["serve-fleet", engine, port] => {
             let port = port.parse().unwrap();
             let cfg = http::Config::from_env();
@@ -1239,7 +1263,7 @@ fn main_with(args: &[&str]) {
                 "interp" => http::serve_fleet_apps(&interp::Interp { max_pages: 16384 }, port, cfg, admin),
                 // Each module as its manifest says (compiled: those in this build, for now).
                 #[cfg(feature = "aot-lite")]
-                "both" => both_in(fc, &cfg.data).and_then(|eng| http::serve_fleet_apps(&eng, port, cfg, admin)),
+                "both" => both_in(fc, &cfg.data).and_then(|(eng, b)| http::serve_fleet_apps(&eng, port, http::Config { builds: Some(std::sync::Arc::new(b)), ..cfg }, admin)),
                 _ => Err("serve-fleet: interp, or both (with the AOT tier)".into()),
             };
             if let Err(e) = r {
@@ -1385,14 +1409,14 @@ fn main_with(args: &[&str]) {
             match engine {
                 "interp" => {
                     let eng = interp::Interp { max_pages: 16384 };
-                    http::serve(&eng, eng.load(&wasm).unwrap(), port)
+                    http::serve(&eng, &wasm, port)
                 }
                 #[cfg(feature = "aot-lite")]
-                "aot" => http::serve(&aot::Aot, aot::Aot.load(&wasm).unwrap(), port),
+                "aot" => http::serve(&aot::Aot, &wasm, port),
                 #[cfg(feature = "wasmtime")]
                 "wasmtime" => {
                     let eng = wt::Wt::new(WT_FUEL, None);
-                    http::serve(&eng, eng.load(&wasm).unwrap(), port)
+                    http::serve(&eng, &wasm, port)
                 }
                 _ => panic!("unknown engine"),
             }
@@ -1878,7 +1902,19 @@ mod tests {
         let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, http::Config { max_conns: 2, ..cfg(&dir.0, 1) });
         let from_elsewhere = || std::net::TcpStream::connect_timeout(&(me, port).into(), Duration::from_secs(2)).map(|_| ()).map_err(|e| e.kind());
         assert_eq!(from_elsewhere(), Ok(()), "listening while there's room");
-        let keep = || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // Two connections it has taken (each answers a ping). One turned
+        // away is tried again: on a loaded machine the probe above may still
+        // count when they come, and be gone after.
+        let keep = || loop {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(b"GET /_combd/ping HTTP/1.1\r\nhost: localhost\r\n\r\n").unwrap();
+            let mut got = [0u8; 12];
+            if s.read_exact(&mut got).is_ok() && got.ends_with(b" 200") {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
         let held = (keep(), keep());
         let last = std::cell::Cell::new(Ok(()));
         // 10 s: alone it takes about 2, and a loaded machine (the full suite
@@ -1927,10 +1963,10 @@ mod tests {
         let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, cfg(&dir.0, 1));
         assert_eq!(http(port, "POST", "/do/t/busy", "300").0, 200);
         let procs = || serde_json::from_str::<serde_json::Value>(&http(port, "GET", "/_combd/stats", "").1).unwrap()["procs"].clone();
-        assert!(eventually(2000, || procs().as_object().is_some_and(|m| !m.is_empty())), "{}", procs());
-        let (name, p) = procs().as_object().unwrap().iter().next().map(|(k, v)| (k.clone(), v.clone())).unwrap();
-        assert!(p["cpu_us"].as_u64().unwrap() >= 100_000, "{name}: {p} (300 ms busy: most of it, even on a loaded machine)");
-        assert!(p["slices"].as_u64().unwrap() >= 2, "{name}: {p}");
+        // Each loop adds its time every 250 ms, so the first look may come
+        // between: wait for most of the 300 ms, even on a loaded machine.
+        let shows = |p: &serde_json::Value| p.as_object().and_then(|m| m.values().next()).is_some_and(|p| p["cpu_us"].as_u64().unwrap_or(0) >= 100_000 && p["slices"].as_u64().unwrap_or(0) >= 2);
+        assert!(eventually(3000, || shows(&procs())), "{}", procs());
     }
 
     /// An app whose module wants to run compiled, and a node that only
@@ -2101,8 +2137,8 @@ mod tests {
     #[test]
     fn a_full_mailbox_refuses_new_requests() {
         let dir = store::tempdir::Dir::new();
-        let (port, _, _) = server_app(interp::Interp { max_pages: 16384 }, cfg(&dir.0, 1), |eng| {
-            let mut a = app::App::single(eng.load(&wasm()).unwrap(), 4);
+        let (port, _, _) = server_app(interp::Interp { max_pages: 16384 }, cfg(&dir.0, 1), |_| {
+            let mut a = app::App::single(&wasm(), 4);
             a.procs.iter_mut().for_each(|p| p.mailbox = 2);
             a
         });
@@ -2386,10 +2422,10 @@ mod tests {
         E::Program: Sync + Send,
     {
         let ev_max = cfg.ev_max;
-        server_app(eng, cfg, move |eng| app::App::single(eng.load(&wasm).unwrap(), ev_max))
+        server_app(eng, cfg, move |_| app::App::single(&wasm, ev_max))
     }
 
-    fn server_app<E: Engine + Sync + Send + 'static>(eng: E, cfg: http::Config, make: impl FnOnce(&E) -> app::App<E::Program> + Send + 'static) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>)
+    fn server_app<E: Engine + Sync + Send + 'static>(eng: E, cfg: http::Config, make: impl FnOnce(&E) -> app::App + Send + 'static) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>)
     where
         E::Program: Sync + Send,
     {
@@ -2463,6 +2499,9 @@ mod tests {
             tls: None,
             redirect_port: None,
             limits: http::Limits::default(),
+            builds: None,
+            cells_child: false,
+            lockdown: false,
         }
     }
 
@@ -2503,7 +2542,7 @@ mod tests {
 
     /// What's on disk for an object, read with a separate connection.
     fn on_disk(data: &std::path::Path, name: &str, sql: &str) -> String {
-        let db = store::Db::open(&store::path_for(data, name)).unwrap();
+        let db = store::Db::open(&store::path_for(&data.join("objects"), name)).unwrap();
         String::from_utf8(db.exec_json(format!("{{\"q\":{sql:?}}}").as_bytes())).unwrap()
     }
 
@@ -2575,6 +2614,10 @@ mod tests {
         stop_a.store(true, std::sync::atomic::Ordering::Relaxed);
         ta.join().unwrap();
         assert!(eventually(10_000, || http(b, "GET", "/do/al2/alarms", "").1.contains("\"fired\":1")), "{:?}", http(b, "GET", "/do/al2/alarms", ""));
+        // Fired, the alarms' keys go, A's too: answers prove the states
+        // without them, and a stale key's fire finds nothing due.
+        let s3 = s3::S3 { bucket: bucket.clone(), ..base.clone() };
+        assert!(eventually(10_000, || s3.list("alarm/").unwrap().is_empty()), "{:?}", s3.list("alarm/"));
         // 3. Eviction: B lets an idle object go; it comes back from the bucket.
         ok(b, "POST", "/do/ev/incr", "");
         ok(b, "POST", "/do/ev/incr", "");
@@ -2759,18 +2802,18 @@ mod tests {
 
     /// `n` fleet nodes on one bucket, each serving `make`'s app: start one
     /// with the closure returned, by number.
-    fn fleet_of(dir: &std::path::Path, base: s3::S3, n: u32, make: impl Fn(&interp::Interp) -> app::App<<interp::Interp as Engine>::Program> + Clone + Send + 'static) -> impl Fn(own::Node) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    fn fleet_of(dir: &std::path::Path, base: s3::S3, n: u32, make: impl Fn(&interp::Interp) -> app::App + Clone + Send + 'static) -> impl Fn(own::Node) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         fleet_placing(dir, base, n, 0, make)
     }
 
     /// `fleet_of`, with placement looking every `place_ms` (0: never).
-    fn fleet_placing(dir: &std::path::Path, base: s3::S3, n: u32, place_ms: u64, make: impl Fn(&interp::Interp) -> app::App<<interp::Interp as Engine>::Program> + Clone + Send + 'static) -> impl Fn(own::Node) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    fn fleet_placing(dir: &std::path::Path, base: s3::S3, n: u32, place_ms: u64, make: impl Fn(&interp::Interp) -> app::App + Clone + Send + 'static) -> impl Fn(own::Node) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         fleet_in(dir, base, &vec![""; n as usize], &[], place_ms, make)
     }
 
     /// `fleet_placing`, its nodes in `regions` (`region/zone`, one per
     /// node; "" for none), with `areas` (`name`, `region+region`).
-    fn fleet_in(dir: &std::path::Path, base: s3::S3, regions: &[&str], areas: &[(&str, &str)], place_ms: u64, make: impl Fn(&interp::Interp) -> app::App<<interp::Interp as Engine>::Program> + Clone + Send + 'static) -> impl Fn(own::Node) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    fn fleet_in(dir: &std::path::Path, base: s3::S3, regions: &[&str], areas: &[(&str, &str)], place_ms: u64, make: impl Fn(&interp::Interp) -> app::App + Clone + Send + 'static) -> impl Fn(own::Node) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let n = regions.len() as u32;
         let regions: HashMap<own::Node, String> = regions.iter().enumerate().filter(|(_, r)| !r.is_empty()).map(|(k, r)| (k as own::Node, r.to_string())).collect();
         let areas: HashMap<String, Vec<String>> = areas.iter().map(|(a, rs)| (a.to_string(), rs.split('+').map(String::from).collect())).collect();
@@ -2815,7 +2858,7 @@ mod tests {
             return;
         };
         let dir = store::tempdir::Dir::new();
-        let node = fleet_placing(&dir.0, base, 3, 500, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4));
+        let node = fleet_placing(&dir.0, base, 3, 500, |_| app::App::single(&wasm(), 4));
         let ports: Vec<u16> = (0..3).map(|k| node(k).0).collect();
         for &p in &ports {
             stat(p, "fences");
@@ -2833,7 +2876,7 @@ mod tests {
         assert_eq!(stat(ports[0], "moves"), 1);
         // Its file left node 0 with it (the bucket has it all): a node
         // doesn't keep a copy of everything it ever served.
-        let file = |k: u32| store::path_for(&dir.0.join(format!("d{k}")), "mv");
+        let file = |k: u32| store::path_for(&dir.0.join(format!("d{k}/objects")), "mv");
         assert!(file(1).exists() && !file(0).exists(), "on node 1 only");
         for _ in 0..5 {
             sent += 1;
@@ -2856,8 +2899,8 @@ mod tests {
             return;
         };
         let dir = store::tempdir::Dir::new();
-        let node = fleet_placing(&dir.0, base, 3, 500, |eng| {
-            let mut a = app::App::single(eng.load(&wasm()).unwrap(), 4);
+        let node = fleet_placing(&dir.0, base, 3, 500, |_| {
+            let mut a = app::App::single(&wasm(), 4);
             a.procs.iter_mut().for_each(|p| p.spread = Some(fleet::Scope::Region));
             a
         });
@@ -2888,8 +2931,8 @@ mod tests {
         };
         let dir = store::tempdir::Dir::new();
         // Placement looks only once an hour: the objects stay where they started.
-        let node = fleet_placing(&dir.0, base, 3, 3_600_000, |eng| {
-            let mut a = app::App::single(eng.load(&wasm()).unwrap(), 4);
+        let node = fleet_placing(&dir.0, base, 3, 3_600_000, |_| {
+            let mut a = app::App::single(&wasm(), 4);
             a.procs.iter_mut().for_each(|p| p.spread = Some(fleet::Scope::Region));
             a
         });
@@ -2924,7 +2967,7 @@ mod tests {
             return;
         };
         let dir = store::tempdir::Dir::new();
-        let node = fleet_placing(&dir.0, base, 3, 0, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4));
+        let node = fleet_placing(&dir.0, base, 3, 0, |_| app::App::single(&wasm(), 4));
         let ports: Vec<u16> = (0..2).map(|k| node(k).0).collect();
         assert_eq!(stat(ports[0], "objects_live"), 0);
         // "Node 2" is a rogue with the fleet's certificate: it never serves,
@@ -2962,7 +3005,7 @@ mod tests {
         let dir = store::tempdir::Dir::new();
         let low = Arc::new(AtomicBool::new(true));
         // Control: alone, the floor holds.
-        let (single, ..) = server_app(interp::Interp { max_pages: 16384 }, http::Config { disk_low_forced: low.clone(), ..cfg(&dir.0.join("single"), 1) }, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4));
+        let (single, ..) = server_app(interp::Interp { max_pages: 16384 }, http::Config { disk_low_forced: low.clone(), ..cfg(&dir.0.join("single"), 1) }, |_| app::App::single(&wasm(), 4));
         assert!(eventually(2000, || stat(single, "disk_low") == 1));
         assert_eq!(http(single, "POST", "/do/full/incr", "").0, 507, "single node");
         // A fleet of one, the same disk.
@@ -2983,10 +3026,10 @@ mod tests {
             regions: HashMap::new(),
             place_ms: 0, areas: HashMap::new(),
         };
-        let (port, ..) = server_app(interp::Interp { max_pages: 16384 }, http::Config { fleet: Some(fc), disk_low_forced: low, ..cfg(&dir.0.join("d0"), 1) }, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4));
+        let (port, ..) = server_app(interp::Interp { max_pages: 16384 }, http::Config { fleet: Some(fc), disk_low_forced: low, ..cfg(&dir.0.join("d0"), 1) }, |_| app::App::single(&wasm(), 4));
         assert!(eventually(2000, || stat(port, "disk_low") == 1));
         let (status, body) = http(port, "POST", "/do/full/incr", "");
-        assert!(status != 200 && !store::path_for(&dir.0.join("d0"), "full").exists(), "fleet node: {status} {body}");
+        assert!(status != 200 && !store::path_for(&dir.0.join("d0/objects"), "full").exists(), "fleet node: {status} {body}");
     }
 
     /// `placement = "pin"`: an object lives in its regions (here the area
@@ -3001,8 +3044,8 @@ mod tests {
             return;
         };
         let pinned = |fallback: bool| {
-            move |eng: &interp::Interp| {
-                let mut a = app::App::single(eng.load(&wasm()).unwrap(), 4);
+            move |_: &interp::Interp| {
+                let mut a = app::App::single(&wasm(), 4);
                 a.procs.iter_mut().for_each(|p| p.pin = Some(app::Pin { places: vec!["eu".into()], fallback }));
                 a
             }
@@ -3074,7 +3117,7 @@ mod tests {
                     place_ms: 0,
                     areas: HashMap::new(),
                 };
-                server_app(interp::Interp { max_pages: 16384 }, http::Config { fleet: Some(fc), restores_at_once: cap, ..cfg(&dir.0.join(data), 1) }, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4))
+                server_app(interp::Interp { max_pages: 16384 }, http::Config { fleet: Some(fc), restores_at_once: cap, ..cfg(&dir.0.join(data), 1) }, |_| app::App::single(&wasm(), 4))
             };
             // The history: each write a segment of its own.
             let (port, stop, t) = node("first");
@@ -3148,8 +3191,8 @@ mod tests {
             return;
         };
         let dir = store::tempdir::Dir::new();
-        let node = fleet_of(&dir.0, base, 3, |eng| {
-            let mut a = app::App::single(eng.load(&wasm()).unwrap(), 4);
+        let node = fleet_of(&dir.0, base, 3, |_| {
+            let mut a = app::App::single(&wasm(), 4);
             a.procs.iter_mut().for_each(|p| p.spread = Some(fleet::Scope::Region));
             a
         });
@@ -3179,7 +3222,7 @@ mod tests {
             return;
         };
         let dir = store::tempdir::Dir::new();
-        let node = fleet_of(&dir.0, base, 3, |eng| app::App::single(eng.load(&wasm()).unwrap(), 4));
+        let node = fleet_of(&dir.0, base, 3, |_| app::App::single(&wasm(), 4));
         let (a, stop_a, ta) = node(0);
         let (b, _, _) = node(1);
         let (_c, _, _) = node(2);
@@ -3241,8 +3284,8 @@ mod tests {
         let start = |n: u32, port: u16, builds: &str| {
             let fc = fleet::FleetCfg { node: n, lease_ms: 1000, replicas: 1, s3: bucket.clone(), peers: peers.clone(), wire_port: wports[n as usize], wire_certs: Some(certs.clone()), insecure: false, upload_ms: 0, upload_bytes: 1 << 20, read_lease: true, regions: HashMap::new(), place_ms: 0, areas: HashMap::new() };
             let b = builds::Builds::new(bucket.clone(), dir.0.join(builds), keys.clone(), n).unwrap();
-            let eng = both::Both { builds: Some(Arc::new(b)), ..both() };
-            let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), ..cfg(&dir.0.join(format!("d{n}")), 1) };
+            let eng = both::Both { builds: Some(b.dir.clone()), ..both() };
+            let c = http::Config { fleet: Some(fc), master_key: Some(master.clone()), builds: Some(Arc::new(b)), ..cfg(&dir.0.join(format!("d{n}")), 1) };
             let admin = (n == 0).then(|| admin::AdminCfg { port: admin_port, public: false, tls: None, tokens: admin::parse_tokens(&line).unwrap(), builders: keys.clone() });
             let stop = c.stop.clone();
             (stop, std::thread::spawn(move || http::serve_fleet_apps(&eng, port, c, admin).unwrap()))
@@ -4138,7 +4181,7 @@ callers = ["api"]
             let h = host(org, app);
             assert_eq!(http_to(port, &h, "GET", "/room/r1/count", "").1, format!("{{\"count\":{}}}", i + 1), "{org}/{app}");
             assert!(on_disk(&data.0, &format!("{org}/{app}/room/r1"), "SELECT v FROM kv").contains(&format!("[[{}]]", i + 1)));
-            assert!(data.0.join(org).join(app).is_dir(), "its own folder");
+            assert!(data.0.join("objects").join(org).join(app).is_dir(), "its own folder");
             // Its own processes: `room` and `worker` are always its own.
             let (_, body) = http_to(port, &h, "POST", "/call", &serde_json::json!({ "to": "room", "id": "r1", "method": "GET", "path": "/count" }).to_string());
             assert!(body.contains(&format!("{{\\\"count\\\":{}}}", i + 1)), "{org}/{app}: {body}");

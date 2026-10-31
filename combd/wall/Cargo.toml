@@ -1,0 +1,15 @@
+[package]
+name = "combd-wall"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "The cells' lockdown on Linux, landlock and seccomp, made with libc's calls and nothing else: combd's unsafe code for the second wall."
+
+[dependencies]
+libc = "0.2"
+
+# Each case runs in a process of its own, locked as the cells are, so the
+# test makes its own main (no harness threads to lock with it).
+[[test]]
+name = "walls"
+harness = false

@@ -51,6 +51,10 @@ joins gets matched with one.
 cd bots && cargo run --release -- http://localhost:8080 8 mix      # 8 bots, all four kinds
 ```
 
+Each bot pings its match once a second over the match's socket
+(`ARENA_PING_MS` to change it), and at the end they print the round
+trips' p50 and p99. `bench/line/run.sh` uses that.
+
 `ARENA_SPREAD=40` pretends the bots live around the world (each has a home
 node; every node away from home adds 40 ms to what it measured), so matches
 land on different nodes even with every bot on one machine.

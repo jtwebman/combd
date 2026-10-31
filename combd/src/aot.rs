@@ -167,6 +167,10 @@ pub fn built(dir: &std::path::Path, wasm: &[u8]) -> Result<&'static Compiled, St
 }
 
 impl Engine for Aot {
+    fn child(&self) -> String {
+        "aot".into()
+    }
+
     type Program = &'static Compiled;
     type Vm = AotVm;
 

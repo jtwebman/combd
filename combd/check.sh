@@ -6,6 +6,18 @@
 # ./check.sh quick skips compiled modules, the spec testsuite, and the fuzzers.
 set -e
 cd "$(dirname "$0")"
+# The line (plan.md, the second wall): a loop's cells (`cells.rs`) reach its
+# node only through it. They get their settings and deploys as messages,
+# never the node's `Shared` or `Live`, and no request's origin there is a
+# connection's, a socket's, or another loop's or node's (the node hands
+# the cells tokens).
+grep -q "^impl<E: Engine> CellLoop" src/cells.rs || { echo "check: can't find impl CellLoop in src/cells.rs"; exit 1; }
+crossed=$(grep -nE "\bShared\b|\bLive\b|self\.sh\b|Origin::(Local|Remote|Wire|Socket|Call)|Msg::" src/cells.rs || true)
+[ -z "$crossed" ] || { printf '%s\n' "$crossed"; echo "check: the cells reach past the line (src/cells.rs)"; exit 1; }
+# And the node loads no program, starts no cell: only the cells do.
+loads=$(grep -nE "\.load_as\(|eng\.(load|spawn|thaw)\(|CellLoop|cells::Progs::new|Code::empty" src/http.rs | grep -v "^[0-9]*:\s*//" || true)
+loads=$(printf '%s\n' "$loads" | grep -v "cells::Progs::new(), &" || true)
+[ -z "$loads" ] || { printf '%s\n' "$loads"; echo "check: the node loads programs (src/http.rs)"; exit 1; }
 start() { # name, image (and its command), port, env...
     name=$1 image=$2 port=$3; shift 3
     docker ps --format '{{.Names}}' | grep -qx "$name" && return
@@ -32,15 +44,23 @@ cargo test --release -q >"$out" 2>&1 || true
 grep -E "test result|FAILED|panicked" "$out"
 grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { grep -E "^error" -A8 "$out" | head -30; echo "check: tests failed"; exit 1; }
 cargo test --release -q -p combd-mem -p combd-load >"$out" 2>&1 || true
-grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { grep -E "FAILED|panicked" "$out"; echo "check: combd-mem or combd-load failed"; exit 1; }
+grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { grep -E "FAILED|panicked|^error" -A8 "$out" || true; echo "check: combd-mem or combd-load failed"; exit 1; }
+# The cells' lockdown, which is Linux's: its escape tests, and a node whose
+# cells run locked in a child, in Docker (under its own seccomp profile too).
+if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+    docker run --rm -v "$(git rev-parse --show-toplevel)":/repo -v combd-cargo:/usr/local/cargo/registry -w /repo/combd \
+        -e CARGO_TARGET_DIR=/repo/combd/target-linux rust:1.99.1-slim-bookworm \
+        sh -c 'cargo test --release -q -p combd-wall && cargo test --release -q --test child' >"$out" 2>&1 \
+        || { grep -E "FAILED|panicked|^error" -A8 "$out" || tail -20 "$out"; echo "check: the lockdown failed on Linux"; exit 1; }
+fi
 # The guard-page wall: a fault in the running cell's memory traps, and every
 # other fault still kills the process (combd-aot's own tests).
 cargo test --release -q -p combd-aot --features guard >"$out" 2>&1 || true
-grep -q "test result: ok. [1-9]" "$out" && ! grep -q FAILED "$out" || { grep -E "FAILED|panicked|^error" "$out"; echo "check: the guard-page wall failed"; exit 1; }
+grep -q "test result: ok. [1-9]" "$out" && ! grep -q FAILED "$out" || { grep -E "FAILED|panicked|^error" -A8 "$out" || true; echo "check: the guard-page wall failed"; exit 1; }
 # The compiled tier too, when aot.sh has made its modules (they aren't in git).
 if [ -f aot/src/gen_rust.rs ]; then
     cargo test --release -q --features aot >"$out" 2>&1 || true
-    grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { grep -E "FAILED|panicked" "$out"; echo "check: the compiled tier's tests failed"; exit 1; }
+    grep -q "test result: ok" "$out" && ! grep -q FAILED "$out" || { grep -E "FAILED|panicked|^error" -A8 "$out" || true; echo "check: the compiled tier's tests failed"; exit 1; }
 fi
 # No secrets in what's about to be pushed (gitleaks; .gitleaks.toml), and no
 # dependency with a known hole (cargo audit; .cargo/audit.toml says what's
@@ -62,4 +82,9 @@ cargo test --release -q --features aot-lite -- --include-ignored a_build_loads a
 ./target/release/combd fuzz 3000 | grep -q "no mismatches" || { echo "check: fuzz found a mismatch"; exit 1; }
 # The host API, with memory the cell keeps rewriting between calls (15 s).
 ./target/release/combd fuzz-host 1000 | tee "$out" | grep -q "no problems" || { cat "$out"; echo "check: fuzz-host found a problem"; exit 1; }
+# The line from the node's side: a hostile cells' process, on a node alone
+# and in a fleet (with the bucket). Its log is the node's, and long.
+for run in "1" "2" ${COMBD_S3:+"1 fleet" "2 fleet"}; do
+    ./target/release/combd fuzz-ipc 20000 $run 2>/dev/null | tee "$out" | grep -q "no problems" || { cat "$out"; echo "check: fuzz-ipc found a problem"; exit 1; }
+done
 echo "check: ok"

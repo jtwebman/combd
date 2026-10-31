@@ -15,6 +15,7 @@ use wasmtime::{
 pub struct Wt {
     engine: wasmtime::Engine,
     fuel_slice: u64,
+    pool: Option<u32>,
 }
 
 impl Wt {
@@ -30,7 +31,7 @@ impl Wt {
             p.total_core_instances(slots).total_memories(slots).total_tables(slots).total_stacks(slots);
             c.allocation_strategy(InstanceAllocationStrategy::Pooling(p));
         }
-        Wt { engine: wasmtime::Engine::new(&c).expect("wasmtime config"), fuel_slice }
+        Wt { engine: wasmtime::Engine::new(&c).expect("wasmtime config"), fuel_slice, pool }
     }
 }
 
@@ -98,6 +99,9 @@ fn from_u64(t: &ValType, v: u64) -> Val {
 impl Engine for Wt {
     type Program = InstancePre<HostState>;
     type Vm = WtVm;
+    fn child(&self) -> String {
+        format!("wasmtime:{}:{}", self.fuel_slice, self.pool.map_or(String::new(), |p| p.to_string()))
+    }
 
     fn load(&self, wasm: &[u8]) -> Result<InstancePre<HostState>, String> {
         let module = Module::new(&self.engine, wasm).map_err(e)?;

@@ -61,6 +61,12 @@ The first release: Durable Objects on your own machines, as one binary.
   unless `COMBD_PG_ALLOW` lists them, and it connects to the address it
   checked. combd takes the bucket's keys out of its environment at
   start, and on Linux it's non-dumpable.
+- Cells run in a process of their own, apart from the keys, TLS, the
+  bucket, and the wire, with an empty environment. On Linux it locks
+  itself down before it loads a module: landlock (only the objects'
+  files, read only builds, no TCP) and seccomp (no socket, no new
+  process, no program, no memory made executable unless it loads
+  compiled builds). Objects' files move to `objects/` in the data folder.
 - Builders hold no bucket credentials: one asks any node's admin API for
   work and sends back what it built (`COMBD_FLEET`), each request signed
   with its builder key, which the nodes must list.
@@ -77,10 +83,11 @@ The first release: Durable Objects on your own machines, as one binary.
   goes quiet), and an idle builder backs off to 30 s.
 
 **Checked**
-- TLA+ specs for ownership, replication, and the catalog; a deterministic
-  simulator of crashes, splits, lost messages, and moves; the Wasm spec
-  test suite; differential fuzzing; three rounds of security review, each
-  finding proven with a failing test.
+- TLA+ specs for ownership, replication, the catalog, and the alarm index;
+  a deterministic simulator of crashes, splits, lost messages, and moves;
+  the Wasm spec test suite; differential fuzzing; a fuzzer playing a
+  hostile cells' process against the node; three rounds of security
+  review, each finding proven with a failing test.
 - The guard-page wall tested the way V8 tests its sandbox: a fault in the
   running cell's memory traps, and any other fault (another cell's memory,
   a paused cell's, no cell's) still kills the process. Each test was seen
