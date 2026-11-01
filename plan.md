@@ -2,7 +2,7 @@
 
 Status: hardening before we tell people about it. A working runtime,
 live on a three-node fleet of $6 droplets (the arena and million).
-Updated: 2026-10-26
+Updated: 2026-10-31
 
 This plan was written before we built anything. Most of it held up. Where
 building taught us something, the section below says what changed and why,
@@ -128,6 +128,9 @@ and the rest of the plan is updated to match.
    - Whether the X race goes in the launch post (JT).
    - **A second wall around the engine** (JT, 2026-10-29: before release).
      See "Before release: a wall that holds when the engine doesn't".
+     Steps 1 to 4 done (2026-10-31): the cells in a locked-down child,
+     which starts again when it dies (C4c). Step 5, cordons, deferred
+     (JT). Left: see the lockdown on x86-64 (a droplet).
    - Phoenix keeps the shorter p99 at 100 connections (23 ms to 29 to 37).
    - Show the agent's ceiling gone on a big machine (here Postgres runs out
      first): a many-core box, combd and Postgres apart.
@@ -2341,10 +2344,12 @@ call today:
 ### Failure
 
 A child that dies takes only its cordon's cells. Its in-flight requests get
-503, as when a cell crashes. Its objects' files are on disk and their
-writes are safe in peers or the bucket, so the restarted child loads them
-as after a crash today. To the core, the node didn't die, so there's no
-takeover. The simulator gets a "cordon crash" fault to check that.
+503, as when a cell crashes. Alone, a node's objects reopen from their
+files, as after a crash. In a fleet they can't: what ran since the last
+seal is in a file and in no entry (the WAL's tail, kept in the child's
+memory, is gone), so the core gives up what the child held and claims it
+again, as after a crash of the node (`own::Event::Lost`, C4c). The
+simulator's `cells` fault checks that.
 
 ### Testing it like V8
 
@@ -2492,9 +2497,8 @@ takeover. The simulator gets a "cordon crash" fault to check that.
    - C4: the child process. `combd cells`, started with an empty
      environment and only its socket pairs; settings and deploys come
      over them. A child that dies: its requests in flight get 503, it
-     starts again, gets the deploys again, and reopens the objects the
-     node still owns from their files (to the core, the node didn't die).
-     In pieces:
+     starts again, and gets the deploys again (C4c says what becomes of
+     its objects). In pieces:
      - C4a (done): `cells::spawn` and `combd cells`. The child gets a
        control socket as stdin, its loops' sockets over it
        (`SCM_RIGHTS`), then a `line::Start`: the parent's build (a hash
@@ -2502,8 +2506,8 @@ takeover. The simulator gets a "cordon crash" fault to check that.
        running even after an update replaced its file), the engine
        (`Engine::child`), and the settings. `COMBD_CELLS=threads` keeps
        them on threads, as the tests do (their binary is the test
-       runner); `tests/child.rs` runs the built binary. For now a child
-       that dies stops the node.
+       runner); `tests/child.rs` runs the built binary. A child that
+       died stopped the node then (until C4c).
      - C4b (done): the parent loads no program. `cells::start` makes a
        `Link` first, and a deploy's check (`Link::check`, `line::Ctl`)
        goes to the cells, which load programs once each (`Progs`) for
@@ -2514,18 +2518,50 @@ takeover. The simulator gets a "cordon crash" fault to check that.
        before (the cells' check). `check.sh` fails if `http.rs` loads a
        program. Two tests fixed that read too soon on a loaded machine
        (`a_full_node_refuses_at_tcp`, `stats_count_each_process_time`).
-     - C4c: a child that dies starts again, as above. Until then it stops
-       the node, which systemd starts again: to the fleet a node crash,
-       which the model and the simulator already cover. Starting only the
-       child keeps the node's objects, but its requests and seals in
-       flight, and the objects it owns, need the simulator's "cordon
-       crash" first. With one cordon a node, stopping the node costs no
-       more than a child alone would: everything on it was in that child.
-       It matters with several (step 5), where one org's crash mustn't
-       take the rest, so it comes with cordons. What a crash loses: the
-       files keep every commit (a process crash doesn't lose the page
-       cache); runs with no `Ran`, seals with no `Sealed`, and restores
-       in flight are what the simulator must cover.
+     - C4c (done, 2026-10-31): a child that dies starts again, and the
+       node goes on. JT asked for it before cordons. `http::keep_cells`
+       waits on the cells (`cells::Link::wait`) and starts them again
+       (`Link::again`), each loop getting its new line (`Msg::Cells`).
+       One that dies again within 30 s of its start waits longer each
+       time (100 ms doubling, up to 30 s). A loop that finds its line
+       closed, or broken (what doesn't decode, more than `MAX_UP`), stops
+       the cells (`Link::kill`, only the start of them it talked to, so a
+       late loop can't kill new ones). `Loop::cells_down` answers 503 for
+       every token, lets go of database handles (a lease that comes back
+       later, for cells now gone, goes straight back: `inst`), `call`s,
+       `Behind`, and anchors, and closes `ws` sessions with 1012 (their
+       state was the child's). Object WebSockets stay: `cells_up` sends
+       the new cells every `SockOpen` again, with the app, the health,
+       and the files to drop. While there are none, what needs cells gets
+       503 at once (`submit`, `no_cells`), and the stats page has the
+       node's counts. In a fleet, the files can't be trusted: the WAL's
+       tail since the last seal (`Db::tail`) was the child's memory, so
+       what ran since is in a file and in no entry. `own::Event::Lost`
+       gives up every object served or being restored, as `drop_obj`
+       does (in hand: `Failed`; waiting: `NotRun`), and the next request
+       claims it again: a new epoch, fenced, from the peers' tails and
+       the bucket, as after a node's crash, which the specs cover (any
+       process may claim at any time). A fetch for a restore given up is
+       for nobody (`Core::wants_restore`). The simulator's `cells` fault:
+       now and then a process's executor dies and its core goes on, its
+       data and every answer it hadn't sent gone (answers carry the
+       executor's generation), answers taking 0 to 3 ms. 600 runs and 300
+       with moves, splits, beats, a lost disk and a lost node: no
+       problem. A core that ignores `Lost` (`ignore_lost`) is caught, and
+       one that forgets restores in flight never takes a write again (the
+       probe). Found on the way: executor answers that overtook each
+       other let a read's answer show a write not yet sealed (seed 8);
+       the line keeps order, so the simulator does too, and the core
+       relies on it. And on macOS a restarted child's lines read as
+       closed at once: its sockets, sent with `SCM_RIGHTS` and closed in
+       the parent, were only in flight when another socket closed (the
+       old control socket), and the kernel flushed them. The parent
+       keeps them now until the child says it has them. Tests:
+       `cells_that_die_start_again`, `a_session_closes_when_its_cells_die`,
+       `a_fleet_node_whose_cells_die_loses_no_write` (fails, hung,
+       without `Lost`), `a_cells_process_that_dies_is_started_again`
+       (SIGKILL, the built binary, Linux locked too), and fuzz-ipc checks
+       that junk closes only the line it came on.
    - C5 (done, 2026-10-31): bench against S0, back to back, million's
      server pinned to one CPU (`bench/line/results/2026-10-31-c5.txt`,
      S0, child, child, S0, each pair averaged). Arena (native, many
@@ -2670,8 +2706,45 @@ takeover. The simulator gets a "cordon crash" fault to check that.
    - Step 5 must keep builds out of every cordon's `rw` (a planted `.so`
      loaded by another cordon would cross the wall): today they're
      `data/builds`, beside `objects/`, so they are.
-5. **Cordons:** config for which orgs share one (default: one per org),
-   stats per cordon, the docs ("What it doesn't do" in `security.md`).
+5. **Cordons: deferred** (JT, 2026-10-31). With one company on a fleet,
+   a cordon per org changes nothing (one org, one process, as now), and
+   the walls that matter to it are up: the keys, TLS, the bucket, and
+   Postgres passwords are out of the process that runs code. Cordons pay
+   off for a host of many tenants, or (per app) to keep one app's
+   compromised dependency from another app's secrets and objects. Built
+   when someone needs that. `security.md` says what holds until then:
+   one cells' process for every app on a node.
+   How, when it's built (worked out 2026-10-31):
+   - The policy is a hook beside `policy::home`: `policy::cordon(org,
+     app) -> String`, the key of the process an app's cells run in. The
+     default and the config (`COMBD_CORDONS`) decide per app, per org, or
+     in groups, as Cloudflare groups by trust. Environments, when built,
+     are part of the app's key.
+   - A cordon is a child with a cell loop for each of the node's loops
+     (loop i talks to loop i of each), so `owner()` is unchanged. It
+     starts when its first app is checked, and the loops pick up a new
+     cordon's lines before a new `App`.
+   - It's sent only its apps' programs, processes, and env vars: others'
+     keep their slot (an empty program, a retired process with no name,
+     an app with no name), so indices match on both sides
+     (`App::for_cordon`; `cells::Code` holds `Option` programs).
+   - Walls: read and write only its apps' folders (`objects/<org>/<app>`;
+     the node makes them first), and each app's alarm index in its own
+     folder (`store::split_alarms` moves the shared one).
+   - The node routes each message by the name's org and app, or the
+     process's tenant, and checks every message a cordon sends: names,
+     processes, tokens, calls, and database handles must be its own
+     apps' (a handle also its own app's: today the cells side checks
+     that, not the node). Another's is dropped, logged, and counted.
+   - Behind per cordon: a cordon behind gets its new sockets refused
+     (503); the node stops listening only when all are.
+   - A cordon's fsync threads start as needed, so an idle one is cheap.
+   - `fuzz-ipc` with two cordons: the hostile one replays the other's
+     names, tokens, and handles, and the honest one's clients must only
+     ever get its own answers.
+   - Spectre: Cloudflare (2020) takes away precise timers and moves a
+     Worker that looks like an attack to a process of its own. Look at
+     what our clocks give a cell.
 
 ### Decided (JT, 2026-10-29)
 
@@ -2680,5 +2753,10 @@ takeover. The simulator gets a "cordon crash" fault to check that.
   out of the process that runs code.
 - The budget is 10% at p50 on the arena and million benches, with p99
   reported. Over it, we make it faster before it ships.
+- (2026-10-31) Restated: 10% at p50 at 100 connections or more, or on 2
+  CPUs or more. One CPU at 10 connections pays one process switch a
+  request (about 25 us, +24% at p50, C6), which no transport removes: the
+  price of keeping the keys out of the process that runs code. Shown as
+  is in the docs.
 
 A bug bounty (V8's VRP) waits until someone backs the project.

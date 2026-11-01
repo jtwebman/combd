@@ -256,6 +256,15 @@ pub enum Event {
     /// Start serving the object here now, with no request: it was just
     /// handed to us (`Effect::Handed`). Ignored unless it's idle here.
     Claim { obj: Obj },
+    /// The executor lost all it held (the cells' process died, and another
+    /// starts): every object's data, and every run, seal, and restore it
+    /// hadn't answered. Its files can't be trusted: what ran since the last
+    /// seal is in them, in no entry. So every object it served, or was
+    /// restoring, is given up as if this node had crashed: what was in hand
+    /// fails, and the next request claims it again (a new epoch, from the
+    /// bucket and the peers' tails). Entries already sealed are on the peers
+    /// or in the bucket, so no acknowledged write is lost.
+    Lost,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -343,6 +352,9 @@ pub struct Bugs {
     /// Compaction: delete by the newest image the listing shows, not the one
     /// the round proved (a later one may be unproven).
     pub gc_newest_image: bool,
+    /// The executor lost everything (`Event::Lost`), and the core serves on
+    /// as if it hadn't.
+    pub ignore_lost: bool,
 }
 
 /// For a store that lost its disk and is relearning `o` (record at `epoch`):
@@ -780,9 +792,11 @@ struct ObjSt {
     etag: String,
     /// Fencing for epoch E, until the manifest is written.
     fence: Option<FenceSt>,
-    /// The activation being started, and its epoch.
+    /// The activation being started, and its epoch; and whether the
+    /// executor has its restore (`Effect::Restore`), not answered yet.
     act: Act,
     epoch: u32,
+    restoring: bool,
 }
 
 /// Counts, for tests and stats.
@@ -951,6 +965,7 @@ impl Core {
             fence: None,
             act: 0,
             epoch: 0,
+            restoring: false,
         })
     }
 
@@ -993,6 +1008,12 @@ impl Core {
         let born = self.born.unwrap_or(now);
         let alive = |n: Node| n == self.node || now.saturating_sub(self.heard.get(&n).copied().unwrap_or(born)) < self.lease_ms;
         among.iter().copied().filter(|&n| alive(n)).max_by_key(|&n| spread_score(o, n))
+    }
+
+    /// Does the core still wait on this restore? A fetch that comes back
+    /// after the executor was lost (`Event::Lost`) is for nobody.
+    pub fn wants_restore(&self, o: Obj, act: Act) -> bool {
+        self.objs.get(&o).is_some_and(|st| matches!(st.phase, Phase::Starting) && st.act == act && st.restoring)
     }
 
     pub fn on(&mut self, now: u64, ev: Event) -> Vec<Effect> {
@@ -1157,6 +1178,13 @@ impl Core {
                     self.reply(now, w, res);
                 }
             }
+            Event::Lost if self.bugs.ignore_lost => {}
+            Event::Lost => {
+                let gone: Vec<Obj> = self.objs.iter().filter(|(_, st)| matches!(st.phase, Phase::Serving(_)) || st.restoring).map(|(&o, _)| o).collect();
+                for o in gone {
+                    self.drop_obj(o);
+                }
+            }
         }
         std::mem::take(&mut self.out)
     }
@@ -1166,6 +1194,7 @@ impl Core {
         if !matches!(st.phase, Phase::Starting) || st.act != act {
             return;
         }
+        st.restoring = false;
         if !ok {
             return self.drop_obj(o);
         }
@@ -1443,6 +1472,7 @@ impl Core {
         let waiting: Vec<ReqId> = st.waiting.drain(..).collect();
         st.early = None;
         st.fence = None;
+        st.restoring = false;
         self.out.push(Effect::Drop { obj: o });
         for r in failed {
             self.answer(r, Answer::Failed);
@@ -1621,6 +1651,7 @@ impl Core {
                 let st = self.st(o);
                 st.act = act;
                 st.epoch = e;
+                st.restoring = true;
                 self.out.push(Effect::Restore { obj: o, act, segs, image });
             }
 

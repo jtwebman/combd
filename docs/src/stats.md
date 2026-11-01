@@ -79,13 +79,15 @@ curl -s https://n0.arena.combd.dev/_combd/stats
 | Field | What it is |
 |---|---|
 | `ev_instances`, `ev_requests` | Event-cell instances started, and the requests they took. |
+| `cells_restarts` | Times the cells' process died and the node started another ([Security](security.md#the-cells-own-process)). The cells' own counts, such as `objects_live`, `commits`, and the sessions', start over then. |
 | `procs` | Per `org/app/process`: `cpu_us`, its cells' run time with host calls, `slices`, and `engine`, `compiled` or `interpreted`. |
 | `node` | This node's number in a fleet, `null` on one node. |
 | `version` | The combd version, `dev` for a build with none set. |
 
 Watch these first: `pressure`, `tcp_refusing`, `sessions_ready`,
 `mailbox_refused`, `conns_refused`, and `disk_low`. Any of them above 0
-means the node is turning work away.
+means the node is turning work away. `cells_restarts` above 0 means the
+cells' process died: the node's log says why.
 
 ## `/v1/nodes`
 

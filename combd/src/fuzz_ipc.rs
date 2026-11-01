@@ -8,7 +8,9 @@
 //! - it never stalls: its own check (`/_combd/ping`) answers within `SLOW`
 //!   all along,
 //! - each loop keeps reading its line,
-//! - and last, bytes that don't decode stop only the loop they came on.
+//! - and last, bytes that don't decode close only the line they came on
+//!   (a real node's cells are stopped then, and start again), and the node
+//!   goes on.
 //!
 //! What a cordon may name (its own tenants' objects, sockets, and
 //! handles) is checked once there's more than one (plan.md, step 5).
@@ -278,16 +280,19 @@ pub fn run(n: u64, seed: u64, wasm: &[u8], fleet: bool) -> Stats {
     }
     // Even seeds: no app yet, as a fleet node before its first deploy.
     let app = if seed % 2 == 0 { App::empty() } else { App::single(wasm, 4) };
-    std::thread::spawn(move || http::serve_linked(&http::Live::new(app), port, cfg, node_ends));
+    std::thread::spawn(move || http::serve_linked(&http::Live::new(app), port, cfg, None, node_ends));
     let seen = Arc::new(Mutex::new(Seen::default()));
-    for s in &ours {
-        let (mut s, seen) = (s.try_clone().unwrap(), seen.clone());
+    // Each line, once the node has closed it.
+    let closed: Vec<Arc<std::sync::atomic::AtomicBool>> = (0..threads).map(|_| Arc::default()).collect();
+    for (s, closed) in ours.iter().zip(&closed) {
+        let (mut s, seen, closed) = (s.try_clone().unwrap(), seen.clone(), closed.clone());
         std::thread::spawn(move || {
             while let Some(b) = read_frame(&mut s) {
                 if let Some(m) = Down::decode(&b) {
                     learn(&seen, &m);
                 }
             }
+            closed.store(true, std::sync::atomic::Ordering::Relaxed);
         });
     }
     let start = Instant::now();
@@ -347,11 +352,15 @@ pub fn run(n: u64, seed: u64, wasm: &[u8], fleet: bool) -> Stats {
         }
     }
     std::thread::sleep(Duration::from_millis(200));
-    // Last, what doesn't decode: loop 0 stops, and the node still answers
-    // its check on the other.
+    // Last, what doesn't decode: loop 0 closes its line, the others keep
+    // theirs, and the node still answers its check.
     let junk: Vec<u8> = (0..64).map(|_| r.next() as u8).collect();
     let _ = ours[0].write_all(&(junk.len() as u32).to_le_bytes()).and_then(|()| ours[0].write_all(&junk));
     std::thread::sleep(Duration::from_millis(200));
+    let shut: Vec<bool> = closed.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+    if shut.first() != Some(&true) || shut[1..].contains(&true) {
+        st.problems.push(format!("seed {seed}: after junk on line 0, the lines closed are {shut:?}"));
+    }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let up = (0..20).any(|_| ask(port, "GET", "/_combd/ping", SLOW) == 200);
     if !up {

@@ -1956,6 +1956,64 @@ mod tests {
         assert!(eventually(2000, || stat(port, "sessions_live") == 1), "and takes new sessions");
     }
 
+    /// The cells die and start again (C4c), the node going on: the request
+    /// they had gets 503, the object's writes are all there after, and its
+    /// WebSocket, the node's, stays open, its object hearing it again.
+    #[test]
+    fn cells_that_die_start_again() {
+        let dir = store::tempdir::Dir::new();
+        let c = cfg(&dir.0, 2);
+        let kill = c.cells_kill.clone();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, c);
+        for n in 1..=3 {
+            assert_eq!(http(port, "POST", "/do/k/incr", ""), (200, format!("{{\"count\":{n}}}")));
+        }
+        let mut w = Ws::open(port, "/do/room/ws").unwrap();
+        w.text("before");
+        assert!(String::from_utf8(w.recv().1).unwrap().contains("before"));
+        let busy = std::thread::spawn(move || http(port, "POST", "/do/k/busy", "1500"));
+        std::thread::sleep(Duration::from_millis(300));
+        kill.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(busy.join().unwrap().0, 503, "what the cells had in hand");
+        // 503 until they're back (none of those ran), then on from 3.
+        assert!(eventually(10_000, || http(port, "POST", "/do/k/incr", "").0 == 200), "the cells came back");
+        assert_eq!(http(port, "GET", "/do/k/count", ""), (200, "{\"count\":4}".into()));
+        assert_eq!(stat(port, "cells_restarts"), 1);
+        w.text("after");
+        assert!(String::from_utf8(w.recv().1).unwrap().contains("after"));
+        let msgs = http(port, "GET", "/do/room/msgs", "").1;
+        assert!(msgs.contains("before") && msgs.contains("after"), "{msgs}");
+    }
+
+    /// A session's state was the cells': when they die, its socket closes
+    /// (1012, "service restart"), and a new one starts on the new cells.
+    #[test]
+    fn a_session_closes_when_its_cells_die() {
+        let app = store::tempdir::Dir::new();
+        std::fs::create_dir(app.0.join("modules")).unwrap();
+        std::fs::write(app.0.join("combd.toml"), "[app]\nname = \"slow\"\n[ws.slow]\nmodule = \"classic\"\nroutes = [\"/slow\"]\non_close = \"drop\"\nhibernate = \"off\"\n").unwrap();
+        std::fs::copy(GUEST, app.0.join("modules/classic.wasm")).unwrap();
+        let eng = interp::Interp { max_pages: 16384 };
+        let (a, _) = http::load_app(&eng, &app.0).unwrap_or_else(|e| panic!("{e}"));
+        let dir = store::tempdir::Dir::new();
+        let c = cfg(&dir.0, 1);
+        let kill = c.cells_kill.clone();
+        let (port, _, _) = server_app(eng, c, move |_| a);
+        let mut w = Ws::open_to(port, "slow.localhost", "/slow").unwrap();
+        w.text("session-busy 1");
+        assert!(eventually(2000, || stat(port, "sessions_live") == 1));
+        kill.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(w.recv(), (8, 1012u16.to_be_bytes().to_vec()));
+        let w = std::cell::RefCell::new(None);
+        assert!(eventually(10_000, || {
+            *w.borrow_mut() = Ws::open_to(port, "slow.localhost", "/slow").ok();
+            w.borrow().is_some()
+        }), "a new session, once the cells are back");
+        w.borrow_mut().as_mut().unwrap().text("session-busy 1");
+        assert!(eventually(2000, || stat(port, "sessions_live") == 1), "on the new cells");
+        assert_eq!(stat(port, "cells_restarts"), 1);
+    }
+
     /// Stats count each process's time: an object busy for 300 ms shows it.
     #[test]
     fn stats_count_each_process_time() {
@@ -2486,6 +2544,7 @@ mod tests {
             max_awake: 1000,
             stop: Arc::default(),
             disk_low_forced: Arc::default(),
+            cells_kill: Arc::default(),
             sync_delay: Duration::ZERO,
             fleet: None,
             pg: None,
@@ -3244,6 +3303,58 @@ mod tests {
         stop_a.store(true, std::sync::atomic::Ordering::Relaxed);
         ta.join().unwrap();
         assert!(eventually(15_000, || http(b, "GET", "/do/fb/count", "") == (200, "{\"count\":7}".into())), "{:?}", http(b, "GET", "/do/fb/count", ""));
+    }
+
+    /// Fleet mode: a node's cells die (C4c). Their files can't be trusted
+    /// (what ran since the last seal is in them, in no entry), so the node
+    /// gives up what they held (`own::Event::Lost`) and claims it again: a
+    /// new epoch, fenced, from the peers' tails. No write is lost.
+    #[test]
+    fn a_fleet_node_whose_cells_die_loses_no_write() {
+        let Some(base) = s3::S3::from_env() else {
+            eprintln!("skipping: set COMBD_S3 to test fleet mode against a real bucket");
+            return;
+        };
+        let dir = store::tempdir::Dir::new();
+        wire::make_certs(&dir.0.join("certs"), 3).unwrap();
+        let bucket = test_bucket();
+        let wports = free_ports(3);
+        let peers: HashMap<own::Node, String> = (0..3).map(|n| (n, format!("127.0.0.1:{}", wports[n as usize]))).collect();
+        let node = |n: own::Node| {
+            let fc = fleet::FleetCfg {
+                node: n,
+                lease_ms: 1000,
+                replicas: 2,
+                s3: s3::S3 { bucket: bucket.clone(), ..base.clone() },
+                peers: peers.clone(),
+                wire_port: wports[n as usize],
+                wire_certs: Some(dir.0.join("certs")),
+                insecure: false,
+                upload_ms: 60_000,
+                upload_bytes: 1 << 20,
+                read_lease: true,
+                regions: HashMap::new(), place_ms: 0, areas: HashMap::new(),
+            };
+            let c = http::Config { fleet: Some(fc), ..cfg(&dir.0.join(format!("d{n}")), 1) };
+            let kill = c.cells_kill.clone();
+            (do_server(interp::Interp { max_pages: 16384 }, c).0, kill)
+        };
+        let (a, kill) = node(0);
+        node(1);
+        node(2);
+        assert!(eventually(10_000, || http(a, "POST", "/do/cd/incr", "").0 == 200), "a first write");
+        for n in 2..=5 {
+            assert_eq!(http(a, "POST", "/do/cd/incr", ""), (200, format!("{{\"count\":{n}}}")));
+        }
+        let fences = stat(a, "fences");
+        let busy = std::thread::spawn(move || http(a, "POST", "/do/cd/busy", "1500"));
+        std::thread::sleep(Duration::from_millis(300));
+        kill.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(busy.join().unwrap().0, 503, "what the cells had in hand");
+        assert!(eventually(15_000, || http(a, "POST", "/do/cd/incr", "").0 == 200), "the object is served again");
+        assert_eq!(http(a, "GET", "/do/cd/count", ""), (200, "{\"count\":6}".into()));
+        assert_eq!(stat(a, "cells_restarts"), 1);
+        assert!(stat(a, "fences") > fences, "claimed again, from its peers: {}", http(a, "GET", "/_combd/stats", "").1);
     }
 
     /// Compile on deploy, end to end: an app with a compiled module is

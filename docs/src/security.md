@@ -151,7 +151,7 @@ for good:
 - **System calls** (seccomp): a short list, the ones it is seen to make.
   It can't open a socket, connect anywhere, run a program, start a
   process, trace or read another process, or signal one. A call off the
-  list kills it, and the node stops and says why.
+  list kills it, and the node says why.
 - **No code of its own**: with only interpreted modules, no memory can be
   made executable. Compiled builds need it, so a node that loads them
   allows it.
@@ -164,7 +164,18 @@ cells' process runs without it and says so.
 
 The node reads what that process sends as it reads a cell's host calls:
 every message is checked, and a fuzzer plays a hostile cells' process
-against it.
+against it. A message that doesn't check out, or more than the process may
+send, gets it stopped.
+
+When the cells' process dies, for any reason, the node starts another.
+The node keeps its connections and its WebSockets. What the cells had in
+hand gets 503, and a `ws` session closes with 1012, since its state was
+in that process. One that dies again soon after it starts waits longer
+each time, up to 30 s. In a fleet, the node can't trust the objects' files
+(what ran since the last seal is in them, in no entry), so it gives up
+each object the cells held and claims it again from its peers and the
+bucket, as after a crash. `cells_restarts` in the
+[stats](stats.md) counts the restarts.
 
 ## How it's been checked
 
@@ -189,9 +200,11 @@ are hostile too.
 
 ## What it doesn't do (yet)
 
-- **One cells' process for every tenant on a node.** A cell that broke
-  out of its sandbox could read other tenants' objects on that node,
-  though not the node's keys. A process per org is next.
+- **One cells' process for every app on a node.** A cell that broke
+  out of its sandbox could read other apps' objects, env vars, and
+  secrets on that node (another org's too), though not the node's keys,
+  the bucket, TLS, or Postgres passwords. A process per app or per org
+  (cordons) is planned, not built.
 - **One compromised node is the whole fleet.** Every node holds the
   bucket's credentials, and mTLS proves "a fleet member", not which one.
 - **No rules between tenants.** combd runs your own apps. Any org with a

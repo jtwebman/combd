@@ -2500,12 +2500,31 @@ pub fn check<E: Engine>(eng: &E, progs: &Progs<E::Program>, app: &App) -> Result
 }
 
 /// The node's hold on its cells, wherever they run: each loop's end of its
-/// line, and the control socket (deploy checks; while it's open, they run).
+/// line, the control socket (deploy checks; while it's open, they run), and
+/// the cells now, which the node's keeper starts again when they die
+/// (`http::keep_cells`).
 pub struct Link {
     pub ends: Vec<mio::net::UnixStream>,
     ctl: Mutex<std::os::unix::net::UnixStream>,
-    /// The child process, if they're in one.
-    pub child: Option<std::process::Child>,
+    now: Mutex<Now>,
+    /// What they were told first (`line::Start`, encoded), to start again.
+    start: Vec<u8>,
+    child: bool,
+}
+
+/// The cells running now: which start of them it is (one more each time),
+/// and whether a loop asked to stop them (`Link::kill`).
+struct Now {
+    run: Running,
+    inst: u64,
+    stop: bool,
+}
+
+enum Running {
+    Child(std::process::Child),
+    /// On threads (tests): the thread, and the cells' ends of their
+    /// sockets, to cut, as a process that dies cuts its own.
+    Threads(std::thread::JoinHandle<()>, Vec<std::os::unix::net::UnixStream>),
 }
 
 impl Link {
@@ -2523,46 +2542,125 @@ impl Link {
         ctl.read_exact(&mut b).map_err(gone)?;
         crate::line::Ctl::decode_answer(&b).ok_or_else(|| "the cells' answer to a check doesn't decode".to_string())?
     }
+
+    /// Which start of the cells runs now (0 first; each line a loop has
+    /// comes from one).
+    #[cfg(test)]
+    pub fn inst(&self) -> u64 {
+        self.now.lock().unwrap().inst
+    }
+
+    /// A loop found start `inst`'s line closed or broken: stop them, if
+    /// they're still the ones running (`wait` does it, and says they died).
+    pub fn kill(&self, inst: u64) {
+        let mut now = self.now.lock().unwrap();
+        if now.inst == inst {
+            now.stop = true;
+        }
+    }
+
+    /// Wait until the cells die (stopping them, if asked), and say how; or
+    /// `None` once `quit` is set.
+    pub fn wait(&self, quit: &std::sync::atomic::AtomicBool) -> Option<String> {
+        while !quit.load(Relaxed) {
+            {
+                let mut now = self.now.lock().unwrap();
+                let stop = std::mem::take(&mut now.stop);
+                match &mut now.run {
+                    Running::Child(c) => {
+                        if stop {
+                            let _ = c.kill();
+                        }
+                        if let Ok(Some(status)) = c.try_wait() {
+                            use std::os::unix::process::ExitStatusExt;
+                            // `SIGSYS`: seccomp's, for a call off the lockdown's list.
+                            let why = if status.signal() == Some(rustix::process::Signal::SYS.as_raw()) { ", killed by its lockdown for a system call it may not make" } else { "" };
+                            return Some(format!("{status}{why}"));
+                        }
+                    }
+                    Running::Threads(t, theirs) => {
+                        if stop {
+                            for s in theirs.iter() {
+                                let _ = s.shutdown(std::net::Shutdown::Both);
+                            }
+                        }
+                        if t.is_finished() {
+                            return Some("their threads stopped".into());
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    /// Start the cells again, as they were first (`start`): each loop's new
+    /// end of its line, and which start this is.
+    pub fn again(&self) -> std::io::Result<(Vec<mio::net::UnixStream>, u64)> {
+        let (ends, ctl, run) = spawn(&self.start, self.child)?;
+        *self.ctl.lock().unwrap() = ctl;
+        let mut now = self.now.lock().unwrap();
+        now.run = run;
+        now.inst += 1;
+        now.stop = false;
+        Ok((ends, now.inst))
+    }
 }
 
 /// Start a node's cells: in a process of their own (`combd cells`), or, if
 /// not `child`, on threads here. Either way they're reached over sockets,
 /// and make their own engine from `start.engine` (`Engine::child`).
 pub fn start(start: crate::line::Start, child: bool) -> std::io::Result<Link> {
-    use std::io::Write;
+    let mut b = vec![];
+    start.encode(&mut b);
+    let (ends, ctl, run) = spawn(&b, child)?;
+    Ok(Link { ends, ctl: Mutex::new(ctl), now: Mutex::new(Now { run, inst: 0, stop: false }), start: b, child })
+}
+
+fn spawn(start: &[u8], child: bool) -> std::io::Result<(Vec<mio::net::UnixStream>, std::os::unix::net::UnixStream, Running)> {
+    use std::io::{Read, Write};
     use std::os::fd::{AsFd, OwnedFd};
     use std::os::unix::net::UnixStream;
+    let spec = crate::line::Start::decode(start).ok_or_else(|| std::io::Error::other("a start that doesn't decode"))?;
     let (ctl, ctl_cells) = UnixStream::pair()?;
     let (mut ends, mut theirs) = (vec![], vec![]);
-    for _ in 0..start.set.threads {
+    for _ in 0..spec.set.threads {
         let (a, b) = UnixStream::pair()?;
         a.set_nonblocking(true)?;
         ends.push(mio::net::UnixStream::from_std(a));
         theirs.push(b);
     }
     if !child {
-        std::thread::Builder::new().name("cells".into()).spawn(move || {
-            if let Err(e) = serve_spec(start, theirs, ctl_cells, false) {
+        let cut = theirs.iter().chain([&ctl_cells]).map(UnixStream::try_clone).collect::<std::io::Result<_>>()?;
+        let t = std::thread::Builder::new().name("cells".into()).spawn(move || {
+            if let Err(e) = serve_spec(spec, theirs, ctl_cells, false) {
                 eprintln!("combd     cells: {e}");
             }
         })?;
-        return Ok(Link { ends, ctl: Mutex::new(ctl), child: None });
+        return Ok((ends, ctl, Running::Threads(t, cut)));
     }
     // An empty environment, nothing open but the control socket (as its
     // stdin), which brings its loops' sockets and then what it's told first.
     let mut ctl_w = ctl;
     let child = std::process::Command::new(own_exe()).arg("cells").env_clear().stdin(std::process::Stdio::from(OwnedFd::from(ctl_cells))).spawn()?;
+    println!("combd     cells in process {}", child.id());
     let fds: Vec<_> = theirs.iter().map(|s| s.as_fd()).collect();
     let mut space = vec![std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
     let mut anc = rustix::net::SendAncillaryBuffer::new(&mut space);
     anc.push(rustix::net::SendAncillaryMessage::ScmRights(&fds));
     rustix::net::sendmsg(&ctl_w, &[std::io::IoSlice::new(&[0])], &mut anc, rustix::net::SendFlags::empty())?;
+    // Ours stay open until the child says it has them: a socket that's
+    // only in flight can be flushed by the kernel meanwhile (macOS, when
+    // another socket closes: a restarted child's lines read as closed).
+    let mut got = [0u8; 1];
+    ctl_w.set_read_timeout(Some(Duration::from_secs(30)))?;
+    ctl_w.read_exact(&mut got).map_err(|e| std::io::Error::other(format!("the cells' process didn't take its sockets: {e}")))?;
+    ctl_w.set_read_timeout(None)?;
     drop(theirs);
-    let mut b = vec![];
-    start.encode(&mut b);
-    ctl_w.write_all(&(b.len() as u32).to_le_bytes())?;
-    ctl_w.write_all(&b)?;
-    Ok(Link { ends, ctl: Mutex::new(ctl_w), child: Some(child) })
+    ctl_w.write_all(&(start.len() as u32).to_le_bytes())?;
+    ctl_w.write_all(start)?;
+    Ok((ends, ctl_w, Running::Child(child)))
 }
 
 /// `combd cells`: a node's cells, in a process of their own (`start`).
@@ -2597,6 +2695,7 @@ fn child_run() -> std::io::Result<()> {
             ends.extend(fds.map(std::os::unix::net::UnixStream::from));
         }
     }
+    std::io::Write::write_all(&mut ctl, &[1])?;
     let mut n = [0u8; 4];
     ctl.read_exact(&mut n)?;
     let mut b = vec![0; u32::from_le_bytes(n) as usize];

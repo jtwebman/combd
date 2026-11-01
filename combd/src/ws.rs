@@ -32,6 +32,9 @@ pub const BAD_DATA: u16 = 1007;
 pub const TOO_BIG: u16 = 1009;
 /// We closed it: it read too slowly (policy violation).
 pub const TOO_SLOW: u16 = 1008;
+/// Its session's state is gone: the cells' process died (1012, service
+/// restart: connect again).
+pub const RESTART: u16 = 1012;
 
 /// Joins fragments across reads, up to `max` bytes a message.
 pub struct Decoder {

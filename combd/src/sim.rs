@@ -18,7 +18,10 @@
 //! - heartbeats between nodes (how they tell who's alive) go the same way
 //!   as everything else: lost, late, or cut by a split,
 //! - with `loss`, one node dies for good partway through: what it owned must
-//!   be taken over.
+//!   be taken over,
+//! - with `cells`, a process's executor dies (a node's cells' process) and
+//!   another starts, while the process and its core go on: its data, and
+//!   every answer it hadn't sent, are gone (`Event::Lost`).
 //!
 //! Each process also plays the executor: it keeps an object's data (a list
 //! of writes), seals segments, and restores from them, through the bucket,
@@ -114,12 +117,15 @@ pub struct Settings {
     /// Now and then a process hands an object it serves to another node
     /// (`Event::Move`), as placement does.
     pub moves: bool,
+    /// Now and then a process's executor dies and another starts (a node's
+    /// cells' process), and its answers take 0 to 3 ms, so some are lost.
+    pub cells: bool,
     pub bugs: Bugs,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, lease: true, uploads: None, beats: false, peer_ms: None, moves: false, bugs: Bugs::default() }
+        Settings { nodes: 3, objects: 2, clients: 6, duration: 20_000, lost: 0.03, crash: 0.005, freeze: 0.005, replicas: 0, splits: false, wipes: false, loss: false, lease: true, uploads: None, beats: false, peer_ms: None, moves: false, cells: false, bugs: Bugs::default() }
     }
 }
 
@@ -150,6 +156,8 @@ pub struct Stats {
     pub wipes: u64,
     /// Nodes lost for good (`loss`).
     pub lost: u64,
+    /// Executors lost while their process went on (`cells`).
+    pub cells_lost: u64,
     /// The longest time any object went without an acknowledged write, in ms
     /// (while traffic was running).
     pub max_gap: u64,
@@ -162,6 +170,9 @@ const CLIENT_TIMEOUT: u64 = 5_000;
 enum Msg {
     /// To a process: an event from the outside world.
     Proc(usize, Event),
+    /// To a process, from its executor: lost if that executor has died
+    /// since (its generation is past).
+    Exec(usize, u64, Event),
     /// A bucket call arriving at the bucket.
     Bucket(usize, OpId, Call, bool),
     /// A peer call arriving at a node's peer store.
@@ -225,6 +236,10 @@ struct Proc {
     data: HashMap<Obj, Data>,
     /// The history each request saw, for its answer.
     saw: HashMap<ReqId, Vec<W>>,
+    /// Its executor's generation: one more each time one dies; and when its
+    /// last answer arrives (they keep their order, as on the line).
+    exec: u64,
+    exec_at: u64,
 }
 
 struct Pending {
@@ -377,6 +392,8 @@ impl Sim {
             off,
             data: HashMap::new(),
             saw: HashMap::new(),
+            exec: 0,
+            exec_at: 0,
         });
         let p = self.procs.len() - 1;
         self.current.insert(node, p);
@@ -457,6 +474,11 @@ impl Sim {
     fn step(&mut self, m: Msg) -> Result<(), String> {
         match m {
             Msg::Proc(p, ev) => self.deliver(p, ev),
+            Msg::Exec(p, gen, ev) => {
+                if gen == self.procs[p].exec {
+                    self.deliver(p, ev);
+                }
+            }
             Msg::Beat(p) => {
                 if !self.procs[p].alive {
                     return Ok(());
@@ -646,6 +668,14 @@ impl Sim {
             return;
         }
         let node = self.procs[p].node;
+        if self.s.cells && self.rng.chance(0.02) {
+            // The cells' process: what it held, and what it hadn't said, go.
+            self.stats.cells_lost += 1;
+            self.procs[p].exec += 1;
+            self.procs[p].data.clear();
+            self.deliver(p, Event::Lost);
+            return;
+        }
         if self.rng.chance(self.s.crash) {
             self.stats.crashes += 1;
             self.procs[p].alive = false;
@@ -732,14 +762,14 @@ impl Sim {
                 let h = d.history.clone();
                 self.procs[p].saw.insert(req, h);
                 let proof = !self.beats.contains(&req);
-                self.at(0, Msg::Proc(p, Event::Ran { obj, act, req, changed: write.is_some(), proof }));
+                self.exec_answer(p, Event::Ran { obj, act, req, changed: write.is_some(), proof });
             }
             Effect::Seal { obj, act, image } => {
                 let d = self.procs[p].data.entry(obj).or_default();
                 let changes = encode(&std::mem::take(&mut d.unsealed));
                 // As of this entry: everything run so far.
                 d.image = image.map(|k| (k, encode(&d.history)));
-                self.at(0, Msg::Proc(p, Event::Sealed { obj, act, changes }));
+                self.exec_answer(p, Event::Sealed { obj, act, changes });
             }
             Effect::Restore { obj, act, segs, image } => {
                 // Segments are write-once, so reading them all now is the same
@@ -761,8 +791,8 @@ impl Sim {
                     }
                 }
                 self.procs[p].data.insert(obj, Data { history, unsealed: vec![], image: None });
-                let d = self.latency();
-                self.at(d, Msg::Proc(p, Event::Restored { obj, act, ok }));
+                let (d, gen) = (self.latency(), self.procs[p].exec);
+                self.at(d, Msg::Exec(p, gen, Event::Restored { obj, act, ok }));
             }
             Effect::PutImage { obj, act } => {
                 // Sometimes never written (a crash, a lost PUT).
@@ -788,6 +818,18 @@ impl Sim {
                 }
             }
         }
+    }
+
+    /// The executor's answer to its core: at once, or with `cells`, in 0 to
+    /// 3 ms (and lost if it dies first). In order: the core counts on a
+    /// write's `Ran` coming before that of a read run after it (a read let
+    /// past it was answered with a write not yet sealed: seed 8).
+    fn exec_answer(&mut self, p: usize, ev: Event) {
+        let d = if self.s.cells { self.rng.below(4) } else { 0 };
+        let at = (self.now + d).max(self.procs[p].exec_at);
+        self.procs[p].exec_at = at;
+        let gen = self.procs[p].exec;
+        self.at(at - self.now, Msg::Exec(p, gen, ev));
     }
 
     /// The bucket: linearizable, with conditional writes.
@@ -1042,6 +1084,7 @@ pub fn run_with(seeds: std::ops::Range<u64>, settings: &dyn Fn() -> Settings) ->
         total.splits += s.splits;
         total.wipes += s.wipes;
         total.lost += s.lost;
+        total.cells_lost += s.cells_lost;
         total.max_gap = total.max_gap.max(s.max_gap);
         total.probe_ms = total.probe_ms.max(s.probe_ms);
         if let Err(e) = r {
@@ -1205,6 +1248,25 @@ mod tests {
         assert!(bad.is_none(), "far peers, beats, splits, wipes: {bad:?}");
         let (_, bad) = run_with(0..100, &|| Settings { replicas: 2, moves: true, uploads: Some((5000, 1 << 20)), bugs: Bugs { seal_early: true, ..Bugs::default() }, ..Settings::default() });
         assert!(bad.is_some(), "seal_early wasn't caught through a move");
+    }
+
+    /// A node's cells' process dies and another starts, the node going on
+    /// (`Event::Lost`): every invariant holds, with every other fault on.
+    /// A core that serves on as if nothing happened is caught.
+    #[test]
+    fn a_lost_executor_loses_nothing() {
+        for replicas in [0, 2] {
+            let (s, bad) = run_with(0..300, &|| Settings { replicas, cells: true, ..Settings::default() });
+            assert!(bad.is_none(), "replicas {replicas}: {bad:?}");
+            assert!(s.cells_lost > 1000 && s.writes_acked > 10_000, "{s:?}");
+            let (_, bad) = run_with(0..300, &|| Settings { replicas, cells: true, moves: true, splits: true, beats: true, ..Settings::default() });
+            assert!(bad.is_none(), "replicas {replicas}, with moves, splits, and beats: {bad:?}");
+            let ignore = Bugs { ignore_lost: true, ..Bugs::default() };
+            let (_, bad) = run_with(0..300, &|| Settings { replicas, cells: true, bugs: ignore, ..Settings::default() });
+            assert!(bad.is_some(), "replicas {replicas}: ignore_lost wasn't caught");
+        }
+        let (_, bad) = run_with(0..300, &|| Settings { replicas: 2, cells: true, wipes: true, loss: true, ..Settings::default() });
+        assert!(bad.is_none(), "with a lost disk and a lost node: {bad:?}");
     }
 
     /// Each known-bad version must be caught, or the oracle is blind.

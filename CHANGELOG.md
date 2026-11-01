@@ -67,6 +67,10 @@ The first release: Durable Objects on your own machines, as one binary.
   files, read only builds, no TCP) and seccomp (no socket, no new
   process, no program, no memory made executable unless it loads
   compiled builds). Objects' files move to `objects/` in the data folder.
+  If that process dies, the node starts another and keeps its
+  connections; what the cells had in hand gets 503. In a fleet, the
+  node claims their objects again from its peers and the bucket, so no
+  acknowledged write is lost.
 - Builders hold no bucket credentials: one asks any node's admin API for
   work and sends back what it built (`COMBD_FLEET`), each request signed
   with its builder key, which the nodes must list.

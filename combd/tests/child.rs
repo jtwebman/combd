@@ -14,9 +14,13 @@ fn http(port: u16, method: &str, path: &str) -> (u16, String) {
     (status, r.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
 }
 
-/// Process `pid` is still there.
-fn alive(pid: u32) -> bool {
-    Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+fn pid(n: u32) -> rustix::process::Pid {
+    rustix::process::Pid::from_raw(n as i32).unwrap()
+}
+
+/// Process `n` is still there (a zombie counts: its parent hasn't waited).
+fn alive(n: u32) -> bool {
+    rustix::process::test_kill_process(pid(n)).is_ok()
 }
 
 #[test]
@@ -70,6 +74,51 @@ fn the_cells_run_in_a_child_that_ends_with_the_node() {
     let start = Instant::now();
     while alive(cells) {
         assert!(start.elapsed() < Duration::from_secs(5), "the cells' process outlived the node");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cells' process killed (C4c): the node starts another, and goes on
+/// serving on the same port, every write still there. When the node goes,
+/// the new one goes with it.
+#[test]
+fn a_cells_process_that_dies_is_started_again() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let dir = std::env::temp_dir().join(format!("combd-child-again-{}-{port}", std::process::id()));
+    let mut node = Command::new(env!("CARGO_BIN_EXE_combd")).args(["serve", "interp", "rust", &port.to_string()]).env("COMBD_DATA", &dir).env("COMBD_THREADS", "2").stdout(Stdio::piped()).spawn().unwrap();
+    let mut out = BufReader::new(node.stdout.take().unwrap()).lines();
+    let mut next_cells = move || -> u32 { out.by_ref().map_while(Result::ok).find_map(|l| l.split("cells in process ").nth(1).map(|p| p.trim().parse().unwrap())).expect("the cells' process") };
+    let first = next_cells();
+    let start = Instant::now();
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(start.elapsed() < Duration::from_secs(10), "the node didn't listen");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for n in 1..=3 {
+        assert_eq!(http(port, "POST", "/do/room1/incr"), (200, format!("{{\"count\":{n}}}")));
+    }
+    rustix::process::kill_process(pid(first), rustix::process::Signal::KILL).unwrap();
+    let second = next_cells();
+    assert_ne!(first, second);
+    let start = Instant::now();
+    while http(port, "POST", "/do/room1/incr").0 != 200 {
+        assert!(start.elapsed() < Duration::from_secs(10), "the new cells didn't serve");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(http(port, "GET", "/do/room1/count"), (200, "{\"count\":4}".into()));
+    assert!(http(port, "GET", "/_combd/stats").1.contains("\"cells_restarts\":1"));
+    assert!(alive(second));
+    let start = Instant::now();
+    while alive(first) {
+        assert!(start.elapsed() < Duration::from_secs(5), "the dead cells' process wasn't waited for");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    node.kill().unwrap();
+    node.wait().unwrap();
+    let start = Instant::now();
+    while alive(second) {
+        assert!(start.elapsed() < Duration::from_secs(5), "the new cells' process outlived the node");
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = std::fs::remove_dir_all(&dir);

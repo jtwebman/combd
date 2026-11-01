@@ -143,6 +143,10 @@ pub struct Config {
     /// Tests only: the data disk reads as nearly full (`disk_low`).
     #[cfg(test)]
     pub disk_low_forced: Arc<AtomicBool>,
+    /// Tests only: set it to stop the cells, as if their process died
+    /// (`keep_cells` starts them again).
+    #[cfg(test)]
+    pub cells_kill: Arc<AtomicBool>,
     /// Tests only: every fsync takes at least this long, to prove the output
     /// gate waits for it.
     pub sync_delay: Duration,
@@ -316,6 +320,8 @@ impl Config {
         Config {
             #[cfg(test)]
             disk_low_forced: Default::default(),
+            #[cfg(test)]
+            cells_kill: Default::default(),
             threads: num("COMBD_THREADS", std::thread::available_parallelism().map_or(1, |n| n.get())),
             data: PathBuf::from(std::env::var("COMBD_DATA").unwrap_or_else(|_| "data".into())),
             idle: Duration::from_millis(num("COMBD_IDLE_MS", 60_000) as u64),
@@ -390,6 +396,9 @@ struct Stats {
     /// frames for a socket go in one).
     ws_frames: AtomicU64,
     ws_flushes: AtomicU64,
+    /// Times the cells' process died and was started again (their own
+    /// counts start over then).
+    cells_restarts: AtomicU64,
 }
 
 /// What the loops share.
@@ -579,8 +588,11 @@ enum Msg {
     WsPush { name: String, sock: u64, op: u8, payload: Vec<u8> },
     /// Fleet mode: a push of ours couldn't reach the socket's node.
     WsLost { name: String, sock: u64 },
-    /// A database call is done (the node's: a lease becomes a handle).
-    DbDone { to: CallTo, done: DbDone },
+    /// A database call is done (the node's: a lease becomes a handle), for
+    /// cells started as `inst`.
+    DbDone { to: CallTo, done: DbDone, inst: u64 },
+    /// The cells started again (start `inst`): this loop's new line to them.
+    Cells { line: mio::net::UnixStream, inst: u64 },
     /// The answer to a `call` this loop made.
     CallDone { id: u64, reply: (u16, String) },
 }
@@ -745,7 +757,7 @@ pub fn serve<E: Engine>(eng: &E, wasm: &[u8], port: u16) {
     let mut link = start_cells(eng, &cfg);
     link.check(&app).unwrap_or_else(|e| panic!("{e}"));
     let ends = std::mem::take(&mut link.ends);
-    serve_linked(&Live::new(app), port, cfg, ends);
+    serve_linked(&Live::new(app), port, cfg, Some(&link), ends);
 }
 
 /// The app in `dir`: its manifest, resolved for the local `dev` environment,
@@ -781,7 +793,7 @@ fn serve_apps_in<E: Engine>(eng: &E, apps: &[(String, std::path::PathBuf)], port
                 std::process::exit(1);
             }
             let ends = std::mem::take(&mut link.ends);
-            serve_linked(&Live::new(app), port, cfg, ends);
+            serve_linked(&Live::new(app), port, cfg, Some(&link), ends);
         }
         Err(e) => {
             // Any mistake in any app, and nothing starts.
@@ -858,7 +870,7 @@ pub fn serve_fleet_apps<E: Engine>(eng: &E, port: u16, mut cfg: Config, admin: O
                 }
             }
         });
-        serve_linked(live, port, cfg, ends);
+        serve_linked(live, port, cfg, Some(link), ends);
     });
     Ok(())
 }
@@ -1318,7 +1330,7 @@ pub fn serve_with<E: Engine>(eng: &E, app: App, port: u16, cfg: Config) {
     let mut link = start_cells(eng, &cfg);
     link.check(&app).unwrap_or_else(|e| panic!("{e}"));
     let ends = std::mem::take(&mut link.ends);
-    serve_linked(&Live::new(app), port, cfg, ends);
+    serve_linked(&Live::new(app), port, cfg, Some(&link), ends);
 }
 
 /// Serve what's `live`, with cells of its own.
@@ -1326,39 +1338,71 @@ pub fn serve_with<E: Engine>(eng: &E, app: App, port: u16, cfg: Config) {
 pub fn serve_live<E: Engine>(eng: &E, live: &Live, port: u16, cfg: Config) {
     let mut link = start_cells(eng, &cfg);
     let ends = std::mem::take(&mut link.ends);
-    serve_linked(live, port, cfg, ends);
+    serve_linked(live, port, cfg, Some(&link), ends);
 }
 
 /// Start the node's cells (`cells::start`): in a process of their own
 /// unless `COMBD_CELLS=threads` (always on threads in tests), told what they
-/// need of `cfg`. The node can't go on without them: a child that ends ends
-/// it. ponytail: started again on its own comes with cordons (plan.md, C4c).
+/// need of `cfg`. Once the node serves, `keep_cells` starts them again
+/// whenever they die.
 fn start_cells<E: Engine>(eng: &E, cfg: &Config) -> cells::Link {
     std::fs::create_dir_all(&cfg.data).unwrap_or_else(|e| panic!("create the data directory {}: {e}", cfg.data.display()));
     let objects = crate::store::objects_dir(&cfg.data).unwrap_or_else(|e| panic!("the objects' folder in {}: {e}", cfg.data.display()));
     let set = cells::Settings { data: objects, threads: cfg.threads, idle: cfg.idle, max_awake: cfg.max_awake, max_objects: cfg.max_objects, environ: cfg.environ.clone(), node: cfg.fleet.as_ref().map(|f| f.node) };
     let start = line::Start { build: if cfg.cells_child { cells::build_id() } else { String::new() }, engine: eng.child(), aot_dir: std::env::var_os("COMBD_AOT_DIR").map(PathBuf::from), set, sync_delay: cfg.sync_delay, lock: cfg.lockdown };
-    let mut link = cells::start(start, cfg.cells_child).unwrap_or_else(|e| panic!("the cells: {e}"));
-    if let Some(mut child) = link.child.take() {
-        println!("combd     cells in process {}", child.id());
-        let stop = cfg.stop.clone();
-        std::thread::spawn(move || {
-            let status = child.wait();
-            if !stop.load(Relaxed) {
-                use std::os::unix::process::ExitStatusExt;
-                // `SIGSYS`: seccomp's, for a call off the lockdown's list.
-                let why = if status.as_ref().is_ok_and(|s| s.signal() == Some(rustix::process::Signal::SYS.as_raw())) { ", killed by its lockdown for a system call it may not make" } else { "" };
-                eprintln!("combd     the cells' process ended ({status:?}{why}): stopping");
-                std::process::exit(1);
+    cells::start(start, cfg.cells_child).unwrap_or_else(|e| panic!("the cells: {e}"))
+}
+
+/// Why the line failed: `None` if the cells are just gone (their end
+/// closed), else what's odd about it.
+fn gone_or(e: &std::io::Error, doing: &str) -> Option<String> {
+    (!matches!(e.kind(), ErrorKind::BrokenPipe | ErrorKind::ConnectionReset)).then(|| format!("{doing}: {e}"))
+}
+
+/// Keep the cells running: when they die (or a loop finds their line
+/// broken, and stops them), start them again, and hand each loop its new
+/// line (`Loop::cells_up`). The node keeps its connections, sockets, and
+/// what it owns in the fleet; what the cells had in hand got 503
+/// (`Loop::cells_down`). Cells that die again soon after they start wait a
+/// little longer each time, up to 30 s, so a crash at start doesn't spin.
+fn keep_cells(link: &cells::Link, sh: &Shared) {
+    let quit = &sh.cfg.stop;
+    let (mut wait, mut started) = (Duration::ZERO, Instant::now());
+    loop {
+        let Some(why) = link.wait(quit) else { return };
+        sh.stats.cells_restarts.fetch_add(1, Relaxed);
+        wait = if started.elapsed() < Duration::from_secs(30) { (wait * 2).clamp(Duration::from_millis(100), Duration::from_secs(30)) } else { Duration::ZERO };
+        eprintln!("combd     the cells' process ended ({why}): starting it again in {wait:?}");
+        loop {
+            let until = Instant::now() + wait;
+            while Instant::now() < until {
+                if quit.load(Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-        });
+            match link.again() {
+                Ok((ends, inst)) => {
+                    for ((tx, waker), line) in sh.peers.iter().zip(ends) {
+                        let _ = tx.send(Msg::Cells { line, inst });
+                        let _ = waker.wake();
+                    }
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("combd     the cells didn't start: {e}");
+                    wait = (wait * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
+                }
+            }
+        }
+        started = Instant::now();
     }
-    link
 }
 
 /// Serve what's `live`, on `port`, each loop with its line to the cells
-/// (`ends`, from `start_cells`).
-pub(crate) fn serve_linked(live: &Live, port: u16, mut cfg: Config, ends: Vec<mio::net::UnixStream>) {
+/// (`ends`, from `start_cells`), which `link` keeps running (none: whoever
+/// holds the other ends does, as `fuzz-ipc`).
+pub(crate) fn serve_linked(live: &Live, port: u16, mut cfg: Config, link: Option<&cells::Link>, ends: Vec<mio::net::UnixStream>) {
     let app = live.now();
     std::fs::create_dir_all(&cfg.data).unwrap_or_else(|e| panic!("create the data directory {}: {e}", cfg.data.display()));
     // Every connection is a file: the limit goes to its ceiling, and the
@@ -1413,6 +1457,18 @@ pub(crate) fn serve_linked(live: &Live, port: u16, mut cfg: Config, ends: Vec<mi
     };
     let sh = &sh;
     std::thread::scope(|sc| {
+        if let Some(link) = link {
+            sc.spawn(move || keep_cells(link, sh));
+            #[cfg(test)]
+            sc.spawn(move || {
+                while !sh.cfg.stop.load(Relaxed) {
+                    if sh.cfg.cells_kill.swap(false, Relaxed) {
+                        link.kill(link.inst());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+        }
         for (me, ((poll, inbox), node_end)) in polls.into_iter().zip(inboxes).zip(node_ends).enumerate() {
             let l = sh.public.lock().unwrap().as_ref().unwrap().try_clone().expect("clone listener");
             let local = local.try_clone().expect("clone listener");
@@ -1482,8 +1538,11 @@ pub(crate) fn serve_linked(live: &Live, port: u16, mut cfg: Config, ends: Vec<mi
                     health: (0, false),
                     stats_waiting: vec![],
                     last_sweep: Instant::now(),
-                    line: line::End::new(node_end, line::MAX_UP),
+                    line: Some(line::End::new(node_end, line::MAX_UP)),
                     line_writable: false,
+                    link,
+                    inst: 0,
+                    drops: vec![],
                 };
                 if let Err(e) = lp.run(TcpListener::from_std(l), TcpListener::from_std(local), r.map(TcpListener::from_std)) {
                     eprintln!("event loop stopped: {e}");
@@ -1585,9 +1644,17 @@ struct Loop<'a> {
     cells_progs: usize,
     /// When the node last swept (`sweep_node`).
     last_sweep: Instant,
-    /// The line to this loop's cells, and whether it waits to be writable.
-    line: line::End,
+    /// The line to this loop's cells (none while they start again), and
+    /// whether it waits to be writable.
+    line: Option<line::End>,
     line_writable: bool,
+    /// What keeps the cells running, and which start of them the line is
+    /// to (`cells::Link::inst`).
+    link: Option<&'a cells::Link>,
+    inst: u64,
+    /// Objects let go while the cells were down: their files go once
+    /// they're back.
+    drops: Vec<String>,
 }
 
 /// Fleet mode: check the bucket, then start the bucket pool and the wire.
@@ -1833,7 +1900,9 @@ impl Loop<'_> {
             self.poll.registry().register(r, REDIRECT, Interest::READABLE)?;
         }
         self.ensure_pools();
-        self.poll.registry().register(&mut self.line.s, LINE, Interest::READABLE)?;
+        if let Some(line) = self.line.as_mut() {
+            self.poll.registry().register(&mut line.s, LINE, Interest::READABLE)?;
+        }
         let mut touched: Vec<usize> = vec![];
         // Listeners whose last accept stopped at its slice: more may be waiting.
         let mut more: Vec<Token> = vec![];
@@ -1946,45 +2015,166 @@ impl Loop<'_> {
     /// Send the cells what's queued; what the socket doesn't take goes when
     /// it's writable again.
     fn flush_line(&mut self) -> std::io::Result<()> {
-        self.line.flush()?;
-        if self.line.pending() != self.line_writable {
-            self.line_writable = self.line.pending();
+        let Some(line) = self.line.as_mut() else { return Ok(()) };
+        if let Err(e) = line.flush() {
+            return self.cells_down(gone_or(&e, "sending to them").as_deref());
+        }
+        if line.pending() != self.line_writable {
+            self.line_writable = line.pending();
             let interest = if self.line_writable { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
-            self.poll.registry().reregister(&mut self.line.s, LINE, interest)?;
+            self.poll.registry().reregister(&mut line.s, LINE, interest)?;
         }
         Ok(())
     }
 
-    /// What the cells sent. They're gone, or sent what doesn't decode: this
-    /// loop can't go on without them.
+    /// What the cells sent: first all of it, even from cells that just
+    /// died. Gone, or broken (what doesn't decode, or more than they may
+    /// send), they're stopped and started again (`cells_down`).
     fn read_line(&mut self, closed: bool) -> std::io::Result<()> {
         self.flush_line()?;
-        if !self.line.fill(closed)? {
-            return Err(std::io::Error::other("the cells closed the line"));
-        }
+        let Some(line) = self.line.as_mut() else { return Ok(()) };
+        let open = match line.fill(closed) {
+            Ok(open) => open,
+            Err(e) => return self.cells_down(gone_or(&e, "reading from them").as_deref()),
+        };
+        let whole = match line.take_whole() {
+            Ok(w) => w,
+            Err(e) => return self.cells_down(Some(&e.to_string())),
+        };
         // An answer for a connection here goes from the line's bytes into
         // the connection's; the rest are decoded.
-        let whole = self.line.take_whole()?;
         for m in line::frames(&whole) {
             match Up::answer(m) {
                 Some((token, status, body)) => match self.tokens.remove(&token) {
                     Some(Origin::Local(who)) => self.reply_local(who, status, body)?,
-                    Some(origin) => {
-                        let body = String::from_utf8(body.to_vec()).map_err(|_| std::io::Error::other("an answer from the cells that isn't text"))?;
-                        self.deliver(origin, (status, body))?
-                    }
+                    Some(origin) => match String::from_utf8(body.to_vec()) {
+                        Ok(body) => self.deliver(origin, (status, body))?,
+                        Err(_) => {
+                            self.tokens.insert(token, origin);
+                            return self.cells_down(Some("an answer that isn't text"));
+                        }
+                    },
                     None => {}
                 },
-                None => self.on_up(Up::decode(m).ok_or_else(|| std::io::Error::other("a message from the cells that doesn't decode"))?)?,
+                None => match Up::decode(m) {
+                    Some(up) => self.on_up(up)?,
+                    None => return self.cells_down(Some("a message that doesn't decode")),
+                },
+            }
+            if self.line.is_none() {
+                return Ok(());
             }
         }
-        self.line.recycle(whole);
+        if let Some(line) = self.line.as_mut() {
+            line.recycle(whole);
+        }
+        if !open {
+            return self.cells_down(None);
+        }
         Ok(())
     }
 
-    /// The node sends to the cells.
+    /// The node sends to the cells (or, while they start again, answers
+    /// for them: `no_cells`).
     fn down(&mut self, m: Down) {
-        self.line.send(|b| m.encode(b));
+        match self.line.as_mut() {
+            Some(line) => line.send(|b| m.encode(b)),
+            None => self.no_cells(m),
+        }
+    }
+
+    /// What was for the cells, while there are none: a request gets 503, a
+    /// restore fails, a file to drop waits, the stats page has only the
+    /// node's counts, and the rest (what they'd hold, or have as news) is
+    /// nothing to cells that start empty.
+    fn no_cells(&mut self, m: Down) {
+        match m {
+            Down::Run { origin: Origin::Token(t), .. } | Down::Worker { origin: Origin::Token(t), .. } => {
+                if let Some(origin) = self.tokens.remove(&t) {
+                    let _ = self.deliver(origin, (503, "{\"error\":\"retry\"}".into()));
+                }
+            }
+            Down::Restore { name, act, .. } => self.restored(name, act, None, None),
+            Down::Drop { name } => self.drops.push(name),
+            // The node's own counts, and none of theirs.
+            Down::Stats => {
+                for who in std::mem::take(&mut self.stats_waiting) {
+                    let body = self.stats_page(&cells::Counts::default());
+                    let _ = self.deliver(Origin::Local(who), (200, body));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The cells are gone (their process died: `broken` is `None`), or this
+    /// loop found them broken, and has them stopped. What they had in hand
+    /// fails: each request gets 503, their database handles and `call`s
+    /// are let go, a session (its state was theirs) closes its socket, and
+    /// in a fleet the core gives up every object they held
+    /// (`own::Event::Lost`), to claim it again from the bucket and the
+    /// peers. Until `keep_cells` brings them back (`cells_up`), what needs
+    /// them gets 503.
+    fn cells_down(&mut self, broken: Option<&str>) -> std::io::Result<()> {
+        let Some(mut line) = self.line.take() else { return Ok(()) };
+        let _ = self.poll.registry().deregister(&mut line.s);
+        drop(line);
+        self.line_writable = false;
+        if let Some(why) = broken {
+            eprintln!("combd     loop {}: the cells are broken ({why}): stopping them", self.me);
+        }
+        if let Some(link) = self.link {
+            link.kill(self.inst);
+        }
+        for (_, origin) in std::mem::take(&mut self.tokens) {
+            self.deliver(origin, (503, "{\"error\":\"retry\"}".into()))?;
+        }
+        self.no_cells(Down::Stats);
+        self.calls.clear();
+        for (_, lease) in self.pg_handles.drain() {
+            lease.release();
+        }
+        if std::mem::take(&mut self.cells_behind) {
+            self.sh.behind.fetch_sub(1, Relaxed);
+        }
+        self.anchored.clear();
+        let app = &self.app;
+        let session = |name: &str| session_sock(name).is_some() && app.procs.get(app.object_proc(name)).is_some_and(|p| p.socket);
+        let sessions: Vec<(String, u64)> = self.local_socks.iter().filter_map(|(&sock, &who)| self.conns.get(who.0)?.as_ref().filter(|c| c.gen == who.1)?.ws.as_ref().filter(|w| session(&w.obj)).map(|w| (w.obj.clone(), sock))).collect();
+        for (name, sock) in sessions {
+            self.ws_frame(&name, sock, 8, &crate::ws::encode(8, &crate::ws::RESTART.to_be_bytes()))?;
+        }
+        if self.core.is_some() {
+            self.restore_index.clear();
+            self.core_on(own::Event::Lost);
+        }
+        Ok(())
+    }
+
+    /// The cells are back (`keep_cells`), as start `inst`: this loop's new
+    /// line to them. They start empty, so they get all of the app, the
+    /// node's health, the sockets this loop holds (an object's own list says
+    /// which are its), and the files to drop.
+    fn cells_up(&mut self, s: mio::net::UnixStream, inst: u64) -> std::io::Result<()> {
+        // The old line's end not seen yet: what's on it, then that.
+        if self.line.is_some() {
+            self.read_line(true)?;
+            self.cells_down(None)?;
+        }
+        let mut line = line::End::new(s, line::MAX_UP);
+        self.poll.registry().register(&mut line.s, LINE, Interest::READABLE)?;
+        (self.line, self.inst) = (Some(line), inst);
+        (self.app_gen, self.cells_progs) = (u64::MAX, 0);
+        self.pick_up_app();
+        self.down(Down::Health { pressure: self.health.0, disk_low: self.health.1 });
+        let socks: Vec<u64> = self.local_socks.keys().copied().collect();
+        for sock in socks {
+            self.down(Down::SockOpen(sock));
+        }
+        for name in std::mem::take(&mut self.drops) {
+            self.down(Down::Drop { name });
+        }
+        self.flush_line()
     }
 
     /// A deploy swapped in a new app: the node takes its routes and starts
@@ -2085,7 +2275,8 @@ impl Loop<'_> {
                 }
                 Msg::WsPush { name, sock, op, payload } => self.ws_local(&name, sock, op, &payload)?,
                 Msg::WsLost { name, sock } => self.down(Down::SockLost { name, sock }),
-                Msg::DbDone { to, done } => self.db_back(to, done),
+                Msg::DbDone { to, done, inst } => self.db_back(to, done, inst),
+                Msg::Cells { line, inst } => self.cells_up(line, inst)?,
                 Msg::CallDone { id, reply } => self.call_done(id, reply),
                 Msg::Reply { who, reply } => self.deliver(Origin::Local(who), reply)?,
                 Msg::Bucket { op, res } => self.core_on(own::Event::Reply { op, res }),
@@ -2236,8 +2427,9 @@ impl Loop<'_> {
     /// back through the inbox (`db_back`).
     fn db_ask(&mut self, to: CallTo, proc: usize, ask: DbAsk) {
         let (tx, waker) = self.sh.peers[self.me].clone();
+        let inst = self.inst;
         let reply = move |done: DbDone| {
-            let _ = tx.send(Msg::DbDone { to, done });
+            let _ = tx.send(Msg::DbDone { to, done, inst });
             let _ = waker.wake();
         };
         // The errors name the call the cell made.
@@ -2283,8 +2475,15 @@ impl Loop<'_> {
     }
 
     /// A database call is back (from a pool's thread): a lease becomes a
-    /// handle here, and the cells get its number.
-    fn db_back(&mut self, to: CallTo, done: DbDone) {
+    /// handle here, and the cells get its number. For cells that died since,
+    /// it goes nowhere, and a lease goes back.
+    fn db_back(&mut self, to: CallTo, done: DbDone, inst: u64) {
+        if inst != self.inst || self.line.is_none() {
+            if let DbDone::Pinned(Ok(lease)) = done {
+                lease.release();
+            }
+            return;
+        }
         let back = match done {
             DbDone::Answer(a) => Back::Answer(a),
             DbDone::Pinned(Err(e)) => Back::Failed(e),
@@ -2400,7 +2599,7 @@ impl Loop<'_> {
     fn stats_page(&self, c: &cells::Counts) -> String {
         let s = &self.sh.stats;
         let body = format!(
-            "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"moves\":{},\"reseats\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"disk_low\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{}}}",
+            "{{\"objects_live\":{},\"objects_opened\":{},\"evictions\":{},\"alarms_fired\":{},\"alarms_failed\":{},\"forwarded\":{},\"commits\":{},\"fsyncs\":{},\"checkpoints\":{},\"fsyncs_slow\":{},\"fsync_max_us\":{},\"peer_acks\":{},\"bucket_acks\":{},\"fences\":{},\"tail_entries\":{},\"uploads\":{},\"lease_reads\":{},\"fence_waits\":{},\"gc_deleted\":{},\"moves\":{},\"reseats\":{},\"sockets_open\":{},\"ws_messages\":{},\"ws_handoffs\":{},\"sessions_live\":{},\"sessions_hibernated\":{},\"sessions_woken\":{},\"sessions_ready\":{},\"sessions_waited\":{},\"mailbox_refused\":{},\"batched\":{},\"ws_frames\":{},\"ws_flushes\":{},\"heap_in_use\":{},\"conns_open\":{},\"conns_refused\":{},\"tcp_refusing\":{},\"disk_low\":{},\"accept_failed\":{},\"memory_used\":{},\"memory_budget\":{},\"machine_available\":{},\"pressure\":{},\"ev_instances\":{},\"ev_requests\":{},\"cells_restarts\":{}}}",
             c.objects_live,
             c.objects_opened,
             c.evictions + s.evictions.load(Relaxed),
@@ -2445,7 +2644,8 @@ impl Loop<'_> {
             s.machine_available.load(Relaxed),
             s.pressure.load(Relaxed),
             c.ev_instances,
-            c.ev_requests
+            c.ev_requests,
+            s.cells_restarts.load(Relaxed)
         );
         // Per process: the time its cells ran (us, host calls in) and their slices.
         let engine = |k: crate::engine::Kind| if k == crate::engine::Kind::Compiled { "compiled" } else { "interpreted" };
@@ -3187,6 +3387,12 @@ impl Loop<'_> {
 
     /// Run a request on an object this loop owns, now or after the ones ahead of it.
     fn submit(&mut self, origin: Origin, name: String, req: String) {
+        // No cells (they're starting again): no use claiming objects for
+        // them. (The core's own runs never come now: it serves nothing
+        // until the cells restore it.)
+        if self.line.is_none() && !matches!(origin, Origin::Fleet(_)) {
+            return drop(self.deliver(origin, (503, "{\"error\":\"retry\"}".into())));
+        }
         if session_sock(&name).is_some() && self.app.procs.get(self.app.object_proc(&name)).is_some_and(|p| p.socket) {
             let origin = self.tok(origin);
             return self.down(Down::Run { origin, name, req, new: false });
@@ -3408,6 +3614,10 @@ impl Loop<'_> {
     /// An object's segments arrived: the cells rebuild its database.
     fn fetched(&mut self, obj: own::Obj, act: Act, data: Result<Vec<Vec<u8>>, String>, index: Vec<String>, image: Option<String>) {
         let Some(name) = self.names.get(&obj).cloned() else { return };
+        // For cells that died since: the core gave it up (`Event::Lost`).
+        if !self.core.as_ref().is_some_and(|c| c.wants_restore(obj, act)) {
+            return;
+        }
         // A new object (nothing to restore) on a disk nearly full, or one
         // the policy refuses (`policy::new_object`): refused, as alone
         // (`submit`). One that exists still comes back.
