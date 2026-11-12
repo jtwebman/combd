@@ -128,3 +128,48 @@ object "acme/shop/cart/42" trapped: unreachable (panicked at src/lib.rs:12: ...)
 
 `GET /_combd/ping` answers `{}` and is cheap. The arena's scripts wait on
 it to know a node is up.
+
+## Alerts
+
+`combd watch` tells you when a node is down. Run it every minute on each
+node, from cron, with the node's own environment. It asks the next node
+for `/_combd/ping` (the node after its own in `COMBD_PUBLIC_URLS`; a node
+alone asks itself). So every node is watched by another, and a combd that
+can't start is seen too.
+
+- Three misses in a row, and it says the node is down.
+- It says so again every hour while the node stays down.
+- It says when the node answers again.
+
+Where alerts go is a file, named by `COMBD_ALERTS`, one place a line. It
+holds keys, so keep it mode 600.
+
+```text
+# /etc/combd/alerts
+forwardemail <api key> alerts@example.com you@example.com
+slack https://hooks.slack.com/services/<...>
+pagerduty <routing key>
+webhook https://example.com/hook
+```
+
+| Line | Where it goes |
+|---|---|
+| `forwardemail <api key> <from> <to>` | An email through [Forward Email](https://forwardemail.net). `from` must be an alias of a domain set up there for sending. |
+| `slack <webhook url>` | A Slack channel, by an incoming webhook. |
+| `pagerduty <routing key>` | A PagerDuty incident (Events API v2). It opens when the node goes down and closes when it's back. |
+| `webhook <url>` | A POST of `{"key", "state", "subject", "text"}` as JSON. `state` is `down` or `up`. |
+
+`combd watch test` sends a test alert to every line and says which ones
+failed. Run it once after you write the file.
+
+The cron line, as the arena's nodes have it:
+
+```text
+* * * * * root [ -s /etc/combd/alerts ] && { set -a; . /etc/combd/env; set +a; COMBD_ALERTS=/etc/combd/alerts /opt/combd/current/combd/target/release/combd watch 2>&1 | logger -t combd-watch; }
+```
+
+It keeps what it knows in `COMBD_DATA/watch`. Without `COMBD_ALERTS` it
+does nothing.
+
+If every machine is off at once, no node is left to say so. For that,
+point an outside checker at `/_combd/ping` as well.

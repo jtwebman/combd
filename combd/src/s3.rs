@@ -88,7 +88,7 @@ fn hmac(k: &[u8], m: &str) -> Vec<u8> {
 }
 
 /// RFC 3986 encoding, as SigV4 wants it. `/` stays in paths.
-fn enc(s: &str, path: bool) -> String {
+pub(crate) fn enc(s: &str, path: bool) -> String {
     let mut o = String::new();
     for b in s.bytes() {
         match b {
@@ -416,6 +416,21 @@ impl S3 {
         Ok(())
     }
 
+    /// The storage test, once for a bucket on this node's disk: one that
+    /// passed is noted in `data/bucket-ok`, and a later start doesn't test
+    /// it again. The test is 36 billed writes, and a node that couldn't
+    /// start ran it every 5 seconds for 11 days (2026-11).
+    pub fn check_once(&self, data: &std::path::Path) -> Result<(), String> {
+        // The 1 is the test's version: a changed test runs again.
+        let (note, me) = (data.join("bucket-ok"), format!("1 {} {}\n", self.host, self.bucket));
+        if std::fs::read_to_string(&note).is_ok_and(|s| s == me) {
+            return Ok(());
+        }
+        self.check()?;
+        let _ = std::fs::write(&note, me);
+        Ok(())
+    }
+
     fn check_now(&self) -> Result<(), String> {
         let e = |x: std::io::Error| x.to_string();
         self.make_bucket().map_err(e)?;
@@ -457,6 +472,9 @@ impl S3 {
         if n != 1 {
             return Err(format!("{n} of 16 racing If-None-Match writers won (must be 1): create-if-absent isn't atomic"));
         }
+        // Its two keys go (a delete isn't billed): every start left them.
+        let _ = self.delete(&k);
+        let _ = self.delete(&format!("{k}-fresh"));
         Ok(())
     }
 }
@@ -522,6 +540,20 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A bucket noted as passed isn't asked again (nothing listens at
+    /// port 1, so any request fails); another bucket is.
+    #[test]
+    fn a_bucket_that_passed_isnt_tested_at_the_next_start() {
+        let dir = std::env::temp_dir().join(format!("combd-bucket-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = S3 { pool: Default::default(), host: "127.0.0.1:1".into(), tls: false, bucket: "passed".into(), key: "k".into(), secret: "s".into(), region: "auto".into() };
+        assert!(b.check_once(&dir).is_err(), "no note: it tests");
+        std::fs::write(dir.join("bucket-ok"), "1 127.0.0.1:1 passed\n").unwrap();
+        assert_eq!(b.check_once(&dir), Ok(()));
+        assert!(S3 { bucket: "other".into(), ..b.clone() }.check_once(&dir).is_err(), "another bucket: it tests");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

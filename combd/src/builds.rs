@@ -149,8 +149,16 @@ impl Builds {
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let b = Builds { s3, dir, keys, pin, cpu: cpu().to_string() };
         let me = serde_json::json!({ "pin": b.pin, "pin_text": combd_aot::PIN, "cpu": b.cpu, "version": option_env!("COMBD_VERSION").unwrap_or("dev"), "at": now_ms() });
-        b.s3.put(&format!("_combd/nodes/{node}"), me.to_string().as_bytes(), &Cond::Any).map_err(|e| e.to_string())?.map_err(|()| "can't write the node's record")?;
-        b.s3.put(&format!("_combd/builds/{}/pin", b.pin), combd_aot::PIN.as_bytes(), &Cond::Any).map_err(|e| e.to_string())?.map_err(|()| "can't write the pin")?;
+        // Written only when they change (`at` is since when): a start that
+        // changes nothing reads, and a read costs a twelfth of a write.
+        let (rec, pin) = (format!("_combd/nodes/{node}"), format!("_combd/builds/{}/pin", b.pin));
+        let was: serde_json::Value = b.s3.get(&rec).map_err(|e| e.to_string())?.and_then(|(v, _)| serde_json::from_slice(&v).ok()).unwrap_or_default();
+        if ["pin", "pin_text", "cpu", "version"].iter().any(|k| was[k] != me[k]) {
+            b.s3.put(&rec, me.to_string().as_bytes(), &Cond::Any).map_err(|e| e.to_string())?.map_err(|()| "can't write the node's record")?;
+        }
+        if b.s3.get(&pin).map_err(|e| e.to_string())?.is_none() {
+            b.s3.put(&pin, combd_aot::PIN.as_bytes(), &Cond::Any).map_err(|e| e.to_string())?.map_err(|()| "can't write the pin")?;
+        }
         Ok(b)
     }
 

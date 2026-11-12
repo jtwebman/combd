@@ -223,7 +223,9 @@ COMBD_MEMORY_BUDGET=550M
 COMBD_BUILDER_KEYS=/etc/combd/builder-keys
 ```
 
-On start, a node tests the bucket and catches up on the catalog. It gives
+On start, a node tests the bucket and catches up on the catalog. The test
+runs once: a bucket that passed is noted in `COMBD_DATA/bucket-ok`, so a
+restart writes nothing to it. It gives
 up after 60 s if it can't reach the bucket. It loads every live app, and
 refuses to start with a node number another running node is using. Then
 it serves, and swaps in whatever the catalog says changed.
@@ -329,7 +331,8 @@ walks through it. The parts worth copying:
   user, 1 GB of swap, and a cron job for updates, and starts combd.
 - **`combd.service`** runs `combd serve-fleet both 443` under systemd as
   the `combd` user, with no Docker, `Restart=always`, and
-  `LimitNOFILE=1048576`. It locks combd down, as in
+  `LimitNOFILE=1048576`. A combd that can't start is tried again after
+  1 s, then less often, down to every 2 minutes. It locks combd down, as in
   [Security model](security.md#the-process-around-it). It sets
   `MALLOC_MMAP_THRESHOLD_` and `MALLOC_MMAP_MAX_`, so glibc keeps cells'
   buffers as lazy zero pages.
@@ -338,6 +341,9 @@ walks through it. The parts worth copying:
   node doesn't need.
 - **`combd-update.sh`** runs every minute from cron and moves the node to
   a new combd, as below.
+- **`combd watch`** runs every minute from cron too, if `/etc/combd/alerts`
+  is there. It tells you when the next node is down. See
+  [Alerts](stats.md#alerts).
 - **`tls.sh`** gives every node a renewed certificate, which combd picks
   up within seconds.
 - **`roll.sh`** moves every node now, one at a time, each only once the

@@ -88,6 +88,14 @@ moves to this combd. It exits 0 if every compiled module the fleet runs
 is built for it, 1 if not yet, asking for the missing builds, and 2 if it
 can't tell.
 
+### `combd watch`
+
+Run it every minute from cron, with the node's own environment and
+`COMBD_ALERTS`. It checks the next node answers, and tells the places in
+that file when it goes down, every hour while it's down, and when it's
+back. `combd watch test` sends a test alert to each place. See
+[Alerts](stats.md#alerts).
+
 ### `combd bucket-check`
 
 Runs the startup storage test on the bucket in `COMBD_S3`,

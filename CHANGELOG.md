@@ -84,7 +84,13 @@ The first release: Durable Objects on your own machines, as one binary.
   fleet with its own.
 - Cheap on a bucket that bills per request: an idle node lists its bucket
   once every 30 s (alarms are looked for when one is due, or when a peer
-  goes quiet), and an idle builder backs off to 30 s.
+  goes quiet), and an idle builder backs off to 30 s. A restart writes
+  nothing to the bucket: the storage test runs once per bucket, and a
+  node's records are written only when they change.
+- Alerts: `combd watch`, from cron on each node, checks the next node
+  answers and says when it's down, every hour while it is, and when it's
+  back: by email (Forward Email), Slack, PagerDuty, or a webhook
+  (`COMBD_ALERTS`).
 
 **Checked**
 - TLA+ specs for ownership, replication, the catalog, and the alarm index;

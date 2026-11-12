@@ -13,7 +13,12 @@ Environment=MALLOC_MMAP_THRESHOLD_=131072 MALLOC_MMAP_MAX_=4000000
 WorkingDirectory=/opt/combd/current/combd
 ExecStart=/opt/combd/current/combd/target/release/combd serve-fleet both 443
 Restart=always
+# A node that can't start waits longer each time, 1 s up to 2 minutes: every
+# start runs the bucket's storage test, 38 billed writes (a loop at 1 s was
+# 1.8 million a day, 2026-11). A restart by hand or an update starts at 1 s.
 RestartSec=1
+RestartSteps=6
+RestartMaxDelaySec=120
 LimitNOFILE=1048576
 # Ports 80 and 443, and nothing else a root process could do.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -42,9 +47,11 @@ SystemCallArchitectures=native
 # files), only the calls a service makes (a call outside them fails, EPERM,
 # and combd goes on), and nothing on the machine it can run but itself, its
 # libraries, and its builds: no shell, no curl. (The filter can't refuse
-# execve: systemd needs it to start combd.)
+# execve: systemd needs it to start combd.) @sandbox is landlock and
+# seccomp, which the cells' process locks itself down with: @system-service
+# leaves them out, and without them it can't start.
 MemoryDenyWriteExecute=yes
-SystemCallFilter=@system-service
+SystemCallFilter=@system-service @sandbox
 SystemCallFilter=~@privileged
 SystemCallErrorNumber=EPERM
 # Each place it can write is a mount of its own, which / doesn't cover:

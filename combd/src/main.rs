@@ -9,6 +9,7 @@
 
 mod admin;
 mod alarm_keys;
+mod alert;
 #[cfg(feature = "aot-lite")]
 mod aot;
 #[cfg(feature = "aot-lite")]
@@ -1017,6 +1018,15 @@ fn main_with(args: &[&str]) {
                     eprintln!("combd     {}/{} failed the storage test: {e}", b.host, b.bucket);
                     std::process::exit(1);
                 }
+            }
+        }
+        // Is the node after this one answering? Cron runs it every minute;
+        // it tells the places in COMBD_ALERTS when that changes. `test`
+        // sends each a test alert.
+        ["watch"] | ["watch", "test"] => {
+            if let Err(e) = alert::watch(args.len() == 2) {
+                eprintln!("combd     watch: {e}");
+                std::process::exit(1);
             }
         }
         ["wire-certs", dir, nodes] => match wire::make_certs(std::path::Path::new(dir), nodes.parse().unwrap()) {

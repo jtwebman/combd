@@ -155,6 +155,14 @@ pub trait Api: Sync {
 
 /// GET a JSON answer from `url` (http or https, Mozilla's roots), in 3 s.
 pub fn get_json(url: &str) -> Result<Json, String> {
+    let (_, body) = fetch("GET", url, "", b"", std::time::Duration::from_secs(3))?;
+    serde_json::from_str(&body).map_err(|_| format!("{url}: not JSON"))
+}
+
+/// One request to `url` (http or https, Mozilla's roots): its status and
+/// body. `headers` are whole lines, each ending `\r\n`; `t` is how long to
+/// wait to connect, and for each read and write.
+pub fn fetch(method: &str, url: &str, headers: &str, body: &[u8], t: std::time::Duration) -> Result<(u16, String), String> {
     let (tls, rest) = match url.split_once("://") {
         Some(("https", r)) => (true, r),
         Some(("http", r)) => (false, r),
@@ -163,13 +171,13 @@ pub fn get_json(url: &str) -> Result<Json, String> {
     let (hostport, path) = rest.split_once('/').map_or((rest, "/".to_string()), |(h, p)| (h, format!("/{p}")));
     let host = hostport.rsplit_once(':').map_or(hostport, |(h, _)| h);
     let addr = if hostport.contains(':') { hostport.to_string() } else { format!("{hostport}:{}", if tls { 443 } else { 80 }) };
-    let t = std::time::Duration::from_secs(3);
     let a = std::net::ToSocketAddrs::to_socket_addrs(&addr).map_err(|e| format!("{addr}: {e}"))?.next().ok_or(format!("{addr}: no address"))?;
     let s = std::net::TcpStream::connect_timeout(&a, t).map_err(|e| format!("{addr}: {e}"))?;
     let _ = s.set_read_timeout(Some(t));
-    let head = format!("GET {path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n");
+    let _ = s.set_write_timeout(Some(t));
+    let head = format!("{method} {path} HTTP/1.1\r\nhost: {host}\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n", body.len());
     let mut out = vec![];
-    let go = |s: &mut dyn ReadWrite, out: &mut Vec<u8>| s.write_all(head.as_bytes()).and_then(|()| s.read_to_end(out)).map(|_| ());
+    let go = |s: &mut dyn ReadWrite, out: &mut Vec<u8>| s.write_all(head.as_bytes()).and_then(|()| s.write_all(body)).and_then(|()| s.read_to_end(out)).map(|_| ());
     let r = if tls {
         let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
         let conn = rustls::ClientConnection::new(crate::s3::tls_config(), name).map_err(|e| e.to_string())?;
@@ -181,8 +189,8 @@ pub fn get_json(url: &str) -> Result<Json, String> {
         return Err(r.err().map_or("no answer".into(), |e| e.to_string()));
     }
     let text = String::from_utf8_lossy(&out);
-    let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
-    serde_json::from_str(body).map_err(|_| format!("{url}: not JSON"))
+    let status = text.get(9..12).and_then(|c| c.parse().ok()).ok_or(format!("{url}: not HTTP"))?;
+    Ok((status, text.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_string()))
 }
 
 /// Serve the admin API (blocking: a thread per connection; it's for

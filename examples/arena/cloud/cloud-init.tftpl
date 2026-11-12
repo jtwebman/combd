@@ -72,6 +72,17 @@ write_files:
   - path: /etc/cron.d/combd-update
     content: |
       * * * * * root /usr/local/bin/combd-update
+  # Each node watches the next one, and tells the places in /etc/combd/alerts
+  # when it's down and when it's back (`combd watch`; nothing without the file).
+  - path: /etc/cron.d/combd-watch
+    content: |
+      * * * * * root [ -s /etc/combd/alerts ] && { set -a; . /etc/combd/env; set +a; COMBD_ALERTS=/etc/combd/alerts /opt/combd/current/combd/target/release/combd watch 2>&1 | logger -t combd-watch; }
+%{ if alerts != "" ~}
+  - path: /etc/combd/alerts
+    permissions: "0600"
+    encoding: b64
+    content: ${base64encode(alerts)}
+%{ endif ~}
 runcmd:
   # A little swap: 1 GB is tight.
   - fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab

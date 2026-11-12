@@ -200,6 +200,10 @@ resource "digitalocean_droplet" "node" {
     service     = file("${path.module}/combd.service")
     release_pub = file("${path.module}/release.pub")
     tune        = file("${path.module}/combd-tune.sh")
+    # Where to say a node is down or back up (`combd watch`), one place a
+    # line, if the file is there: `forwardemail <api key> <from> <to>`,
+    # `slack <webhook url>`, `pagerduty <routing key>`, or `webhook <url>`.
+    alerts      = fileexists("${local.secrets}/alerts") ? file("${local.secrets}/alerts") : ""
   })
   # Running nodes keep what they started with: a change here is for new
   # droplets (combd itself rolls out through combd-update).

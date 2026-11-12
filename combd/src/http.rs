@@ -810,11 +810,11 @@ fn serve_apps_in<E: Engine>(eng: &E, apps: &[(String, std::path::PathBuf)], port
 pub fn serve_fleet_apps<E: Engine>(eng: &E, port: u16, mut cfg: Config, admin: Option<crate::admin::AdminCfg>) -> Result<(), String> {
     let fc = cfg.fleet.as_ref().ok_or("fleet mode needs a bucket (COMBD_S3)")?;
     let s3 = fc.s3.clone();
+    std::fs::create_dir_all(&cfg.data).map_err(|e| e.to_string())?;
     // The storage test first (it makes the bucket too): never serve on one
     // that can't do compare-and-swap.
-    s3.check().map_err(|e| format!("the bucket at {} failed the storage test: {e}", s3.host))?;
+    s3.check_once(&cfg.data).map_err(|e| format!("the bucket at {} failed the storage test: {e}", s3.host))?;
     let peers: Vec<own::Node> = fc.peers.keys().copied().filter(|&n| n != fc.node).collect();
-    std::fs::create_dir_all(&cfg.data).map_err(|e| e.to_string())?;
     let cat = crate::catnode::CatNode::start(Arc::new(s3.clone()), cfg.data.join("catalog.snap"), peers);
     cfg.catalog = Some(cat.clone());
     if !cat.ready(Duration::from_secs(60)) {
@@ -1720,7 +1720,7 @@ fn rand_u64() -> u64 {
 
 fn start_fleet(fc: FleetCfg, loops: &[(Sender<Msg>, Arc<LoopWaker>)], threads: usize, data: &std::path::Path, catalog: Option<Arc<crate::catnode::CatNode>>) -> FleetShared {
     // The startup storage test: never serve on a bucket that can't do CAS.
-    if let Err(e) = fc.s3.check() {
+    if let Err(e) = fc.s3.check_once(data) {
         eprintln!("combd     the bucket at {} failed the storage test: {e}", fc.s3.host);
         std::process::exit(1);
     }

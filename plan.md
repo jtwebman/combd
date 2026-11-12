@@ -130,7 +130,20 @@ and the rest of the plan is updated to match.
      See "Before release: a wall that holds when the engine doesn't".
      Steps 1 to 4 done (2026-10-31): the cells in a locked-down child,
      which starts again when it dies (C4c). Step 5, cordons, deferred
-     (JT). Left: see the lockdown on x86-64 (a droplet).
+     (JT). Seen on x86-64 (the droplets, 2026-11-12), late: the arena's
+     systemd unit refused landlock and seccomp, so from 2026-10-31 no node
+     started, for 11 days, and each try ran the bucket's storage test
+     (1.8 million PUTs a day, about $90 of R2 writes). The unit allows
+     `@sandbox` now and waits longer between failed starts. A restart
+     writes nothing to the bucket now (the storage test runs once per
+     bucket, noted in `data/bucket-ok`; a node's records are written only
+     when they change). And nothing told us: `combd watch` does now
+     (alert.rs: each node checks the next from cron, and says down, hourly,
+     and back up by Forward Email, Slack, PagerDuty, or a webhook). Left:
+     put `/etc/combd/alerts` and the cron line on the arena's nodes, once
+     this is released. More to alert on later, through the same
+     `alert::tell`: a disk nearly full, a certificate about to expire, a
+     cells' process that keeps dying.
    - Phoenix keeps the shorter p99 at 100 connections (23 ms to 29 to 37).
    - Show the agent's ceiling gone on a big machine (here Postgres runs out
      first): a many-core box, combd and Postgres apart.
@@ -2653,8 +2666,10 @@ simulator's `cells` fault checks that.
      `getdents64`, `sendmsg`, `poll`, ...) and kept what a rare path needs
      (`abort`'s `tgkill`, a guard page's `rt_sigreturn`, SQLite's busy
      sleep and `faccessat`, `mremap` for a big `realloc`). The same three
-     workloads locked: nothing killed. Not yet seen: x86-64 (the
-     droplets); a node there says `cells locked down` or why not.
+     workloads locked: nothing killed. On x86-64 (the droplets,
+     2026-11-12) a node says `cells locked down: landlock 4 and seccomp`,
+     once its systemd unit lets it (`SystemCallFilter=@system-service
+     @sandbox`: `@system-service` has neither landlock nor seccomp).
    - L5: `fuzz-ipc` (`combd fuzz-ipc N [seed [fleet]]`, in `check.sh`):
      a node whose cells are fake, sent messages built from what it said
      (tokens, names, sockets, calls, requests, activations) or made up,
