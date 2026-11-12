@@ -139,9 +139,9 @@ and the rest of the plan is updated to match.
      bucket, noted in `data/bucket-ok`; a node's records are written only
      when they change). And nothing told us: `combd watch` does now
      (alert.rs: each node checks the next from cron, and says down, hourly,
-     and back up by Forward Email, Slack, PagerDuty, or a webhook). Left:
-     put `/etc/combd/alerts` and the cron line on the arena's nodes, once
-     this is released. More to alert on later, through the same
+     and back up by Forward Email, Slack, PagerDuty, or a webhook). Live
+     on the arena's nodes (2026-11-12): `/etc/combd/alerts` and the cron
+     line, copied by hand. More to alert on later, through the same
      `alert::tell`: a disk nearly full, a certificate about to expire, a
      cells' process that keeps dying.
    - Phoenix keeps the shorter p99 at 100 connections (23 ms to 29 to 37).
