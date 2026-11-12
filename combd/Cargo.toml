@@ -42,7 +42,7 @@ wasmparser = "0.261"
 mio = { version = "1", features = ["net", "os-poll"] }
 httparse = "1"
 # Durable Object storage: one SQLite file per object, in the host.
-rusqlite = { version = "0.37", features = ["bundled", "hooks", "limits"] }
+rusqlite = { version = "0.42", features = ["bundled", "hooks", "limits"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # The wire between nodes: mTLS, and certificates for a fleet.

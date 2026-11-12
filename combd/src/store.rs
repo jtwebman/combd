@@ -146,7 +146,7 @@ pub fn make_dirs(dir: &Path, file: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Db> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         // This connection never syncs, not even the WAL header after a
         // restart (that was an fsync inside commits, on the event loop). It's
         // safe because every sync happens elsewhere, in the right order:
@@ -161,7 +161,7 @@ impl Db {
         // Checkpoints happen on the fsync threads (see `checkpoint`).
         conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         // Count the WAL's pages after each commit, to know when to checkpoint.
-        conn.wal_hook(Some(note_wal_pages));
+        conn.wal_hook(Some(note_wal_pages))?;
         // No busy timeout: a passive checkpoint never takes the write lock,
         // and when it holds a read lock the writer just skips restarting the
         // WAL. A timeout here would sleep on the event loop instead.
@@ -212,14 +212,14 @@ impl Db {
                 }
                 _ => Authorization::Allow,
             }
-        }));
+        }))?;
         let steps = Arc::new(AtomicU32::new(0));
         let started = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
         let (s, t, h) = (steps.clone(), started.clone(), host.clone());
         // Every 100 VM steps (a step can be costly), for cell statements only.
         conn.progress_handler(100, Some(move || {
             !h.load(Relaxed) && (s.fetch_add(1, Relaxed) >= MAX_STEPS || t.lock().unwrap().elapsed() > MAX_STATEMENT)
-        }));
+        }))?;
         let mut wal_path = path.as_os_str().to_owned();
         wal_path.push("-wal");
         Ok(Db { conn, path: path.to_path_buf(), wal_path: wal_path.into(), wal: Default::default(), wrote: Default::default(), wal_pages: Default::default(), tail: std::cell::Cell::new((WAL_HEADER, 0)), host, steps, started })
@@ -390,7 +390,7 @@ thread_local! {
     static WAL_PAGES: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
-fn note_wal_pages(_: &rusqlite::hooks::Wal, pages: std::ffi::c_int) -> rusqlite::Result<()> {
+fn note_wal_pages(_: &mut rusqlite::hooks::Wal, pages: std::ffi::c_int) -> rusqlite::Result<()> {
     WAL_PAGES.with(|p| p.set(pages));
     Ok(())
 }
