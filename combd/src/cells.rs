@@ -625,6 +625,7 @@ impl<E: Engine> CellLoop<'_, E> {
             Done::Checkpointed { obj } => {
                 if let Some(o) = self.objects.get_mut(&obj) {
                     o.checkpointing = false;
+                    o.db.lock().unwrap().checkpointed();
                 }
                 self.next_waiting(&obj);
                 self.kick_sync(&obj);

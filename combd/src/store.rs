@@ -250,6 +250,12 @@ impl Db {
         self.wal_pages.get() >= CHECKPOINT_PAGES
     }
 
+    /// A checkpoint ran. The count is from the last commit, so without this
+    /// an object with no write since wants another, and another.
+    pub fn checkpointed(&self) {
+        self.wal_pages.set(0);
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -476,6 +482,7 @@ impl Db {
         let r = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         self.host.store(false, Relaxed);
         self.tail.set((WAL_HEADER, 0));
+        self.checkpointed();
         r
     }
 }

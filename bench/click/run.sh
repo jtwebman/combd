@@ -181,6 +181,9 @@ active() {
     done
     dead=$(up || died)
     logs "$log"
+    # combd's own counts (frames to a write: ws_frames over ws_flushes).
+    [ "$s" = combd ] && docker run --rm --network $NET bench-click-combd bash -c \
+        'exec 3<>/dev/tcp/srv/8080 && printf "GET /_combd/stats HTTP/1.1\r\nhost: million.localhost\r\nconnection: close\r\n\r\n" >&3 && cat <&3' > "$log-stats.txt" 2>/dev/null
     # Per 10 s window, summed over the clients (the worst client's p50 and
     # p99); windows up to SECS.
     cat "$log"-cli*.log | awk -v secs="$SECS" -v n="$n" -v s="$s" '

@@ -3169,3 +3169,49 @@ sweeps in the session's notes; each measured at pool 32 unless said):
 Measuring first changed the order: the plan was to remove thread hops; the
 measurement (per-thread CPU, `pg_stat_statements`) put the reset first and
 the hops last.
+
+## A hold under load: no gain, and a checkpoint loop found (2026-11-11)
+
+An idea from the servers that win one-CPU races: a busy loop waits a few
+milliseconds before it looks again, so more arrives for one turn (one trip
+to the cells for many requests, more frames to a socket in one write).
+Built as `COMBD_HOLD_MS`: a loop whose last wait ended sooner than the hold
+slept that long before its next; a quiet loop never slept. Measured with
+`bench/click/run.sh` (combd alone, `PIN=1`, 120 s of clicking), summaries
+in `bench/click/results/2026-11-11-hold.txt`:
+
+| Test | No hold | 1 ms | 5 ms |
+|---|---|---|---|
+| `GET /api/count`, 10 conns | 57,216 req/s | 1,401 | 303 |
+| `GET /api/count`, 100 conns | 122,261 req/s | 13,731 | 3,539 |
+| `GET /api/count`, 1,000 conns | 104,291 req/s | 77,644 | 28,881 |
+| 10,000 clicking pages, CPU | 55% | 58% | 58% |
+| 20,000 clicking pages, echo p50 | 4.2 s | 6.6 s | 9.4 s |
+| 20,000 clicking pages, clicks lost | 3 | 38 | 536 |
+| Frames to a write, 20,000 pages | 1.04 | 1.03 | 1.04 |
+
+- **Plain requests lose by construction.** wrk sends a connection's next
+  request only after its answer, so a sleeping server is an idle one. And
+  a loaded loop groups by itself: each look takes all that has arrived.
+- **WebSockets: nothing to group.** A page gets about ten pushes a second,
+  so two inside one hold are rare; frames to a write (`ws_frames` over
+  `ws_flushes`) didn't move, and the wait was only delay.
+
+So it's out, as io_uring was. The race keeps one thing from it: a clicking
+test saves combd's `/_combd/stats` (`<server>-<pages>-stats.txt`).
+
+**What the counts showed instead:** 633,246 checkpoints for 194,446
+commits at 20,000 pages (54,931 for 102,237 at 10,000). An object whose
+WAL passed 1,000 pages was checkpointed again and again until its next
+write: the page count is taken at a commit, so after the checkpoint it
+still said "big", and each round was an fsync, a new SQLite connection,
+and a pause for the object. An idle object did 3,911 in 300 ms
+(`a_big_wal_is_checkpointed_once`). A finished checkpoint clears the count
+now (`Db::checkpointed`): 249 checkpoints at 20,000 pages, 71 at 10,000,
+and an fsync per commit. It's the single node's path only: a fleet's
+objects checkpoint after a seal, which follows a write.
+
+The race itself didn't move with the fix (10,000 pages: 56% CPU, echo p50
+114 ms and p99 329 ms, against 55%, 121 and 368; 20,000 is at the limit
+either way): fsync is cheap in Docker's file system. On a real disk each
+of those was a write to it.

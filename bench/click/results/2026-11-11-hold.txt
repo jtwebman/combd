@@ -1,0 +1,36 @@
+== hold 0 ms (378695c and the hold)
+combd           req    10 conns  GET /             79094 req/s  p50  97.00us  p99 137.00us  errors      0  memory   15 MiB peak  cpu 100% avg 
+combd           req    10 conns  GET /api/count    57216 req/s  p50 136.00us  p99 184.00us  errors      0  memory   15 MiB peak  cpu 100% avg 
+combd           req   100 conns  GET /            108085 req/s  p50   0.92ms  p99   1.25ms  errors      0  memory   25 MiB peak  cpu 100% avg 
+combd           req   100 conns  GET /api/count   122261 req/s  p50 793.00us  p99   1.26ms  errors      0  memory   27 MiB peak  cpu 100% avg 
+combd           req  1000 conns  GET /            104181 req/s  p50   9.39ms  p99  13.30ms  errors      0  memory  128 MiB peak  cpu 100% avg 
+combd           req  1000 conns  GET /api/count   104291 req/s  p50   9.21ms  p99  15.10ms  errors      0  memory  131 MiB peak  cpu 100% avg 
+combd            10000 pages  changes/s  125811 avg  148800 peak  clicks  91910  lost     0 (0.00%)  worst p50   121 ms  p99   368 ms  up 10000 closed 0  refused 0  memory  336 MiB peak (base   7)  cpu  55% avg 
+combd            20000 pages  changes/s  394278 avg  616441 peak  clicks 183599  lost     3 (0.00%)  worst p50  4221 ms  p99  6989 ms  up 20000 closed 0  refused 0  memory  492 MiB peak (base   9)  cpu  90% avg 
+== hold 1 ms (378695c and the hold)
+combd           req    10 conns  GET /              2682 req/s  p50   2.98ms  p99   3.93ms  errors      0  memory   15 MiB peak  cpu  19% avg 
+combd           req    10 conns  GET /api/count     1401 req/s  p50   5.71ms  p99   7.43ms  errors      0  memory   15 MiB peak  cpu  14% avg 
+combd           req   100 conns  GET /             12048 req/s  p50   8.06ms  p99  13.43ms  errors      0  memory   23 MiB peak  cpu  47% avg 
+combd           req   100 conns  GET /api/count    13731 req/s  p50   7.21ms  p99  10.32ms  errors      0  memory   23 MiB peak  cpu  52% avg 
+combd           req  1000 conns  GET /             10964 req/s  p50  95.90ms  p99 113.44ms  errors      0  memory  134 MiB peak  cpu  52% avg 
+combd           req  1000 conns  GET /api/count    77644 req/s  p50  12.47ms  p99  18.70ms  errors      0  memory  133 MiB peak  cpu  81% avg 
+combd            10000 pages  changes/s  126883 avg  149247 peak  clicks  91781  lost     0 (0.00%)  worst p50   122 ms  p99   367 ms  up 10000 closed 0  refused 0  memory  328 MiB peak (base   9)  cpu  58% avg 
+combd            20000 pages  changes/s  365823 avg 1018812 peak  clicks 183120  lost    38 (0.02%)  worst p50  6620 ms  p99  9497 ms  up 20000 closed 0  refused 0  memory  479 MiB peak (base   9)  cpu  80% avg 
+== hold 5 ms (378695c and the hold)
+combd           req    10 conns  GET /               606 req/s  p50  13.24ms  p99  15.64ms  errors      0  memory   13 MiB peak  cpu   6% avg 
+combd           req    10 conns  GET /api/count      303 req/s  p50  26.83ms  p99  30.25ms  errors      0  memory   12 MiB peak  cpu   4% avg 
+combd           req   100 conns  GET /              3580 req/s  p50  29.04ms  p99  35.29ms  errors      0  memory   27 MiB peak  cpu  24% avg 
+combd           req   100 conns  GET /api/count     3539 req/s  p50  28.83ms  p99  33.24ms  errors      0  memory   27 MiB peak  cpu  20% avg 
+combd           req  1000 conns  GET /              3550 req/s  p50 286.87ms  p99 316.97ms  errors      0  memory  130 MiB peak  cpu  26% avg 
+combd           req  1000 conns  GET /api/count    28881 req/s  p50  34.52ms  p99  39.21ms  errors      0  memory  134 MiB peak  cpu  47% avg 
+combd            10000 pages  changes/s  127748 avg  148905 peak  clicks  92049  lost     0 (0.00%)  worst p50   145 ms  p99   376 ms  up 10000 closed 0  refused 0  memory  308 MiB peak (base   7)  cpu  58% avg 
+combd            20000 pages  changes/s  367686 avg  960062 peak  clicks 183762  lost   536 (0.29%)  worst p50  9387 ms  p99  9998 ms  up 20000 closed 0  refused 0  memory  600 MiB peak (base   7)  cpu  72% avg 
+== no hold, checkpoints fixed
+combd           req    10 conns  GET /             78819 req/s  p50  97.00us  p99 130.00us  errors      0  memory   17 MiB peak  cpu 100% avg 
+combd           req    10 conns  GET /api/count    58060 req/s  p50 134.00us  p99 185.00us  errors      0  memory   17 MiB peak  cpu 100% avg 
+combd           req   100 conns  GET /            103577 req/s  p50   0.95ms  p99   1.36ms  errors      0  memory   25 MiB peak  cpu 100% avg 
+combd           req   100 conns  GET /api/count   115661 req/s  p50 842.00us  p99   1.26ms  errors      0  memory   24 MiB peak  cpu 100% avg 
+combd           req  1000 conns  GET /             93693 req/s  p50  10.48ms  p99  14.50ms  errors      0  memory  123 MiB peak  cpu 100% avg 
+combd           req  1000 conns  GET /api/count    93511 req/s  p50  10.48ms  p99  16.09ms  errors      0  memory  131 MiB peak  cpu 100% avg 
+combd            10000 pages  changes/s  126000 avg  150572 peak  clicks  91414  lost     0 (0.00%)  worst p50   114 ms  p99   329 ms  up 10000 closed 0  refused 0  memory  329 MiB peak (base   7)  cpu  56% avg 
+combd            20000 pages  changes/s  404379 avg  793901 peak  clicks 183450  lost     1 (0.00%)  worst p50  5882 ms  p99  6310 ms  up 20000 closed 0  refused 0  memory  515 MiB peak (base   7)  cpu  98% avg 

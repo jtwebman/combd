@@ -1476,6 +1476,12 @@ kernel rather than save it (`combd/RESULTS.md`), and io_uring saved no CPU:
 Linux-only unsafe code for nothing, so out. Git has both (`combd-ktls`,
 `combd-ring`) if NIC offload or bigger sends make them worth measuring again.
 
+**A hold under load, measured (2026-11-11): no gain.** A busy loop that
+waits 1 or 5 ms so more arrives for one turn: plain requests fell hard, and
+WebSocket frames to a write didn't move (1.04), since a page rarely gets
+two pushes in one hold. Out. Its runs found an object checkpointing in a
+loop after its WAL got big, fixed (`combd/RESULTS.md`, "A hold under load").
+
 ## The edge: TLS in combd, or edge nodes in front (2026-10-20)
 
 combd gets an idle connection down to 2.24 KB, but in front of it on each

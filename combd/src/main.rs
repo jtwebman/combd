@@ -2242,6 +2242,26 @@ mod tests {
         assert_eq!(http(port, "GET", "/do/bt/count", "").1, "{\"count\":7}");
     }
 
+    /// An object whose WAL got big is checkpointed once, not again and again
+    /// until its next write (it was: 633,000 checkpoints for 194,000 commits
+    /// under 20,000 clicking pages, each an fsync and a pause for the object).
+    #[test]
+    fn a_big_wal_is_checkpointed_once() {
+        let dir = store::tempdir::Dir::new();
+        let (port, _, _) = do_server(interp::Interp { max_pages: 16384 }, cfg(&dir.0, 1));
+        let big = "x".repeat(500_000);
+        // Write until the first checkpoint, and no more: a later write
+        // starts the WAL again, and hides it.
+        let mut wrote = 0;
+        while wrote < 20 && !eventually(150, || stat(port, "checkpoints") >= 1) {
+            assert_eq!(http(port, "POST", "/do/ck/msg", &big).0, 201);
+            wrote += 1;
+        }
+        assert!(wrote < 20, "10 MB written and no checkpoint");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(stat(port, "checkpoints"), 1, "no write since, so no checkpoint");
+    }
+
     #[test]
     fn batches_frame_and_unframe() {
         let parts = vec!["do POST /a 1".to_string(), String::new(), "héllo\n2".to_string()];
